@@ -1,0 +1,30 @@
+# Example: Pipelock agent security scan in CI
+#
+# Scans your project for AI agent security risks on every PR.
+# Detects exposed secrets, missing configs, and validates scanning coverage.
+#
+# Usage:
+#   1. Copy this to .github/workflows/pipelock.yaml
+#   2. Optionally add a pipelock.yaml config to your repo root
+#      (or let the action generate one automatically)
+
+name: Pipelock Security Scan
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for PR diff scanning
+
+      - name: Pipelock Scan
+        uses: luckyPipewrench/pipelock@v2
+        with:
+          # config: pipelock.yaml  # uncomment if you have a config
+          scan-diff: 'true'
+          fail-on-findings: 'true'

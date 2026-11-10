@@ -1,0 +1,53 @@
+name: Test with user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/pipelock-clean-project" "$RUNNER_TEMP/pipelock-reports"
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-clean-project"
+          printf '# Clean project\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/README.md"
+          printf 'def add(a, b):\n    return a + b\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/main.py"
+      - id: generate
+        uses: .
+        continue-on-error: true
+        env:
+          RUNNER_TEMP: /tmp/pipelock-gen-temp
+        with:
+          version: '2.5.0'
+          directory: pipelock-clean-project
+          test-vectors: 'false'
+          fail-on-findings: 'false'
+      - name: Copy generated config
+        env:
+          GEN: ${{ steps.generate.outputs.config-path }}
+        run: |
+          echo "generated: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then echo "FAIL: no generated config"; exit 1; fi
+          cp "$GEN" "$GITHUB_WORKSPACE/user-pipelock.yaml"
+      - id: action
+        uses: .
+        continue-on-error: true
+        env:
+          RUNNER_TEMP: /tmp/pipelock-user-temp
+        with:
+          version: '2.5.0'
+          directory: pipelock-clean-project
+          test-vectors: 'false'
+          config: ${{ github.workspace }}/user-pipelock.yaml
+      - name: Assert config-path echoes user config
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          EXPECTED: ${{ github.workspace }}/user-pipelock.yaml
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "actual: $ACTUAL"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then echo "FAIL: expected '$EXPECTED'"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          echo "PASS"

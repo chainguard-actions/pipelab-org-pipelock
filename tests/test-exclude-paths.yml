@@ -1,0 +1,44 @@
+name: Test exclude-paths with vectors and gate disabled
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/pipelock-clean-project" "$RUNNER_TEMP/pipelock-reports"
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-clean-project/vendor"
+          printf '# Clean project\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/README.md"
+          printf 'def add(a, b):\n    return a + b\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/main.py"
+          printf 'def helper():\n    return 1\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/vendor/lib.py"
+      - id: action
+        uses: .
+        continue-on-error: true
+        env:
+          # Keep reports out of ${{ runner.temp }}/pipelock-reports so the internal
+          # upload-artifact step (unsupported under act) has nothing to upload.
+          RUNNER_TEMP: /tmp/pipelock-exclude-temp
+        with:
+          version: 'v2.5.0'
+          directory: pipelock-clean-project
+          test-vectors: 'false'
+          fail-on-findings: 'false'
+          exclude-paths: |
+            vendor/
+              *.generated.go
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+        run: |
+          echo "outcome=$OUTCOME audit_failed=$AUDIT_FAILED score=$SCORE findings=$FINDINGS criticals=$CRITICALS"
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          case "$SCORE" in ''|*[!0-9]*) echo "FAIL: score not numeric"; exit 1;; esac
+          case "$FINDINGS" in ''|*[!0-9]*) echo "FAIL: findings-count not numeric"; exit 1;; esac
+          case "$CRITICALS" in ''|*[!0-9]*) echo "FAIL: critical-count not numeric"; exit 1;; esac
+          echo "PASS"

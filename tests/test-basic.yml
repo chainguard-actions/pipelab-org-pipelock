@@ -1,0 +1,62 @@
+name: Test basic audit of a clean directory
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/pipelock-clean-project" "$RUNNER_TEMP/pipelock-reports"
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-clean-project"
+          printf '# Clean project\n\nNothing to see here.\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/README.md"
+          printf 'def add(a, b):\n    return a + b\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/main.py"
+      - id: action
+        uses: .
+        # Pipelock may report config-level critical findings even for a clean
+        # project, which makes the fail-on-findings gate fail. The outcome is
+        # checked against the critical count below.
+        continue-on-error: true
+        env:
+          # Send reports somewhere other than ${{ runner.temp }}/pipelock-reports so the
+          # internal upload-artifact step (act's artifact server doesn't support it)
+          # finds no files and is skipped via if-no-files-found: ignore.
+          RUNNER_TEMP: /tmp/pipelock-basic-temp
+        with:
+          version: '2.5.0'
+          directory: pipelock-clean-project
+          # Built-in test vectors report gaps (MCP scanning disabled) with the
+          # generated config, so turn them off to keep the gate deterministic.
+          test-vectors: 'false'
+      - name: Assert audit outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome=$OUTCOME score=$SCORE findings=$FINDINGS criticals=$CRITICALS config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          case "$SCORE" in ''|*[!0-9]*) echo "FAIL: score not numeric"; exit 1;; esac
+          if [ "$SCORE" -lt 0 ] || [ "$SCORE" -gt 100 ]; then echo "FAIL: score out of range"; exit 1; fi
+          case "$FINDINGS" in ''|*[!0-9]*) echo "FAIL: findings-count not numeric"; exit 1;; esac
+          case "$CRITICALS" in ''|*[!0-9]*) echo "FAIL: critical-count not numeric"; exit 1;; esac
+          if [ "$CRITICALS" -gt "$FINDINGS" ]; then echo "FAIL: critical-count exceeds findings-count"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: generated config missing"; exit 1; fi
+          case "$CONFIG_PATH" in *suggested.yaml) ;; *) echo "FAIL: unexpected config path"; exit 1;; esac
+          # fail-on-findings defaults to true: the gate must fail iff criticals > 0
+          if [ "$CRITICALS" -gt 0 ]; then
+            if [ "$OUTCOME" != "failure" ]; then echo "FAIL: expected failure with $CRITICALS critical finding(s), got '$OUTCOME'"; exit 1; fi
+          else
+            if [ "$OUTCOME" != "success" ]; then echo "FAIL: expected success with 0 critical findings, got '$OUTCOME'"; exit 1; fi
+          fi
+          echo "PASS"
+      - name: Assert pipelock binary installed
+        run: |
+          BIN=/tmp/pipelock-basic-temp/pipelock-bin/pipelock
+          if command -v pipelock >/dev/null 2>&1; then BIN=pipelock; fi
+          "$BIN" version || { echo "FAIL: pipelock binary not usable"; exit 1; }
+          echo "PASS"
