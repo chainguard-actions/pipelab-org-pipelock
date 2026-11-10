@@ -1,0 +1,60 @@
+name: Test scanning coverage test vectors
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean fixture project
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/pl-clean-project"
+          mkdir -p "$D"
+          printf '# Clean project\n\nNothing sensitive here.\n' > "$D/README.md"
+          printf 'def add(a, b):\n    return a + b\n' > "$D/app.py"
+      # Outcome may be failure: upload-artifact fails under act's artifact server,
+      # and pipelock 2.6.0's generated config has a known --fail-on-gap gap
+      # (entropy path segment vector). Test-vector execution is verified below.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.6.0'
+          directory: pl-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'true'
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome=$OUTCOME config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: config not found"; exit 1; fi
+          echo "PASS: outputs valid"
+      - name: Assert test vectors run against generated config
+        env:
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+        run: |
+          rc=0
+          pipelock test --config "$CONFIG_PATH" --fail-on-gap > /tmp/vectors.txt 2>&1 || rc=$?
+          cat /tmp/vectors.txt
+          echo "exit code: $rc"
+          if ! grep -q "Pipelock Test Suite" /tmp/vectors.txt; then
+            echo "FAIL: test suite header missing"; exit 1
+          fi
+          RESULTS="$(grep -E 'Results: [0-9]+ passed' /tmp/vectors.txt || true)"
+          echo "results line: $RESULTS"
+          if [ -z "$RESULTS" ]; then echo "FAIL: no results line"; exit 1; fi
+          PASSED="$(echo "$RESULTS" | sed -E 's/.*Results: ([0-9]+) passed.*/\1/')"
+          if [ "$PASSED" -lt 1 ]; then echo "FAIL: no vectors passed"; exit 1; fi
+          # Core DLP coverage must work with the generated config
+          for v in "GitHub token in URL" "Anthropic API key in URL" "Clean URL (no secrets)"; do
+            if ! grep -F "[PASS] $v" /tmp/vectors.txt > /dev/null; then
+              echo "FAIL: expected vector '$v' to pass"; exit 1
+            fi
+          done
+          echo "PASS: $PASSED vectors passed"

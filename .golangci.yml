@@ -1,0 +1,73 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosec
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errname
+    - errorlint
+    - goconst
+    - godot
+    - misspell
+    - noctx
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  exclusions:
+    rules:
+      - path: internal/proxy/proxy\.go
+        linters: [gosec]
+        text: "G704"
+      # Config schema holds YAML-bound container fields for user-supplied
+      # tokens (APIToken, AuthToken, BearerTokens). These are NOT hardcoded
+      # credentials — gosec G117's "field name matches secret pattern"
+      # check is a false positive for config containers.
+      - path: internal/config/schema\.go
+        linters: [gosec]
+        text: "G117"
+      # goconst fires on repeated literal test fixture data where extracting
+      # constants hurts readability without finding real bugs. noctx stays
+      # enforced on tests so context-aware request/listener patterns required
+      # by CLAUDE.md do not regress on tests.
+      - path: _test\.go$
+        linters: [goconst]
+  settings:
+    gosec:
+      excludes:
+        # Taint analysis rules — false positives for CLI tools and HTTP proxies.
+        # Pipelock IS a proxy; client.Do(req) is its core purpose. SSRF protection
+        # lives in the scanner pipeline, not the Go type system.
+        - G704 # SSRF via taint analysis
+        - G705 # XSS via taint analysis — CLI terminal output, not web
+        - G703 # Path traversal via taint analysis — paths are validated upstream
+    goconst:
+      # goconst v2.12 made the default (min-occurrences: 3, min-len: 3)
+      # much noisier without finding bugs. Raise both thresholds so the
+      # rule still surfaces egregious duplication of meaningfully-long
+      # strings — short tokens (install/remove/command/POST) and the
+      # prometheus namespace "pipelock" repeated across every metric file
+      # are routine API surfaces, not refactor opportunities. Truly
+      # repeated long strings (DLP pattern names, CIDR sentinels) still
+      # surface.
+      min-occurrences: 30
+      min-len: 12
+    revive:
+      rules:
+        - name: var-naming
+          disabled: true
+
+formatters:
+  enable:
+    - gofumpt
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5

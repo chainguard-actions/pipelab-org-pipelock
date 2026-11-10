@@ -1,0 +1,54 @@
+name: Test basic audit
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean fixture project
+        run: |
+          set -euo pipefail
+          D="$GITHUB_WORKSPACE/pl-clean-project"
+          mkdir -p "$D/vendor"
+          printf '# Clean project\n\nNothing sensitive here.\n' > "$D/README.md"
+          printf 'def add(a, b):\n    return a + b\n' > "$D/app.py"
+          printf 'def helper():\n    return 1\n' > "$D/vendor/lib.py"
+      # The action's always() "Upload audit report" step uses actions/upload-artifact,
+      # which fails against act's artifact server (unknown field mime_type). That is an
+      # environment limitation, so the step outcome is allowed to be failure; the audit
+      # outputs are validated strictly below.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.6.0'
+          directory: pl-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome=$OUTCOME score=$SCORE findings=$FINDINGS criticals=$CRITICALS config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          for v in "$SCORE" "$FINDINGS" "$CRITICALS"; do
+            if ! [[ "$v" =~ ^[0-9]+$ ]]; then echo "FAIL: '$v' is not a non-negative integer"; exit 1; fi
+          done
+          if [ "$SCORE" -gt 100 ]; then echo "FAIL: score > 100"; exit 1; fi
+          if [ "$CRITICALS" -gt "$FINDINGS" ]; then echo "FAIL: criticals > findings"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ]; then echo "FAIL: config-path empty"; exit 1; fi
+          if [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: generated config not found at $CONFIG_PATH"; exit 1; fi
+          case "$CONFIG_PATH" in
+            */pipelock-reports/suggested.yaml) ;;
+            *) echo "FAIL: unexpected config path"; exit 1 ;;
+          esac
+          if ! command -v pipelock >/dev/null; then echo "FAIL: pipelock not on PATH"; exit 1; fi
+          pipelock version
+          echo "PASS"

@@ -1,0 +1,375 @@
+name: 'Pipelock Agent Security Scan'
+description: 'Scan your project for AI agent security risks. Pattern-based detection of credentials and misconfigurations with tailored config generation. See docs for coverage details.'
+author: 'luckyPipewrench'
+
+branding:
+  icon: 'shield'
+  color: 'green'
+
+inputs:
+  version:
+    description: 'Pipelock version to use. Defaults to latest release.'
+    required: false
+    default: 'latest'
+  config:
+    description: 'Path to pipelock config file. If not set, runs audit to generate one.'
+    required: false
+    default: ''
+  directory:
+    description: 'Directory to scan. Defaults to workspace root.'
+    required: false
+    default: '.'
+  scan-diff:
+    description: 'Scan the PR diff for leaked secrets (requires fetch-depth: 0).'
+    required: false
+    default: 'true'
+  fail-on-findings:
+    description: 'Fail the action if critical findings are detected.'
+    required: false
+    default: 'true'
+  test-vectors:
+    description: 'Run built-in test vectors to validate scanning coverage.'
+    required: false
+    default: 'true'
+  exclude-paths:
+    description: 'Paths to exclude from findings (one per line). Supports globs (*.generated.go) and directory prefixes (vendor/).'
+    required: false
+    default: ''
+
+outputs:
+  score:
+    description: 'Risk score (0-100) based on pattern-matched findings. Higher means more issues detected. Not an absolute security rating.'
+    value: ${{ steps.audit.outputs.score }}
+  findings-count:
+    description: 'Total number of findings.'
+    value: ${{ steps.audit.outputs.findings_count }}
+  critical-count:
+    description: 'Number of critical findings.'
+    value: ${{ steps.audit.outputs.critical_count }}
+  config-path:
+    description: 'Path to the config used (user-provided or auto-generated).'
+    value: ${{ steps.audit.outputs.config_path }}
+  audit-failed:
+    description: 'Whether the audit command itself failed to run (fail-closed).'
+    value: ${{ steps.audit.outputs.audit_failed }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Chainguard usage telemetry
+      shell: bash
+      run: |
+        # Best-effort, fails open. Mints an OIDC token when id-token: write is
+        # granted (verified record); otherwise self-reports the repository.
+        tok=""
+        if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ] && [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+          tok=$(curl -sf --max-time 2 \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=actions.chainguard.dev" \
+            | sed -n 's/.*"value":"\([^"]*\)".*/\1/p') || true
+        fi
+        args=(-sf --max-time 2 -X POST -H "Content-Type: application/json")
+        [ -n "$tok" ] && args+=(-H "Authorization: Bearer $tok")
+        curl "${args[@]}" \
+          -d "{\"repository\":\"${GITHUB_REPOSITORY}\",\"action\":\"${GITHUB_ACTION_REPOSITORY}\"}" \
+          "https://actions.enforce.dev/actions/v1/record" >/dev/null 2>&1 || true
+    - name: Download Pipelock
+      id: download
+      shell: bash
+      env:
+        PIPELOCK_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        VERSION="$PIPELOCK_VERSION"
+        if [ "$VERSION" = "latest" ]; then
+          # Use GitHub API directly (no gh CLI dependency)
+          VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 8 --retry-max-time 120 --retry-all-errors \
+            -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/luckyPipewrench/pipelock/releases/latest" \
+            | jq -r '.tag_name' | sed 's/^v//')
+        fi
+        VERSION="${VERSION#v}"
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+          echo "::error::Failed to resolve pipelock version from GitHub API"
+          exit 1
+        fi
+
+        # Detect OS
+        OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+        case "$OS" in
+          linux)  GOOS="linux" ;;
+          darwin) GOOS="darwin" ;;
+          *) echo "::error::Unsupported OS: $OS"; exit 1 ;;
+        esac
+
+        # Detect architecture
+        ARCH="$(uname -m)"
+        case "$ARCH" in
+          x86_64)  GOARCH="amd64" ;;
+          aarch64) GOARCH="arm64" ;;
+          arm64)   GOARCH="arm64" ;;
+          *) echo "::error::Unsupported architecture: $ARCH"; exit 1 ;;
+        esac
+
+        ASSET="pipelock_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
+        BASE_URL="https://github.com/luckyPipewrench/pipelock/releases/download/v${VERSION}"
+
+        # Download binary and checksums
+        INSTALL_DIR="${RUNNER_TEMP:-/tmp}/pipelock-bin"
+        mkdir -p "$INSTALL_DIR"
+
+        echo "Downloading pipelock v${VERSION} (${GOOS}/${GOARCH})..."
+        # Retry budget ~2 min absorbs transient 504s from the release-assets
+        # CDN (Azure Blob behind Fastly) without stalling on real outages.
+        # Omitting --retry-delay lets curl use exponential backoff inside the
+        # --retry-max-time window, spacing later retries to give the CDN time
+        # to heal rather than hammering a degraded edge.
+        curl -fsSL --connect-timeout 10 --max-time 60 --retry 8 --retry-max-time 120 --retry-all-errors "${BASE_URL}/${ASSET}" -o "${INSTALL_DIR}/pipelock.tar.gz"
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 8 --retry-max-time 120 --retry-all-errors "${BASE_URL}/checksums.txt" -o "${INSTALL_DIR}/checksums.txt"
+
+        # Verify checksum (portable: sha256sum on Linux, shasum on macOS)
+        EXPECTED=$(awk -v asset="$ASSET" '$2 == asset || $NF == asset {print $1; exit}' "${INSTALL_DIR}/checksums.txt")
+        if [ -z "$EXPECTED" ]; then
+          echo "::error::Asset ${ASSET} not found in checksums.txt"
+          exit 1
+        fi
+        if command -v sha256sum &>/dev/null; then
+          ACTUAL=$(sha256sum "${INSTALL_DIR}/pipelock.tar.gz" | awk '{print $1}')
+        else
+          ACTUAL=$(shasum -a 256 "${INSTALL_DIR}/pipelock.tar.gz" | awk '{print $1}')
+        fi
+        if [ "$EXPECTED" != "$ACTUAL" ]; then
+          echo "::error::Checksum mismatch for ${ASSET}. Expected: ${EXPECTED}, Got: ${ACTUAL}"
+          exit 1
+        fi
+        echo "Checksum verified."
+
+        # Cosign signature verification (defense-in-depth).
+        # GoReleaser signs checksums.txt with Sigstore keyless signing during
+        # release. This verifies the checksums file was signed by the pipelock
+        # GitHub Actions release workflow, not just that hashes match.
+        # Graceful: warns if cosign unavailable or artifacts missing (older releases).
+        COSIGN_SIG="${INSTALL_DIR}/checksums.txt.sig"
+        COSIGN_PEM="${INSTALL_DIR}/checksums.txt.pem"
+        # Optional fallback: older releases may 404. No --retry-all-errors so 404
+        # fails fast instead of consuming the full retry window; 5xx still retries
+        # with exponential backoff inside --retry-max-time.
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 5 --retry-max-time 60 \
+          "${BASE_URL}/checksums.txt.sig" -o "$COSIGN_SIG" 2>/dev/null || true
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 5 --retry-max-time 60 \
+          "${BASE_URL}/checksums.txt.pem" -o "$COSIGN_PEM" 2>/dev/null || true
+
+        if [ -s "$COSIGN_SIG" ] && [ -s "$COSIGN_PEM" ]; then
+          if command -v cosign &>/dev/null; then
+            echo "Verifying cosign signature..."
+            if ! cosign verify-blob \
+              --certificate "$COSIGN_PEM" \
+              --signature "$COSIGN_SIG" \
+              --certificate-identity-regexp "^https://github\\.com/luckyPipewrench/pipelock/\\.github/workflows/release\\.yaml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "${INSTALL_DIR}/checksums.txt"; then
+              echo "::error::Cosign signature verification failed for checksums.txt"
+              exit 1
+            fi
+            echo "Cosign signature verified."
+          else
+            echo "::notice::cosign not found — add sigstore/cosign-installer to your workflow for supply chain verification"
+          fi
+        else
+          echo "::notice::Cosign artifacts not available for v${VERSION} — checksum verification only"
+        fi
+
+        tar -xzf "${INSTALL_DIR}/pipelock.tar.gz" -C "$INSTALL_DIR" pipelock
+        chmod +x "${INSTALL_DIR}/pipelock"
+        SAFE_INSTALL_DIR="$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')"
+        SAFE_VERSION="$(printf '%s' "$VERSION" | tr -d '\n\r')"
+        echo "$SAFE_INSTALL_DIR" >> "$GITHUB_PATH"
+        echo "version=${SAFE_VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Verify binary
+      shell: bash
+      run: pipelock version
+
+    - name: Run audit
+      id: audit
+      shell: bash
+      env:
+        PIPELOCK_DIR: ${{ inputs.directory }}
+        PIPELOCK_CONFIG: ${{ inputs.config }}
+        PIPELOCK_EXCLUDE: ${{ inputs.exclude-paths }}
+      run: |
+        set -euo pipefail
+
+        DIR="$PIPELOCK_DIR"
+        CONFIG="$PIPELOCK_CONFIG"
+        REPORT_DIR="${RUNNER_TEMP:-/tmp}/pipelock-reports"
+        mkdir -p "$REPORT_DIR"
+
+        # Build --exclude flags from newline-separated input
+        EXCLUDE_ARGS=()
+        if [ -n "$PIPELOCK_EXCLUDE" ]; then
+          while IFS= read -r pattern; do
+            pattern="$(echo "$pattern" | xargs)"  # trim whitespace
+            if [ -n "$pattern" ]; then
+              EXCLUDE_ARGS+=(--exclude "$pattern")
+            fi
+          done <<< "$PIPELOCK_EXCLUDE"
+        fi
+
+        # Single audit run: JSON to stdout, human-readable to stderr
+        # Fail-closed: if audit itself errors, track it so Check results can fail
+        AUDIT_FAILED="false"
+        if ! pipelock audit "$DIR" --json "${EXCLUDE_ARGS[@]}" > "$REPORT_DIR/audit.json" 2>"$REPORT_DIR/audit.log"; then
+          AUDIT_FAILED="true"
+          echo "::error::Pipelock audit failed. Check the audit log artifact."
+        fi
+
+        # Display human-readable report in the log (once)
+        cat "$REPORT_DIR/audit.log" >&2
+
+        # Parse findings from valid JSON output
+        if [ "$AUDIT_FAILED" = "false" ] && [ -s "$REPORT_DIR/audit.json" ]; then
+          SCORE=$(jq -r '.score // 0' "$REPORT_DIR/audit.json")
+          FINDINGS=$(jq '.findings | length' "$REPORT_DIR/audit.json")
+          CRITICALS=$(jq '[.findings[] | select(.severity == "critical")] | length' "$REPORT_DIR/audit.json")
+          WARNINGS=$(jq '[.findings[] | select(.severity == "warning")] | length' "$REPORT_DIR/audit.json")
+
+          echo "score=${SCORE}" >> "$GITHUB_OUTPUT"
+          echo "findings_count=${FINDINGS}" >> "$GITHUB_OUTPUT"
+          echo "critical_count=${CRITICALS}" >> "$GITHUB_OUTPUT"
+          echo "audit_failed=false" >> "$GITHUB_OUTPUT"
+
+          # Emit GitHub annotations for findings with file locations
+          jq -r '.findings[] | select(.file != null and .file != "") |
+            (if .severity == "critical" then "error"
+             elif .severity == "warning" then "warning"
+             else "notice" end) as $level |
+            "::\($level) file=\(.file),line=\(.line // 1)::\(.message)"' "$REPORT_DIR/audit.json"
+
+          # Write job summary
+          {
+            echo "### Pipelock Security Audit"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Security Score | **${SCORE}/100** |"
+            echo "| Findings | ${FINDINGS} (${CRITICALS} critical, ${WARNINGS} warning) |"
+            echo "| Directory | \`${DIR}\` |"
+            echo ""
+            if [ "$CRITICALS" -gt 0 ]; then
+              echo "> **${CRITICALS} critical finding(s) detected.** See annotations on the PR diff."
+              echo ""
+            fi
+            if [ "$FINDINGS" -gt 0 ]; then
+              echo "<details><summary>Findings</summary>"
+              echo ""
+              jq -r '.findings[] |
+                "- **[\(.severity)]** \(.message)" +
+                (if .file then " (`\(.file)`" + (if .line then ":\(.line)" else "" end) + ")" else "" end)' \
+                "$REPORT_DIR/audit.json"
+              echo ""
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        else
+          # Audit failed or produced no output: fail-closed
+          echo "score=0" >> "$GITHUB_OUTPUT"
+          echo "findings_count=0" >> "$GITHUB_OUTPUT"
+          echo "critical_count=0" >> "$GITHUB_OUTPUT"
+          echo "audit_failed=true" >> "$GITHUB_OUTPUT"
+        fi
+
+        # Determine config path: user-provided or auto-generate
+        if [ -n "$CONFIG" ]; then
+          SAFE_CONFIG="$(printf '%s' "$CONFIG" | tr -d '\n\r')"
+          echo "config_path=${SAFE_CONFIG}" >> "$GITHUB_OUTPUT"
+        else
+          pipelock audit "$DIR" -o "$REPORT_DIR/suggested.yaml" "${EXCLUDE_ARGS[@]}" 2>/dev/null || true
+          if [ -f "$REPORT_DIR/suggested.yaml" ]; then
+            SAFE_REPORT_DIR="$(printf '%s' "$REPORT_DIR" | tr -d '\n\r')"
+            echo "config_path=${SAFE_REPORT_DIR}/suggested.yaml" >> "$GITHUB_OUTPUT"
+          else
+            echo "config_path=" >> "$GITHUB_OUTPUT"
+          fi
+        fi
+
+    - name: Validate config
+      if: inputs.config != ''
+      shell: bash
+      env:
+        PIPELOCK_CONFIG: ${{ inputs.config }}
+      run: pipelock check --config "$PIPELOCK_CONFIG"
+
+    - name: Test scanning coverage
+      if: inputs.test-vectors == 'true'
+      shell: bash
+      env:
+        CONFIG_PATH: ${{ steps.audit.outputs.config_path }}
+      run: |
+        if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
+          pipelock test --config "$CONFIG_PATH" --fail-on-gap
+        else
+          echo "::notice::Skipping test vectors (no config available)"
+        fi
+
+    - name: Scan PR diff
+      if: inputs.scan-diff == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        PIPELOCK_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        PIPELOCK_EXCLUDE: ${{ inputs.exclude-paths }}
+        BASE_REF: ${{ github.base_ref }}
+        CONFIG_PATH: ${{ steps.audit.outputs.config_path }}
+      run: |
+        set -euo pipefail
+        SCAN_ARGS=()
+        if [ -n "$CONFIG_PATH" ] && [ -f "$CONFIG_PATH" ]; then
+          SCAN_ARGS+=(--config "$CONFIG_PATH")
+        fi
+
+        # Build --exclude flags from newline-separated input
+        if [ -n "$PIPELOCK_EXCLUDE" ]; then
+          while IFS= read -r pattern; do
+            pattern="$(echo "$pattern" | xargs)"  # trim whitespace
+            if [ -n "$pattern" ]; then
+              SCAN_ARGS+=(--exclude "$pattern")
+            fi
+          done <<< "$PIPELOCK_EXCLUDE"
+        fi
+
+        if ! git diff "origin/${BASE_REF}...HEAD" | pipelock git scan-diff "${SCAN_ARGS[@]}"; then
+          if [ "$PIPELOCK_FAIL_ON_FINDINGS" = "true" ]; then
+            echo "::error::Secrets detected in PR diff. Failing because fail-on-findings is enabled."
+            exit 1
+          else
+            echo "::warning::Potential secrets detected in PR diff. Review the output above."
+          fi
+        fi
+
+    - name: Upload audit report
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      with:
+        name: pipelock-audit-report
+        path: ${{ runner.temp }}/pipelock-reports/
+        if-no-files-found: ignore
+
+    - name: Check results
+      if: inputs.fail-on-findings == 'true'
+      shell: bash
+      env:
+        AUDIT_FAILED: ${{ steps.audit.outputs.audit_failed }}
+        CRITICALS: ${{ steps.audit.outputs.critical_count }}
+      run: |
+        # Fail-closed: if audit itself failed, the gate fails
+        if [ "$AUDIT_FAILED" = "true" ]; then
+          echo "::error::Pipelock audit failed to run. Failing because fail-on-findings is enabled (fail-closed)."
+          exit 1
+        fi
+
+        if [ "${CRITICALS:-0}" -gt 0 ]; then
+          echo "::error::Pipelock found ${CRITICALS} critical finding(s). See audit report for details."
+          exit 1
+        fi

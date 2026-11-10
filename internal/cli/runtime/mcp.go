@@ -1,0 +1,1168 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"syscall"
+	"unicode"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/sandbox"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
+	session "github.com/luckyPipewrench/pipelock/internal/session"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// reservedTransportHeaders are header names operators must not override via
+// --header. The MCP HTTP transport manages framing (Content-Type, Accept,
+// Content-Length, Transfer-Encoding), session correlation (Mcp-Session-Id),
+// and host routing (Host). Letting --header clobber any of these would
+// either break the transport contract or - for Mcp-Session-Id specifically -
+// let an attacker pin the upstream's session correlation to a value of their
+// choice on the very first request, before HTTPClient has a session ID to
+// overwrite with. Lookup is canonical (textproto) so case variants like
+// "mcp-session-id" or "MCP-SESSION-ID" are also rejected.
+var reservedTransportHeaders = map[string]struct{}{
+	http.CanonicalHeaderKey("Content-Type"):      {},
+	http.CanonicalHeaderKey("Accept"):            {},
+	http.CanonicalHeaderKey("Mcp-Session-Id"):    {},
+	http.CanonicalHeaderKey("Content-Length"):    {},
+	http.CanonicalHeaderKey("Transfer-Encoding"): {},
+	http.CanonicalHeaderKey("Host"):              {},
+}
+
+// parseHeaderFlags converts repeatable --header "Key: Value" entries into an
+// http.Header. Returns nil for an empty input so callers can pass the result
+// straight to transports that interpret nil as "no extras". Both an empty
+// key and a missing colon are rejected with a descriptive error so a typo
+// (e.g. "Authorization Bearer xyz") can't silently drop the auth header.
+//
+// Reserved transport-managed headers are rejected with a descriptive error
+// so an operator does not accidentally poison transport framing or - in the
+// Mcp-Session-Id case - force the upstream onto an attacker-chosen session
+// correlation token on the first request. The transport also strips these
+// defensively (defense-in-depth), but rejecting at parse time gives a
+// clearer error than silent removal would.
+func parseHeaderFlags(raw []string) (http.Header, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	h := make(http.Header, len(raw))
+	for _, entry := range raw {
+		key, value, ok := strings.Cut(entry, ":")
+		if !ok {
+			return nil, fmt.Errorf("--header %q: expected 'Key: Value' format", entry)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("--header %q: key is empty", entry)
+		}
+		if !validHeaderName(key) {
+			return nil, fmt.Errorf("--header %q: key contains invalid characters", entry)
+		}
+		// Validate the raw value before trimming so leading/trailing CRLF,
+		// control chars, or unicode whitespace are rejected rather than
+		// silently stripped by TrimSpace and then accepted.
+		if !validHeaderValue(value) {
+			return nil, fmt.Errorf("--header %q: value contains invalid characters", entry)
+		}
+		// Trim ASCII space/tab only after validation; full TrimSpace would
+		// strip unicode whitespace that the validator just rejected, leaving
+		// the bypass available through the header value's edges.
+		value = strings.Trim(value, " \t")
+		if _, reserved := reservedTransportHeaders[http.CanonicalHeaderKey(key)]; reserved {
+			return nil, fmt.Errorf("--header %q: %q is managed by the MCP HTTP transport and cannot be overridden via --header", entry, key)
+		}
+		h.Add(key, value)
+	}
+	return h, nil
+}
+
+// readHeaderFile reads "Key: Value" entries from a sidecar file with strict
+// permissions. Empty path returns nil. Lines starting with '#' and blank
+// lines are skipped. The file must be regular and its permission bits must
+// be 0o600 or 0o640 (group-read allowed for k8s fsGroup parity with
+// signing.LoadPrivateKeyFile). Values are not validated here; the caller
+// hands the returned lines to parseHeaderFlags which applies the same
+// validation as --header.
+func readHeaderFile(path string) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	clean := filepath.Clean(path)
+	info, err := os.Stat(clean)
+	if err != nil {
+		return nil, fmt.Errorf("--header-file %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("--header-file %q: not a regular file (mode=%s)", path, info.Mode())
+	}
+	if info.Mode().Perm()&0o037 != 0 {
+		return nil, fmt.Errorf("--header-file %q: permissions %04o reveal the header values to other users; restrict to 0600 or 0640", path, info.Mode().Perm())
+	}
+	data, err := os.ReadFile(clean) //nolint:gosec // path is operator-supplied and cleaned + perm-gated above
+	if err != nil {
+		return nil, fmt.Errorf("--header-file %q: %w", path, err)
+	}
+	var lines []string
+	for _, raw := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines = append(lines, raw)
+	}
+	return lines, nil
+}
+
+func validHeaderName(key string) bool {
+	if key == "" {
+		return false
+	}
+	// HTTP header names are ASCII tokens (RFC 7230 §3.2.6); iterate by byte
+	// so any non-ASCII byte is rejected by isHTTPTokenChar.
+	for i := 0; i < len(key); i++ {
+		if !isHTTPTokenChar(key[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHTTPTokenChar(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func validHeaderValue(value string) bool {
+	for _, r := range value {
+		if r == '\t' || r == ' ' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+		if r > 127 && unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// handleProxyError classifies MCP proxy errors: subprocess exits get a
+// user-facing message and a specific exit code; other errors are reported
+// to Sentry (if available) and returned as-is.
+func handleProxyError(err error, logW io.Writer, sentryClient *plsentry.Client) error {
+	if errors.Is(err, mcp.ErrSubprocessExit) {
+		_, _ = fmt.Fprintf(logW, "pipelock: %v\n", err)
+		return cliutil.ExitCodeError(cliutil.ExitSubprocess, err)
+	}
+	if sentryClient != nil {
+		sentryClient.CaptureError(err)
+	}
+	return err
+}
+
+// ErrInjectionDetected is returned when pipelock mcp scan detects prompt injection.
+var ErrInjectionDetected = errors.New("prompt injection detected")
+
+// safeWriter wraps an io.Writer with a mutex for concurrent use.
+// Used to synchronize file sentry goroutines and RunProxy stderr output.
+type safeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (sw *safeWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+// URL scheme constants used for upstream validation.
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
+// buildRedirectRT derives a RedirectRuntime from config for built-in redirect
+// handlers. Always returns a non-nil runtime so quarantine-write works even
+// when fetch_proxy is not configured. FetchEndpoint is only populated when the
+// fetch proxy listen address is valid; fetch-proxy redirect handlers fail
+// closed ("no fetch_endpoint") when it is empty.
+func buildRedirectRT(cfg *config.Config) *mcp.RedirectRuntime {
+	rt := &mcp.RedirectRuntime{
+		QuarantineDir: cfg.MCPToolPolicy.QuarantineDir,
+	}
+	if cfg.FetchProxy.Listen != "" {
+		host, port, err := net.SplitHostPort(cfg.FetchProxy.Listen)
+		if err == nil {
+			switch host {
+			case "", "0.0.0.0":
+				host = "127.0.0.1"
+			case "::":
+				host = "::1"
+			}
+			rt.FetchEndpoint = "http://" + net.JoinHostPort(host, port) + "/fetch"
+		}
+	}
+	return rt
+}
+
+// McpCmd returns the mcp cobra command.
+func McpCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "mcp",
+		Short: "MCP (Model Context Protocol) security scanning",
+		Long: `Scan MCP JSON-RPC 2.0 responses for prompt injection before they reach the agent.
+
+Examples:
+  mcp-server | pipelock mcp scan
+  mcp-server | pipelock mcp scan --json --config pipelock.yaml`,
+	}
+
+	cmd.AddCommand(mcpScanCmd())
+	cmd.AddCommand(mcpProxyCmd())
+	cmd.AddCommand(mcpIntegrityCmd())
+	return cmd
+}
+
+func mcpScanCmd() *cobra.Command {
+	var configFile string
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "scan",
+		Short: "Scan MCP responses from stdin for prompt injection",
+		Long: `Reads newline-delimited MCP JSON-RPC 2.0 responses from stdin and scans
+text content blocks for prompt injection patterns.
+
+Exit code 0 if all responses are clean, 1 if any injection is detected.
+In text mode, only findings are printed. In JSON mode, every line produces a verdict.
+
+Examples:
+  mcp-server | pipelock mcp scan
+  pipelock mcp scan --json --config pipelock.yaml < responses.jsonl`,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := cliutil.LoadConfigOrDefault(configFile)
+			if err != nil {
+				return err
+			}
+
+			// Resolve effective policy for scan mode: response-scanning
+			// fallback + bundle merge on a cloned config. The scan
+			// command does not auto-enable MCP scanning because it never
+			// wraps an upstream server; RuntimeMCPProxy mode supplies the
+			// response-scanning fallback behavior the command needs.
+			var bundleResult *rules.LoadResult
+			var resolveInfo config.ResolveRuntimeInfo
+			cfg, resolveInfo = cfg.ResolveRuntime(config.RuntimeResolveOpts{
+				Mode: config.RuntimeMCPScan,
+				MergeBundles: func(c *config.Config) {
+					bundleResult = rules.MergeIntoConfig(c, cliutil.Version)
+				},
+			})
+			for _, e := range bundleResult.Errors {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
+			for _, w := range bundleResult.Warnings {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
+			}
+			if bundleResult.Degraded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
+			}
+			emitResolveInfoLogs(cmd.ErrOrStderr(), resolveInfo, "scan")
+			sc := scanner.New(cfg)
+			defer sc.Close()
+
+			found, err := mcp.ScanStream(cmd.InOrStdin(), cmd.OutOrStdout(), sc, jsonOutput)
+			if err != nil {
+				return err
+			}
+			if found {
+				return ErrInjectionDetected
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output results as JSON (one object per line)")
+	return cmd
+}
+
+func mcpProxyCmd() *cobra.Command {
+	var configFile string
+	var upstreamURL string
+	var listenAddr string
+	var envVars []string
+	var rawHeaders []string
+	var headerFile string
+	var agentName string
+	var sandboxEnabled bool
+	var sandboxStrict bool
+	var sandboxBestEffort bool
+	var sandboxWorkspace string
+
+	cmd := &cobra.Command{
+		Use:   "proxy [flags] [-- COMMAND [ARGS...]]",
+		Short: "Proxy an MCP server, scanning responses for prompt injection",
+		Long: `Launches an MCP server subprocess and proxies its stdio transport with
+bidirectional scanning:
+
+  - Responses (server->client) are scanned for prompt injection before forwarding.
+  - Requests (client->server) are scanned for DLP leaks and injection in tool arguments.
+
+Response action is controlled by response_scanning.action (warn/block/strip/ask).
+Request action is controlled by mcp_input_scanning.action (warn/block).
+
+Input scanning is auto-enabled unless explicitly configured in your config file.
+Use this as a drop-in wrapper in your MCP client configuration.
+
+Subprocess (stdio) mode:
+  pipelock mcp proxy -- npx @modelcontextprotocol/server-filesystem /tmp
+  pipelock mcp proxy --config pipelock.yaml -- python my_server.py
+
+HTTP transport mode (stdio client, HTTP upstream):
+  pipelock mcp proxy --upstream http://localhost:8080/mcp
+  pipelock mcp proxy --upstream https://mcp.example.com/v1 --config pipelock.yaml
+
+HTTP reverse proxy mode (HTTP listener, HTTP upstream):
+  pipelock mcp proxy --listen 0.0.0.0:8889 --upstream http://localhost:3000/mcp
+  pipelock mcp proxy --listen :8889 --upstream http://web:3000/mcp --config pipelock.yaml
+
+Claude Desktop config (local subprocess):
+  {
+    "mcpServers": {
+      "filesystem": {
+        "command": "pipelock",
+        "args": ["mcp", "proxy", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      }
+    }
+  }
+
+Claude Desktop config (remote server):
+  {
+    "mcpServers": {
+      "remote": {
+        "command": "pipelock",
+        "args": ["mcp", "proxy", "--upstream", "http://host.docker.internal:8080/mcp"]
+      }
+    }
+  }
+
+Environment passthrough (subprocess mode only):
+  pipelock mcp proxy --env BRAIN_DIR --env API_URL=http://localhost:8081 -- node server.js
+
+  By default, pipelock strips the child process environment to prevent secret leakage.
+  Use --env KEY to pass through a variable from the current environment, or
+  --env KEY=VALUE to set it explicitly.
+
+When flight_recorder.enabled is true in config, pipelock writes tamper-evident
+MCP evidence. If flight_recorder.signing_key_path is also set, pipelock emits
+signed action receipts for MCP decisions.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dashIdx := cmd.ArgsLenAtDash()
+			hasSubprocess := dashIdx >= 0 && dashIdx < len(args)
+			hasUpstream := upstreamURL != ""
+			hasListen := listenAddr != ""
+
+			// Mutual exclusion validation.
+			if hasUpstream && hasSubprocess {
+				return errors.New("--upstream and subprocess command (--) are mutually exclusive")
+			}
+			if hasListen && hasSubprocess {
+				return errors.New("--listen and subprocess command (--) are mutually exclusive")
+			}
+			if hasListen && !hasUpstream {
+				return errors.New("--listen requires --upstream")
+			}
+			if !hasUpstream && !hasSubprocess {
+				return errors.New("specify --upstream URL or -- COMMAND [ARGS...]")
+			}
+			// Reject sandbox CLI flag with remote modes.
+			if sandboxEnabled {
+				if hasUpstream {
+					return errors.New("--sandbox cannot be used with --upstream (cannot sandbox a remote server)")
+				}
+				if hasListen {
+					return errors.New("--sandbox cannot be used with --listen (cannot sandbox a remote server)")
+				}
+			}
+
+			// Validate upstream URL scheme.
+			var isWSUpstream bool
+			if hasUpstream {
+				u, err := url.Parse(upstreamURL)
+				if err != nil || u.Host == "" {
+					return fmt.Errorf("invalid upstream URL %q: must include a scheme and host", upstreamURL)
+				}
+				switch u.Scheme {
+				case schemeHTTP, schemeHTTPS:
+					// HTTP transport.
+				case "ws", "wss":
+					isWSUpstream = true
+				default:
+					return fmt.Errorf("invalid upstream URL %q: scheme must be http, https, ws, or wss", upstreamURL)
+				}
+			}
+
+			cfg, err := cliutil.LoadConfigOrDefault(configFile)
+			if err != nil {
+				return err
+			}
+
+			// Build edition so _default fallback works the same as HTTP proxy.
+			// Bootstrap scanner is used only for edition init; closed before
+			// rebuilding with the resolved config.
+			bootSC := scanner.New(cfg)
+			ed, edErr := edition.NewEditionFunc(cfg, bootSC)
+			if edErr != nil {
+				bootSC.Close()
+				return fmt.Errorf("edition init: %w", edErr)
+			}
+			defer ed.Close()
+
+			// Resolve agent: known name -> that profile, unknown -> error, empty -> _default.
+			resolved, found := ed.LookupProfile(agentName)
+			if agentName != "" && !found {
+				// Distinguish truly unknown from known-but-expired.
+				if known := ed.KnownProfiles(); known[agentName] {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: agent profile %q exists but license has expired; using default profile\n", agentName)
+				} else {
+					bootSC.Close()
+					return fmt.Errorf("unknown agent profile %q", agentName)
+				}
+			}
+			cfg = resolved.Config
+			bootSC.Close() // done with bootstrap scanner
+
+			// Set up Sentry error reporting
+			sentryClient, sentryErr := plsentry.Init(cfg, cliutil.Version)
+			if sentryErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: sentry init failed: %v\n", sentryErr)
+			}
+			if sentryClient != nil {
+				defer sentryClient.Close()
+			}
+
+			// Resolve effective runtime policy on a clone. The MCP proxy
+			// mode response-scanning fallback, MCP scanning auto-enable,
+			// and bundle merges all run inside ResolveRuntime so the
+			// loaded cfg is never mutated and the clone's CanonicalPolicyHash
+			// reflects the effective policy every downstream emitter,
+			// scanner, and receipt stamp consumes.
+			var bundleResult *rules.LoadResult
+			var resolveInfo config.ResolveRuntimeInfo
+			cfg, resolveInfo = cfg.ResolveRuntime(config.RuntimeResolveOpts{
+				Mode: config.RuntimeMCPProxy,
+				MergeBundles: func(c *config.Config) {
+					bundleResult = rules.MergeIntoConfig(c, cliutil.Version)
+				},
+				DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
+			})
+			for _, e := range bundleResult.Errors {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
+			for _, w := range bundleResult.Warnings {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
+			}
+			if bundleResult.Degraded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
+			}
+			emitResolveInfoLogs(cmd.ErrOrStderr(), resolveInfo, "proxy")
+			extraPoison := rules.ConvertToolPoison(bundleResult.ToolPoison)
+
+			// Rebuild scanner with the (possibly modified) resolved config.
+			sc := scanner.New(cfg)
+			defer sc.Close()
+			auditLogger := audit.NewNop()
+
+			ks := killswitch.New(cfg)
+
+			var approver *hitl.Approver
+			if sc.ResponseAction() == config.ActionAsk {
+				approver = hitl.New(cfg.ResponseScanning.AskTimeoutSeconds)
+				defer approver.Close()
+			}
+
+			inputCfg := &mcp.InputScanConfig{
+				Enabled:      cfg.MCPInputScanning.Enabled,
+				Action:       cfg.MCPInputScanning.Action,
+				OnParseError: cfg.MCPInputScanning.OnParseError,
+			}
+
+			var mcpRedactMatcher *redact.Matcher
+			if cfg.Redaction.Enabled {
+				var redactErr error
+				mcpRedactMatcher, redactErr = cfg.Redaction.BuildMatcher(cfg.Redaction.DefaultProfile)
+				if redactErr != nil {
+					return fmt.Errorf("build MCP redaction matcher: %w", redactErr)
+				}
+			}
+
+			var toolCfg *tools.ToolScanConfig
+			if cfg.MCPToolScanning.Enabled {
+				toolCfg = &tools.ToolScanConfig{
+					Action:      cfg.MCPToolScanning.Action,
+					DetectDrift: cfg.MCPToolScanning.DetectDrift,
+					ExtraPoison: extraPoison,
+				}
+				// Wire session binding into tool scanning when enabled.
+				if cfg.MCPSessionBinding.Enabled {
+					toolCfg.BindingUnknownAction = cfg.MCPSessionBinding.UnknownToolAction
+					toolCfg.BindingNoBaselineAction = cfg.MCPSessionBinding.NoBaselineAction
+				}
+			}
+
+			var policyCfg *policy.Config
+			if cfg.MCPToolPolicy.Enabled {
+				policyCfg = policy.New(cfg.MCPToolPolicy)
+			}
+
+			// Initialize chain matcher if tool chain detection is configured.
+			var chainMatcher *chains.Matcher
+			if cfg.ToolChainDetection.Enabled {
+				chainMatcher = chains.New(&cfg.ToolChainDetection)
+			}
+
+			// Build CEE deps when cross-request detection is enabled.
+			var cee *mcp.CEEDeps
+			if cfg.CrossRequestDetection.Enabled {
+				m := metrics.New()
+				ceeCfg := cfg.CrossRequestDetection
+				cee = &mcp.CEEDeps{Config: &ceeCfg, Metrics: m}
+				if ceeCfg.EntropyBudget.Enabled {
+					cee.Tracker = scanner.NewEntropyTracker(
+						ceeCfg.EntropyBudget.BitsPerWindow,
+						ceeCfg.EntropyBudget.WindowMinutes*60, // minutes to seconds
+					)
+				}
+				if ceeCfg.FragmentReassembly.Enabled {
+					cee.Buffer = scanner.NewFragmentBuffer(
+						ceeCfg.FragmentReassembly.MaxBufferBytes,
+						10000, // 10K max sessions, matching proxy constant
+						ceeCfg.FragmentReassembly.WindowMinutes*60,
+					)
+				}
+			}
+
+			// Create session manager for adaptive enforcement in MCP proxy mode.
+			// Uses a dedicated metrics instance for MCP; reuses the same session
+			// profiling config as the HTTP proxy. store and adaptiveCfg are nil-safe
+			// downstream when session profiling is disabled.
+			var store session.Store
+			var adaptiveCfg *config.AdaptiveEnforcement
+			var mcpMetrics *metrics.Metrics
+			if cfg.AdaptiveEnforcement.Enabled {
+				adaptiveCfg = &cfg.AdaptiveEnforcement
+			}
+			if cfg.SessionProfiling.Enabled {
+				mcpMetrics = metrics.New()
+				sm := proxy.NewSessionManager(&cfg.SessionProfiling, adaptiveCfg, mcpMetrics)
+				if cfg.BehavioralBaseline.Enabled {
+					if err := sm.EnableBaseline(&cfg.BehavioralBaseline); err != nil {
+						return fmt.Errorf("behavioral baseline: %w", err)
+					}
+				}
+				defer sm.Close()
+				store = sm.AsStore()
+			}
+
+			// Denial-of-wallet tracker: _default budget is free tier (always
+			// available). Named agent budgets are safe to read from cfg.Agents
+			// because EnforceLicenseGate (called during Load) already stripped
+			// named agents when the license is missing/invalid. In enterprise
+			// builds the gate preserves _default and removes the rest; in OSS
+			// builds the gate func is nil so only _default survives if no
+			// named agents are configured.
+			var dowCheck mcp.DoWCheckFunc
+			var dowBudget *config.BudgetConfig
+			if ap, ok := cfg.Agents["_default"]; ok {
+				dowBudget = &ap.Budget
+			}
+			if agentName != "" && agentName != "_default" {
+				if ap, ok := cfg.Agents[agentName]; ok {
+					dowBudget = &ap.Budget
+				}
+			}
+			if dowBudget != nil && dowBudget.HasDoWFields() {
+				tracker := proxy.NewDoWTracker(proxy.DoWConfig{
+					MaxToolCallsPerSession: dowBudget.MaxToolCallsPerSession,
+					MaxConcurrentToolCalls: dowBudget.MaxConcurrentToolCalls,
+					MaxWallClockMinutes:    dowBudget.MaxWallClockMinutes,
+					MaxRetriesPerTool:      dowBudget.MaxRetriesPerTool,
+					MaxRetriesPerEndpoint:  dowBudget.MaxRetriesPerEndpoint,
+					LoopDetectionWindow:    dowBudget.LoopDetectionWindow,
+					FanOutLimit:            dowBudget.FanOutLimit,
+					FanOutWindowSeconds:    dowBudget.FanOutWindowSeconds,
+					Action:                 dowBudget.DoWAction,
+				})
+				dowAction := dowBudget.DoWAction
+				if dowAction == "" {
+					dowAction = config.ActionBlock
+				}
+				dowCheck = func(toolName, argsJSON string) (bool, string, string, string) {
+					r := tracker.RecordToolCall(toolName, argsJSON)
+					return r.Allowed, dowAction, r.Reason, r.BudgetType
+				}
+			}
+
+			var receiptEmitter *receipt.Emitter
+			if cfg.FlightRecorder.Enabled {
+				recCfg := recorder.Config{
+					Enabled:            cfg.FlightRecorder.Enabled,
+					Dir:                cfg.FlightRecorder.Dir,
+					CheckpointInterval: cfg.FlightRecorder.CheckpointInterval,
+					RetentionDays:      cfg.FlightRecorder.RetentionDays,
+					Redact:             cfg.FlightRecorder.Redact,
+					SignCheckpoints:    cfg.FlightRecorder.SignCheckpoints,
+					MaxEntriesPerFile:  cfg.FlightRecorder.MaxEntriesPerFile,
+					FileMode:           cfg.FlightRecorder.FileMode,
+					RawEscrow:          cfg.FlightRecorder.RawEscrow,
+					EscrowPublicKey:    cfg.FlightRecorder.EscrowPublicKey,
+				}
+
+				var redactFn recorder.RedactFunc
+				if cfg.FlightRecorder.Redact {
+					redactFn = sc.ScanTextForDLP
+				}
+
+				var recPrivKey ed25519.PrivateKey
+				if cfg.FlightRecorder.SigningKeyPath != "" {
+					k, kErr := signing.LoadPrivateKeyFile(cfg.FlightRecorder.SigningKeyPath)
+					if kErr != nil {
+						return fmt.Errorf("loading flight recorder signing key: %w", kErr)
+					}
+					recPrivKey = k
+				}
+
+				rec, recErr := recorder.New(recCfg, redactFn, recPrivKey)
+				if recErr != nil {
+					return fmt.Errorf("creating flight recorder: %w", recErr)
+				}
+				defer func() { _ = rec.Close() }()
+
+				// ConfigHash here uses cfg.Hash() (raw YAML bytes) - the
+				// receipt is a point-in-time audit fingerprint of the
+				// loaded configuration file. The envelope emitter below
+				// uses cfg.CanonicalPolicyHash() because its contract is
+				// about effective policy equivalence, not file identity.
+				// Intentional split, preserved across the runtime-resolve
+				// refactor: the resolved cfg carries the original rawBytes
+				// so Hash() still reflects the on-disk YAML even after
+				// bundle merge and auto-enable.
+				receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
+					Recorder:   rec,
+					PrivKey:    recPrivKey,
+					ConfigHash: cfg.Hash(),
+					Principal:  "local",
+					Actor:      "pipelock",
+				})
+
+				cmd.PrintErrf("  Recorder: %s (flight recorder enabled)\n", cfg.FlightRecorder.Dir)
+				// receipt.NewEmitter returns nil when no signing key is
+				// configured. Receipts must be signed - there is no
+				// "unsigned receipt" mode - so report the operator-facing
+				// status by signing-key presence, not by emitter identity.
+				// This is more honest than the prior branch which could
+				// never execute.
+				if len(recPrivKey) > 0 {
+					cmd.PrintErrf("  Receipts: enabled (action receipts signed)\n")
+				} else {
+					cmd.PrintErrf("  Receipts: disabled — set flight_recorder.signing_key_path to enable signed action receipts\n")
+				}
+			}
+			sc.SetDLPWarnHook(func(ctx context.Context, patternName, severity string) {
+				emitDLPWarn(auditLogger, nil, receiptEmitter, ctx, patternName, severity)
+			})
+
+			// Envelope emitter: create when mediation_envelope.enabled=true.
+			var envEmitter *envelope.Emitter
+			if cfg.MediationEnvelope.Enabled {
+				envEmitter = envelope.NewEmitter(envelope.EmitterConfig{
+					ConfigHash:  cfg.CanonicalPolicyHash(),
+					ActorFormat: cfg.MediationEnvelope.ActorFormat,
+					TrustDomain: cfg.MediationEnvelope.TrustDomain,
+				})
+			}
+			captureConfigHash := cfg.CanonicalPolicyHash()
+			captureProfile := resolved.Name
+			if captureProfile == "" {
+				captureProfile = edition.ProfileDefault
+			}
+			contractLoader, contractLoaderErr := mcp.NewContractLoaderFromConfig(cfg)
+			if contractLoaderErr != nil {
+				return fmt.Errorf("building MCP contract loader: %w", contractLoaderErr)
+			}
+			contractAgent := agentName
+			if contractAgent == "" {
+				contractAgent = captureProfile
+			}
+
+			toolAction := "disabled"
+			if toolCfg != nil {
+				toolAction = toolCfg.Action
+			}
+			policyAction := "disabled"
+			if policyCfg != nil {
+				policyAction = policyCfg.Action
+			}
+			if hasUpstream {
+				if len(envVars) > 0 {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: --env is ignored in HTTP transport mode (no child process)")
+				}
+
+				fileHeaders, fileErr := readHeaderFile(headerFile)
+				if fileErr != nil {
+					return fileErr
+				}
+				mergedHeaders := append([]string{}, fileHeaders...)
+				mergedHeaders = append(mergedHeaders, rawHeaders...)
+				extraHeaders, headerErr := parseHeaderFlags(mergedHeaders)
+				if headerErr != nil {
+					return headerErr
+				}
+				if len(extraHeaders) > 0 && (hasListen || isWSUpstream) {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: --header is only honored in stdio-to-HTTP --upstream mode; ignored for --listen and ws/wss upstreams")
+				}
+
+				ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+				defer cancel()
+
+				// HTTP reverse proxy mode: --listen + --upstream.
+				if hasListen && isWSUpstream {
+					err := fmt.Errorf("--listen with WebSocket upstream (ws/wss) is not yet supported; use stdio mode: pipelock mcp proxy --upstream %s", upstreamURL)
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
+				}
+				if hasListen {
+					mcpLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", listenAddr)
+					if lnErr != nil {
+						err := fmt.Errorf("MCP listener bind %s: %w", listenAddr, lnErr)
+						if sentryClient != nil {
+							sentryClient.CaptureError(err)
+						}
+						return err
+					}
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: MCP reverse proxy %s -> %s (response=%s, input=%s, tools=%s, policy=%s)\n",
+						listenAddr, upstreamURL, sc.ResponseAction(), inputCfg.Action, toolAction, policyAction)
+					// Wrap static adaptiveCfg in a function to satisfy the
+					// AdaptiveConfigFunc signature. Short-lived: no hot-reload concern.
+					adaptiveFn := mcp.AdaptiveConfigFunc(func() *config.AdaptiveEnforcement {
+						return adaptiveCfg
+					})
+					if err := mcp.RunHTTPListenerProxy(ctx, mcpLn, upstreamURL, cmd.ErrOrStderr(), mcp.MCPProxyOpts{
+						Scanner: sc, Approver: approver,
+						InputCfg: inputCfg, RequestBodyCfg: &cfg.RequestBodyScanning,
+						ToolCfg: toolCfg, PolicyCfg: policyCfg,
+						KillSwitch: ks, ChainMatcher: chainMatcher,
+						CEE: cee, Store: store, AdaptiveCfgFn: adaptiveFn, Metrics: mcpMetrics,
+						ConfigHash: captureConfigHash, Profile: captureProfile,
+						RedirectRT:      buildRedirectRT(cfg),
+						ProvenanceCfg:   &cfg.MCPToolProvenance,
+						EnvelopeEmitter: envEmitter,
+						DoWCheck:        dowCheck,
+						ReceiptEmitter:  receiptEmitter,
+						MediaPolicy:     &cfg.MediaPolicy,
+						RedactMatcher:   mcpRedactMatcher,
+						RedactLimits:    cfg.Redaction.Limits.ToLimits(),
+						RedactProfile:   cfg.Redaction.DefaultProfile,
+						TaintCfg:        &cfg.Taint,
+						ContractLoader:  contractLoader,
+						ContractAgent:   contractAgent,
+					}); err != nil {
+						if sentryClient != nil {
+							sentryClient.CaptureError(err)
+						}
+						return err
+					}
+					return nil
+				}
+
+				// Stdio-to-WebSocket mode: --upstream ws:// or wss://.
+				if isWSUpstream {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying WS upstream %s (response=%s, input=%s, tools=%s, policy=%s)\n",
+						upstreamURL, sc.ResponseAction(), inputCfg.Action, toolAction, policyAction)
+					wsOpts := mcp.MCPProxyOpts{
+						Scanner: sc, Approver: approver,
+						InputCfg: inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+						KillSwitch: ks, ChainMatcher: chainMatcher,
+						CEE: cee, Store: store,
+						AdaptiveCfg:     adaptiveCfg,
+						ConfigHash:      captureConfigHash,
+						Profile:         captureProfile,
+						Metrics:         mcpMetrics,
+						ReceiptEmitter:  receiptEmitter,
+						RedirectRT:      buildRedirectRT(cfg),
+						DoWCheck:        dowCheck,
+						EnvelopeEmitter: envEmitter,
+						MediaPolicy:     &cfg.MediaPolicy,
+						RedactMatcher:   mcpRedactMatcher,
+						RedactLimits:    cfg.Redaction.Limits.ToLimits(),
+						RedactProfile:   cfg.Redaction.DefaultProfile,
+						TaintCfg:        &cfg.Taint,
+						ContractLoader:  contractLoader,
+						ContractAgent:   contractAgent,
+					}
+					if err := mcp.RunWSProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), upstreamURL, wsOpts); err != nil {
+						if sentryClient != nil {
+							sentryClient.CaptureError(err)
+						}
+						return err
+					}
+					return nil
+				}
+
+				// Stdio-to-HTTP mode: --upstream only.
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying upstream %s (response=%s, input=%s, tools=%s, policy=%s)\n",
+					upstreamURL, sc.ResponseAction(), inputCfg.Action, toolAction, policyAction)
+				httpOpts := mcp.MCPProxyOpts{
+					Scanner: sc, Approver: approver,
+					InputCfg: inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+					KillSwitch: ks, ChainMatcher: chainMatcher,
+					CEE: cee, Store: store,
+					AdaptiveCfg: adaptiveCfg, Metrics: mcpMetrics,
+					ConfigHash: captureConfigHash, Profile: captureProfile,
+					RedirectRT:      buildRedirectRT(cfg),
+					EnvelopeEmitter: envEmitter,
+					DoWCheck:        dowCheck,
+					ReceiptEmitter:  receiptEmitter,
+					IntegrityCfg:    &cfg.MCPBinaryIntegrity,
+					ProvenanceCfg:   &cfg.MCPToolProvenance,
+					MediaPolicy:     &cfg.MediaPolicy,
+					RedactMatcher:   mcpRedactMatcher,
+					RedactLimits:    cfg.Redaction.Limits.ToLimits(),
+					RedactProfile:   cfg.Redaction.DefaultProfile,
+					TaintCfg:        &cfg.Taint,
+					ContractLoader:  contractLoader,
+					ContractAgent:   contractAgent,
+				}
+				if err := mcp.RunHTTPProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), upstreamURL, extraHeaders, httpOpts); err != nil {
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
+				}
+				return nil
+			}
+
+			// Parse --env flags into KEY=VALUE pairs for the child process.
+			// KEY without value: pass through from current environment.
+			// KEY=VALUE: set explicitly.
+			// Empty keys, safe-list keys, and dangerous keys are rejected.
+			var extraEnv []string
+			for _, e := range envVars {
+				key, _, hasValue := strings.Cut(e, "=")
+				if key == "" {
+					return errors.New("--env requires a non-empty variable name")
+				}
+				if mcp.IsSafeEnvKey(key) {
+					return fmt.Errorf("--env %s is already set by pipelock and cannot be overridden", key)
+				}
+				if mcp.IsDangerousEnvKey(key) {
+					return fmt.Errorf("--env %s is blocked: this variable can inject code or redirect traffic in the child process", key)
+				}
+				if hasValue {
+					extraEnv = append(extraEnv, e)
+				} else if val, found := os.LookupEnv(e); found {
+					extraEnv = append(extraEnv, e+"="+val)
+				}
+			}
+			if len(extraEnv) > 0 {
+				keys := make([]string, 0, len(extraEnv))
+				for _, e := range extraEnv {
+					k, _, _ := strings.Cut(e, "=")
+					keys = append(keys, k)
+				}
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: passing %d env var(s) to child process: %s\n",
+					len(keys), strings.Join(keys, ", "))
+			}
+
+			// Subprocess mode.
+			serverCmd := args[dashIdx:]
+			// --sandbox-strict and --sandbox-best-effort imply --sandbox.
+			if sandboxStrict || sandboxBestEffort {
+				sandboxEnabled = true
+			}
+			useSandbox := sandboxEnabled || cfg.Sandbox.Enabled
+
+			// Reject sandbox with remote modes.
+			if useSandbox && (hasUpstream || hasListen) {
+				return errors.New("sandbox cannot be used with --upstream or --listen (cannot sandbox a remote server)")
+			}
+
+			// Sandboxed MCP proxy: child in isolated namespace.
+			if useSandbox {
+				// File sentry is not yet integrated with sandbox mode.
+				// Warn explicitly so users don't lose coverage silently.
+				if cfg.FileSentry.Enabled {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+						"pipelock: WARNING: file_sentry is not yet supported with --sandbox; file write DLP scanning is disabled for this session")
+				}
+				workspace := sandboxWorkspace
+				if workspace == "" {
+					workspace = cfg.Sandbox.Workspace
+				}
+				if workspace == "" {
+					workspace, _ = os.Getwd()
+				}
+				workspace, _ = filepath.Abs(workspace)
+
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"pipelock: proxying MCP server %v [SANDBOXED] (response=%s, input=%s, tools=%s, policy=%s, workspace=%s)\n",
+					serverCmd, sc.ResponseAction(), inputCfg.Action, toolAction, policyAction, workspace)
+
+				ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+				defer cancel()
+
+				mcpStrict := sandboxStrict || cfg.Sandbox.Strict
+				mcpBestEffort := sandboxBestEffort || cfg.Sandbox.BestEffort
+
+				if mcpStrict && mcpBestEffort {
+					return errors.New("--sandbox-strict and --sandbox-best-effort are mutually exclusive")
+				}
+
+				launchCfg := sandbox.LaunchConfig{
+					Ctx:        ctx,
+					Command:    serverCmd,
+					Workspace:  workspace,
+					Strict:     mcpStrict,
+					BestEffort: mcpBestEffort,
+					ExtraEnv:   extraEnv,
+				}
+				if cfg.Sandbox.FS != nil {
+					p := sandbox.DefaultPolicy(workspace)
+					// Merge custom paths into defaults (don't replace).
+					p.AllowReadDirs = append(p.AllowReadDirs, cfg.Sandbox.FS.AllowRead...)
+					p.AllowRWDirs = append(p.AllowRWDirs, cfg.Sandbox.FS.AllowWrite...)
+					launchCfg.Policy = &p
+				}
+
+				// Binary integrity: verify before sandbox wraps the command.
+				// The sandbox re-execs pipelock as the parent, so checking
+				// after PrepareSandboxCmd would verify pipelock itself, not
+				// the MCP server binary. Pass workspace so relative script
+				// arguments resolve the same way the sandbox child resolves
+				// them after chdir(workspace).
+				if cfg.MCPBinaryIntegrity.Enabled {
+					if err := mcp.VerifyBinaryIntegrity(serverCmd, &cfg.MCPBinaryIntegrity, cmd.ErrOrStderr(), workspace); err != nil {
+						return err
+					}
+				}
+
+				closeBridge, bridgeErr := setupMCPSandboxBridge(
+					ctx, runtime.GOOS, cfg, ks, auditLogger, mcpMetrics, receiptEmitter, envEmitter,
+					cmd.ErrOrStderr(), &launchCfg, startMCPSandboxBridge,
+				)
+				if bridgeErr != nil {
+					return bridgeErr
+				}
+				defer closeBridge()
+
+				sandboxCmd, sErr := sandbox.PrepareSandboxCmd(launchCfg)
+				if sErr != nil {
+					return fmt.Errorf("sandbox prepare: %w", sErr)
+				}
+				sandboxCmd.Stderr = cmd.ErrOrStderr()
+
+				proxyOpts := mcp.MCPProxyOpts{
+					Scanner: sc, Approver: approver,
+					InputCfg: inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+					KillSwitch: ks, ChainMatcher: chainMatcher,
+					CEE: cee, Store: store,
+					AdaptiveCfg: adaptiveCfg, Metrics: mcpMetrics,
+					ConfigHash: captureConfigHash, Profile: captureProfile,
+					RedirectRT: buildRedirectRT(cfg), DoWCheck: dowCheck,
+					EnvelopeEmitter: envEmitter,
+					ReceiptEmitter:  receiptEmitter,
+					IntegrityCfg:    &cfg.MCPBinaryIntegrity,
+					ProvenanceCfg:   &cfg.MCPToolProvenance,
+					MediaPolicy:     &cfg.MediaPolicy,
+					RedactMatcher:   mcpRedactMatcher,
+					RedactLimits:    cfg.Redaction.Limits.ToLimits(),
+					RedactProfile:   cfg.Redaction.DefaultProfile,
+					TaintCfg:        &cfg.Taint,
+					ContractLoader:  contractLoader,
+					ContractAgent:   contractAgent,
+				}
+				if err := mcp.RunProxyWithSandbox(ctx, sandboxCmd, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), proxyOpts, mcpStrict); err != nil {
+					return handleProxyError(err, cmd.ErrOrStderr(), sentryClient)
+				}
+				return nil
+			}
+
+			// Normal (unsandboxed) subprocess mode.
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying MCP server %v (response=%s, input=%s, tools=%s, policy=%s)\n",
+				serverCmd, sc.ResponseAction(), inputCfg.Action, toolAction, policyAction)
+
+			ctx, cancel := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
+			defer cancel()
+
+			// Wrap stderr in a mutex so file sentry goroutines and RunProxy
+			// (which wraps logW in its own syncWriter) don't interleave.
+			logW := &safeWriter{w: cmd.ErrOrStderr()}
+
+			// File sentry: watch agent working directories for secret writes.
+			// Watches are installed synchronously (Arm) before the child starts
+			// to prevent early writes from being missed.
+			var lin filesentry.Lineage
+			var onChildReady func()
+			if cfg.FileSentry.Enabled {
+				lin = filesentry.NewLineage()
+				// Error handler for non-fatal runtime errors (e.g. failing to watch new dirs).
+				onErr := func(err error) {
+					_, _ = fmt.Fprintf(logW, "pipelock: [file_sentry] %v\n", err)
+				}
+				watcher, watchErr := filesentry.NewWatcher(&cfg.FileSentry, sc, lin, onErr)
+				if watchErr != nil {
+					if cfg.FileSentry.BestEffort {
+						_, _ = fmt.Fprintf(logW, "pipelock: file sentry init failed (best_effort: continuing without file monitoring): %v\n", watchErr)
+					} else {
+						return fmt.Errorf("file sentry init failed (feature is enabled): %w", watchErr)
+					}
+				}
+				// Arm synchronously before child launch.
+				if watcher != nil {
+					if armErr := watcher.Arm(); armErr != nil {
+						_ = watcher.Close()
+						if cfg.FileSentry.BestEffort {
+							_, _ = fmt.Fprintf(logW, "pipelock: file sentry failed to arm watches (best_effort: continuing without file monitoring): %v\n", armErr)
+							watcher = nil
+						} else {
+							return fmt.Errorf("file sentry failed to arm watches (feature is enabled): %w", armErr)
+						}
+					}
+				}
+
+				if watcher != nil {
+					// Consume findings: log to stderr, record metrics, and
+					// (in block action mode) cancel the proxy ctx on the
+					// first agent-attributed finding so the MCP child fails
+					// closed after a detected leak. See filesentry.ConsumeFindings
+					// for the full enforcement matrix.
+					var findingHook filesentry.FindingHook
+					if mcpMetrics != nil {
+						findingHook = mcpMetrics.RecordFileSentryFinding
+					}
+					waitConsumer := filesentry.ConsumeFindings(filesentry.ConsumerOpts{
+						Watcher:   watcher,
+						Action:    cfg.FileSentry.Action,
+						Log:       logW,
+						OnFinding: findingHook,
+						Cancel:    cancel,
+					})
+					// Single defer: close watcher (flushes + closes channel),
+					// then wait for consumer to finish processing.
+					defer func() {
+						_ = watcher.Close()
+						waitConsumer()
+					}()
+					_, _ = fmt.Fprintf(logW, "pipelock: file sentry watching %d path(s) (action=%s)\n",
+						len(cfg.FileSentry.WatchPaths), cfg.FileSentry.Action)
+
+					// onChildReady: called by RunProxy after cmd.Start() + TrackPID.
+					// Starts the file sentry event loop AFTER the child PID is registered,
+					// so attribution is ready before classifying any writes.
+					onChildReady = func() {
+						go func() {
+							if startErr := watcher.Start(ctx); startErr != nil {
+								_, _ = fmt.Fprintf(logW, "pipelock: file sentry fatal: %v — cancelling proxy\n", startErr)
+								cancel()
+							}
+						}()
+					}
+				} // watcher != nil
+			}
+
+			proxyOpts := mcp.MCPProxyOpts{
+				Scanner: sc, Approver: approver,
+				InputCfg: inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+				KillSwitch: ks, ChainMatcher: chainMatcher,
+				CEE: cee, Store: store,
+				AdaptiveCfg: adaptiveCfg, Metrics: mcpMetrics,
+				ConfigHash: captureConfigHash, Profile: captureProfile,
+				RedirectRT: buildRedirectRT(cfg), DoWCheck: dowCheck,
+				EnvelopeEmitter: envEmitter,
+				ReceiptEmitter:  receiptEmitter,
+				IntegrityCfg:    &cfg.MCPBinaryIntegrity,
+				ProvenanceCfg:   &cfg.MCPToolProvenance,
+				MediaPolicy:     &cfg.MediaPolicy,
+				RedactMatcher:   mcpRedactMatcher,
+				RedactLimits:    cfg.Redaction.Limits.ToLimits(),
+				RedactProfile:   cfg.Redaction.DefaultProfile,
+				TaintCfg:        &cfg.Taint,
+				Lineage:         lin, OnChildReady: onChildReady,
+				ContractLoader: contractLoader,
+				ContractAgent:  contractAgent,
+			}
+			if err := mcp.RunProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), logW, serverCmd, proxyOpts, extraEnv...); err != nil {
+				return handleProxyError(err, logW, sentryClient)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
+	cmd.Flags().StringVar(&upstreamURL, "upstream", "", "upstream MCP server URL (Streamable HTTP transport)")
+	cmd.Flags().StringVar(&listenAddr, "listen", "", "listen address for HTTP reverse proxy mode (e.g. 0.0.0.0:8889)")
+	cmd.Flags().StringArrayVar(&envVars, "env", nil, "pass environment variable to child process (KEY or KEY=VALUE, repeatable)")
+	cmd.Flags().StringArrayVar(&rawHeaders, "header", nil, "extra HTTP header for upstream MCP server in --upstream HTTP mode (repeatable, format: 'Key: Value')")
+	cmd.Flags().StringVar(&headerFile, "header-file", "", "path to a 0o600 (or 0o640) file with extra HTTP headers, one per line as 'Key: Value' (comments with '#'); merged with --header")
+	cmd.Flags().StringVar(&agentName, "agent", "", "agent profile name (resolves to config profile for policy/scanner)")
+	cmd.Flags().BoolVar(&sandboxEnabled, "sandbox", false, "run child in sandbox (Landlock + seccomp + network namespace, Linux only)")
+	cmd.Flags().BoolVar(&sandboxStrict, "sandbox-strict", false, "strict sandbox: error on missing layers, private /dev/shm, block clone3 (implies --sandbox)")
+	cmd.Flags().BoolVar(&sandboxBestEffort, "sandbox-best-effort", false, "degrade gracefully when namespace isolation is unavailable (implies --sandbox)")
+	cmd.Flags().StringVar(&sandboxWorkspace, "workspace", "", "sandbox workspace directory (default: current directory)")
+	return cmd
+}

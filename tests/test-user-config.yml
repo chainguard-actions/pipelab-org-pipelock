@@ -1,0 +1,49 @@
+name: Test user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create fixture and generate a valid pipelock config
+        run: |
+          set -euo pipefail
+          P="$GITHUB_WORKSPACE/pl-clean-project"
+          mkdir -p "$P"
+          printf '# Clean project\n\nNothing sensitive here.\n' > "$P/README.md"
+          printf 'def add(a, b):\n    return a + b\n' > "$P/app.py"
+          ARCH="$(uname -m)"
+          case "$ARCH" in x86_64) A=amd64 ;; aarch64|arm64) A=arm64 ;; *) echo "unsupported $ARCH"; exit 1 ;; esac
+          D="$(mktemp -d)"
+          curl -fsSL --retry 5 --retry-all-errors \
+            "https://github.com/luckyPipewrench/pipelock/releases/download/v2.6.0/pipelock_2.6.0_linux_${A}.tar.gz" \
+            -o "$D/p.tar.gz"
+          tar -xzf "$D/p.tar.gz" -C "$D" pipelock
+          "$D/pipelock" audit "$P" -o "$GITHUB_WORKSPACE/user-pipelock.yaml" || true
+          test -s "$GITHUB_WORKSPACE/user-pipelock.yaml"
+          rm -rf "${RUNNER_TEMP:-/tmp}/pipelock-reports"
+      # Upload-artifact inside the action fails under act's artifact server; outcome
+      # may be failure for that reason. Outputs and config validity are checked below.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.6.0'
+          config: user-pipelock.yaml
+          directory: pl-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert config-path is the user config
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome=$OUTCOME config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome"; exit 1; fi
+          if [ "$CONFIG_PATH" != "user-pipelock.yaml" ]; then echo "FAIL: expected user-pipelock.yaml"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if [ -f "${RUNNER_TEMP:-/tmp}/pipelock-reports/suggested.yaml" ]; then echo "FAIL: config should not be auto-generated"; exit 1; fi
+          if ! pipelock check --config user-pipelock.yaml; then echo "FAIL: user config does not validate"; exit 1; fi
+          echo "PASS"
