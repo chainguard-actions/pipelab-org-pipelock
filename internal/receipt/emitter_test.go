@@ -1,0 +1,1045 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package receipt
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+const (
+	testPrincipal  = "test-principal"
+	testActor      = "test-actor"
+	testConfigHash = "abc123"
+)
+
+func newTestRecorder(t *testing.T, dir string, priv ed25519.PrivateKey) *recorder.Recorder {
+	t.Helper()
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}, nil, priv)
+	if err != nil {
+		t.Fatalf("recorder.New: %v", err)
+	}
+	return rec
+}
+
+func TestNewEmitter_NilRecorder(t *testing.T) {
+	t.Parallel()
+
+	_, priv := generateTestKey(t)
+	e := NewEmitter(EmitterConfig{
+		Recorder: nil,
+		PrivKey:  priv,
+	})
+	if e != nil {
+		t.Error("NewEmitter() with nil recorder should return nil")
+	}
+}
+
+func TestNewEmitter_NilPrivateKey(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	_, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+	defer func() { _ = rec.Close() }()
+
+	e := NewEmitter(EmitterConfig{
+		Recorder: rec,
+		PrivKey:  nil,
+	})
+	if e != nil {
+		t.Error("NewEmitter() with nil private key should return nil")
+	}
+}
+
+func TestNewEmitter_ShortPrivateKey(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	_, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+	defer func() { _ = rec.Close() }()
+
+	e := NewEmitter(EmitterConfig{
+		Recorder: rec,
+		PrivKey:  make([]byte, 16), // wrong size
+	})
+	if e != nil {
+		t.Error("NewEmitter() with short private key should return nil")
+	}
+}
+
+func TestNewEmitter_ValidInputs(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	_, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+	defer func() { _ = rec.Close() }()
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+	if e == nil {
+		t.Fatal("NewEmitter() with valid inputs returned nil")
+	}
+}
+
+func TestEmitter_Emit_NilEmitter(t *testing.T) {
+	t.Parallel()
+
+	var e *Emitter
+	err := e.Emit(EmitOpts{
+		Target:    testTarget,
+		Verdict:   config.ActionBlock,
+		Transport: testTransport,
+		Method:    http.MethodGet,
+	})
+	if err != nil {
+		t.Errorf("Emit() on nil emitter should be no-op, got error: %v", err)
+	}
+}
+
+func TestEmitter_Emit_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+	if e == nil {
+		t.Fatal("NewEmitter() returned nil")
+	}
+
+	err := e.Emit(EmitOpts{
+		ActionID:  NewActionID(),
+		Target:    testTarget,
+		Verdict:   config.ActionBlock,
+		Transport: testTransport,
+		Method:    http.MethodGet,
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+
+	// Close the recorder to flush.
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close() error: %v", err)
+	}
+
+	// Read the JSONL file back and find our receipt entry.
+	receipt := readReceiptFromDir(t, dir, pub)
+	if receipt.ActionRecord.Target != testTarget {
+		t.Errorf("target = %q, want %q", receipt.ActionRecord.Target, testTarget)
+	}
+	if receipt.ActionRecord.Verdict != "block" {
+		t.Errorf("verdict = %q, want %q", receipt.ActionRecord.Verdict, "block")
+	}
+	if receipt.ActionRecord.PolicyHash != testConfigHash {
+		t.Errorf("policy_hash = %q, want %q", receipt.ActionRecord.PolicyHash, testConfigHash)
+	}
+	if receipt.ActionRecord.RunNonce == "" {
+		t.Fatal("run_nonce is empty")
+	}
+	if _, err := hex.DecodeString(receipt.ActionRecord.RunNonce); err != nil {
+		t.Fatalf("run_nonce is not hex: %v", err)
+	}
+	if len(receipt.ActionRecord.RunNonce) != 32 {
+		t.Fatalf("run_nonce length = %d, want 32", len(receipt.ActionRecord.RunNonce))
+	}
+	if receipt.ActionRecord.Principal != testPrincipal {
+		t.Errorf("principal = %q, want %q", receipt.ActionRecord.Principal, testPrincipal)
+	}
+}
+
+func TestEmitter_RunNoncePerProcessRun(t *testing.T) {
+	t.Parallel()
+
+	dirA := t.TempDir()
+	pubA, privA := generateTestKey(t)
+	recA := newTestRecorder(t, dirA, privA)
+	eA := NewEmitter(EmitterConfig{
+		Recorder:   recA,
+		PrivKey:    privA,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+	if eA == nil {
+		t.Fatal("NewEmitter A returned nil")
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := eA.Emit(EmitOpts{
+			ActionID:  NewActionID(),
+			Target:    testTarget,
+			Verdict:   config.ActionAllow,
+			Transport: testTransport,
+			Method:    http.MethodGet,
+		}); err != nil {
+			t.Fatalf("Emit A %d: %v", i, err)
+		}
+	}
+	if err := recA.Close(); err != nil {
+		t.Fatalf("Close A: %v", err)
+	}
+
+	receiptsA := readAllReceiptsFromDir(t, dirA, pubA)
+	if len(receiptsA) != 2 {
+		t.Fatalf("receipts A = %d, want 2", len(receiptsA))
+	}
+	if receiptsA[0].ActionRecord.RunNonce == "" {
+		t.Fatal("first run_nonce is empty")
+	}
+	if receiptsA[0].ActionRecord.RunNonce != receiptsA[1].ActionRecord.RunNonce {
+		t.Fatalf("same emitter produced different run_nonce values: %q != %q",
+			receiptsA[0].ActionRecord.RunNonce, receiptsA[1].ActionRecord.RunNonce)
+	}
+
+	dirB := t.TempDir()
+	pubB, privB := generateTestKey(t)
+	recB := newTestRecorder(t, dirB, privB)
+	eB := NewEmitter(EmitterConfig{
+		Recorder:   recB,
+		PrivKey:    privB,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+	if eB == nil {
+		t.Fatal("NewEmitter B returned nil")
+	}
+	if err := eB.Emit(EmitOpts{
+		ActionID:  NewActionID(),
+		Target:    testTarget,
+		Verdict:   config.ActionAllow,
+		Transport: testTransport,
+		Method:    http.MethodGet,
+	}); err != nil {
+		t.Fatalf("Emit B: %v", err)
+	}
+	if err := recB.Close(); err != nil {
+		t.Fatalf("Close B: %v", err)
+	}
+
+	receiptsB := readAllReceiptsFromDir(t, dirB, pubB)
+	if len(receiptsB) != 1 {
+		t.Fatalf("receipts B = %d, want 1", len(receiptsB))
+	}
+	if receiptsA[0].ActionRecord.RunNonce == receiptsB[0].ActionRecord.RunNonce {
+		t.Fatalf("different emitters reused run_nonce %q", receiptsA[0].ActionRecord.RunNonce)
+	}
+}
+
+func TestEmitter_Emit_TaintFields(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+
+	source := session.TaintSourceRef{
+		URL:   "https://evil.example/issue/123",
+		Kind:  "http_response",
+		Level: session.TaintExternalUntrusted,
+	}
+	err := e.Emit(EmitOpts{
+		ActionID:            NewActionID(),
+		Target:              testTarget,
+		Verdict:             config.ActionAllow,
+		Transport:           testTransport,
+		Method:              http.MethodPost,
+		SessionTaintLevel:   session.TaintExternalUntrusted.String(),
+		SessionContaminated: true,
+		RecentTaintSources:  []session.TaintSourceRef{source},
+		SessionTaskID:       "task-123",
+		SessionTaskLabel:    "review auth fix",
+		AuthorityKind:       session.AuthorityOperatorOverride.String(),
+		TaintDecision:       "ask",
+		TaintDecisionReason: "protected_write_after_untrusted_external_exposure",
+		TaskOverrideApplied: true,
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close() error: %v", err)
+	}
+
+	got := readReceiptFromDir(t, dir, pub)
+	if got.ActionRecord.SessionTaintLevel != session.TaintExternalUntrusted.String() {
+		t.Fatalf("session_taint_level = %q", got.ActionRecord.SessionTaintLevel)
+	}
+	if !got.ActionRecord.SessionContaminated {
+		t.Fatal("expected session_contaminated to be true")
+	}
+	if len(got.ActionRecord.RecentTaintSources) != 1 {
+		t.Fatalf("recent_taint_sources length = %d, want 1", len(got.ActionRecord.RecentTaintSources))
+	}
+	if got.ActionRecord.SessionTaskID != "task-123" {
+		t.Fatalf("session_task_id = %q", got.ActionRecord.SessionTaskID)
+	}
+	if got.ActionRecord.SessionTaskLabel != "review auth fix" {
+		t.Fatalf("session_task_label = %q", got.ActionRecord.SessionTaskLabel)
+	}
+	if got.ActionRecord.AuthorityKind != session.AuthorityOperatorOverride.String() {
+		t.Fatalf("authority_kind = %q", got.ActionRecord.AuthorityKind)
+	}
+	if got.ActionRecord.TaintDecision != "ask" {
+		t.Fatalf("taint_decision = %q", got.ActionRecord.TaintDecision)
+	}
+	if got.ActionRecord.TaintDecisionReason != "protected_write_after_untrusted_external_exposure" {
+		t.Fatalf("taint_decision_reason = %q", got.ActionRecord.TaintDecisionReason)
+	}
+	if !got.ActionRecord.TaskOverrideApplied {
+		t.Fatal("expected task_override_applied to be true")
+	}
+}
+
+func TestEmitter_Emit_RedactionSummary(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+
+	err := e.Emit(EmitOpts{
+		ActionID:         NewActionID(),
+		Target:           testTarget,
+		Verdict:          config.ActionAllow,
+		Transport:        testTransport,
+		Method:           http.MethodPost,
+		RedactionProfile: "code",
+		RedactionReport: &redact.Report{
+			Applied:         true,
+			Provider:        "gemini",
+			Parser:          redact.ParserJSON,
+			TotalRedactions: 2,
+			ByClass: map[redact.Class]int{
+				redact.ClassAWSAccessKey: 1,
+				redact.ClassFQDN:         1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close() error: %v", err)
+	}
+
+	got := readReceiptFromDir(t, dir, pub)
+	if got.ActionRecord.Redaction == nil {
+		t.Fatal("expected redaction summary in receipt")
+	}
+	if got.ActionRecord.Redaction.Profile != "code" {
+		t.Fatalf("profile = %q, want %q", got.ActionRecord.Redaction.Profile, "code")
+	}
+	if got.ActionRecord.Redaction.Provider != "gemini" {
+		t.Fatalf("provider = %q, want gemini", got.ActionRecord.Redaction.Provider)
+	}
+	if got.ActionRecord.Redaction.Parser != redact.ParserJSON {
+		t.Fatalf("parser = %q, want %q", got.ActionRecord.Redaction.Parser, redact.ParserJSON)
+	}
+	if got.ActionRecord.Redaction.TotalRedactions != 2 {
+		t.Fatalf("total_redactions = %d, want 2", got.ActionRecord.Redaction.TotalRedactions)
+	}
+	if got.ActionRecord.Redaction.ByClass[string(redact.ClassAWSAccessKey)] != 1 {
+		t.Fatalf("aws-access-key count = %d, want 1", got.ActionRecord.Redaction.ByClass[string(redact.ClassAWSAccessKey)])
+	}
+}
+
+func TestEmitter_Emit_ShieldSummary(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+
+	err := e.Emit(EmitOpts{
+		ActionID:       NewActionID(),
+		ParentActionID: "parent-action-id",
+		Target:         testTarget,
+		Verdict:        config.ActionAllow,
+		Transport:      testTransport,
+		Method:         http.MethodGet,
+		Layer:          "browser_shield",
+		Pattern:        "browser_shield_rewrite",
+		Severity:       config.SeverityInfo,
+		Shield: &ShieldSummary{
+			Pipeline:                 "html",
+			TotalRewrites:            4,
+			ExtensionProbes:          1,
+			TrackingBeacons:          1,
+			AgentTraps:               1,
+			FingerprintShimInjected:  true,
+			BodyBytes:                2048,
+			ScannedBytes:             1024,
+			Partial:                  true,
+			AdaptiveSignalsRecorded:  1,
+			AdaptiveSignalMaxPerBody: 1,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close() error: %v", err)
+	}
+
+	got := readReceiptFromDir(t, dir, pub)
+	if got.ActionRecord.Shield == nil {
+		t.Fatal("expected shield summary in receipt")
+	}
+	if got.ActionRecord.Shield.Pipeline != "html" {
+		t.Fatalf("pipeline = %q, want html", got.ActionRecord.Shield.Pipeline)
+	}
+	if got.ActionRecord.Shield.TotalRewrites != 4 {
+		t.Fatalf("total_rewrites = %d, want 4", got.ActionRecord.Shield.TotalRewrites)
+	}
+	if got.ActionRecord.ParentActionID != "parent-action-id" {
+		t.Fatalf("parent_action_id = %q, want parent-action-id", got.ActionRecord.ParentActionID)
+	}
+	if got.ActionRecord.Shield.AdaptiveSignalsRecorded != 1 {
+		t.Fatalf("adaptive_signals_recorded = %d, want 1", got.ActionRecord.Shield.AdaptiveSignalsRecorded)
+	}
+}
+
+func TestEmitter_Emit_NilRedactionReportOmitted(t *testing.T) {
+	t.Parallel()
+
+	makeActionRecordJSON := func(t *testing.T, opts EmitOpts) []byte {
+		t.Helper()
+
+		dir := t.TempDir()
+		pub, priv := generateTestKey(t)
+		rec := newTestRecorder(t, dir, priv)
+		e := NewEmitter(EmitterConfig{
+			Recorder:   rec,
+			PrivKey:    priv,
+			ConfigHash: testConfigHash,
+			Principal:  testPrincipal,
+			Actor:      testActor,
+		})
+		if err := e.Emit(opts); err != nil {
+			t.Fatalf("Emit() error: %v", err)
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("recorder.Close() error: %v", err)
+		}
+		got := readReceiptFromDir(t, dir, pub)
+		got.ActionRecord.Timestamp = time.Time{}
+		got.ActionRecord.RunNonce = ""
+		data, err := json.Marshal(got.ActionRecord)
+		if err != nil {
+			t.Fatalf("json.Marshal(ActionRecord): %v", err)
+		}
+		if bytes.Contains(data, []byte(`"redaction"`)) {
+			t.Fatalf("redaction block should be omitted, got %s", data)
+		}
+		return data
+	}
+
+	baseOpts := EmitOpts{
+		ActionID:  "fixed-action-id",
+		Target:    testTarget,
+		Verdict:   config.ActionAllow,
+		Transport: testTransport,
+		Method:    http.MethodGet,
+	}
+
+	baseJSON := makeActionRecordJSON(t, baseOpts)
+	nilReportJSON := makeActionRecordJSON(t, EmitOpts{
+		ActionID:         baseOpts.ActionID,
+		Target:           baseOpts.Target,
+		Verdict:          baseOpts.Verdict,
+		Transport:        baseOpts.Transport,
+		Method:           baseOpts.Method,
+		RedactionProfile: "code",
+		RedactionReport:  nil,
+	})
+
+	if !bytes.Equal(baseJSON, nilReportJSON) {
+		t.Fatalf("action record JSON changed when redaction report was nil\nbase: %s\nnil : %s", baseJSON, nilReportJSON)
+	}
+}
+
+func TestEmitter_Emit_HTTPClassification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		method     string
+		wantAction ActionType
+	}{
+		{name: "GET_is_read", method: http.MethodGet, wantAction: ActionRead},
+		{name: "POST_is_write", method: http.MethodPost, wantAction: ActionWrite},
+		{name: "DELETE_is_write", method: http.MethodDelete, wantAction: ActionWrite},
+		{name: "HEAD_is_read", method: http.MethodHead, wantAction: ActionRead},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			pub, priv := generateTestKey(t)
+			rec := newTestRecorder(t, dir, priv)
+
+			e := NewEmitter(EmitterConfig{
+				Recorder:   rec,
+				PrivKey:    priv,
+				ConfigHash: testConfigHash,
+				Principal:  testPrincipal,
+				Actor:      testActor,
+			})
+
+			err := e.Emit(EmitOpts{
+				ActionID:  NewActionID(),
+				Target:    testTarget,
+				Verdict:   config.ActionAllow,
+				Transport: testTransport,
+				Method:    tc.method,
+			})
+			if err != nil {
+				t.Fatalf("Emit() error: %v", err)
+			}
+
+			if err := rec.Close(); err != nil {
+				t.Fatalf("Close() error: %v", err)
+			}
+
+			receipt := readReceiptFromDir(t, dir, pub)
+			if receipt.ActionRecord.ActionType != tc.wantAction {
+				t.Errorf("action_type = %q, want %q",
+					receipt.ActionRecord.ActionType, tc.wantAction)
+			}
+		})
+	}
+}
+
+func TestEmitter_Emit_MCPClassification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		mcpMethod  string
+		toolName   string
+		wantAction ActionType
+	}{
+		{name: "tools_call_read", mcpMethod: "tools/call", toolName: "getUser", wantAction: ActionRead},
+		{name: "tools_call_write", mcpMethod: "tools/call", toolName: "createFile", wantAction: ActionWrite},
+		{name: "tools_call_delegate", mcpMethod: "tools/call", toolName: "runCommand", wantAction: ActionDelegate},
+		{name: "tools_list", mcpMethod: "tools/list", toolName: "", wantAction: ActionRead},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			pub, priv := generateTestKey(t)
+			rec := newTestRecorder(t, dir, priv)
+
+			e := NewEmitter(EmitterConfig{
+				Recorder:   rec,
+				PrivKey:    priv,
+				ConfigHash: testConfigHash,
+				Principal:  testPrincipal,
+				Actor:      testActor,
+			})
+
+			err := e.Emit(EmitOpts{
+				ActionID:  NewActionID(),
+				Target:    testTarget,
+				Verdict:   config.ActionAllow,
+				Transport: "mcp",
+				MCPMethod: tc.mcpMethod,
+				ToolName:  tc.toolName,
+			})
+			if err != nil {
+				t.Fatalf("Emit() error: %v", err)
+			}
+
+			if err := rec.Close(); err != nil {
+				t.Fatalf("Close() error: %v", err)
+			}
+
+			receipt := readReceiptFromDir(t, dir, pub)
+			if receipt.ActionRecord.ActionType != tc.wantAction {
+				t.Errorf("action_type = %q, want %q",
+					receipt.ActionRecord.ActionType, tc.wantAction)
+			}
+			// MCP calls should have reversibility set to unknown.
+			if receipt.ActionRecord.Reversibility != ReversibilityUnknown {
+				t.Errorf("reversibility = %q, want %q",
+					receipt.ActionRecord.Reversibility, ReversibilityUnknown)
+			}
+		})
+	}
+}
+
+func TestEmitter_Emit_ActorLabel(t *testing.T) {
+	t.Parallel()
+
+	t.Run("default_actor", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		pub, priv := generateTestKey(t)
+		rec := newTestRecorder(t, dir, priv)
+
+		e := NewEmitter(EmitterConfig{
+			Recorder:   rec,
+			PrivKey:    priv,
+			ConfigHash: testConfigHash,
+			Principal:  testPrincipal,
+			Actor:      testActor,
+		})
+
+		err := e.Emit(EmitOpts{
+			ActionID:  NewActionID(),
+			Target:    testTarget,
+			Verdict:   config.ActionAllow,
+			Transport: testTransport,
+			Method:    http.MethodGet,
+		})
+		if err != nil {
+			t.Fatalf("Emit() error: %v", err)
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+
+		receipt := readReceiptFromDir(t, dir, pub)
+		if receipt.ActionRecord.Actor != testActor {
+			t.Errorf("actor = %q, want %q", receipt.ActionRecord.Actor, testActor)
+		}
+	})
+
+	t.Run("agent_override", func(t *testing.T) {
+		t.Parallel()
+
+		dir := t.TempDir()
+		pub, priv := generateTestKey(t)
+		rec := newTestRecorder(t, dir, priv)
+
+		e := NewEmitter(EmitterConfig{
+			Recorder:   rec,
+			PrivKey:    priv,
+			ConfigHash: testConfigHash,
+			Principal:  testPrincipal,
+			Actor:      testActor,
+		})
+
+		const agentLabel = "custom-agent"
+		err := e.Emit(EmitOpts{
+			ActionID:  NewActionID(),
+			Target:    testTarget,
+			Verdict:   config.ActionAllow,
+			Transport: testTransport,
+			Method:    http.MethodGet,
+			Agent:     agentLabel,
+		})
+		if err != nil {
+			t.Fatalf("Emit() error: %v", err)
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+
+		receipt := readReceiptFromDir(t, dir, pub)
+		if receipt.ActionRecord.Actor != agentLabel {
+			t.Errorf("actor = %q, want %q", receipt.ActionRecord.Actor, agentLabel)
+		}
+	})
+}
+
+func TestEmitter_UpdateConfigHash(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: "hash-before",
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+
+	// Emit first receipt with original hash.
+	err := e.Emit(EmitOpts{
+		ActionID:  NewActionID(),
+		Target:    testTarget,
+		Verdict:   config.ActionAllow,
+		Transport: testTransport,
+		Method:    http.MethodGet,
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+
+	// Update config hash (simulates hot reload).
+	e.UpdateConfigHash("hash-after")
+
+	// Emit second receipt with updated hash.
+	err = e.Emit(EmitOpts{
+		ActionID:  NewActionID(),
+		Target:    "https://other.example.com",
+		Verdict:   config.ActionBlock,
+		Transport: testTransport,
+		Method:    http.MethodPost,
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	// Read all receipts and verify policy_hash values differ.
+	receipts := readAllReceiptsFromDir(t, dir, pub)
+	if len(receipts) < 2 {
+		t.Fatalf("expected at least 2 receipts, got %d", len(receipts))
+	}
+
+	if receipts[0].ActionRecord.PolicyHash != "hash-before" {
+		t.Errorf("first receipt policy_hash = %q, want %q",
+			receipts[0].ActionRecord.PolicyHash, "hash-before")
+	}
+	if receipts[1].ActionRecord.PolicyHash != "hash-after" {
+		t.Errorf("second receipt policy_hash = %q, want %q",
+			receipts[1].ActionRecord.PolicyHash, "hash-after")
+	}
+}
+
+func TestEmitter_UpdateConfigHash_NilEmitter(t *testing.T) {
+	t.Parallel()
+
+	var e *Emitter
+	// Should not panic.
+	e.UpdateConfigHash("anything")
+}
+
+func TestEmitter_Emit_NoMethodOrMCP(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv := generateTestKey(t)
+	rec := newTestRecorder(t, dir, priv)
+
+	e := NewEmitter(EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: testConfigHash,
+		Principal:  testPrincipal,
+		Actor:      testActor,
+	})
+
+	// Emit with no Method and no MCPMethod => unclassified.
+	err := e.Emit(EmitOpts{
+		ActionID:  NewActionID(),
+		Target:    testTarget,
+		Verdict:   config.ActionBlock,
+		Transport: testTransport,
+	})
+	if err != nil {
+		t.Fatalf("Emit() error: %v", err)
+	}
+
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	receipt := readReceiptFromDir(t, dir, pub)
+	if receipt.ActionRecord.ActionType != ActionUnclassified {
+		t.Errorf("action_type = %q, want %q",
+			receipt.ActionRecord.ActionType, ActionUnclassified)
+	}
+}
+
+func TestEmitter_Emit_MCPSideEffects(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		toolName       string
+		wantSideEffect SideEffectClass
+	}{
+		{name: "read_tool", toolName: "getUser", wantSideEffect: SideEffectExternalRead},
+		{name: "write_tool", toolName: "createFile", wantSideEffect: SideEffectExternalWrite},
+		{name: "delegate_tool", toolName: "runCommand", wantSideEffect: SideEffectExternalWrite},
+		{name: "unclassified_tool", toolName: "mystery", wantSideEffect: SideEffectNone},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			pub, priv := generateTestKey(t)
+			rec := newTestRecorder(t, dir, priv)
+
+			e := NewEmitter(EmitterConfig{
+				Recorder:   rec,
+				PrivKey:    priv,
+				ConfigHash: testConfigHash,
+				Principal:  testPrincipal,
+				Actor:      testActor,
+			})
+
+			err := e.Emit(EmitOpts{
+				ActionID:  NewActionID(),
+				Target:    testTarget,
+				Verdict:   config.ActionAllow,
+				Transport: "mcp",
+				MCPMethod: "tools/call",
+				ToolName:  tc.toolName,
+			})
+			if err != nil {
+				t.Fatalf("Emit() error: %v", err)
+			}
+			if err := rec.Close(); err != nil {
+				t.Fatalf("Close() error: %v", err)
+			}
+
+			receipt := readReceiptFromDir(t, dir, pub)
+			if receipt.ActionRecord.SideEffectClass != tc.wantSideEffect {
+				t.Errorf("side_effect_class = %q, want %q",
+					receipt.ActionRecord.SideEffectClass, tc.wantSideEffect)
+			}
+		})
+	}
+}
+
+func TestSideEffectFromMCPAction(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		actionType ActionType
+		want       SideEffectClass
+	}{
+		{name: "read", actionType: ActionRead, want: SideEffectExternalRead},
+		{name: "write", actionType: ActionWrite, want: SideEffectExternalWrite},
+		{name: "commit", actionType: ActionCommit, want: SideEffectExternalWrite},
+		{name: "delegate", actionType: ActionDelegate, want: SideEffectExternalWrite},
+		{name: "spend", actionType: ActionSpend, want: SideEffectFinancial},
+		{name: "actuate", actionType: ActionActuate, want: SideEffectPhysical},
+		{name: "unclassified", actionType: ActionUnclassified, want: SideEffectNone},
+		{name: "derive", actionType: ActionDerive, want: SideEffectNone},
+		{name: "authorize", actionType: ActionAuthorize, want: SideEffectNone},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := sideEffectFromMCPAction(tc.actionType)
+			if got != tc.want {
+				t.Errorf("sideEffectFromMCPAction(%q) = %q, want %q",
+					tc.actionType, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRecorderSeqStart(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		path string
+		want uint64
+	}{
+		{name: "normal", path: "session-5.jsonl", want: 5},
+		{name: "zero", path: "session-0.jsonl", want: 0},
+		{name: "no_dash", path: "nodash.jsonl", want: 0},
+		{name: "non_numeric", path: "foo-bar.jsonl", want: 0},
+		{name: "max_uint64", path: "session-18446744073709551615.jsonl", want: 18446744073709551615},
+		{name: "with_leading_dirs", path: "/tmp/evidence/session-7.jsonl", want: 7},
+		{name: "evidence_prefix", path: "evidence-proxy-42.jsonl", want: 42},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := recorderSeqStart(tt.path)
+			if got != tt.want {
+				t.Errorf("recorderSeqStart(%q) = %d, want %d", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecorderFiles_EmptyDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	files, err := recorderFiles(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected 0 files, got %d", len(files))
+	}
+}
+
+func TestRecorderFiles_EmptyDirString(t *testing.T) {
+	t.Parallel()
+
+	files, err := recorderFiles("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if files != nil {
+		t.Fatalf("expected nil, got %v", files)
+	}
+}
+
+func TestRecorderFiles_BadDir(t *testing.T) {
+	t.Parallel()
+
+	_, err := recorderFiles("/nonexistent/dir")
+	if err == nil {
+		t.Fatal("expected error for nonexistent dir")
+	}
+}
+
+func TestReceiptFromEntry_MarshalError(t *testing.T) {
+	t.Parallel()
+
+	// An entry whose Detail cannot be round-tripped properly.
+	// We use a channel value which json.Marshal will reject.
+	entry := recorder.Entry{
+		Sequence: 99,
+		Type:     recorderEntryType,
+		Detail:   make(chan int),
+	}
+	_, err := receiptFromEntry(entry)
+	if err == nil {
+		t.Fatal("expected error for unmarshalable detail")
+	}
+}
+
+// readReceiptFromDir reads the first action_receipt entry from JSONL files
+// in dir, parses the receipt, and verifies its signature.
+func readReceiptFromDir(t *testing.T, dir string, pub ed25519.PublicKey) Receipt {
+	t.Helper()
+	receipts := readAllReceiptsFromDir(t, dir, pub)
+	if len(receipts) == 0 {
+		t.Fatal("no action_receipt entries found in evidence files")
+	}
+	return receipts[0]
+}
+
+// readAllReceiptsFromDir reads all action_receipt entries from JSONL files in dir.
+// It verifies each receipt's signature against the provided public key.
+func readAllReceiptsFromDir(t *testing.T, dir string, pub ed25519.PublicKey) []Receipt {
+	t.Helper()
+
+	expectedKeyHex := hex.EncodeToString(pub)
+
+	entries, err := os.ReadDir(filepath.Clean(dir))
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", dir, err)
+	}
+
+	var receipts []Receipt
+	for _, de := range entries {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".jsonl") {
+			continue
+		}
+
+		path := filepath.Join(dir, de.Name())
+		fileEntries, err := recorder.ReadEntries(path)
+		if err != nil {
+			t.Fatalf("ReadEntries(%q): %v", path, err)
+		}
+
+		for _, entry := range fileEntries {
+			if entry.Type != "action_receipt" {
+				continue
+			}
+
+			// entry.Detail is map[string]any after JSON unmarshal.
+			// Marshal it back to JSON, then unmarshal as Receipt.
+			detailJSON, err := json.Marshal(entry.Detail)
+			if err != nil {
+				t.Fatalf("json.Marshal(entry.Detail): %v", err)
+			}
+
+			r, err := Unmarshal(detailJSON)
+			if err != nil {
+				t.Fatalf("Unmarshal(receipt): %v", err)
+			}
+
+			if err := VerifyWithKey(r, expectedKeyHex); err != nil {
+				t.Fatalf("VerifyWithKey(receipt): %v", err)
+			}
+
+			receipts = append(receipts, r)
+		}
+	}
+	return receipts
+}
+
+// Ensure crypto/rand is used (lint satisfaction for the import).
+var _ = rand.Reader

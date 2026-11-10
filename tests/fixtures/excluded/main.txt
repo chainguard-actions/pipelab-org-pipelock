@@ -1,0 +1,1 @@
+Top-level file for the exclude-paths fixture.

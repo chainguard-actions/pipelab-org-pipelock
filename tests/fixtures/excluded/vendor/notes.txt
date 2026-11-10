@@ -1,0 +1,1 @@
+Vendored notes file used to exercise the exclude-paths input.

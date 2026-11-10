@@ -1,0 +1,49 @@
+name: Test exclude-paths and pinned version
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create fixture directory with excludable paths
+        run: |
+          D="$GITHUB_WORKSPACE/pipelock-test-excluded"
+          mkdir -p "$D/vendor"
+          echo "main project notes" > "$D/main.txt"
+          echo "vendored notes" > "$D/vendor/notes.txt"
+          echo "package gen" > "$D/thing.generated.go"
+      # Upload audit report (if: always()) fails under act's artifact server; the
+      # outputs are still set and asserted below.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: v2.7.0
+          directory: pipelock-test-excluded
+          test-vectors: 'false'
+          fail-on-findings: 'false'
+          exclude-paths: |
+            vendor/
+              *.generated.go
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+        run: |
+          echo "outcome=$OUTCOME findings=$FINDINGS audit_failed=$AUDIT_FAILED config=$CONFIG_PATH"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: unexpected outcome '$OUTCOME'"; exit 1
+          fi
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: audit-failed should be false"; exit 1
+          fi
+          if ! echo "$FINDINGS" | grep -qE '^[0-9]+$'; then
+            echo "FAIL: findings-count not numeric"; exit 1
+          fi
+          if ! pipelock version 2>&1 | grep -q '2\.7\.0'; then
+            echo "FAIL: expected pipelock 2.7.0"; pipelock version; exit 1
+          fi
+          echo "PASS"

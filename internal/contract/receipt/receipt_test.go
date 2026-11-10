@@ -1,0 +1,462 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package receipt_test
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/contract"
+	"github.com/luckyPipewrench/pipelock/internal/contract/receipt"
+)
+
+const validReceiptSignature = "ed25519:" +
+	"0000000000000000000000000000000000000000000000000000000000000000" +
+	"0000000000000000000000000000000000000000000000000000000000000000"
+const validPolicyHash = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// minimalProxyDecisionPayload returns a valid proxy_decision payload as raw JSON.
+func minimalProxyDecisionPayload() json.RawMessage {
+	return json.RawMessage(`{
+		"action_type": "block",
+		"target": "https://example.com/",
+		"verdict": "blocked",
+		"transport": "forward",
+		"policy_sources": ["dlp"],
+		"winning_source": "dlp"
+	}`)
+}
+
+func validReceipt() receipt.EvidenceReceipt {
+	return receipt.EvidenceReceipt{
+		RecordType:       receipt.RecordTypeEvidenceV2,
+		ReceiptVersion:   2,
+		PayloadKind:      receipt.PayloadProxyDecision,
+		Canonicalization: receipt.DefaultCanonicalizationProfile(),
+		Crit:             receipt.CritForPayloadKind(receipt.PayloadProxyDecision),
+		EventID:          "01900000-0000-7000-8000-000000000001",
+		Timestamp:        time.Now(),
+		PolicyHash:       validPolicyHash,
+		Payload:          minimalProxyDecisionPayload(),
+		Signature: receipt.SignatureProof{
+			SignerKeyID: "receipt-key",
+			KeyPurpose:  "receipt-signing",
+			Algorithm:   "ed25519",
+			Signature:   validReceiptSignature,
+		},
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsV1RecordType(t *testing.T) {
+	r := validReceipt()
+	r.RecordType = receipt.RecordTypeActionV1
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrUnsupportedRecordType) {
+		t.Fatalf("expected ErrUnsupportedRecordType, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsWrongVersion(t *testing.T) {
+	r := validReceipt()
+	r.ReceiptVersion = 3
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrWrongReceiptVersion) {
+		t.Fatalf("expected ErrWrongReceiptVersion, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsMissingCanonicalization(t *testing.T) {
+	r := validReceipt()
+	r.Canonicalization = receipt.CanonicalizationProfile{}
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("expected ErrPayloadInvalidEnum, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsUnknownCrit(t *testing.T) {
+	r := validReceipt()
+	r.Crit = []string{receipt.CritCanonicalization, "future_extension"}
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("expected ErrPayloadInvalidEnum, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsMissingSourceSpanCrit(t *testing.T) {
+	r, _ := signedSpannedReceipt(t)
+	r.Crit = []string{receipt.CritCanonicalization}
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadMissingField) {
+		t.Fatalf("expected ErrPayloadMissingField, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsSourceSpanCritOnPlainPayload(t *testing.T) {
+	r := validReceipt()
+	r.Crit = []string{receipt.CritCanonicalization, receipt.CritSourceSpans}
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("expected ErrPayloadInvalidEnum, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsMissingEventID(t *testing.T) {
+	r := validReceipt()
+	r.EventID = ""
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadMissingField) {
+		t.Fatalf("expected ErrPayloadMissingField, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsUnknownPayloadKind(t *testing.T) {
+	r := validReceipt()
+	r.PayloadKind = "not_a_real_kind"
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrUnknownPayloadKind) {
+		t.Fatalf("expected ErrUnknownPayloadKind, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_AcceptsValidProxyDecision(t *testing.T) {
+	r := validReceipt()
+	if err := r.Validate(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsDecisionMissingPolicyHash(t *testing.T) {
+	r := validReceipt()
+	r.PolicyHash = ""
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadMissingField) {
+		t.Fatalf("expected ErrPayloadMissingField, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsDecisionMalformedPolicyHash(t *testing.T) {
+	r := validReceipt()
+	r.PolicyHash = "sha256:ABCDEF"
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("expected ErrPayloadInvalidEnum, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_AllowsLifecycleWithoutPolicyHash(t *testing.T) {
+	r := validReceipt()
+	r.PayloadKind = receipt.PayloadContractPromoteCommitted
+	r.Crit = receipt.CritForPayloadKind(receipt.PayloadContractPromoteCommitted)
+	r.PolicyHash = ""
+	r.Payload = json.RawMessage(`{"target_manifest_hash":"sha256:target","prior_manifest_hash":"sha256:prior","intent_id":"intent-1","validation_outcome":"accepted"}`)
+	if err := r.Validate(); err != nil {
+		t.Fatalf("unexpected lifecycle validation error: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_ReservedDeferKindFailsClosed(t *testing.T) {
+	r := validReceipt()
+	r.PayloadKind = receipt.PayloadDeferOpened
+	r.Crit = receipt.CritForPayloadKind(receipt.PayloadDeferOpened)
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadKindNotImplemented) {
+		t.Fatalf("expected ErrPayloadKindNotImplemented, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsMissingSignature(t *testing.T) {
+	r := validReceipt()
+	r.Signature = receipt.SignatureProof{}
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadMissingField) {
+		t.Fatalf("expected ErrPayloadMissingField, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsWrongKeyPurpose(t *testing.T) {
+	r := validReceipt()
+	r.Signature.KeyPurpose = "contract-activation-signing"
+	err := r.Validate()
+	if !errors.Is(err, contract.ErrWrongKeyPurpose) {
+		t.Fatalf("expected ErrWrongKeyPurpose, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsWrongSignatureAlgorithm(t *testing.T) {
+	r := validReceipt()
+	r.Signature.Algorithm = "ed25519ph"
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("expected ErrPayloadInvalidEnum, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_Validate_RejectsBadSignatureEncoding(t *testing.T) {
+	r := validReceipt()
+	r.Signature.Signature = "ed25519:not-hex"
+	err := r.Validate()
+	if !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("expected ErrPayloadInvalidEnum, got: %v", err)
+	}
+}
+
+func TestEvidenceReceipt_SignablePreimage_Stable(t *testing.T) {
+	r := validReceipt()
+	a, err := r.SignablePreimage()
+	if err != nil {
+		t.Fatalf("first call error: %v", err)
+	}
+	b, err := r.SignablePreimage()
+	if err != nil {
+		t.Fatalf("second call error: %v", err)
+	}
+	if string(a) != string(b) {
+		t.Fatalf("preimage not stable: first=%q second=%q", a, b)
+	}
+}
+
+func TestEvidenceReceipt_SignablePreimage_RejectsDuplicateJSONKey(t *testing.T) {
+	// ParseJSONStrict rejects duplicate keys; the payload field is included in
+	// the preimage, so duplicate keys in the envelope JSON must surface as an
+	// error from SignablePreimage.
+	r := validReceipt()
+	// Inject a duplicate key at the envelope level by building raw JSON manually.
+	// We can't marshal a Go struct with duplicate keys, so we build a preimage
+	// that contains a duplicate by re-marshalling with modified JSON.
+	// Instead, we test that a receipt whose Payload is invalid does NOT silently
+	// produce a preimage: use a json.RawMessage that is invalid JSON.
+	r.Payload = json.RawMessage(`{invalid`)
+	// json.Marshal succeeds (Payload is just bytes), but ParseJSONStrict will fail.
+	_, err := r.SignablePreimage()
+	if err == nil {
+		t.Fatal("expected error from SignablePreimage with invalid payload JSON, got nil")
+	}
+}
+
+func TestEvidenceReceipt_SignablePreimage_RejectsPayloadDuplicateKey(t *testing.T) {
+	// A payload with duplicate JSON keys passes json.RawMessage.MarshalJSON
+	// (the bytes are valid JSON), but ParseJSONStrict (which rejects duplicate
+	// keys) returns ErrDuplicateKey. This exercises the ParseJSONStrict error
+	// branch in EvidenceReceipt.SignablePreimage.
+	r := validReceipt()
+	r.Payload = json.RawMessage(`{"action_type":"block","action_type":"warn"}`)
+	_, err := r.SignablePreimage()
+	if err == nil {
+		t.Fatal("expected error from ParseJSONStrict duplicate key, got nil")
+	}
+}
+
+func TestEvidenceReceipt_SignablePreimage_ExcludesSignature(t *testing.T) {
+	// Base receipt is shared; only Signature differs between the two variants.
+	base := validReceipt()
+
+	r1 := base
+	r1.Signature = receipt.SignatureProof{
+		SignerKeyID: "key-alpha",
+		KeyPurpose:  "receipt-signing",
+		Algorithm:   "ed25519",
+		Signature:   "ed25519:aabbcc",
+	}
+	preimageWithSig, err := r1.SignablePreimage()
+	if err != nil {
+		t.Fatalf("error with sig: %v", err)
+	}
+
+	r2 := base
+	r2.Signature = receipt.SignatureProof{
+		SignerKeyID: "key-beta",
+		KeyPurpose:  "receipt-signing",
+		Algorithm:   "ed25519",
+		Signature:   "ed25519:ddeeff",
+	}
+	preimageWithDiffSig, err := r2.SignablePreimage()
+	if err != nil {
+		t.Fatalf("error with diff sig: %v", err)
+	}
+
+	if string(preimageWithSig) != string(preimageWithDiffSig) {
+		t.Fatalf("signature field affects preimage: got different bytes")
+	}
+}
+
+func TestReceiptHash_StableAndPayloadSensitive(t *testing.T) {
+	r := validReceipt()
+	first, err := receipt.ReceiptHash(r)
+	if err != nil {
+		t.Fatalf("ReceiptHash first: %v", err)
+	}
+	second, err := receipt.ReceiptHash(r)
+	if err != nil {
+		t.Fatalf("ReceiptHash second: %v", err)
+	}
+	if first != second {
+		t.Fatalf("ReceiptHash unstable: first=%q second=%q", first, second)
+	}
+
+	r.Payload = json.RawMessage(`{"action_type":"block","target":"https://example.com/other","verdict":"blocked","transport":"forward","policy_sources":["dlp"],"winning_source":"dlp"}`)
+	changed, err := receipt.ReceiptHash(r)
+	if err != nil {
+		t.Fatalf("ReceiptHash changed payload: %v", err)
+	}
+	if changed == first {
+		t.Fatalf("ReceiptHash did not change after payload mutation: %q", changed)
+	}
+}
+
+func TestReceiptHash_RejectsInvalidPayloadJSON(t *testing.T) {
+	r := validReceipt()
+	r.Payload = json.RawMessage(`{invalid`)
+	if _, err := receipt.ReceiptHash(r); err == nil {
+		t.Fatal("ReceiptHash invalid payload error = nil, want error")
+	}
+}
+
+func TestVerifyWithKey(t *testing.T) {
+	r, pub := signedReceipt(t)
+	if err := receipt.VerifyWithKey(r, pub, "receipt-key"); err != nil {
+		t.Fatalf("VerifyWithKey valid receipt: %v", err)
+	}
+
+	if err := receipt.VerifyWithKey(r, pub, ""); !errors.Is(err, receipt.ErrPayloadMissingField) {
+		t.Fatalf("VerifyWithKey empty signer key id error = %v, want ErrPayloadMissingField", err)
+	}
+
+	if err := receipt.VerifyWithKey(r, pub, "other-key"); !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("VerifyWithKey signer key mismatch error = %v, want ErrPayloadInvalidEnum", err)
+	}
+
+	if err := receipt.VerifyWithKey(r, ed25519.PublicKey("short"), "receipt-key"); !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("VerifyWithKey short key error = %v, want ErrPayloadInvalidEnum", err)
+	}
+
+	badHex := r
+	badHex.Signature.Signature = "ed25519:not-hex"
+	if err := receipt.VerifyWithKey(badHex, pub, "receipt-key"); !errors.Is(err, receipt.ErrPayloadInvalidEnum) {
+		t.Fatalf("VerifyWithKey bad hex error = %v, want ErrPayloadInvalidEnum", err)
+	}
+
+	tampered := r
+	tampered.Payload = json.RawMessage(`{"action_type":"block","target":"https://example.com/tampered","verdict":"blocked","transport":"forward","policy_sources":["dlp"],"winning_source":"dlp"}`)
+	if err := receipt.VerifyWithKey(tampered, pub, "receipt-key"); !errors.Is(err, receipt.ErrSignatureVerification) {
+		t.Fatalf("VerifyWithKey tampered error = %v, want ErrSignatureVerification", err)
+	}
+}
+
+func TestVerifyWithKey_SpannedReceiptTamperBreaksSignature(t *testing.T) {
+	t.Parallel()
+	r, pub := signedSpannedReceipt(t)
+	if err := receipt.VerifyWithKey(r, pub, "receipt-key"); err != nil {
+		t.Fatalf("VerifyWithKey valid spanned receipt: %v", err)
+	}
+
+	var payload receipt.PayloadProxyDecisionWithSpansStruct
+	if err := json.Unmarshal(r.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	payload.SourceSpans[0].NormalizedView = receipt.NormalizedViewDLPNormalized
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal tampered payload: %v", err)
+	}
+	r.Payload = body
+	if err := receipt.VerifyWithKey(r, pub, "receipt-key"); !errors.Is(err, receipt.ErrSignatureVerification) {
+		t.Fatalf("VerifyWithKey tampered spanned receipt error = %v, want ErrSignatureVerification", err)
+	}
+}
+
+func signedReceipt(t *testing.T) (receipt.EvidenceReceipt, ed25519.PublicKey) {
+	t.Helper()
+	seed := sha256.Sum256([]byte("receipt verify test key"))
+	priv := ed25519.NewKeyFromSeed(seed[:])
+	r := validReceipt()
+	r.Signature = receipt.SignatureProof{}
+	preimage, err := r.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage: %v", err)
+	}
+	r.Signature = receipt.SignatureProof{
+		SignerKeyID: "receipt-key",
+		KeyPurpose:  "receipt-signing",
+		Algorithm:   "ed25519",
+		Signature:   "ed25519:" + fmt.Sprintf("%x", ed25519.Sign(priv, preimage)),
+	}
+	return r, priv.Public().(ed25519.PublicKey)
+}
+
+func signedSpannedReceipt(t *testing.T) (receipt.EvidenceReceipt, ed25519.PublicKey) {
+	t.Helper()
+	const eventID = "01900000-0000-7000-8000-000000000010"
+	seed := sha256.Sum256([]byte("receipt verify spanned test key"))
+	priv := ed25519.NewKeyFromSeed(seed[:])
+	payload := receipt.PayloadProxyDecisionWithSpansStruct{
+		ActionType:    "block",
+		Target:        "https://example.com/" + testRedactedValue,
+		Verdict:       "block",
+		Transport:     "forward",
+		PolicySources: []string{"dlp"},
+		WinningSource: "scanner",
+		RuleID:        testAWSAccessKeyRule,
+		SourceSpans:   []receipt.SourceSpan{receiptTestSourceSpan(t, eventID)},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	r := receipt.EvidenceReceipt{
+		RecordType:       receipt.RecordTypeEvidenceV2,
+		ReceiptVersion:   2,
+		PayloadKind:      receipt.PayloadProxyDecisionWithSpans,
+		Canonicalization: receipt.DefaultCanonicalizationProfile(),
+		Crit:             receipt.CritForPayloadKind(receipt.PayloadProxyDecisionWithSpans),
+		EventID:          eventID,
+		Timestamp:        time.Date(2026, 6, 6, 0, 0, 0, 0, time.UTC),
+		ChainPrevHash:    "sha256:0",
+		PolicyHash:       validPolicyHash,
+		Payload:          body,
+	}
+	preimage, err := r.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage: %v", err)
+	}
+	r.Signature = receipt.SignatureProof{
+		SignerKeyID: "receipt-key",
+		KeyPurpose:  "receipt-signing",
+		Algorithm:   "ed25519",
+		Signature:   "ed25519:" + fmt.Sprintf("%x", ed25519.Sign(priv, preimage)),
+	}
+	return r, priv.Public().(ed25519.PublicKey)
+}
+
+func receiptTestSourceSpan(t *testing.T, eventID string) receipt.SourceSpan {
+	t.Helper()
+	offset := 20
+	length := len(testRedactedValue)
+	span := receipt.SourceSpan{
+		SourceID:             "request-url",
+		SourceKind:           receipt.SourceKindHTTPRequestURL,
+		NormalizedView:       receipt.NormalizedViewSanitizedTarget,
+		PipelockBinaryDigest: testSHA256Digest,
+		RulesBundleDigest:    testSHA256Digest,
+		TransformProfile:     "pipelock-transform-v1",
+		PolicyHash:           testSHA256Digest,
+		RuleID:               testAWSAccessKeyRule,
+		CharOffset:           &offset,
+		CharLength:           &length,
+		MatchHashAlg:         testHMACSHA256,
+		MatchClass:           "secret:aws_access_key",
+		RedactedSample:       testRedactedValue,
+	}
+	hash, err := receipt.SourceSpanMatchHash([]byte(testSpanMACKey), eventID, 0, span, span.RedactedSample)
+	if err != nil {
+		t.Fatalf("SourceSpanMatchHash: %v", err)
+	}
+	span.MatchHash = hash
+	return span
+}

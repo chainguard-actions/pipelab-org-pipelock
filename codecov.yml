@@ -1,0 +1,53 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 95%
+        threshold: 2%
+    patch:
+      default:
+        target: 75%
+ignore:
+  - "tests/ws-helper/**"
+  # Golden-fixture generator for the verifiable-shadow-rollout example. It
+  # imports internal packages to deterministically emit a signed shadow bundle
+  # and is validated by running it and verifying the output through the
+  # standalone pipelock-verifier, not by unit tests.
+  - "tools/gen-shadow-example/**"
+  # Agent-egress overhead benchmark: harness, mocks, and entry binary
+  # orchestrate subprocesses, raw TCP sockets, and live metrics scraping
+  # against a running pipelock process. Go's coverage tool cannot follow
+  # those code paths from the in-tree test process; integration testing
+  # happens via `make bench-egress` instead.
+  - "bench/egress/**"
+  - "internal/filesentry/lineage_other.go"  # build-tagged !linux, untestable on Linux CI
+  # Sandbox files that run inside forked child processes or require kernel
+  # namespace primitives (CLONE_NEWUSER+CLONE_NEWNET). These are exercised by
+  # 130+ subprocess integration tests but Go's coverage tool cannot cross
+  # process boundaries. TODO: GOCOVERDIR/covdata subprocess coverage merging.
+  - "internal/sandbox/child_init.go"
+  - "internal/sandbox/child_standalone_init.go"
+  - "internal/sandbox/launcher.go"
+  - "internal/sandbox/standalone_launch.go"
+  - "internal/sandbox/landlock_linux.go"
+  - "internal/sandbox/seccomp_linux.go"
+  - "internal/sandbox/rlimit_linux.go"
+  - "internal/cli/sandbox.go"
+  - "internal/cli/mcp.go"  # sandbox path additions require kernel primitives
+  - "internal/mcp/proxy_sandbox.go"
+  - "internal/sandbox/subreaper_linux.go"  # kernel primitive (prctl)
+  - "internal/sandbox/shm_linux.go"  # kernel primitive (mount), runs in forked child
+  # macOS sandbox files — build-tagged darwin, untestable on Linux CI.
+  - "internal/sandbox/launcher_darwin.go"
+  - "internal/sandbox/seatbelt_darwin.go"
+  - "internal/sandbox/detect_darwin.go"
+  - "internal/sandbox/default_policy_darwin.go"
+  - "internal/sandbox/landlock_darwin.go"
+  - "internal/sandbox/seccomp_darwin.go"
+  - "internal/sandbox/rlimit_darwin.go"
+  - "internal/sandbox/shm_darwin.go"
+  - "internal/sandbox/preflight.go"  # probes kernel capabilities via Detect()
+  - "internal/cli/diagnose.go"  # sandbox diagnose path uses Detect() + CLI orchestration
+  - "cmd/pipelock/main.go"  # sandbox init hooks in main(), untestable
+comment:
+  layout: "reach, diff, files"

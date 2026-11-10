@@ -1,0 +1,831 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package setup
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/discover"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// TestInitCmd_ProvisionsFlightRecorder proves done-state #1: a stock `pipelock
+// init` writes a config with the flight recorder live (enabled + dir + signing
+// key), so receipts work out of the box. Validation runs (not skipped) to prove
+// the generated config is valid with the recorder on.
+func TestInitCmd_ProvisionsFlightRecorder(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "cfg", "pipelock.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--skip-canary",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("init failed: %v\noutput:\n%s", err, buf.String())
+	}
+
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatalf("loading generated config: %v", err)
+	}
+	if !cfg.FlightRecorder.Enabled {
+		t.Error("generated config has flight_recorder.enabled = false, want true")
+	}
+	if cfg.FlightRecorder.Dir == "" {
+		t.Error("generated config has empty flight_recorder.dir; receipts would be inert")
+	}
+	if !filepath.IsAbs(cfg.FlightRecorder.Dir) {
+		t.Errorf("flight_recorder.dir = %q, want an absolute path", cfg.FlightRecorder.Dir)
+	}
+	if cfg.FlightRecorder.SigningKeyPath == "" {
+		t.Fatal("generated config has empty flight_recorder.signing_key_path; receipts cannot be signed")
+	}
+	if !cfg.FlightRecorder.Redact {
+		t.Error("generated config has flight_recorder.redact = false; receipts would persist targets in the clear")
+	}
+
+	// The signing key must exist on disk and load as a usable Ed25519 key.
+	if _, err := os.Stat(cfg.FlightRecorder.SigningKeyPath); err != nil {
+		t.Fatalf("signing key not on disk: %v", err)
+	}
+	if _, err := signing.LoadPrivateKeyFile(cfg.FlightRecorder.SigningKeyPath); err != nil {
+		t.Fatalf("generated signing key does not load: %v", err)
+	}
+	assertFlightRecorderPublicKeySidecar(t, cfg.FlightRecorder.SigningKeyPath)
+
+	// The recorder directory must exist (created during provisioning).
+	if info, err := os.Stat(cfg.FlightRecorder.Dir); err != nil || !info.IsDir() {
+		t.Fatalf("recorder dir not provisioned: err=%v", err)
+	}
+}
+
+// TestEnsureFlightRecorderSigningKey_ReusesExisting proves an existing signing
+// key is never regenerated. Clobbering it would orphan any receipts already
+// signed under the old key (they fail to resume and emission bricks), so a
+// second provisioning pass (e.g. `pipelock init --force`) must keep the key.
+func TestEnsureFlightRecorderSigningKey_ReusesExisting(t *testing.T) {
+	base := t.TempDir()
+	keyPath := filepath.Join(base, "keys", "flight-recorder-signing.key")
+	recorderDir := filepath.Join(base, "recorder")
+
+	if err := ensureFlightRecorderSigningKey(keyPath, recorderDir); err != nil {
+		t.Fatalf("first provision: %v", err)
+	}
+	first, err := os.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		t.Fatalf("reading first key: %v", err)
+	}
+	if err := ensureFlightRecorderSigningKey(keyPath, recorderDir); err != nil {
+		t.Fatalf("second provision: %v", err)
+	}
+	second, err := os.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		t.Fatalf("reading second key: %v", err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Error("signing key was regenerated on the second pass; it must be reused to avoid orphaning the receipt chain")
+	}
+	assertFlightRecorderPublicKeySidecar(t, keyPath)
+
+	priv, err := signing.LoadPrivateKeyFile(keyPath)
+	if err != nil {
+		t.Fatalf("load reused key: %v", err)
+	}
+	stale := strings.Repeat("0", ed25519.PublicKeySize*2) + "\n"
+	if err := os.WriteFile(keyPath+".pub", []byte(stale), 0o600); err != nil {
+		t.Fatalf("write stale pubkey: %v", err)
+	}
+	if err := ensureFlightRecorderSigningKey(keyPath, recorderDir); err != nil {
+		t.Fatalf("third provision refreshes stale pubkey: %v", err)
+	}
+	refreshed, err := os.ReadFile(filepath.Clean(keyPath + ".pub"))
+	if err != nil {
+		t.Fatalf("read refreshed pubkey: %v", err)
+	}
+	want, err := signing.PublicKeyHexFromPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("derive public key: %v", err)
+	}
+	if string(refreshed) != want+"\n" {
+		t.Fatalf("refreshed pubkey = %q, want %q", refreshed, want+"\n")
+	}
+}
+
+// TestEnsureFlightRecorderSigningKey_RegeneratesUnloadable proves a junk key
+// file (zero-byte / corrupt) is replaced with a valid one rather than reused.
+// Such a file signed no valid chain, so regenerating is safe and keeps init from
+// emitting a config that points at a key the recorder would fail to load.
+func TestEnsureFlightRecorderSigningKey_RegeneratesUnloadable(t *testing.T) {
+	base := t.TempDir()
+	keyPath := filepath.Join(base, "keys", "flight-recorder-signing.key")
+	recorderDir := filepath.Join(base, "recorder")
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Pre-seed a corrupt (non-key) file.
+	if err := os.WriteFile(keyPath, []byte("not a key"), 0o600); err != nil {
+		t.Fatalf("seed junk key: %v", err)
+	}
+
+	if err := ensureFlightRecorderSigningKey(keyPath, recorderDir); err != nil {
+		t.Fatalf("provision over junk key: %v", err)
+	}
+	if _, err := signing.LoadPrivateKeyFile(keyPath); err != nil {
+		t.Errorf("key was not regenerated to a loadable Ed25519 key: %v", err)
+	}
+	assertFlightRecorderPublicKeySidecar(t, keyPath)
+}
+
+// TestEnsureFlightRecorderSigningKey_ErrorPaths covers the abort branches that
+// guard against clobbering or misprovisioning, using deterministic filesystem
+// shapes (no permission tricks, so they behave the same under root and non-root
+// CI): a directory component that is actually a regular file makes MkdirAll
+// fail, and an existing key path that is a directory makes the read abort.
+func TestEnsureFlightRecorderSigningKey_ErrorPaths(t *testing.T) {
+	t.Run("recorder_dir_parent_is_file", func(t *testing.T) {
+		base := t.TempDir()
+		blocker := filepath.Join(base, "blocker")
+		if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// recorderDir nested under a regular file -> first MkdirAll fails.
+		err := ensureFlightRecorderSigningKey(filepath.Join(base, "k", "key"), filepath.Join(blocker, "recorder"))
+		if err == nil {
+			t.Fatal("expected error when the recorder dir is nested under a regular file")
+		}
+	})
+	t.Run("key_dir_parent_is_file", func(t *testing.T) {
+		base := t.TempDir()
+		blocker := filepath.Join(base, "blocker")
+		if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// recorderDir is fine, but the key dir is nested under a regular file ->
+		// the second MkdirAll fails.
+		err := ensureFlightRecorderSigningKey(filepath.Join(blocker, "keys", "key"), filepath.Join(base, "recorder"))
+		if err == nil {
+			t.Fatal("expected error when the key dir is nested under a regular file")
+		}
+	})
+	t.Run("existing_unreadable_key_aborts_without_clobber", func(t *testing.T) {
+		base := t.TempDir()
+		keyPath := filepath.Join(base, "keys", "key")
+		// Make the key path itself a directory: it exists (Stat succeeds) but is
+		// unreadable as a file (ReadFile returns EISDIR), so we must abort rather
+		// than regenerate over something we cannot read.
+		if err := os.MkdirAll(keyPath, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		err := ensureFlightRecorderSigningKey(keyPath, filepath.Join(base, "recorder"))
+		if err == nil {
+			t.Fatal("expected abort when the existing key path is unreadable (a directory)")
+		}
+	})
+	t.Run("public_sidecar_write_failure_aborts", func(t *testing.T) {
+		base := t.TempDir()
+		keyPath := filepath.Join(base, "keys", "key")
+		recorderDir := filepath.Join(base, "recorder")
+		_, priv, err := signing.GenerateKeyPair()
+		if err != nil {
+			t.Fatalf("generate signing key: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(keyPath), 0o750); err != nil {
+			t.Fatalf("mkdir key dir: %v", err)
+		}
+		if err := signing.SavePrivateKey(priv, keyPath); err != nil {
+			t.Fatalf("write private key: %v", err)
+		}
+		if err := os.Mkdir(keyPath+".pub", 0o750); err != nil {
+			t.Fatalf("mkdir pubkey blocker: %v", err)
+		}
+
+		err = ensureFlightRecorderSigningKey(keyPath, recorderDir)
+		if err == nil {
+			t.Fatal("expected public sidecar write failure")
+		}
+		if !strings.Contains(err.Error(), "writing public signing key") {
+			t.Fatalf("error = %v, want public signing key diagnostic", err)
+		}
+	})
+}
+
+// TestInitCmd_DryRunProvisionsNoKey proves --dry-run never writes a signing key
+// (no side effects on disk) even though the previewed config names one.
+func TestInitCmd_DryRunProvisionsNoKey(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "cfg", "pipelock.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--dry-run",
+		"--skip-canary",
+		"--skip-validate",
+	})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("init --dry-run failed: %v", err)
+	}
+	_, keyPath := flightRecorderInitPaths(configPath)
+	if _, err := os.Stat(keyPath); err == nil {
+		t.Errorf("dry-run wrote a signing key at %s; it must not touch disk", keyPath)
+	}
+}
+
+func TestInitCmd_DryRun(t *testing.T) {
+	home := t.TempDir()
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"--dry-run", "--scan-home", home, "--skip-canary", "--skip-validate"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !bytes.Contains([]byte(output), []byte("Would write config to")) {
+		t.Errorf("expected 'Would write config to' in output, got:\n%s", output)
+	}
+}
+
+func TestInitCmd_WritesConfig(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "test-config.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		t.Fatal("config file was not written")
+	}
+
+	data, err := os.ReadFile(filepath.Clean(configPath))
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+
+	if !bytes.Contains(data, []byte("mode: balanced")) {
+		t.Errorf("expected 'mode: balanced' in config, got:\n%s", string(data))
+	}
+}
+
+func TestInitCmd_StrictPreset(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "strict.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--preset", "strict",
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Clean(configPath))
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+
+	if !bytes.Contains(data, []byte("mode: strict")) {
+		t.Errorf("expected 'mode: strict' in config, got:\n%s", string(data))
+	}
+}
+
+func TestInitCmd_AuditPreset(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "audit.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--preset", "audit",
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Clean(configPath))
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+
+	if !bytes.Contains(data, []byte("mode: audit")) {
+		t.Errorf("expected 'mode: audit' in config, got:\n%s", string(data))
+	}
+}
+
+func TestInitCmd_BadPreset(t *testing.T) {
+	home := t.TempDir()
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"--scan-home", home, "--preset", "bogus"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for bad preset")
+	}
+}
+
+func TestInitCmd_JSONOutput(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "init.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--json",
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result initResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON output: %v\n%s", err, buf.String())
+	}
+
+	if result.Setup.Preset != "balanced" {
+		t.Errorf("preset = %q, want balanced", result.Setup.Preset)
+	}
+	if !result.Setup.Written {
+		t.Error("expected Written=true")
+	}
+}
+
+func TestInitCmd_DryRunDoesNotWrite(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "should-not-exist.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--dry-run",
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Error("dry run should not have written the config file")
+	}
+}
+
+func TestInitCmd_DefaultConfigPath(t *testing.T) {
+	home := t.TempDir()
+
+	// Use --output to a known location since the default path uses
+	// os.UserConfigDir() which varies by platform and test environment.
+	configPath := filepath.Join(home, "default-test.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		t.Fatalf("expected config at %s", configPath)
+	}
+}
+
+func TestInitCmd_DiscoverWithClaudeConfig(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "init.yaml")
+
+	content := `{"mcpServers":{
+		"brain":{"command":"pipelock","args":["mcp","proxy","--","node","brain.js"]},
+		"raw":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"]}
+	}}`
+	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--json",
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var result initResult
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+
+	if result.Discover.ClientsFound != 1 {
+		t.Errorf("clients_found = %d, want 1", result.Discover.ClientsFound)
+	}
+	if result.Discover.ServersFound != 2 {
+		t.Errorf("servers_found = %d, want 2", result.Discover.ServersFound)
+	}
+}
+
+func TestInitCmd_RefusesOverwrite(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "existing.yaml")
+
+	// Create an existing config.
+	if err := os.WriteFile(configPath, []byte("mode: strict\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Original file should be preserved.
+	data, err := os.ReadFile(filepath.Clean(configPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "mode: strict\n" {
+		t.Error("existing config was overwritten without --force")
+	}
+
+	output := buf.String()
+	if !bytes.Contains([]byte(output), []byte("already exists")) {
+		t.Errorf("expected 'already exists' warning, got:\n%s", output)
+	}
+}
+
+func TestInitCmd_ForceOverwrite(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "existing.yaml")
+
+	if err := os.WriteFile(configPath, []byte("mode: strict\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--force",
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Clean(configPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte("mode: balanced")) {
+		t.Error("--force should have overwritten with new config")
+	}
+}
+
+func TestInitCmd_UnwritablePath(t *testing.T) {
+	home := t.TempDir()
+
+	// Create a regular file, then try to use it as a directory.
+	blocker := filepath.Join(home, "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", filepath.Join(blocker, "config.yaml"),
+		"--skip-canary",
+		"--skip-validate",
+	})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for unwritable path")
+	}
+}
+
+func TestInitCmd_WithVerify(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "init.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--skip-canary",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !bytes.Contains([]byte(output), []byte("Passed:")) {
+		t.Errorf("expected verify results in output, got:\n%s", output)
+	}
+}
+
+func TestInitCmd_WithCanary(t *testing.T) {
+	home := t.TempDir()
+	configPath := filepath.Join(home, "init.yaml")
+
+	var buf bytes.Buffer
+	cmd := InitCmd()
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{
+		"--scan-home", home,
+		"--output", configPath,
+		"--skip-validate",
+	})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !bytes.Contains([]byte(output), []byte("Canary")) {
+		t.Errorf("expected canary results in output, got:\n%s", output)
+	}
+}
+
+func TestBuildConfig_MCPEnablement(t *testing.T) {
+	tests := []struct {
+		name          string
+		servers       int
+		wantMCPInput  bool
+		wantToolChain bool
+	}{
+		{
+			name:          "no servers",
+			servers:       0,
+			wantMCPInput:  false,
+			wantToolChain: false,
+		},
+		{
+			name:          "few servers enables MCP scanning",
+			servers:       2,
+			wantMCPInput:  true,
+			wantToolChain: false,
+		},
+		{
+			name:          "many servers enables tool chain detection",
+			servers:       5,
+			wantMCPInput:  true,
+			wantToolChain: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			report := &discover.Report{
+				Summary: discover.Summary{
+					TotalServers: tc.servers,
+				},
+			}
+
+			cfg := buildConfig(config.ModeBalanced, report)
+
+			if cfg.MCPInputScanning.Enabled != tc.wantMCPInput {
+				t.Errorf("MCPInputScanning.Enabled = %v, want %v",
+					cfg.MCPInputScanning.Enabled, tc.wantMCPInput)
+			}
+			if cfg.ToolChainDetection.Enabled != tc.wantToolChain {
+				t.Errorf("ToolChainDetection.Enabled = %v, want %v",
+					cfg.ToolChainDetection.Enabled, tc.wantToolChain)
+			}
+		})
+	}
+}
+
+func TestScanCanaryURL(t *testing.T) {
+	tests := []struct {
+		name   string
+		preset string
+		url    string
+		want   bool
+	}{
+		{
+			name:   "balanced mode detects canary",
+			preset: config.ModeBalanced,
+			url:    "https://github.com/test?key=" + canaryToken(),
+			want:   true,
+		},
+		{
+			name:   "strict mode detects canary on allowlisted host",
+			preset: config.ModeStrict,
+			url:    "https://github.com/test?key=" + canaryToken(),
+			want:   true,
+		},
+		{
+			name:   "clean URL not detected",
+			preset: config.ModeBalanced,
+			url:    "https://github.com/test",
+			want:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.Mode = tc.preset
+			cfg.DLP.ScanEnv = false // Disable env scanning - CI has GITHUB_TOKEN etc.
+			cfg.Internal = nil      // Disable SSRF - no DNS in unit tests
+			cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+			got := scanCanaryURL(cfg, tc.url)
+			if got != tc.want {
+				t.Errorf("scanCanaryURL(%q) = %v, want %v", tc.url, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteConfig_Permissions(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "subdir", "pipelock.yaml")
+
+	cfg := config.Defaults()
+	if err := writeConfig(cfg, configPath, "balanced"); err != nil {
+		t.Fatalf("writeConfig: %v", err)
+	}
+
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+
+	perm := info.Mode().Perm()
+	if perm != 0o600 {
+		t.Errorf("file permission = %o, want 600", perm)
+	}
+}
+
+func TestInitResult_JSONRoundTrip(t *testing.T) {
+	result := &initResult{
+		Discover: &initDiscoverResult{
+			ClientsFound: 2,
+			ServersFound: 5,
+			Protected:    3,
+			Unprotected:  2,
+		},
+		Setup: &initSetupResult{
+			ConfigPath: "/home/user/.config/pipelock/pipelock.yaml",
+			Preset:     "balanced",
+			Written:    true,
+		},
+		Verify: &initVerifyResult{
+			Passed: 4,
+			Failed: 0,
+		},
+		Canary: &initCanaryResult{
+			Detected: true,
+		},
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var decoded initResult
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.Discover.ClientsFound != 2 {
+		t.Errorf("ClientsFound = %d, want 2", decoded.Discover.ClientsFound)
+	}
+	if decoded.Setup.Preset != "balanced" {
+		t.Errorf("Preset = %q, want balanced", decoded.Setup.Preset)
+	}
+}
+
+func assertFlightRecorderPublicKeySidecar(t *testing.T, keyPath string) {
+	t.Helper()
+
+	priv, err := signing.LoadPrivateKeyFile(keyPath)
+	if err != nil {
+		t.Fatalf("load private key %s: %v", keyPath, err)
+	}
+	want, err := signing.PublicKeyHexFromPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("derive public key: %v", err)
+	}
+	pubPath := keyPath + ".pub"
+	raw, err := os.ReadFile(filepath.Clean(pubPath))
+	if err != nil {
+		t.Fatalf("read public key sidecar %s: %v", pubPath, err)
+	}
+	if string(raw) != want+"\n" {
+		t.Fatalf("public key sidecar = %q, want %q", raw, want+"\n")
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(pubPath)
+		if err != nil {
+			t.Fatalf("stat public key sidecar %s: %v", pubPath, err)
+		}
+		if got := info.Mode().Perm(); got != flightRecorderPublicKeyMode {
+			t.Fatalf("public key sidecar mode = %s, want %s", got, flightRecorderPublicKeyMode)
+		}
+	}
+}

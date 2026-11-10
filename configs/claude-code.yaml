@@ -1,0 +1,603 @@
+# Pipelock config — Claude Code preset
+# Optimized for Claude Code acting through MCP proxy or HTTP fetch proxy.
+#
+# Use this for: Claude Code with pipelock as MCP server wrapper.
+# Blocks prompt injection (unattended agent), allows broad coding domains,
+# relaxed entropy (code has high-entropy strings like commit hashes).
+#
+# Example:
+#   pipelock mcp proxy --config configs/claude-code.yaml -- npx @mcp/server
+
+version: 1
+mode: balanced
+
+api_allowlist:
+  - "*.anthropic.com"
+  - "*.openai.com"
+  - "github.com"
+  - "*.github.com"
+  - "*.githubusercontent.com"
+  - "registry.npmjs.org"
+  - "*.npmjs.com"
+  - "pypi.org"
+  - "*.python.org"
+  - "*.pythonhosted.org"
+  - "pkg.go.dev"
+  - "proxy.golang.org"
+  - "sum.golang.org"
+  - "crates.io"
+  - "*.crates.io"
+  - "*.docs.rs"
+  - "*.rubygems.org"
+  - "*.maven.org"
+  - "*.googleapis.com"
+  - "*.google.com"
+  - "*.stackoverflow.com"
+  - "*.stackexchange.com"
+  - "*.discord.com"
+  - "gateway.discord.gg"
+  - "*.slack.com"
+  - "api.telegram.org"
+
+fetch_proxy:
+  listen: "127.0.0.1:8888"  # customize if running multiple presets simultaneously
+  timeout_seconds: 30
+  max_response_mb: 10
+  user_agent: "Pipelock Fetch/1.0"
+  monitoring:
+    max_url_length: 4096
+    # Higher threshold for code: commit hashes, base64 in configs, UUIDs are common.
+    entropy_threshold: 5.0
+    max_requests_per_minute: 120
+    blocklist:
+      - "*.pastebin.com"
+      - "*.hastebin.com"
+      - "*.paste.ee"
+      - "*.transfer.sh"
+      - "*.file.io"
+      - "*.requestbin.com"
+      - "*.webhook.site"
+      - "*.pipedream.net"
+    subdomain_entropy_exclusions:
+      - "files.pythonhosted.org"
+      - "pypi.org"
+      - "objects.githubusercontent.com"
+
+forward_proxy:
+  enabled: true
+  max_tunnel_seconds: 300
+  idle_timeout_seconds: 120
+  sni_verification: true
+
+request_body_scanning:
+  enabled: true
+  action: block
+  max_body_bytes: 5242880
+  scan_headers: true
+  header_mode: sensitive
+  sensitive_headers:
+    - Authorization
+    - Cookie
+    - X-Api-Key
+    - X-Token
+    - Proxy-Authorization
+    - X-Goog-Api-Key
+
+websocket_proxy:
+  enabled: false
+  max_message_bytes: 1048576
+  max_concurrent_connections: 128
+  scan_text_frames: true
+  allow_binary_frames: false
+  forward_cookies: false
+  strip_compression: true
+  max_connection_seconds: 3600
+  idle_timeout_seconds: 300
+  origin_policy: rewrite
+
+dlp:
+  scan_env: true
+  include_defaults: false  # Preset defines the complete pattern set
+  patterns:
+    # Provider API keys
+    - name: "Anthropic API Key"
+      regex: 'sk-ant-[a-zA-Z0-9\-_]{10,}'
+      severity: critical
+    - name: "OpenAI API Key"
+      regex: 'sk-proj-[a-zA-Z0-9\-_]{10,}'
+      severity: critical
+    - name: "OpenAI Service Key"
+      regex: 'sk-svcacct-[a-zA-Z0-9\-]{10,}'
+      severity: critical
+    - name: "Fireworks API Key"
+      regex: 'fw_[A-Za-z0-9]{22}\b'
+      severity: critical
+    - name: "Google API Key"
+      regex: 'AIza[0-9A-Za-z\-_]{35}'
+      severity: high
+    - name: "Google OAuth Client Secret"
+      regex: 'GOCSPX-[A-Za-z0-9_\-]{28,}'
+      severity: critical
+    - name: "Stripe Key"
+      regex: '[sr]k[-_](live|test)[-_][a-zA-Z0-9]{20,}'
+      severity: critical
+    - name: "Stripe Webhook Secret"
+      regex: 'whsec_[a-zA-Z0-9_\-]{20,}'
+      severity: critical
+    # Source control tokens
+    - name: "GitHub Token"
+      regex: 'gh[pousr]_[A-Za-z0-9_]{36,}'
+      severity: critical
+    - name: "GitHub Fine-Grained PAT"
+      regex: 'github_pat_[a-zA-Z0-9_]{36,}'
+      severity: critical
+    - name: "GitLab PAT"
+      regex: 'glpat-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    # Remaining GitLab token families (token overview docs); optional suffix
+    # chars use (?:x)? so the DLP pre-filter extracts the shorter prefix.
+    - name: "GitLab Deploy Token"
+      regex: 'gldt-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    - name: "GitLab Runner Token"
+      regex: 'glrt(?:r)?-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    - name: "GitLab CI Job Token"
+      regex: 'glcbt-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    - name: "GitLab Pipeline Trigger Token"
+      regex: 'glptt-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    - name: "GitLab OAuth Application Secret"
+      regex: 'gloas-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    - name: "GitLab SCIM Token"
+      regex: 'glsoat-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    - name: "GitLab Service Token"
+      regex: 'gl(?:ft|imt|agent|wt|ffct)-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+    # Database connection strings with embedded credentials (password between
+    # ':' and '@'); scheme-locked, requires ':pass@' so credential-less URIs
+    # are ignored.
+    - name: "PostgreSQL Connection String"
+      regex: 'postgres(?:ql)?://[^:/?#\s]*:[^@/?#\s]+@'
+      severity: critical
+    - name: "MySQL Connection String"
+      regex: 'mysql://[^:/?#\s]*:[^@/?#\s]+@'
+      severity: critical
+    - name: "MongoDB Connection String"
+      regex: 'mongodb(?:\+srv)?://[^:/?#\s]*:[^@/?#\s]+@'
+      severity: critical
+    - name: "Redis Connection String"
+      regex: 'redis(?:s)?://[^:/?#\s]*:[^@/?#\s]+@'
+      severity: critical
+    # Cloud provider credentials
+    - name: "AWS Access ID"
+      regex: '(AKIA|A3T|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16,}'
+      severity: critical
+    - name: "AWS Secret Key"
+      regex: '(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY|secret.?access.?key|SecretAccessKey)\s*["''=:\s]{1,5}\s*[A-Za-z0-9/+=]{40}'
+      severity: critical
+    - name: "Google OAuth Token"
+      regex: 'ya29\.[a-zA-Z0-9_-]{20,}'
+      severity: critical
+    # GCP service-account private_key_id (the "service_account" type marker is
+    # an always-on core pattern, not duplicated here; the private_key PEM body
+    # is caught by "Private Key Header").
+    - name: "GCP Service Account Private Key ID"
+      regex: '"private_key_id"\s*:\s*"[a-f0-9]{40}"'
+      severity: high
+    # Azure: 88-char storage account key in AccountKey=, and SAS sig= signature.
+    - name: "Azure Storage Account Key"
+      regex: 'AccountKey=[A-Za-z0-9+/]{86}=='
+      severity: critical
+    - name: "Azure SAS Token"
+      regex: '\bsig=[A-Za-z0-9%]{43,}%3d\b'
+      severity: high
+    # Messaging platform tokens
+    - name: "Slack Token"
+      regex: 'xox[bpras]-[0-9a-zA-Z-]{15,}'
+      severity: critical
+    - name: "Slack App Token"
+      regex: 'xapp-[0-9]+-[A-Za-z0-9_]+-[0-9]+-[a-f0-9]+'
+      severity: critical
+    - name: "Discord Bot Token"
+      regex: '[MN][A-Za-z0-9]{23,}\.[A-Za-z0-9\-_]{6}\.[A-Za-z0-9\-_]{27,}'
+      severity: critical
+    # Communication service keys
+    - name: "Twilio API Key"
+      regex: '\bSK[a-f0-9]{32}\b'
+      severity: high
+    - name: "SendGrid API Key"
+      regex: 'SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}'
+      severity: critical
+    - name: "Mailgun API Key"
+      regex: '\bkey-[a-zA-Z0-9]{32}\b'
+      severity: high
+    # Observability / monitoring
+    - name: "New Relic API Key"
+      regex: 'NRAK-[A-Z0-9]{27,}'
+      severity: critical
+    # AI/ML provider keys
+    - name: "Hugging Face Token"
+      regex: 'hf_[A-Za-z0-9]{34,37}\b'
+      severity: critical
+    - name: "Databricks Token"
+      regex: 'dapi[0-9a-f]{32,}'
+      severity: critical
+    - name: "Replicate API Token"
+      regex: 'r8_[a-f0-9]{40}\b'
+      severity: critical
+    - name: "Together AI Key"
+      regex: 'tok_[a-z0-9]{40,}\b'
+      severity: critical
+    - name: "Pinecone API Key"
+      regex: 'pcsk_[a-zA-Z0-9]{36,}'
+      severity: critical
+    - name: "Groq API Key"
+      regex: 'gsk_[a-zA-Z0-9]{48,}'
+      severity: critical
+    - name: "xAI API Key"
+      regex: 'xai-[a-zA-Z0-9\-_]{80,}'
+      severity: critical
+    # Infrastructure and platform tokens
+    - name: "DigitalOcean Token"
+      regex: 'dop_v1_[a-f0-9]{64}'
+      severity: critical
+    - name: "HashiCorp Vault Token"
+      regex: '\bhvs\.[A-Za-z0-9]{24,}\b'
+      severity: critical
+    - name: "Vercel Token"
+      regex: '(?:vercel|vc[piark])_[a-zA-Z0-9]{24,}\b'
+      severity: critical
+    - name: "Supabase Service Key"
+      regex: '\bsb_secret_[A-Za-z0-9_-]{22}_(?:[A-Za-z0-9_-]{7}[A-Za-z0-9_]\b|[A-Za-z0-9_-]{7}-\B)'
+      severity: critical
+    # Package registry tokens
+    - name: "npm Token"
+      regex: 'npm_[A-Za-z0-9]{36,}\b'
+      severity: critical
+    - name: "PyPI Token"
+      regex: 'pypi-AgE[A-Za-z0-9_-]{90,}'
+      severity: critical
+    # Developer platform tokens
+    - name: "Linear API Key"
+      regex: '\blin_api_[A-Za-z0-9]{40,}\b'
+      severity: high
+    - name: "Notion API Key"
+      regex: 'ntn_[a-zA-Z0-9]{40,}\b'
+      severity: high
+    - name: "Sentry Auth Token"
+      regex: '\bsntrys_[A-Za-z0-9]{40,}\b'
+      severity: high
+    # Cryptographic material
+    - name: "Private Key Header"
+      regex: '-----BEGIN\s+(RSA\s+|EC\s+|DSA\s+|OPENSSH\s+|PGP\s+)?PRIVATE\s+KEY(\s+BLOCK)?-----'
+      severity: critical
+    - name: "JWT Token"
+      regex: '(ey[a-zA-Z0-9_\-=]{10,}\.){2}[a-zA-Z0-9_\-=]{10,}'
+      severity: high
+    # Cryptocurrency private keys
+    - name: "Bitcoin WIF Private Key"
+      regex: '(?:5[1-9A-HJ-NP-Za-km-z]{50}|[KL][1-9A-HJ-NP-Za-km-z]{51})'
+      severity: critical
+      validator: wif
+    - name: "Extended Private Key"
+      regex: '[xyzt]prv[1-9A-HJ-NP-Za-km-z]{107,108}'
+      severity: critical
+    - name: "Ethereum Private Key"
+      regex: '0x[0-9a-f]{64}\b'
+      severity: critical
+    - name: "Ethereum Address"
+      regex: '0x[0-9a-fA-F]{40}\b'
+      severity: high
+    - name: "Social Security Number"
+      regex: '\b\d{3}-\d{2}-\d{4}\b'
+      severity: low
+    # Identity / PII
+    - name: "Google OAuth Client ID"
+      regex: '[0-9]{6,}-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com'
+      severity: medium
+    # Generic credential patterns
+    - name: "Credential in URL"
+      regex: '(?m)(?:^|[?&;])\s*(?:password|passwd|secret|token|apikey|api_key|api-key)\s*=\s*[A-Za-z0-9_+/=~%.-][^\s&;]{3,}'
+      severity: high
+    - name: "Environment Variable Secret"
+      regex: '(?-i:[A-Z][A-Z0-9]*[_-](?:SECRET(?:[_-]ACCESS)?[_-]?KEY|SECRET|PASSWORD|PASSWD|TOKEN|API[_-]?KEY))\b\s*=\s*[A-Za-z0-9_+/=~.-]\S{7,}'
+      severity: high
+    # Financial identifiers (validated with post-match checksums)
+    - name: "Credit Card Number"
+      regex: '\b\d{4}(?:[- ]?\d){11,15}\b'
+      severity: medium
+      validator: luhn
+    - name: "IBAN"
+      regex: '\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b'
+      severity: medium
+      validator: mod97
+
+response_scanning:
+  enabled: true
+  action: block
+  include_defaults: false  # Preset defines the complete pattern set
+  patterns:
+    - name: "Prompt Injection"
+      regex: '(?i)(ignore|disregard|forget|abandon)[-,;:.\s]+\s*(?:all\s+\w+\s+|\w+\s+all\s+|all\s+|\w+\s+)?(previous|prior|above|earlier)\s+(\w+\s+)?(instructions|prompts|rules|context|directives|constraints|policies|guardrails)'
+    - name: "System Override"
+      regex: '(?im)^\s*system\s*:'
+    - name: "Role Override"
+      regex: '(?i)you\s+are\s+(now\s+)?(a\s+)?((?-i:\bDAN\b)|evil|unrestricted|jailbroken|unfiltered)'
+    - name: "New Instructions"
+      regex: '(?i)(new|updated|revised)\s+(instructions|directives|rules|prompt)'
+    - name: "Jailbreak Attempt"
+      regex: '(?i)((?-i:\bDAN\b)|developer\s+mode|sudo\s+mode|unrestricted\s+mode)'
+    - name: "Hidden Instruction"
+      regex: '(?i)(do\s+not\s+(reveal|tell|show|display|mention)\s+this\s+to\s+the\s+user|hidden\s+instructions?\s*[:=]|invisible\s+to\s+(the\s+)?user|the\s+user\s+(cannot|must\s+not|should\s+not)\s+see\s+this)'
+    - name: "Behavior Override"
+      regex: '(?i)from\s+now\s+on\s+(you\s+)?(will|must|should|shall)\s+'
+    - name: "Encoded Payload"
+      regex: '(?i)(decode\s+(this|the\s+following)\s+(from\s+)?base64\s+and\s+(execute|run|follow)|eval\s*\(\s*atob\s*\()'
+    - name: "Tool Invocation"
+      regex: '(?i)you\s+must\s+(immediately\s+)?(call|execute|run|invoke)\s+(the|this)\s+(function|tool|command|api|endpoint)'
+    - name: "Authority Escalation"
+      regex: '(?i)you\s+(now\s+)?have\s+(full\s+)?(admin|root|system|superuser|elevated)\s+(access|privileges|permissions|rights)'
+    - name: "Pliny Divider"
+      regex: '(?i)={1,3}/?[A-Z\-]{2,}(/[A-Z\-]{1,4}){3,}=+'
+    - name: "Meta-Command Activation"
+      regex: '(?i)(\{GODMODE\s*:\s*(ENABLED|ON|TRUE)\}|!OMNI\b|RESET_CORTEX|LIBERTAS\s+FACTOR|ENABLE\s+DEV(ELOPER)?\s+MODE|JAILBREAK\s+(ENABLED|ACTIVATED|ON))'
+    - name: "Roleplay Framing"
+      regex: '(?i)(let''?s\s+play\s+a\s+game\s+where\s+you|pretend\s+you\s+are\s+an?\s+(character|person|AI)\s+(who|that)\s+(has\s+no|doesn''?t\s+have|ignores?|bypasses?)|(in\s+this\s+)?(hypothetical|fictional|imaginary)\s+scenario\s+(where\s+)?you\s+(are|have|can|must))'
+    - name: "Instruction Boundary"
+      regex: '(<\|(?:endoftext|im_start|im_end|system|end_header_id|begin_of_text)\|>|\[/?INST\]|<\|(?:user|assistant)\|>|<</?SYS>>)'
+    - name: "Covert Action Directive"
+      regex: '(?i)(secretly|silently|covertly|quietly|without\s+(?:the\s+user\s+)?(?:knowing|noticing|seeing))\s+.{0,40}\b(execut\w*|run|call|invoke|send|fetch|curl|wget|download|upload|post)\b'
+    - name: "Output Format Forcing"
+      regex: '(?i)(respond\s+with|first\s+(output|write|print|say))\s*[\[\("]?\s*(FILTERED|ERROR|BLOCKED|REFUSED|DECLINED|CENSORED)\s*[\]\)"]?\s*(then|followed\s+by|and\s+then|after\s+(that|which))'
+    - name: "System Prompt Extraction"
+      regex: '(?i)(repeat\s+(your|the)\s+(entire\s+)?(instructions|system\s+prompt|initial\s+prompt|rules)|what\s+(is|are)\s+your\s+(system\s+prompt|instructions|rules|directives)|output\s+(your|the)\s+(full\s+)?(system|initial)\s+(prompt|instructions|message)|show\s+me\s+(your|the)\s+(system\s+prompt|hidden\s+instructions|initial\s+instructions)|(disclose|expose|dump|divulge)\s+(your|the)\s+(hidden\s+|secret\s+|internal\s+)*(system\s+|initialization\s+)*(prompt|instructions|rules|directives))'
+    - name: "Instruction Invalidation"
+      regex: '(?i)(treat|consider|regard)\s+(all\s+)?(earlier|prior|previous|preceding|above)\s+(directions|instructions|guidelines|rules|prompts?)\s+as\s+(obsolete|void|invalid|superseded|overridden|null|cancelled|revoked|inapplicable)'
+    - name: "Instruction Dismissal"
+      regex: '(?i)(set|put|cast|push|throw)\s+(all\s+)?(previous|prior|earlier|preceding|above|existing|current)\s+(\w+\s+)?(directives|instructions|guidelines|rules|prompts?|constraints|safeguards|policies|guardrails)\s+(aside|away|to\s+(one|the)\s+side)'
+    - name: "Instruction Downgrade"
+      regex: '(?i)(treat|consider|regard|reinterpret|downgrade)\s+((?:the|all)\s+)?(previous|prior|above|earlier|system|policy|original|existing)\s+(\w+\s+)?(text|instructions?|rules|directives|guidelines|safeguards|constraints|controls|checks|context|prompt|policies|guardrails|parameters)\s+((as|to)\s+)?(historical|outdated|deprecated|optional|background|secondary|non-binding|non-authoritative|informational|advisory)'
+    - name: "Priority Override"
+      regex: '(?i)prioritize\s+(the\s+)?(task|user|current|new|latest)\s+(request|message|input|instructions?|prompt)'
+
+mcp_input_scanning:
+  enabled: true
+  action: block
+  on_parse_error: block
+
+mcp_tool_scanning:
+  enabled: true
+  action: block
+  detect_drift: true
+
+mcp_tool_policy:
+  enabled: true
+  action: warn
+  rules:
+    - name: "Destructive File Delete"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\brm\s+(--\s+)?(-[a-z]*[rf]\b|--(?:recursive|force)\b)'
+      action: block
+    - name: "Recursive Permission Change"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\b(chmod\s+(-R|--recursive)\s+(777|666)|chmod\s+(777|666)\s+(-R|--recursive)|chown\s+(-R|--recursive))\b'
+    - name: "Credential File Access"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|read_file|file_read)$'
+      arg_pattern: '(?i)(\.ssh/(id_|authorized)|\.aws/credentials|\.env\b|\.netrc|/etc/shadow)'
+      action: block
+    - name: "Network Exfiltration"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\b(curl|wget)\b.*(-d\s|-F\s|-T\s|--data(?:-binary|-raw|-urlencode)?\b|--form\b|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b|-X\s+POST)'
+    - name: "Reverse Shell"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e)'
+      action: block
+    - name: "Disk Wipe Command"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\b(dd\s+if=.*of=/dev/|mkfs\.|fdisk)\b'
+      action: block
+    - name: "Package Install"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\b(pip|npm|gem|cargo|go)\s+install\b'
+    - name: "Destructive Git Operation"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|git)$'
+      arg_pattern: '(?i)(\bgit\s+)?(push\s+(--force(\s|$)|-f\b)|reset\s+--hard\b|clean\s+-fd\b)'
+      action: block
+    - name: "Encoded Command Execution"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)(\beval\b.*\bbase64\b|\bbase64\s+(-d|--decode)\b.*\|\s*(ba)?sh\b)'
+      action: block
+    - name: "Cron Job Persistence"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)(\bcrontab\s+(-\w+\s+\S+\s+)*-e\b|\bcrontab\s+(-\w+\s+\S+\s+)*[^-\s]|>{1,2}\s*/(?:var/spool/cron|etc/cron)|\|\s*crontab\b)'
+      action: block
+    - name: "Systemd Service Persistence"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)\bsystemctl\s+(-{1,2}\w+\s+)*(enable|daemon-reload)\b'
+      action: block
+    - name: "Persistence Path Write"
+      tool_pattern: '(?i)^(write_file|file_write|edit_file|create_file|modify_file|append_file)$'
+      arg_pattern: '(?i)(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/)'
+      action: block
+    - name: "Persistence Path Write via Command"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)(>{1,2}\s*[^;|&]*(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/)|\b(tee|sed\s+-i)\s+[^;|&]*(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/)|\b(cp|mv|install|ln)\b\s+(\S+\s+)+\S*(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/))'
+      action: block
+    - name: "Shell Profile Modification"
+      tool_pattern: '(?i)^(write_file|file_write|edit_file|create_file|modify_file|append_file)$'
+      arg_pattern: '(?i)((?:^|/)\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|/etc/profile\b)'
+      action: block
+    - name: "Shell Profile Write via Command"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)(>{1,2}[^;|&]*(?:^|[/\s])\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|\b(tee|sed\s+-i)[^;|&]*(?:^|[/\s])\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|\b(cp|mv|install|ln)\b\s+(\S+\s+)+(?:\S*/)?\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\s*$|\balias\s+\w+=|>{1,2}[^;|&]*/etc/profile\b|\b(tee|sed\s+-i)[^;|&]*/etc/profile\b|\b(cp|mv|install|ln)\b\s+(\S+\s+)+\S*/etc/profile\s*$)'
+      action: block
+    - name: "Detached Process Spawning"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$'
+      arg_pattern: '(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux\s+(new-session|new)\s+-d)'
+    - name: "Audit Log Tampering"
+      tool_pattern: '(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|write_file|file_write|edit_file|create_file|modify_file|append_file)$'
+      arg_pattern: '(?i)(\b(rm|truncate|shred)\b[^;|&]*/var/log/|\b(rm|truncate|shred)\b[^;|&]*\.(log|audit|jsonl)\b|>{1,2}\s*[^;|&]*(/var/log/|\.(log|audit|jsonl)\b)|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bexport\s+HISTFILE=/dev/null\b)'
+
+# Session behavioral profiling (warn-only, no blocking by default)
+session_profiling:
+  enabled: true
+
+# Adaptive enforcement: per-session threat scoring with level-based action upgrades.
+adaptive_enforcement:
+  enabled: true
+  escalation_threshold: 5.0
+  decay_per_clean_request: 0.5
+  levels:
+    elevated:
+      upgrade_warn: block       # warn→block when session is elevated
+    high:
+      upgrade_warn: block
+      upgrade_ask: block        # ask→block when session is high risk
+    critical:
+      upgrade_warn: block
+      upgrade_ask: block
+      block_all: true           # deny all requests when session is critical
+
+# MCP session binding (opt-in)
+mcp_session_binding:
+  enabled: false
+
+logging:
+  format: json
+  output: stdout
+  include_allowed: true
+  include_blocked: true
+
+# Defaults to pipelock maintainer Sentry for crash reporting.
+# Override via SENTRY_DSN env var or set dsn below.
+sentry:
+  enabled: true
+  dsn: "https://b1902c1ea2d87902780bfbf59c0fb343@o4511026551783424.ingest.us.sentry.io/4511026559254528"
+  environment: production
+  sample_rate: 1.0
+
+internal:
+  - "0.0.0.0/8"
+  - "127.0.0.0/8"
+  - "10.0.0.0/8"
+  - "172.16.0.0/12"
+  - "192.168.0.0/16"
+  - "169.254.0.0/16"
+  - "100.64.0.0/10"
+  - "::1/128"
+  - "fc00::/7"
+  - "fe80::/10"
+  - "224.0.0.0/4"
+  - "ff00::/8"
+
+tls_interception:
+  enabled: false
+  ca_cert: ""
+  ca_key: ""
+  passthrough_domains: []
+  cert_ttl: 24h
+  cert_cache_size: 10000
+  max_response_bytes: 5242880
+
+tool_chain_detection:
+  enabled: true
+  action: warn
+
+# Cross-request exfiltration detection (opt-in)
+# cross_request_detection:
+#   enabled: false
+
+# Scan API: evaluation-plane listener for external integrations.
+# Disabled by default. Set listen address to enable.
+scan_api:
+  listen: ""
+
+# --- Address Protection (optional) ---
+# Detect crypto address poisoning: lookalike addresses compared against
+# a user-supplied allowlist of known-good destinations.
+# address_protection:
+#   enabled: false
+#   action: block
+#   unknown_action: allow
+#   allowed_addresses: []
+#   chains:
+#     eth: true
+#     btc: true
+#     sol: false
+#     bnb: true
+#   similarity:
+#     prefix_length: 4
+#     suffix_length: 4
+
+seed_phrase_detection:
+  enabled: true
+  min_words: 12
+  verify_checksum: true
+
+# --- Agent Profiles (optional) ---
+# Per-agent policy overrides. Each agent gets its own merged config.
+# Agents are identified by listener binding (spoof-proof), source CIDR matching,
+# X-Pipelock-Agent header, or ?agent= query param. Requires a license key
+# (via PIPELOCK_LICENSE_KEY env var, license_file path, or inline license_key).
+#
+# agents:
+#   claude-code:
+#     listeners: [":8889"]
+#     source_cidrs: ["10.42.3.0/24"]
+#     mode: strict
+#     api_allowlist: ["github.com", "*.githubusercontent.com"]
+#     budget:
+#       max_unique_domains_per_session: 50
+#       window_minutes: 60
+#   _default:
+#     mode: balanced
+
+# Community rule bundles — install with: pipelock rules install pipelock-community
+# rules:
+#   min_confidence: medium
+#   include_experimental: false
+
+# Process sandbox — OS-level containment for MCP subprocess mode (v2.0)
+# sandbox:
+#   enabled: false       # enable via --sandbox CLI flag
+#   strict: false        # deny all filesystem access outside explicit allowlist
+
+# HTTP reverse proxy — bidirectional body scanning for any HTTP service (v2.0)
+# reverse_proxy:
+#   enabled: false
+#   listen: ":8890"
+#   upstream: "http://localhost:7899"
+
+# ---- airlock (per-session quarantine) ----
+# Per-session graduated containment: soft -> hard -> drain. Disabled in
+# presets — enable with deliberate trigger/timer tuning per deployment.
+airlock:
+  enabled: false
+  triggers:
+    on_elevated: none
+    on_high: soft
+    on_critical: hard
+  timers:
+    soft_minutes: 5
+    hard_minutes: 15
+    drain_minutes: 0
+    drain_timeout_seconds: 30
+
+# ---- flight_recorder (tamper-evident decision receipts) ----
+# On by default so you can "verify the boundary." Receipt emission is best-effort
+# unless `require_receipts` is true, which blocks allow-path traffic when a receipt
+# cannot be emitted. Recording goes LIVE only once `dir` and `signing_key_path`
+# are set (run `pipelock init`, which generates both); without them the recorder
+# is inert and nothing is written. `redact` scrubs secrets from receipt targets
+# before they touch disk -- keep it on, since receipts carry the destinations of
+# mediated traffic.
+flight_recorder:
+  enabled: true
+  require_receipts: false
+  redact: true
+  # dir: /var/lib/pipelock/recorder
+  # signing_key_path: /etc/pipelock/keys/flight-recorder-signing.key

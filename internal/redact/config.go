@@ -1,0 +1,365 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package redact
+
+import (
+	"errors"
+	"fmt"
+	"mime"
+	"strings"
+)
+
+// Config is the top-level YAML config for redaction. Embedded into the
+// main pipelock Config as the `redaction:` block.
+type Config struct {
+	// Enabled toggles the feature. When false, no other fields have any
+	// effect and the feature is inert.
+	Enabled bool `yaml:"enabled"`
+
+	// DefaultProfile names the profile applied to every request unless a
+	// per-agent override selects a different one. Must be a key in Profiles
+	// when Enabled is true.
+	DefaultProfile string `yaml:"default_profile"`
+
+	// Profiles is the set of named redaction configurations. A profile
+	// composes class names + dictionary names. Operators can ship a
+	// `code` profile that enables only API/token classes, a `business`
+	// profile that adds PII classes and customer dictionaries, etc.
+	Profiles map[string]ProfileSpec `yaml:"profiles"`
+
+	// Dictionaries is the set of named operator-supplied literal lists
+	// that profiles reference. Each key is a dictionary name; the value
+	// describes the class and entries.
+	Dictionaries map[string]DictionarySpec `yaml:"dictionaries"`
+
+	// Limits caps defensive ceilings for fail-closed behavior.
+	Limits LimitsSpec `yaml:"limits"`
+
+	// StrictReload, when true, fails requests closed if a dictionary file
+	// referenced by an active profile cannot be reloaded (disappeared or
+	// corrupted). Default false - retain previous snapshot instead.
+	StrictReload bool `yaml:"strict_reload"`
+
+	// AllowlistUnparseable lists hosts whose request bodies are permitted
+	// to flow through redaction as opaque text when the body is not
+	// parseable JSON. Bodies from hosts not in this list are blocked per
+	// the fail-closed invariant.
+	AllowlistUnparseable []string `yaml:"allowlist_unparseable"`
+
+	// AllowlistUnparseableRoutes narrows non-JSON redaction bypasses to a
+	// host plus at least one route constraint. Use this for trusted OAuth
+	// token endpoints or upload routes instead of broad host-only entries.
+	AllowlistUnparseableRoutes []UnparseableRouteSpec `yaml:"allowlist_unparseable_routes"`
+
+	// Providers registers provider parser profiles. Built-ins for Anthropic,
+	// OpenAI, and Gemini are always present; entries here add or override
+	// profiles without code changes. Provider selection never exempts fields
+	// from scanning - v1 profiles map to the whole-body JSON parser.
+	Providers map[string]ProviderSpec `yaml:"providers" json:"providers,omitempty"`
+}
+
+// ProfileSpec describes a single redaction profile as YAML.
+type ProfileSpec struct {
+	// Classes is the list of built-in redaction class names (e.g.
+	// "ipv4", "aws-access-key") that are enabled for this profile.
+	// Unknown class names are validated against the shipped registry.
+	Classes []string `yaml:"classes"`
+	// Dictionaries is the list of dictionary names (keys in
+	// Config.Dictionaries) that this profile attaches to the matcher.
+	Dictionaries []string `yaml:"dictionaries"`
+}
+
+// DictionarySpec is a YAML-friendly version of Dictionary. Either Entries
+// or EntriesFile must be set; EntriesFile loading is the responsibility of
+// the caller (the redact package does not touch the filesystem).
+type DictionarySpec struct {
+	// Class tags every hit of this dictionary.
+	Class string `yaml:"class"`
+	// Entries lists literal strings to match. Either this or EntriesFile
+	// must be non-empty.
+	Entries []string `yaml:"entries,omitempty"`
+	// EntriesFile points at a YAML/JSON file containing a string list.
+	// Not loaded by this package; resolve before calling BuildMatcher.
+	EntriesFile string `yaml:"entries_file,omitempty"`
+	// CaseInsensitive toggles case-insensitive matching.
+	CaseInsensitive bool `yaml:"case_insensitive"`
+	// WordBoundary requires `\b` surrounding each entry's match span.
+	WordBoundary bool `yaml:"word_boundary"`
+	// Priority positions this dictionary in overlap resolution.
+	Priority int `yaml:"priority"`
+}
+
+// LimitsSpec mirrors Limits but uses YAML-idiomatic zero values. Fields
+// with zero value take the package-level defaults (see walker.go).
+type LimitsSpec struct {
+	MaxBodyBytes            int `yaml:"max_body_bytes"`
+	MaxRedactionsPerRequest int `yaml:"max_redactions_per_request"`
+	MaxDepth                int `yaml:"max_depth"`
+}
+
+// UnparseableRouteSpec is a route-scoped non-JSON redaction exception.
+// Matching requests still pass through request body/header scanning; this
+// only skips the JSON rewrite gate for trusted non-JSON formats.
+type UnparseableRouteSpec struct {
+	Host         string   `yaml:"host"`
+	Methods      []string `yaml:"methods,omitempty"`
+	PathPrefixes []string `yaml:"path_prefixes,omitempty"`
+	PathSuffixes []string `yaml:"path_suffixes,omitempty"`
+	ContentTypes []string `yaml:"content_types,omitempty"`
+}
+
+// ToLimits converts the YAML form into the internal Limits type.
+// Struct fields match one-for-one so a Go conversion is sufficient.
+func (s LimitsSpec) ToLimits() Limits {
+	return Limits(s)
+}
+
+// Validate returns nil iff cfg is internally consistent. Callers should
+// wire this into the overall config validation so startup fails closed.
+//
+// Structural checks on allowlist_unparseable host entries and dictionary
+// class names run UNCONDITIONALLY - they are cheap and must not depend on
+// the Enabled gate, because a disabled config with malformed fields can
+// still be loaded, and the fields are security-sensitive once Enabled
+// flips on. Skipping structure checks when disabled would defeat the
+// fail-fast posture (bots already flagged this on 2026-04-19).
+func (c *Config) Validate() error {
+	// Structural: allowlist host entries. Runs before the Enabled gate.
+	for i, host := range c.AllowlistUnparseable {
+		if err := validateHostEntry(host); err != nil {
+			return fmt.Errorf("redact: allowlist_unparseable[%d] %q: %w", i, host, err)
+		}
+	}
+	for i, route := range c.AllowlistUnparseableRoutes {
+		if err := route.Validate(); err != nil {
+			return fmt.Errorf("redact: allowlist_unparseable_routes[%d]: %w", i, err)
+		}
+	}
+	// Structural: dictionary class names must match the placeholder-safe
+	// shape so a runtime BuildMatcher call doesn't reject a "valid" config.
+	for name, d := range c.Dictionaries {
+		if d.Class != "" && !classNameRe.MatchString(d.Class) {
+			return fmt.Errorf("redact: dictionary %q class %q must match [a-z0-9][a-z0-9_-]*", name, d.Class)
+		}
+	}
+	if _, err := NewProviderRegistry(c.Providers); err != nil {
+		return err
+	}
+
+	if !c.Enabled {
+		return nil // inert; no further checks.
+	}
+	if c.DefaultProfile == "" {
+		return errors.New("redact: default_profile required when enabled")
+	}
+	if _, ok := c.Profiles[c.DefaultProfile]; !ok {
+		return fmt.Errorf("redact: default_profile %q not defined in profiles", c.DefaultProfile)
+	}
+
+	validClasses := shippedClassNames()
+	for name, p := range c.Profiles {
+		if len(p.Classes) == 0 && len(p.Dictionaries) == 0 {
+			return fmt.Errorf("redact: profile %q has no classes or dictionaries", name)
+		}
+		for _, cl := range p.Classes {
+			if _, ok := validClasses[cl]; !ok {
+				return fmt.Errorf("redact: profile %q references unknown class %q", name, cl)
+			}
+		}
+		for _, dn := range p.Dictionaries {
+			if _, ok := c.Dictionaries[dn]; !ok {
+				return fmt.Errorf("redact: profile %q references unknown dictionary %q", name, dn)
+			}
+		}
+	}
+
+	for name, d := range c.Dictionaries {
+		if d.Class == "" {
+			return fmt.Errorf("redact: dictionary %q missing class", name)
+		}
+		if len(d.Entries) == 0 && d.EntriesFile == "" {
+			return fmt.Errorf("redact: dictionary %q has no entries or entries_file", name)
+		}
+	}
+	return nil
+}
+
+// Validate rejects broad or ambiguous route exceptions. Host is required,
+// and at least one route constraint beyond host is required so operators do
+// not accidentally recreate a host-only allowlist entry in the route surface.
+func (r UnparseableRouteSpec) Validate() error {
+	if err := validateHostEntry(r.Host); err != nil {
+		return fmt.Errorf("host %q: %w", r.Host, err)
+	}
+	if len(r.Methods) == 0 && len(r.PathPrefixes) == 0 && len(r.PathSuffixes) == 0 && len(r.ContentTypes) == 0 {
+		return errors.New("must include at least one of methods, path_prefixes, path_suffixes, or content_types")
+	}
+	for i, method := range r.Methods {
+		if method == "" {
+			return fmt.Errorf("methods[%d]: empty", i)
+		}
+		if strings.ToUpper(method) != method {
+			return fmt.Errorf("methods[%d] %q: must be uppercase", i, method)
+		}
+		if strings.ContainsAny(method, " \t\r\n") {
+			return fmt.Errorf("methods[%d] %q: must not contain whitespace", i, method)
+		}
+	}
+	for i, prefix := range r.PathPrefixes {
+		if !strings.HasPrefix(prefix, "/") {
+			return fmt.Errorf("path_prefixes[%d] %q: must start with /", i, prefix)
+		}
+		if prefix == "/" && len(r.Methods) == 0 && len(r.PathSuffixes) == 0 && len(r.ContentTypes) == 0 {
+			return fmt.Errorf("path_prefixes[%d] %q: root prefix requires methods, path_suffixes, or content_types", i, prefix)
+		}
+	}
+	for i, suffix := range r.PathSuffixes {
+		if suffix == "" {
+			return fmt.Errorf("path_suffixes[%d]: empty", i)
+		}
+	}
+	for i, ct := range r.ContentTypes {
+		mt, params, err := mime.ParseMediaType(ct)
+		if err != nil {
+			return fmt.Errorf("content_types[%d] %q: %w", i, ct, err)
+		}
+		if len(params) != 0 {
+			return fmt.Errorf("content_types[%d] %q: parameters are not allowed", i, ct)
+		}
+		if strings.ToLower(mt) != ct {
+			return fmt.Errorf("content_types[%d] %q: must be lowercase canonical media type", i, ct)
+		}
+	}
+	return nil
+}
+
+// validateHostEntry rejects ambiguous host-allowlist entries so once v1b
+// enforcement lands the allowlist match semantics are unambiguous. The
+// rules: non-empty, no scheme/path/query, no port, no uppercase, no
+// leading/trailing dot, no consecutive dots, valid label characters only.
+func validateHostEntry(h string) error {
+	if h == "" {
+		return errors.New("empty")
+	}
+	if strings.ContainsAny(h, "/?#@") {
+		return errors.New("must not contain scheme, path, query, or userinfo")
+	}
+	if strings.ContainsRune(h, ':') {
+		return errors.New("must not contain a port (bare hostname only)")
+	}
+	if strings.ToLower(h) != h {
+		return errors.New("must be lowercase")
+	}
+	if strings.HasPrefix(h, ".") || strings.HasSuffix(h, ".") {
+		return errors.New("leading or trailing dot not permitted")
+	}
+	if strings.Contains(h, "..") {
+		return errors.New("consecutive dots not permitted")
+	}
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= '0' && r <= '9',
+			r == '-', r == '.', r == '*':
+			continue
+		default:
+			return fmt.Errorf("invalid character %q", r)
+		}
+	}
+	return nil
+}
+
+// BuildMatcher compiles the named profile into a Matcher. Entries from
+// dictionaries referenced by the profile must already be fully resolved
+// (EntriesFile loaded into Entries); the redact package does not perform
+// file I/O.
+func (c *Config) BuildMatcher(profileName string) (*Matcher, error) {
+	if !c.Enabled {
+		return nil, errors.New("redact: cannot build matcher with Enabled=false")
+	}
+	if profileName == "" {
+		profileName = c.DefaultProfile
+	}
+	profile, ok := c.Profiles[profileName]
+	if !ok {
+		return nil, fmt.Errorf("redact: profile %q not found", profileName)
+	}
+
+	m := &Matcher{}
+
+	// Filter the shipped class registry down to the profile's class set.
+	classSet := make(map[string]struct{}, len(profile.Classes))
+	for _, cl := range profile.Classes {
+		classSet[cl] = struct{}{}
+	}
+	for _, cp := range defaultRegistry() {
+		if _, ok := classSet[string(cp.class)]; ok {
+			m.patterns = append(m.patterns, cp)
+		}
+	}
+	if _, ok := classSet[string(ClassSeedPhrase)]; ok {
+		m.seedPhrase = true
+	}
+
+	// Attach each referenced dictionary. The redact package does not read
+	// the filesystem; if EntriesFile is set, the caller must resolve it
+	// into Entries before calling BuildMatcher. A dictionary with only
+	// EntriesFile set will surface here as an empty-entries build error,
+	// which we diagnose explicitly so operators don't think a validated
+	// config somehow failed at matcher build.
+	for _, dn := range profile.Dictionaries {
+		spec := c.Dictionaries[dn]
+		if len(spec.Entries) == 0 && spec.EntriesFile != "" {
+			return nil, fmt.Errorf("redact: build dictionary %q: entries_file %q was not resolved before BuildMatcher (caller must load file contents into Entries)", dn, spec.EntriesFile)
+		}
+		if err := m.AddDictionary(Dictionary{
+			Class:           Class(spec.Class),
+			Entries:         spec.Entries,
+			CaseInsensitive: spec.CaseInsensitive,
+			WordBoundary:    spec.WordBoundary,
+			Priority:        spec.Priority,
+		}); err != nil {
+			return nil, fmt.Errorf("redact: build dictionary %q: %w", dn, err)
+		}
+	}
+
+	return m, nil
+}
+
+// BuildProviderRegistry returns the redaction provider parser registry for c.
+func (c *Config) BuildProviderRegistry() (*ProviderRegistry, error) {
+	return NewProviderRegistry(c.Providers)
+}
+
+// shippedClassNames returns the set of class string values known to the
+// shipped registry. Used for Validate to reject typos in operator profiles.
+func shippedClassNames() map[string]struct{} {
+	reg := defaultRegistry()
+	out := make(map[string]struct{}, len(reg)+1)
+	for _, cp := range reg {
+		out[string(cp.class)] = struct{}{}
+	}
+	out[string(ClassSeedPhrase)] = struct{}{}
+	return out
+}
+
+// DefaultLimits returns a LimitsSpec populated with the package defaults,
+// suitable for emission in example configs and defaults functions.
+func DefaultLimits() LimitsSpec {
+	return LimitsSpec{
+		MaxBodyBytes:            DefaultMaxBodyBytes,
+		MaxRedactionsPerRequest: DefaultMaxRedactions,
+		MaxDepth:                DefaultMaxDepth,
+	}
+}
+
+// DefaultConfig returns a disabled redaction config suitable as the
+// zero-value embedded in pipelock's main Config. When the operator does
+// not supply a `redaction:` block, this is what they get - inert and safe.
+func DefaultConfig() Config {
+	return Config{
+		Enabled: false,
+		Limits:  DefaultLimits(),
+	}
+}

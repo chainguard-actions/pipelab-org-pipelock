@@ -1,0 +1,64 @@
+name: Test with user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean fixture directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-test-clean"
+          printf '# Clean fixture\n\nNothing sensitive here.\n' > "$GITHUB_WORKSPACE/pipelock-test-clean/README.md"
+      # Upload audit report (if: always()) fails under act's artifact server; the
+      # outputs are still set and asserted below.
+      - id: generate
+        uses: .
+        continue-on-error: true
+        with:
+          directory: pipelock-test-clean
+          test-vectors: 'false'
+          fail-on-findings: 'false'
+      - name: Copy generated config into place
+        env:
+          GEN: ${{ steps.generate.outputs.config-path }}
+          DEST: ${{ runner.temp }}/user-pipelock.yaml
+        run: |
+          echo "generated: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then
+            echo "FAIL: no generated config"; exit 1
+          fi
+          mkdir -p "$(dirname "$DEST")"
+          cp "$GEN" "$DEST"
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          directory: pipelock-test-clean
+          config: ${{ runner.temp }}/user-pipelock.yaml
+          test-vectors: 'false'
+          fail-on-findings: 'false'
+      - name: Assert config-path echoes the user config
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          EXPECTED: ${{ runner.temp }}/user-pipelock.yaml
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          echo "actual: $ACTUAL"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: unexpected outcome '$OUTCOME'"; exit 1
+          fi
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "FAIL: expected '$EXPECTED'"; exit 1
+          fi
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: audit-failed should be false, got '$AUDIT_FAILED'"; exit 1
+          fi
+          # The action's own outcome is masked by the artifact upload failure, so
+          # validate the user config directly with the installed binary.
+          if ! pipelock check --config "$EXPECTED"; then
+            echo "FAIL: user config did not validate"; exit 1
+          fi
+          echo "PASS"

