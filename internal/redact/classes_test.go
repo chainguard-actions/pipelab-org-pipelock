@@ -1,0 +1,539 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package redact
+
+import (
+	"encoding/base64"
+	"strings"
+	"testing"
+)
+
+// TestDefaultMatcher_StructuredClasses exercises every built-in matcher class
+// shipped in v1 with at least one positive example and asserts the class +
+// span are correct.
+func TestDefaultMatcher_StructuredClasses(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	cases := []struct {
+		name  string
+		input string
+		want  Class
+	}{
+		{"ipv4", "connect to 192.0.2.104 now", ClassIPv4},
+		{"ipv4-private", "192.168.1.5", ClassIPv4},
+		{"cidr", "route 10.0.0.0/16 next", ClassCIDR},
+		{"ipv6-compressed", "try 2001:db8::1 now", ClassIPv6},
+		{"ipv6-full", "use 2001:0db8:85a3:0000:0000:8a2e:0370:7334 please", ClassIPv6},
+		{"mac-colon", "mac aa:bb:cc:dd:ee:ff", ClassMAC},
+		{"mac-dash", "mac aa-bb-cc-dd-ee-ff", ClassMAC},
+		{"email", "contact jsmith@contoso.com for info", ClassEmail},
+		{"fqdn", "visit dc01.corp.local for login", ClassFQDN},
+		{"aws-access-key-akia", "key AKIA" + "IOSFODNN7EXAMPLE exposed", ClassAWSAccessKey},
+		{"aws-access-key-asia", "temp " + "ASIA" + "Q5ZABCDEFG1234XY", ClassAWSAccessKey},
+		{"aws-secret-key", "AWS_SECRET_ACCESS_KEY=" + strings.Repeat("A", 40), ClassEnvSecret},
+		{"google-api-key", "AIza" + "SyD4mHwK8NQ2J5B1v6xR3L9fP7aW0cZu8kE", ClassGoogleAPIKey},
+		{"github-pat", "token ghp_" + strings.Repeat("A", 36) + " expires", ClassGitHubToken},
+		{"github-new", "token github_pat_" + strings.Repeat("B", 40), ClassGitHubToken},
+		{"gitlab-token", "token glpat-" + strings.Repeat("C", 24), ClassGitLabToken},
+		{"slack-bot", "use " + "xox" + "b-12345-67890-abcdefghijklmnopqrstuvwx", ClassSlackToken},
+		{"vercel-token", "deploy token vcp_" + strings.Repeat("A", 24), ClassVercelToken},
+		{"fireworks-api-key", "token fw_" + strings.Repeat("A", 22), ClassFireworksAPIKey},
+		{"llm-router-api-key", "token sk-or-v1-" + strings.Repeat("A", 24), ClassAIProviderKey},
+		{"answer-engine-api-key", "token pplx-" + strings.Repeat("A", 24), ClassAIProviderKey},
+		{"web-research-api-key", "token tvly-" + strings.Repeat("A", 24), ClassAIProviderKey},
+		{"huggingface-token", "token hf_" + strings.Repeat("A", 37), ClassHuggingFaceToken},
+		{"replicate-api-token", "token r8_" + strings.Repeat("A", 40), ClassReplicateAPIToken},
+		{"together-ai-key", "token TOK_" + strings.Repeat("A", 40), ClassTogetherAIKey},
+		{"pinecone-api-key", "token pcsk_" + strings.Repeat("A", 40), ClassAIProviderKey},
+		{"groq-api-key", "token gsk_" + strings.Repeat("A", 48), ClassAIProviderKey},
+		{"xai-api-key", "token xai-" + strings.Repeat("A", 80), ClassAIProviderKey},
+		{"hashicorp-vault-token", "token hvs." + strings.Repeat("A", 24), ClassVaultToken},
+		{"supabase-service-key", "token sb_secret_" + strings.Repeat("A", 22) + "_" + strings.Repeat("B", 8), ClassSupabaseKey},
+		{"supabase-service-key-hyphen-checksum", "token sb_secret_" + strings.Repeat("A", 22) + "_" + strings.Repeat("B", 7) + "-", ClassSupabaseKey},
+		{"databricks-pat", "token dapi" + "aabbccddeeff00112233445566778899", ClassDatabricksPAT},
+		{"openai-api-key", "use sk-proj-" + strings.Repeat("D", 24), ClassOpenAIAPIKey},
+		{"anthropic-api-key", "use sk-ant-" + strings.Repeat("E", 24), ClassAnthropicKey},
+		{"npm-token", "token npm_" + strings.Repeat("A", 36), ClassNPMToken},
+		{"pypi-token", "token PYPI-AGE" + strings.Repeat("A", 90), ClassPyPIToken},
+		{"linear-api-key", "token LIN_API_" + strings.Repeat("A", 40), ClassLinearAPIKey},
+		{"notion-api-key", "token NTN_" + strings.Repeat("A", 40), ClassNotionAPIKey},
+		{"sentry-auth-token", "token SNTRYS_" + strings.Repeat("A", 40), ClassSentryAuthToken},
+		{"telegram-token", "bot 1234567890:" + strings.Repeat("F", 35), ClassTelegramToken},
+		{"discord-token", "bot M" + strings.Repeat("G", 23) + "." + strings.Repeat("H", 6) + "." + strings.Repeat("I", 27), ClassDiscordToken},
+		{"discord-mfa-token", "bot mfa." + strings.Repeat("G", 84), ClassDiscordToken},
+		{"twilio-api-key", "sid SK" + strings.Repeat("a", 32), ClassTwilioAPIKey},
+		{"mailgun-api-key", "send key-" + strings.Repeat("b", 32), ClassMailgunAPIKey},
+		{"sendgrid-api-key", "key SG." + strings.Repeat("A", 22) + "." + strings.Repeat("B", 43), ClassSendGridAPIKey},
+		{"bearer-token", "Authorization: bearer " + strings.Repeat("J", 24), ClassBearer},
+		{"jwt", "bearer eyJ" + "hbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", ClassJWT},
+		{"jwt-header-whitespace", "bearer " + base64.RawURLEncoding.EncodeToString([]byte(`{ "alg":"HS256","typ":"JWT"}`)) + ".eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", ClassJWT},
+		// Payload variants exercising the broadened second-segment branches:
+		// `{ "sub"...}` -> eyA, `{}` -> e30, and a newline-led header -> ew.
+		{"jwt-payload-whitespace", "bearer eyJhbGciOiJIUzI1NiJ9." + base64.RawURLEncoding.EncodeToString([]byte(`{ "sub":"123"}`)) + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", ClassJWT},
+		{"jwt-empty-payload", "bearer eyJhbGciOiJIUzI1NiJ9." + base64.RawURLEncoding.EncodeToString([]byte(`{}`)) + ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", ClassJWT},
+		{"jwt-header-newline", "bearer " + base64.RawURLEncoding.EncodeToString([]byte("{\n\"alg\":\"HS256\"}")) + ".eyJzdWIiOiIxMjMifQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c", ClassJWT},
+		{"ssh-openssh", "-----BEGIN OPENSSH PRIVATE " + "KEY-----", ClassSSHPrivateKey},
+		{"ssh-rsa", "-----BEGIN RSA PRIVATE " + "KEY-----", ClassSSHPrivateKey},
+		// Bare PKCS#8 header (GCP service-account private_key) now redactable.
+		{"ssh-pkcs8", "-----BEGIN PRIVATE " + "KEY-----", ClassSSHPrivateKey},
+		// GitLab token class broadened to every documented prefix family.
+		{"gitlab-deploy-token", "token gldt-" + strings.Repeat("A", 24), ClassGitLabToken},
+		{"gitlab-runner-token", "token glrtr-" + strings.Repeat("A", 24), ClassGitLabToken},
+		{"gitlab-oauth-secret", "token gloas-" + strings.Repeat("A", 24), ClassGitLabToken},
+		{"gitlab-service-token-glimt", "token glimt-" + strings.Repeat("A", 24), ClassGitLabToken},
+		{"gitlab-service-token-glffct", "token glffct-" + strings.Repeat("A", 24), ClassGitLabToken},
+		// Database connection string: password between ':' and '@'.
+		{"db-conn-postgres", "dsn postgres://u:" + strings.Repeat("p", 12) + "@h:5432/app", ClassDBConnString},
+		{"db-conn-redis-pwonly", "dsn redis://:" + strings.Repeat("p", 12) + "@cache:6379", ClassDBConnString},
+		// Azure storage account key (88-char base64 in AccountKey= field).
+		{"azure-storage-key", "conn AccountKey=" + strings.Repeat("A", 86) + "==", ClassAzureStorageKey},
+		// Azure SAS signature parameter.
+		{"azure-sas-token", "url sig=" + strings.Repeat("A", 43) + "%3d", ClassAzureSAS},
+		{"azure-sas-token-decoded", "url sig=" + strings.Repeat("A", 43) + "=", ClassAzureSAS},
+		{"env-secret", fakeTelegramEnvSecret(), ClassEnvSecret},
+		{"seed-phrase", "mnemonic abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", ClassSeedPhrase},
+		{"ad-user", "CONTOSO\\jsmith logged in", ClassADUser},
+		{"ssn", "SSN " + "123-45-" + "6789 on file", ClassSSN},
+		{"credit-card-visa", "card " + "4111 1111 " + "1111 1111", ClassCreditCard},
+		{"credit-card-amex-15digit", "card " + "3782 822463 " + "10005", ClassCreditCard},
+		{"credit-card-amex-dashed", "card " + "3714-496353-" + "98431", ClassCreditCard},
+		// Hash classes now require a contextual keyword prefix (sha256/
+		// md5/etc.) so bare 64-hex strings like SaaS-style OAuth
+		// client_secret values do not trigger the matcher. See
+		// hashClasses() in classes.go for the rationale.
+		{"hash-md5", "md5 " + strings.Repeat("a", 32), ClassHashMD5},
+		{"hash-sha1", "sha1 " + strings.Repeat("b", 40), ClassHashSHA1},
+		{"hash-sha256", "sha256 " + strings.Repeat("c", 64), ClassHashSHA256},
+		{"hash-sha512", "sha512 " + strings.Repeat("d", 128), ClassHashSHA512},
+		{"hash-sha256-colon", "sha256:" + strings.Repeat("c", 64), ClassHashSHA256},
+		{"hash-sha256-dashed-keyword", "SHA-256=" + strings.Repeat("c", 64), ClassHashSHA256},
+		{"hash-sha256-labelled", "hash-sha256 " + strings.Repeat("c", 64), ClassHashSHA256},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			matches := m.Scan(tc.input)
+			if len(matches) == 0 {
+				t.Fatalf("Scan(%q) returned no matches; expected class %s", tc.input, tc.want)
+			}
+			// At least one match must be of the expected class.
+			found := false
+			for _, got := range matches {
+				if got.Class == tc.want {
+					found = true
+					// Verify span slices correctly back to the original.
+					if got.Original != tc.input[got.Start:got.End] {
+						t.Errorf("Match span mismatch: original=%q vs s[Start:End]=%q",
+							got.Original, tc.input[got.Start:got.End])
+					}
+					break
+				}
+			}
+			if !found {
+				classesFound := make([]string, 0, len(matches))
+				for _, got := range matches {
+					classesFound = append(classesFound, string(got.Class))
+				}
+				t.Fatalf("no match of class %s in %q; got classes %v", tc.want, tc.input, classesFound)
+			}
+		})
+	}
+}
+
+func TestDefaultMatcher_ProviderTokenBoundaries(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	cases := []struct {
+		name  string
+		input string
+		class Class
+	}{
+		{
+			name:  "vault followed by underscore suffix",
+			input: "hvs." + strings.Repeat("A", 24) + "_payload",
+			class: ClassVaultToken,
+		},
+		{
+			name:  "supabase followed by underscore suffix",
+			input: "sb_secret_" + strings.Repeat("A", 22) + "_" + strings.Repeat("B", 8) + "_payload",
+			class: ClassSupabaseKey,
+		},
+		{
+			name:  "linear followed by underscore suffix",
+			input: "lin_api_" + strings.Repeat("A", 40) + "_payload",
+			class: ClassLinearAPIKey,
+		},
+		{
+			name:  "sentry followed by underscore suffix",
+			input: "sntrys_" + strings.Repeat("A", 40) + "_payload",
+			class: ClassSentryAuthToken,
+		},
+		{
+			// "task"/"disk"/"risk" + 32 hex must not match: no word boundary
+			// between the trailing "sk" of the word and the digest.
+			name:  "twilio after word ending in sk",
+			input: "task" + strings.Repeat("a", 32),
+			class: ClassTwilioAPIKey,
+		},
+		{
+			// SK + a longer hex blob is an opaque ID, not a 34-char SID.
+			name:  "twilio followed by extra hex",
+			input: "SK" + strings.Repeat("a", 40),
+			class: ClassTwilioAPIKey,
+		},
+		{
+			// "monkey-" embeds "key-" mid-word: no boundary before "key".
+			name:  "mailgun embedded in word",
+			input: "monkey-" + strings.Repeat("a", 32),
+			class: ClassMailgunAPIKey,
+		},
+		{
+			// "key-" + a longer opaque value is not a 36-char Mailgun key.
+			name:  "mailgun followed by extra chars",
+			input: "key-" + strings.Repeat("a", 40),
+			class: ClassMailgunAPIKey,
+		},
+		{
+			name:  "llm-router under floor",
+			input: "sk-or-v1-" + strings.Repeat("a", 10),
+			class: ClassAIProviderKey,
+		},
+		{
+			name:  "web-research under floor",
+			input: "tvly-" + strings.Repeat("a", 10),
+			class: ClassAIProviderKey,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, got := range m.Scan(tc.input) {
+				if got.Class == tc.class {
+					t.Fatalf("matched %s in %q: %+v", tc.class, tc.input, got)
+				}
+			}
+		})
+	}
+}
+
+func TestDefaultMatcher_ProviderKeyProsePrefixesDoNotMatch(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	type providerCase struct {
+		name   string
+		prefix string
+		class  Class
+	}
+	providers := []providerCase{
+		{name: "anthropic", prefix: "ant-", class: ClassAnthropicKey},
+		{name: "openai-project", prefix: "proj-", class: ClassOpenAIAPIKey},
+		{name: "openai-service", prefix: "svcacct-", class: ClassOpenAIAPIKey},
+	}
+	prosePrefixes := []string{"desk", "kiosk", "risk", "task"}
+
+	for _, provider := range providers {
+		provider := provider
+		t.Run(provider.name+"/real-key", func(t *testing.T) {
+			t.Parallel()
+			key := "sk-" + provider.prefix + strings.Repeat("A", 20)
+			for _, match := range m.Scan(key) {
+				if match.Class == provider.class && match.Original == key {
+					return
+				}
+			}
+			t.Fatalf("real-shaped key %q did not match %s", key, provider.class)
+		})
+		for _, prosePrefix := range prosePrefixes {
+			prosePrefix := prosePrefix
+			t.Run(provider.name+"/"+prosePrefix, func(t *testing.T) {
+				t.Parallel()
+				prose := prosePrefix + "-" + provider.prefix + strings.Repeat("a", 20)
+				for _, match := range m.Scan(prose) {
+					if match.Class == provider.class {
+						t.Fatalf("ordinary prose %q matched %s: %+v", prose, provider.class, match)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDefaultMatcher_GitHubTokenInOpaqueRunStillMatches(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "classic",
+			input: strings.Repeat("A", 260) + "." + "ghp_" + strings.Repeat("B", 40) + "." + strings.Repeat("C", 260),
+		},
+		{
+			name:  "fine-grained",
+			input: strings.Repeat("A", 260) + "." + "github_pat_" + strings.Repeat("B", 40) + "." + strings.Repeat("C", 260),
+		},
+		{
+			name:  "uppercase classic",
+			input: strings.Repeat("A", 260) + "." + "GHP_" + strings.Repeat("B", 40) + "." + strings.Repeat("C", 260),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, got := range m.Scan(tc.input) {
+				if got.Class == ClassGitHubToken {
+					return
+				}
+			}
+			t.Fatalf("expected %s token in opaque run to match", tc.name)
+		})
+	}
+}
+
+func TestDefaultMatcher_AzureSASPreservesQueryDelimiter(t *testing.T) {
+	t.Parallel()
+
+	signature := "sig=" + strings.Repeat("A", 43) + "="
+	input := signature + "&next=value"
+	matches := NewDefaultMatcher().Scan(input)
+	for _, match := range matches {
+		if match.Class == ClassAzureSAS {
+			if match.Original != signature {
+				t.Fatalf("Azure SAS match = %q, want %q", match.Original, signature)
+			}
+			return
+		}
+	}
+	t.Fatalf("Azure SAS signature was not detected in %q", input)
+}
+
+func TestDefaultMatcher_ProviderKeyGlueParity(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	cases := []struct {
+		name  string
+		key   string
+		class Class
+	}{
+		{"google-api", "AIza" + strings.Repeat("A", 35), ClassGoogleAPIKey},
+		{"fireworks", "fw_" + strings.Repeat("A", 22), ClassFireworksAPIKey},
+		{"llm-router", "sk-or-v1-" + strings.Repeat("A", 24), ClassAIProviderKey},
+		{"answer-engine", "pplx-" + strings.Repeat("A", 24), ClassAIProviderKey},
+		{"web-research", "tvly-" + strings.Repeat("A", 24), ClassAIProviderKey},
+		{"huggingface", "hf_" + strings.Repeat("A", 37), ClassHuggingFaceToken},
+		{"databricks", "dapi" + strings.Repeat("a", 32), ClassDatabricksPAT},
+		{"replicate", "r8_" + strings.Repeat("a", 40), ClassReplicateAPIToken},
+		{"together", "tok_" + strings.Repeat("a", 40), ClassTogetherAIKey},
+		{"pinecone", "pcsk_" + strings.Repeat("A", 40), ClassAIProviderKey},
+		{"groq", "gsk_" + strings.Repeat("A", 48), ClassAIProviderKey},
+		{"xai", "xai-" + strings.Repeat("A", 80), ClassAIProviderKey},
+		{"vault", "hvs." + strings.Repeat("A", 24), ClassVaultToken},
+		{"supabase", "sb_secret_" + strings.Repeat("A", 22) + "_" + strings.Repeat("B", 8), ClassSupabaseKey},
+		{"linear", "lin_api_" + strings.Repeat("A", 40), ClassLinearAPIKey},
+		{"sentry", "sntrys_" + strings.Repeat("A", 40), ClassSentryAuthToken},
+		// Round 2: source-control, messaging, package-registry, platform tokens
+		{"github-ghp", "ghp_" + strings.Repeat("A", 36), ClassGitHubToken},
+		{"github-ghs-stateless", "ghs_eyJhbGciOiJFUzI1NiJ9." + strings.Repeat("A", 240) + "." + strings.Repeat("B", 220) + "-_", ClassGitHubToken},
+		{"github-pat", "github_pat_" + strings.Repeat("B", 36), ClassGitHubToken},
+		{"gitlab-pat", "glpat-" + strings.Repeat("C", 24), ClassGitLabToken},
+		{"gitlab-deploy", "gldt-" + strings.Repeat("D", 24), ClassGitLabToken},
+		{"gitlab-runner", "glrt-" + strings.Repeat("E", 24), ClassGitLabToken},
+		{"gitlab-ci", "glcbt-" + strings.Repeat("F", 24), ClassGitLabToken},
+		{"gitlab-pipeline", "glptt-" + strings.Repeat("A", 24), ClassGitLabToken},
+		{"gitlab-oauth", "gloas-" + strings.Repeat("B", 24), ClassGitLabToken},
+		{"gitlab-scim", "glsoat-" + strings.Repeat("C", 24), ClassGitLabToken},
+		{"gitlab-service", "glft-" + strings.Repeat("D", 24), ClassGitLabToken},
+		{"slack-xoxb", "xoxb-" + strings.Repeat("1", 15) + "-" + strings.Repeat("a", 10), ClassSlackToken},
+		{"npm", "npm_" + strings.Repeat("E", 36), ClassNPMToken},
+		{"pypi", "pypi-AgE" + strings.Repeat("F", 90), ClassPyPIToken},
+		{"notion", "ntn_" + strings.Repeat("A", 40), ClassNotionAPIKey},
+		{"vercel", "vercel_" + strings.Repeat("B", 24), ClassVercelToken},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			input := "prefixZ" + tc.key
+			for _, got := range m.Scan(input) {
+				if got.Class == tc.class && got.Original == tc.key {
+					return
+				}
+			}
+			t.Fatalf("glued provider key was not redacted as %s in %q", tc.class, input)
+		})
+	}
+}
+
+// TestDefaultMatcher_IPv6DoesNotMatchScopeOperator guards against the
+// false-positive from review finding #4 (2026-04-19): the earlier IPv6
+// regex accepted any `[A-Fa-f0-9:]*::[A-Fa-f0-9:]*` including `::` alone
+// and C++ scope operators like `std::cout`.
+func TestDefaultMatcher_IPv6DoesNotMatchScopeOperator(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+	shouldNotMatch := []string{
+		"std::cout is the output stream",
+		"call foo::bar(x) to run",
+		"the :: operator is C++",
+	}
+	for _, s := range shouldNotMatch {
+		t.Run(s, func(t *testing.T) {
+			t.Parallel()
+			for _, mv := range m.Scan(s) {
+				if mv.Class == ClassIPv6 {
+					t.Fatalf("IPv6 falsely matched in %q: %+v", s, mv)
+				}
+			}
+		})
+	}
+
+	// Real compressed IPv6 must still match.
+	shouldMatch := []string{"::1", "fe80::1", "2001:db8::1"}
+	for _, s := range shouldMatch {
+		t.Run(s, func(t *testing.T) {
+			t.Parallel()
+			found := false
+			for _, mv := range m.Scan(s) {
+				if mv.Class == ClassIPv6 {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("IPv6 failed to match legitimate address %q: scans=%+v", s, m.Scan(s))
+			}
+		})
+	}
+}
+
+// TestDefaultMatcher_Negative verifies non-secret content does not match.
+func TestDefaultMatcher_Negative(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	// Note: FQDN detection is class-level best-effort. Common file
+	// extensions (foo.txt, config.yaml) will sometimes match. v1 accepts
+	// this trade-off - operators who need finer control use dictionaries.
+	cases := []string{
+		"", // empty
+		"just a normal sentence about http and https",   // no identifiers
+		"version 1.2.3 shipped yesterday",               // not a FQDN
+		"this is a plain english sentence with no dots", // nothing to match
+		// Bare hex strings of hash-shape lengths must NOT match a hash
+		// class without a contextual prefix. These are the SaaS-OAuth-
+		// client-secret class of values: opaque hex blobs that look like
+		// SHA-256 digests but are credentials, not hashes. Regression
+		// test for the PR #635 redaction passthrough work.
+		"client_secret=" + strings.Repeat("a", 64),  // 64 hex, no sha256 prefix
+		"refresh_token=" + strings.Repeat("b", 128), // 128 hex, no sha512 prefix
+		strings.Repeat("c", 64),                     // bare 64-hex (would have matched pre-fix)
+		strings.Repeat("d", 128),                    // bare 128-hex
+		strings.Repeat("e", 40),                     // bare 40-hex
+		strings.Repeat("f", 32),                     // bare 32-hex
+		// Issue #1308: only AKIA/ASIA are redactable AWS access-key IDs.
+		// IAM resource-ID prefixes and obfuscated/overlong forms are still
+		// caught by the detection floor but must NOT be redacted (they fail
+		// closed instead of being rewritten).
+		"AIDA" + "IOSFODNN7EXAMPLE",          // IAM user ID prefix, not an access key
+		"AGPA" + "IOSFODNN7EXAMPLE",          // IAM group ID prefix
+		"AROA" + "IOSFODNN7EXAMPLE",          // IAM role ID prefix
+		"AKIA" + "IOSFODNN7EXAMPLE" + "ABCD", // overlong: no trailing word boundary
+		"akia" + "iosfodnn7example",          // lowercase: class is case-sensitive
+		"AKIA" + " " + "IOSFODNN7EXAMPLE",    // whitespace-split: not a contiguous span
+	}
+	for _, s := range cases {
+		t.Run(s, func(t *testing.T) {
+			t.Parallel()
+			if got := m.Scan(s); len(got) != 0 {
+				t.Fatalf("Scan(%q) = %+v; wanted no matches", s, got)
+			}
+		})
+	}
+}
+
+// TestDefaultMatcher_OverlapsResolvedByPriority confirms that when a span
+// matches multiple classes, the highest-priority class wins.
+func TestDefaultMatcher_OverlapsResolvedByPriority(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	// CIDR covers IPv4 + `/N`. Priority table puts CIDR above IPv4.
+	s := "route 10.0.0.0/16 somewhere"
+	matches := m.Scan(s)
+	if len(matches) != 1 {
+		t.Fatalf("expected 1 match (CIDR absorbs IPv4), got %d: %+v", len(matches), matches)
+	}
+	if matches[0].Class != ClassCIDR {
+		t.Fatalf("expected ClassCIDR, got %s", matches[0].Class)
+	}
+}
+
+func TestDefaultMatcher_EnvSecretAbsorbsEmbeddedToken(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+	s := fakeTelegramEnvSecret()
+
+	matches := m.Scan(s)
+	if len(matches) != 1 {
+		t.Fatalf("expected env assignment to redact as one span, got %d: %+v", len(matches), matches)
+	}
+	if matches[0].Class != ClassEnvSecret {
+		t.Fatalf("expected ClassEnvSecret to win overlap, got %s", matches[0].Class)
+	}
+	if matches[0].Original != s {
+		t.Fatalf("env assignment span = %q, want full assignment", matches[0].Original)
+	}
+}
+
+func fakeTelegramEnvSecret() string {
+	return "TELEGRAM_" + "BOT_" + "TOK" + "EN=1234567890:" + strings.Repeat("F", 35)
+}
+
+// TestDefaultMatcher_SpansAreNonOverlapping sorted and non-overlapping.
+func TestDefaultMatcher_SpansAreNonOverlapping(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+	s := "a@b.com 10.0.0.1 dc01.corp.local 10.0.0.2 user@domain.org"
+	matches := m.Scan(s)
+	if len(matches) < 2 {
+		t.Fatalf("expected multiple matches, got %d", len(matches))
+	}
+	for i := 1; i < len(matches); i++ {
+		if matches[i-1].End > matches[i].Start {
+			t.Errorf("matches[%d].End=%d overlaps matches[%d].Start=%d",
+				i-1, matches[i-1].End, i, matches[i].Start)
+		}
+	}
+}
+
+// TestDefaultMatcher_NilSafe ensures a nil Matcher returns nil without
+// panicking (defensive).
+func TestDefaultMatcher_NilSafe(t *testing.T) {
+	t.Parallel()
+	var m *Matcher
+	if got := m.Scan("anything"); got != nil {
+		t.Fatalf("nil Matcher Scan returned %+v, want nil", got)
+	}
+}
+
+// TestDefaultRegistry_Cached ensures the compiled registry is stable across
+// calls (same pointer-equal slice entries).
+func TestDefaultRegistry_Cached(t *testing.T) {
+	t.Parallel()
+	a := defaultRegistry()
+	b := defaultRegistry()
+	if len(a) != len(b) {
+		t.Fatalf("registry length changed: %d vs %d", len(a), len(b))
+	}
+	// Cached: first pattern's compiled regex pointer must match.
+	if a[0].pattern != b[0].pattern {
+		t.Fatalf("registry not cached: pointer identity broke")
+	}
+}

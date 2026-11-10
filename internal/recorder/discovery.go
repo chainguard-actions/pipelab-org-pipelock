@@ -1,0 +1,365 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package recorder
+
+import (
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+var (
+	compactStageDirPattern   = regexp.MustCompile(`^\.pipelock-evidence-compact-[[:alnum:]]{6,12}$`)
+	compactArchiveDirPattern = regexp.MustCompile(`^\.pipelock-evidence-archive-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z$`)
+)
+
+// EvidenceLocation identifies an evidence-file directory below an
+// operator-supplied evidence root. ID is empty for the legacy flat layout and
+// otherwise is a slash-separated path relative to the root.
+type EvidenceLocation struct {
+	Root string
+	ID   string
+	Dir  string
+}
+
+// DiscoverEvidenceLocations finds evidence-file directories under root without
+// following symlinks. Each location holds its immediate evidence files. Any
+// unreadable path or symlink fails closed so missing evidence cannot look
+// absent.
+func DiscoverEvidenceLocations(root string) ([]EvidenceLocation, error) {
+	return discoverEvidenceLocations(root, nil, nil)
+}
+
+// discoverEvidenceLocations anchors traversal to an opened root. The optional
+// hooks let tests replace the pathname around the final root open.
+func discoverEvidenceLocations(root string, beforeRootOpen, afterRootOpen func()) ([]EvidenceLocation, error) {
+	if err := refuseSymlinkInWalkedRootPath(root); err != nil {
+		return nil, err
+	}
+	cleanRoot, err := absEvidenceRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve evidence root: %w", err)
+	}
+	initialInfo, err := validateEvidenceRootComponents(cleanRoot)
+	if err != nil {
+		return nil, err
+	}
+	if !initialInfo.IsDir() {
+		return nil, fmt.Errorf("evidence root %q is not a directory", root)
+	}
+	// Pin every component before opening the root by pathname. A replaced
+	// ancestor can otherwise redirect OpenRoot after the pathname checks.
+	secureRoot, err := openEvidenceLocationDirectory(EvidenceLocation{Root: cleanRoot, Dir: cleanRoot})
+	if err != nil {
+		return nil, fmt.Errorf("open evidence root securely: %w", err)
+	}
+	defer func() { _ = secureRoot.Close() }()
+	secureInfo, err := secureRoot.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat securely opened evidence root: %w", err)
+	}
+	if beforeRootOpen != nil {
+		beforeRootOpen()
+	}
+	rootHandle, err := os.OpenRoot(cleanRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open evidence root: %w", err)
+	}
+	defer func() { _ = rootHandle.Close() }()
+	if afterRootOpen != nil {
+		afterRootOpen()
+	}
+	info, err := validateEvidenceRootComponents(cleanRoot)
+	if err != nil {
+		return nil, err
+	}
+	rootedInfo, err := rootHandle.Stat(".")
+	if err != nil {
+		return nil, fmt.Errorf("stat opened evidence root: %w", err)
+	}
+	if !os.SameFile(secureInfo, rootedInfo) || !os.SameFile(info, rootedInfo) {
+		return nil, fmt.Errorf("evidence root changed while opening: %q", root)
+	}
+
+	locations := make([]EvidenceLocation, 0)
+	rootFS := rootHandle.FS()
+	err = fs.WalkDir(rootFS, ".", func(relPath string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return fmt.Errorf("read evidence path %q: %w", relPath, walkErr)
+		}
+		if entry.IsDir() && relPath != "." && isReservedEvidenceCeremonyDir(entry.Name()) {
+			return fs.SkipDir
+		}
+		entryInfo, infoErr := entry.Info()
+		if infoErr != nil {
+			return fmt.Errorf("stat evidence path %q: %w", relPath, infoErr)
+		}
+		if entryInfo.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%w: refuse symlink in evidence root: %q", ErrEvidenceRefused, relPath)
+		}
+		if !entryInfo.IsDir() {
+			return nil
+		}
+		hasEvidence, readErr := directoryHasEvidenceFiles(rootFS, relPath)
+		if readErr != nil {
+			return fmt.Errorf("read evidence directory %q: %w", relPath, readErr)
+		}
+		if !hasEvidence {
+			return nil
+		}
+		id := ""
+		dir := cleanRoot
+		if relPath != "." {
+			id = relPath
+			dir = filepath.Join(cleanRoot, filepath.FromSlash(relPath))
+		}
+		locations = append(locations, EvidenceLocation{Root: cleanRoot, ID: id, Dir: dir})
+		// A directory containing evidence is a location, not a chain boundary.
+		// Descendants can hold independent evidence files and must be discovered
+		// so a reader never mistakes a partial traversal for complete evidence.
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(locations, func(i, j int) bool { return locations[i].ID < locations[j].ID })
+	return locations, nil
+}
+
+func isReservedEvidenceCeremonyDir(name string) bool {
+	return compactStageDirPattern.MatchString(name) || compactArchiveDirPattern.MatchString(name)
+}
+
+// isPlainRelative reports whether root is resolved from the working directory:
+// relative, with no volume and no leading separator.
+func isPlainRelative(root string) bool {
+	return !filepath.IsAbs(root) && filepath.VolumeName(root) == "" &&
+		(root == "" || !os.IsPathSeparator(root[0]))
+}
+
+// physicalWorkingDir returns the working directory with symlinks resolved.
+// os.Getwd returns the shell's logical $PWD when it names the current
+// directory, but the kernel resolves a relative path from the physical
+// directory, so a relative root is judged from there. A shell that reached
+// its directory through a symlink redirects nothing the operator typed.
+func physicalWorkingDir() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(wd)
+}
+
+// absEvidenceRoot returns the absolute, cleaned evidence root. A relative root
+// is joined to the physical working directory. Cleaning is lexical, so callers
+// run refuseSymlinkInWalkedRootPath first: once no walked component is a
+// symlink or a non-directory before "..", the lexical path is the one the
+// operating system opens.
+func absEvidenceRoot(root string) (string, error) {
+	if !isPlainRelative(root) {
+		return filepath.Abs(filepath.Clean(root))
+	}
+	wd, err := physicalWorkingDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(wd, root), nil
+}
+
+// refuseSymlinkInWalkedRootPath applies the no-symlink root rule to the path
+// the operating system walks, before any lexical cleaning. filepath.Clean
+// turns "link/../ev" into "ev", so validating only the cleaned path never
+// sees the symlink the open would follow, and the verifier reads a different
+// directory from the one the operator's path names.
+func refuseSymlinkInWalkedRootPath(root string) error {
+	raw := root
+	if isPlainRelative(raw) {
+		wd, err := physicalWorkingDir()
+		if err != nil {
+			return fmt.Errorf("resolve evidence root: %w", err)
+		}
+		raw = wd + string(filepath.Separator) + raw
+	} else if volume := filepath.VolumeName(raw); !filepath.IsAbs(raw) && len(volume) == 2 && volume[1] == ':' {
+		// A Windows drive-relative path uses that drive's working directory,
+		// which can differ from the process working directory.
+		driveWD, err := filepath.Abs(volume + ".")
+		if err != nil {
+			return fmt.Errorf("resolve evidence root: %w", err)
+		}
+		raw = driveWD + string(filepath.Separator) + raw[len(volume):]
+	} else if len(raw) > 0 && os.IsPathSeparator(raw[0]) && !filepath.IsAbs(raw) {
+		// A Windows path rooted at a separator uses the current volume's root.
+		// Resolve only that root; cleaning the full path would hide link/...
+		volumeRoot, err := filepath.Abs(string(filepath.Separator))
+		if err != nil {
+			return fmt.Errorf("resolve evidence root: %w", err)
+		}
+		raw = volumeRoot + raw[1:]
+	} else if !filepath.IsAbs(raw) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("resolve evidence root: %w", err)
+		}
+		raw = wd + string(filepath.Separator) + raw
+	}
+	volume := filepath.VolumeName(raw)
+	current := volume + string(filepath.Separator)
+	for _, component := range strings.FieldsFunc(raw[len(volume):], func(r rune) bool {
+		return r == filepath.Separator || r == '/'
+	}) {
+		switch component {
+		case ".":
+			continue
+		case "..":
+			// Every component walked so far was checked and is not a
+			// symlink, so the lexical parent is the physical parent. The
+			// operating system can climb out of a directory only: "file/.."
+			// fails with ENOTDIR, so it must not verify here either.
+			info, err := os.Lstat(current)
+			if err != nil {
+				return fmt.Errorf("stat evidence root component %q: %w", current, err)
+			}
+			if !info.IsDir() {
+				return fmt.Errorf("evidence root component %q is not a directory", current)
+			}
+			current = filepath.Dir(current)
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("stat evidence root component %q: %w", current, err)
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("%w: refuse symlink in evidence root path: %q", ErrEvidenceRefused, current)
+		}
+	}
+	return nil
+}
+
+// validateEvidenceRootComponents checks from the filesystem root down so a
+// symlinked ancestor is rejected before any descendant under its target is
+// inspected.
+func validateEvidenceRootComponents(cleanRoot string) (fs.FileInfo, error) {
+	components := make([]string, 0)
+	for component := cleanRoot; ; component = filepath.Dir(component) {
+		components = append(components, component)
+		if parent := filepath.Dir(component); parent == component {
+			break
+		}
+	}
+
+	var rootInfo fs.FileInfo
+	for i := len(components) - 1; i >= 0; i-- {
+		component := components[i]
+		info, err := os.Lstat(component)
+		if err != nil {
+			return nil, fmt.Errorf("stat evidence root component %q: %w", component, err)
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return nil, fmt.Errorf("%w: refuse symlink in evidence root path: %q", ErrEvidenceRefused, component)
+		}
+		if component == cleanRoot {
+			rootInfo = info
+		}
+	}
+	return rootInfo, nil
+}
+
+func directoryHasEvidenceFiles(rootFS fs.FS, dir string) (bool, error) {
+	entries, err := fs.ReadDir(rootFS, dir)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		entryInfo, infoErr := entry.Info()
+		if infoErr != nil {
+			return false, infoErr
+		}
+		if entryInfo.Mode()&fs.ModeSymlink != 0 {
+			return false, fmt.Errorf("%w: refuse symlink in evidence directory: %q", ErrEvidenceRefused, path.Join(dir, entry.Name()))
+		}
+		if entryInfo.IsDir() {
+			continue
+		}
+		if _, _, ok := ParseEvidenceFilename(entry.Name()); ok {
+			return true, nil
+		}
+		if isEvidenceRawSidecar(entry.Name()) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func isEvidenceRawSidecar(name string) bool {
+	if !strings.HasSuffix(name, ".raw.enc") {
+		return false
+	}
+	base := strings.TrimSuffix(name, ".raw.enc") + ".jsonl"
+	_, _, ok := ParseEvidenceFilename(base)
+	return ok
+}
+
+// ResolveEvidenceLocation returns the evidence-file location a reader may
+// consume. An empty locationID preserves legacy behavior when exactly one
+// location exists. It refuses an ambiguous root rather than silently choosing
+// a location.
+func ResolveEvidenceLocation(root, locationID string) (EvidenceLocation, error) {
+	locations, err := DiscoverEvidenceLocations(root)
+	if err != nil {
+		return EvidenceLocation{}, err
+	}
+	if locationID != "" {
+		cleanID, cleanErr := cleanEvidenceLocationID(locationID)
+		if cleanErr != nil {
+			return EvidenceLocation{}, cleanErr
+		}
+		for _, location := range locations {
+			if location.ID == cleanID {
+				return location, nil
+			}
+		}
+		return EvidenceLocation{}, fmt.Errorf("evidence location %q not found", locationID)
+	}
+	if len(locations) == 0 {
+		cleanRoot, absErr := absEvidenceRoot(root)
+		if absErr != nil {
+			return EvidenceLocation{}, fmt.Errorf("resolve evidence root: %w", absErr)
+		}
+		return EvidenceLocation{Root: cleanRoot, Dir: cleanRoot}, nil
+	}
+	if len(locations) == 1 {
+		return locations[0], nil
+	}
+	ids := make([]string, 0, len(locations))
+	for _, location := range locations {
+		if location.ID == "" {
+			ids = append(ids, ".")
+			continue
+		}
+		ids = append(ids, location.ID)
+	}
+	return EvidenceLocation{}, fmt.Errorf("multiple evidence locations found (%s); select one location", strings.Join(ids, ", "))
+}
+
+func cleanEvidenceLocationID(locationID string) (string, error) {
+	if filepath.IsAbs(locationID) {
+		return "", errors.New("evidence location must be relative to the evidence root")
+	}
+	if locationID == "." {
+		return "", nil
+	}
+	clean := filepath.Clean(locationID)
+	if clean == "." || clean == "" || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("evidence location must name a descendant directory")
+	}
+	return filepath.ToSlash(clean), nil
+}

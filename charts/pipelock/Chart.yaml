@@ -1,0 +1,52 @@
+apiVersion: v2
+name: pipelock
+description: Agent firewall for AI agents. Network scanning, process containment, and tool policy enforcement.
+type: application
+# The chart version tracks the Pipelock version it deploys, and the release
+# gate enforces that both equal the release tag. The chart publishes to an
+# OCI registry under this version as the tag, so a version that did not move
+# every release would overwrite the previously published chart in place.
+version: 3.8.0
+appVersion: "3.8.0"
+home: https://pipelab.org
+sources:
+  - https://github.com/pipelab-org/pipelock
+maintainers:
+  - name: Josh Waldrep
+    url: https://github.com/luckyPipewrench
+keywords:
+  - ai-security
+  - agent-firewall
+  - mcp
+  - dlp
+  - prompt-injection
+  - egress-control
+icon: https://raw.githubusercontent.com/pipelab-org/pipelock/main/assets/pipelock-logo.svg
+annotations:
+  # This is the license of THE CHART, not of the application it deploys, and
+  # Artifact Hub requires a single SPDX identifier here rather than an
+  # expression. These templates live outside enterprise/, so NOTICE puts them
+  # under Apache-2.0. The deployed image is dual-licensed and says so where a
+  # consumer of the image will actually look: the org.opencontainers.image
+  # labels on the image itself, and the Homebrew formula for the binary.
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/containsSecurityUpdates: "true"
+  artifacthub.io/changesURL: https://github.com/pipelab-org/pipelock/releases
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://pipelab.org/learn/
+    - name: Release notes
+      url: https://github.com/pipelab-org/pipelock/releases
+    - name: Receipt verifier (Python)
+      url: https://github.com/luckyPipewrench/pipelock-verify-python
+  artifacthub.io/changes: |
+    - kind: changed
+      description: Pipelock appVersion 3.8.0. Upgrade notes cover dedicated metrics, the container registry move, expiring scanner exceptions and managed containment units.
+    - kind: added
+      description: Synchronous configuration reload, service-aware validation, explicit prompt-injection wording policy and bounded partial inspection of oversized JSON responses.
+    - kind: changed
+      description: Images default to ghcr.io/pipelab-org; proxy Pods have a private writable home while the root filesystem remains read-only. Evidence and follower persistence still require separate storage.
+    - kind: security
+      description: Metrics no longer appear on the agent-facing proxy port. Configure a dedicated listener and restrict direct agent access.
+    - kind: fixed
+      description: Containment activation and rollback, MCP mirrored-header contracts and refusal evidence, response rewrite findings, structured scanning and recorder restart handling.

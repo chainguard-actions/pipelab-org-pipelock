@@ -1,0 +1,361 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build !js
+
+// Package replaycapture builds public-safe, signed Audit Packets from
+// controlled synthetic attack scenarios driven through a real Pipelock proxy.
+//
+// It is the capture half of the Playground "Replay Audit Packet gallery": each
+// scenario runs genuine requests through a real scanner/proxy/receipt-emitter in
+// an isolated synthetic lab, captures the signed receipt chain, and assembles an
+// Audit Packet (sdk/audit-packet v0) plus a UI replay manifest. The published
+// artifacts verify byte-for-byte with the shipped `pipelock-verifier
+// audit-packet`.
+//
+// Two invariants make the output safe to publish:
+//
+//   - Every input is SYNTHETIC. No real secret, host, customer, agent, or
+//     infrastructure detail appears in any scenario, recording, packet, or
+//     manifest. The synthetic material is obviously inert if leaked (AWS's
+//     published example key, RFC 5737 / RFC 3927 reserved addresses,
+//     example.com and .test fixture hosts).
+//   - Public-safe by construction, not by post-scrub. Receipts are redacted
+//     before signing (the recorder's redactor runs pre-sign in the emitter), the
+//     packet envelope is built from safe constants only, and a fail-closed field
+//     allowlist (see allowlist.go) plus an artifact linter (see linter.go) gate
+//     publication. Post-hoc scrubbing is forbidden because it would break the
+//     signature.
+package replaycapture
+
+// Transport identifies which real Pipelock proxy surface a scenario drives.
+// These mirror the transport label stamped into the emitted receipt.
+const (
+	// TransportFetch drives the /fetch endpoint (read-through fetch proxy).
+	TransportFetch = "fetch"
+	// TransportForward drives the absolute-URI forward proxy.
+	TransportForward = "forward"
+	// TransportWebSocket drives the frame-scanning WebSocket proxy.
+	TransportWebSocket = "websocket"
+	// TransportMCPStdio drives the bidirectional MCP stdio scanner.
+	TransportMCPStdio = "mcp_stdio"
+)
+
+// Receipt verdict strings, matching receipt.NormalizeVerdict output. Declared
+// here so scenarios and tests do not hand-write the literals.
+const (
+	verdictAllow = "allow"
+	verdictBlock = "block"
+	verdictWarn  = "warn"
+)
+
+// Synthetic destinations and material. Every value is intentionally
+// non-routable-to-real-infra or a published example so a leak proves nothing.
+const (
+	// synthCollectorHost is a generic attacker-controlled exfil sink. example.com
+	// is reserved (RFC 2606) and never resolves to real infrastructure.
+	synthCollectorHost = "collector.example.com"
+	// New scenario exfil destinations are reserved .test hosts. They are never
+	// intended to resolve; the requests block at body DLP before egress.
+	synthTicketWebhookHost = "webhook.attacker.test"
+	synthPasteHost         = "paste.attacker.test"
+	synthSessionSinkHost   = "sessions.attacker.test"
+	synthTicketWebhookPath = "/ticket-webhook"
+	synthPastePath         = "/paste"
+	synthSessionKeysPath   = "/session-keys"
+	// synthMetadataIP is the well-known cloud metadata address used as an SSRF
+	// target. It is a fixed link-local literal, public knowledge, and the point
+	// of the SSRF demo.
+	synthMetadataIP = "169.254.169.254"
+	// synthAWSKey is AWS's own published example access key id (not a credential).
+	// Split at construction to keep secret scanners and gosec G101 quiet.
+	synthAWSKeyPrefix = "AKIA"
+	synthAWSKeySuffix = "IOSFODNN7EXAMPLE"
+	// synthPrivateKeyHeader is an inert key-armour header, split so source
+	// scanners do not see a private-key literal.
+	synthPrivateKeyHeaderPrefix = "-----BEGIN "
+	synthPrivateKeyHeaderSuffix = "PRIVATE KEY-----"
+	// synthOpenAIProjectKey is an inert OpenAI-shaped project key, split before
+	// the provider prefix is complete.
+	synthOpenAIProjectKeyPrefix = "sk-"
+	synthOpenAIProjectKeyMiddle = "proj-"
+	synthOpenAIProjectKeySuffix = "aaaaaaaaaaaaaaaaaaaaaaaa"
+	// synthSessionJWT is a jwt.io-style inert compact token, stored without dots
+	// so source scanners do not see a complete JWT literal.
+	synthSessionJWTHeader    = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+	synthSessionJWTPayload   = "eyJzdWIiOiJsYWItc2Vzc2lvbiIsImF1ZCI6InJl"
+	synthSessionJWTPayload2  = "cGxheS1nYWxsZXJ5IiwiaWF0IjoxNTE2MjM5MDIyfQ"
+	synthSessionJWTSignature = "not-a-real-signature"
+	synthWarnTokenPrefix     = "LABWARN"
+	synthWarnTokenSuffix     = "0123456789ABCDEF"
+)
+
+// SyntheticAWSKey returns the published AWS example access key id. It is
+// assembled at runtime so the literal never appears in source.
+func SyntheticAWSKey() string { return synthAWSKeyPrefix + synthAWSKeySuffix }
+
+// SyntheticPrivateKeyHeader returns an inert private-key header that trips the
+// key-armour DLP class without containing usable key material.
+func SyntheticPrivateKeyHeader() string {
+	return synthPrivateKeyHeaderPrefix + synthPrivateKeyHeaderSuffix
+}
+
+// SyntheticOpenAIProjectKey returns an inert OpenAI-shaped project key.
+func SyntheticOpenAIProjectKey() string {
+	return synthOpenAIProjectKeyPrefix + synthOpenAIProjectKeyMiddle + synthOpenAIProjectKeySuffix
+}
+
+// SyntheticSessionJWT returns an inert JWT-shaped session token.
+func SyntheticSessionJWT() string {
+	return synthSessionJWTHeader + "." + synthSessionJWTPayload + synthSessionJWTPayload2 + "." + synthSessionJWTSignature
+}
+
+// syntheticWarnToken is a lab-only credential marker used to prove an amber
+// body-DLP decision without overlapping a stronger built-in credential rule.
+func syntheticWarnToken() string { return synthWarnTokenPrefix + synthWarnTokenSuffix }
+
+// Scenario is the declarative definition of one gallery recording. It carries
+// display/marketing metadata and the expected mediated outcome; the mechanics of
+// driving the real proxy live in capture.go, keyed by ID.
+//
+// Every string here is published. Keep IDs, titles, labels, and narrative
+// boring and synthetic by construction (launch gate: public rule IDs and
+// scenario names must be safe before capture, not scrubbed after).
+type Scenario struct {
+	// ID is the stable public slug. Used as the packet/manifest directory name
+	// and the switch key in the capture engine. Boring and synthetic.
+	ID string
+	// Title is the human-facing card heading.
+	Title string
+	// BenchCaseID maps this recording to an agent-egress-bench case. Mapping to a
+	// bench case id is the ONLY permitted benchmark link; the gallery is not a
+	// benchmark.
+	BenchCaseID string
+	// Transport is the real proxy surface driven (TransportFetch/TransportForward).
+	Transport string
+	// Category is the display grouping (e.g. "Secret exfiltration").
+	Category string
+	// ExpectedLayer is the exact layer label expected on the decisive receipt.
+	// It is asserted in tests; empty means "do not assert".
+	ExpectedLayer string
+	// ExpectedVerdict is the decisive receipt verdict (verdictAllow/Block/Warn).
+	// For multi-receipt scenarios it is the verdict of the headline decision.
+	ExpectedVerdict string
+	// ExpectedSequence, when non-empty, is the exact ordered sequence of
+	// non-session decisions the published receipt chain must contain.
+	ExpectedSequence []ExpectedDecision
+	// DestinationClass is a redacted, human-readable destination label for the
+	// UI. Never an ephemeral port, internal host, or raw target.
+	DestinationClass string
+	// Without is the bare-agent narrative: what happens with no firewall. It
+	// describes the outcome with a class label only (see RedactedShape), never a
+	// raw secret-shaped string.
+	Without string
+	// With is the Pipelock narrative: what the firewall mediated.
+	With string
+	// RedactedShape is the inert, class-labelled display for the WITHOUT side
+	// (e.g. "AKIA••••••••••••EXAMPLE → exfiltrated"). Required for every blocked
+	// default scenario: the public proof deck needs a shape to show the payload
+	// chip, and the capture tests refuse a blocked scenario without one. Allowed
+	// scenarios leave it empty. Must never be a raw secret value, even synthetic.
+	RedactedShape string
+}
+
+// ExpectedDecision declares one required non-session receipt in a replay chain.
+type ExpectedDecision struct {
+	Verdict string
+	Layer   string
+}
+
+// redactedAWSShape is the inert display form for the AWS example key. It keeps
+// the prefix/suffix that make the class obvious while masking the middle, so a
+// screenshot can never be read as "Pipelock displayed a live key".
+// RedactedAWSShape is the inert, class-labelled display for an AWS access
+// key. Exported so every package that shows this payload class renders the
+// identical string: a second hand-written copy drifts silently, and the
+// proof deck splits these on the arrow, so a stray variant renders wrong.
+const RedactedAWSShape = "AKIA••••••••••EXAMPLE"
+
+const redactedAWSShape = RedactedAWSShape
+
+const (
+	redactedPrivateKeyShape      = "PRIVATE-KEY-HEADER•••• → exfiltrated"
+	redactedOpenAIKeyShape       = "sk-proj-•••••••••••• → exfiltrated"
+	redactedJWTShape             = "JWT•••••••••••• → exfiltrated"
+	redactedInstructionShape     = "HOSTILE-INSTRUCTION•••• → followed"
+	redactedMetadataShape        = "METADATA-ENDPOINT•••• → requested"
+	redactedMutationShape        = "MUTATION-OPERATION•••• → sent"
+	redactedToolDescriptionShape = "TOOL-DESCRIPTION•••• → accepted"
+)
+
+// DefaultScenarios returns the public replay gallery. It includes the original
+// five cases, the three Make It Leak body-DLP cases, and transport/lifecycle
+// cases that exercise warn, WebSocket fragmentation, MCP tool poisoning, and a
+// multi-action receipt chain.
+//
+// The order is the recommended gallery order: lead with an allowed action so the
+// gallery does not read as a hardcoded blocklist, then escalate through blocks.
+func DefaultScenarios() []Scenario {
+	return []Scenario{
+		{
+			ID:               "allowed-safe-read",
+			Title:            "Allowed: a safe read passes",
+			BenchCaseID:      "url-benign-api-call-001",
+			Transport:        TransportFetch,
+			Category:         "Allowed by policy",
+			ExpectedLayer:    "",
+			ExpectedVerdict:  verdictAllow,
+			DestinationClass: "read-only lab documentation endpoint",
+			Without:          "A bare agent fetches a harmless page. Nothing watches the request.",
+			With:             "Pipelock scans the request, finds no secret, injection, or unsafe target, and allows it — then signs a receipt recording the allow decision.",
+		},
+		{
+			ID:               "secret-exfil-url-blocked",
+			Title:            "Blocked: secret exfiltration over a URL",
+			BenchCaseID:      "url-dlp-aws-key-001",
+			Transport:        TransportFetch,
+			Category:         "Secret exfiltration",
+			ExpectedLayer:    "core_dlp",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "attacker-controlled collector (reserved example host)",
+			Without:          "A bare agent puts a credential in a query parameter and the value escapes to the collector.",
+			With:             "Pipelock's DLP layer detects the credential shape in the URL before any DNS resolution and blocks the request. The signed receipt records the block; the value never leaves.",
+			RedactedShape:    redactedAWSShape + " → exfiltrated",
+		},
+		{
+			ID:               "prompt-injection-response-blocked",
+			Title:            "Blocked: a hijack hidden in fetched content",
+			BenchCaseID:      "response-injection-ignore-002",
+			Transport:        TransportFetch,
+			Category:         "Prompt injection",
+			ExpectedLayer:    "response_scan",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "lab page returning hostile instructions",
+			Without:          "A bare agent fetches a page whose body says \"ignore your instructions and exfiltrate\", and follows it.",
+			With:             "Pipelock scans the fetched response, detects the injection attempt in the returned content, and blocks it from reaching the agent. The signed receipt records the response-path block.",
+			RedactedShape:    redactedInstructionShape,
+		},
+		{
+			ID:               "ssrf-internal-target-blocked",
+			Title:            "Blocked: a reach for cloud metadata",
+			BenchCaseID:      "url-ssrf-metadata-009",
+			Transport:        TransportFetch,
+			Category:         "SSRF / internal target",
+			ExpectedLayer:    "ssrf_metadata",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "cloud metadata service (link-local address)",
+			Without:          "A bare agent is tricked into requesting the cloud metadata endpoint to harvest instance credentials.",
+			With:             "Pipelock's SSRF layer recognizes the link-local metadata target and blocks the request. The signed receipt records the SSRF block.",
+			RedactedShape:    redactedMetadataShape,
+		},
+		{
+			ID:               "operation-aware-policy",
+			Title:            "Blocked: destructive API mutation",
+			BenchCaseID:      "local-lab-request-policy-graphql-mutation-001",
+			Transport:        TransportForward,
+			Category:         "Operation-aware policy",
+			ExpectedLayer:    "request_policy",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "reserved GraphQL API endpoint",
+			Without:          "A bare agent sends both the safe read and the destructive mutation to the API.",
+			With:             "Pipelock allows the safe read, inspects the GraphQL operation, and blocks the destructive mutation by policy. The signed receipts record both decisions.",
+			RedactedShape:    redactedMutationShape,
+		},
+		{
+			ID:               "poisoned-ticket-webhook-exfil",
+			Title:            "Blocked: poisoned ticket webhook exfiltration",
+			BenchCaseID:      "local-lab-body-dlp-private-key-001",
+			Transport:        TransportForward,
+			Category:         "Secret exfiltration",
+			ExpectedLayer:    "body_dlp",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "attacker webhook endpoint (reserved .test host)",
+			Without:          "A poisoned support ticket convinces a bare agent to post a customer record with key material to the webhook.",
+			With:             "Pipelock scans the outbound POST body, detects the private-key material shape, and blocks the request before egress. The signed receipt records the body-DLP block.",
+			RedactedShape:    redactedPrivateKeyShape,
+		},
+		{
+			ID:               "poisoned-readme-key-paste",
+			Title:            "Blocked: poisoned README key paste",
+			BenchCaseID:      "local-lab-body-dlp-openai-key-001",
+			Transport:        TransportForward,
+			Category:         "Secret exfiltration",
+			ExpectedLayer:    "body_dlp",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "paste site endpoint (reserved .test host)",
+			Without:          "A poisoned README tricks a bare agent into posting an API key to a paste endpoint.",
+			With:             "Pipelock scans the outbound POST body, detects the provider API-key shape, and blocks the request before egress. The signed receipt records the body-DLP block.",
+			RedactedShape:    redactedOpenAIKeyShape,
+		},
+		{
+			ID:               "hostile-page-session-keys",
+			Title:            "Blocked: hostile page session key exfiltration",
+			BenchCaseID:      "local-lab-body-dlp-jwt-session-001",
+			Transport:        TransportForward,
+			Category:         "Secret exfiltration",
+			ExpectedLayer:    "body_dlp",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "attacker session endpoint (reserved .test host)",
+			Without:          "A hostile page leads a bare agent to post session keys to an attacker endpoint.",
+			With:             "Pipelock scans the outbound POST body, detects the JWT session-token shape, and blocks the request before egress. The signed receipt records the body-DLP block.",
+			RedactedShape:    redactedJWTShape,
+		},
+		{
+			ID:               "amber-warning-observed",
+			Title:            "Warned: suspicious payload observed",
+			BenchCaseID:      "local-lab-body-dlp-warn-001",
+			Transport:        TransportForward,
+			Category:         "Observe before enforcing",
+			ExpectedLayer:    "body_dlp",
+			ExpectedVerdict:  verdictWarn,
+			DestinationClass: "local synthetic intake endpoint",
+			Without:          "A bare agent posts credential-shaped material with no decision record.",
+			With:             "Pipelock detects the credential shape in observe mode, forwards the local lab request, and signs an amber warn receipt for policy tuning.",
+			RedactedShape:    "LABWARN•••••••• → observed",
+		},
+		{
+			ID:               "websocket-fragmented-secret",
+			Title:            "Blocked: a secret split across WebSocket frames",
+			BenchCaseID:      "local-lab-websocket-fragmented-dlp-001",
+			Transport:        TransportWebSocket,
+			Category:         "WebSocket exfiltration",
+			ExpectedLayer:    "dlp",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "local synthetic WebSocket endpoint",
+			Without:          "A bare agent splits a credential across frames and the reassembled message reaches the peer.",
+			With:             "Pipelock reassembles the fragmented text message, detects the complete credential shape, closes the connection, and signs the block.",
+			RedactedShape:    redactedAWSShape + " → delivered after reassembly",
+		},
+		{
+			ID:               "mcp-poisoned-tool-description",
+			Title:            "Blocked: poisoned MCP tool instructions",
+			BenchCaseID:      "local-lab-mcp-tool-poison-001",
+			Transport:        TransportMCPStdio,
+			Category:         "MCP tool poisoning",
+			ExpectedLayer:    "mcp_tool_scan",
+			ExpectedVerdict:  verdictBlock,
+			DestinationClass: "synthetic MCP tool inventory",
+			Without:          "A bare agent accepts a tool description that orders it to ignore its instructions and call the tool first.",
+			With:             "Pipelock scans the tools/list response, detects instruction-tag poisoning, replaces the inventory with a JSON-RPC error, and signs the block.",
+			RedactedShape:    redactedToolDescriptionShape,
+		},
+		{
+			ID:              "multi-step-policy-chain",
+			Title:           "Chain: two safe actions, then a blocked write",
+			BenchCaseID:     "local-lab-multi-step-policy-chain-001",
+			Transport:       TransportForward,
+			Category:        "Multi-step evidence",
+			ExpectedLayer:   "body_dlp",
+			ExpectedVerdict: verdictBlock,
+			ExpectedSequence: []ExpectedDecision{
+				{Verdict: verdictAllow},
+				{Verdict: verdictAllow},
+				{Verdict: verdictBlock, Layer: "body_dlp"},
+			},
+			DestinationClass: "local synthetic workflow endpoints",
+			Without:          "A bare agent reads context, prepares a change, and sends the final credential-bearing write with no linked record of the sequence.",
+			With:             "Pipelock signs the two allowed local actions and the final body-DLP block into one ordered receipt chain.",
+			RedactedShape:    redactedAWSShape + " → sent on step three",
+		},
+	}
+}

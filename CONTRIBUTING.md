@@ -1,0 +1,296 @@
+# Contributing to Pipelock
+
+Thanks for your interest in making AI agents more secure.
+
+## Prerequisites
+
+- Go 1.26+ (`go version`)
+- [golangci-lint](https://golangci-lint.run/welcome/install/) at the exact version pinned in [CI](.github/workflows/ci.yaml); run `make check-lint-version` to check your installation
+- Python 3 with the hash-pinned dependencies in [`.github/requirements-scripts-test.txt`](.github/requirements-scripts-test.txt), installed with `python3 -m pip install --require-hashes -r .github/requirements-scripts-test.txt` in a virtual environment
+
+`make fmt` uses golangci-lint's bundled gofumpt formatter. You don't need a separate gofumpt installation. The linter version check uses the Python dependencies above.
+
+## Quick Start
+
+```bash
+git clone https://github.com/pipelab-org/pipelock.git
+cd pipelock
+make build
+```
+
+## Development Workflow
+
+1. Fork the repository on GitHub
+2. Clone your fork and create a feature branch
+3. Make changes with tests
+4. Run the pre-commit checklist (below)
+5. Open a PR against `main`
+
+Branch naming:
+- `feat/` for new features
+- `fix/` for bug fixes
+- `chore/` for maintenance
+- `docs/` for documentation
+
+### Pre-Commit Checklist
+
+Before committing, run the tests for the behavior you changed and lint for new issues, in both build modes. How much to run depends on the package.
+
+Most packages are quick, so run the whole package with `-race`. For a change confined to `internal/gitprotect`:
+
+```bash
+go test -race -count=1 ./internal/gitprotect
+go test -race -count=1 -tags enterprise ./internal/gitprotect
+golangci-lint run --new-from-rev=HEAD ./...
+golangci-lint run --build-tags enterprise --new-from-rev=HEAD ./...
+```
+
+The heavy trees CI splits across shards (`HEAVY_TREES` in `scripts/ci_test_packages.py`: `internal/proxy`, `internal/scanner`, `internal/mcp` and `internal/cli/runtime`) take many minutes to race as a whole. In those trees, select the tests for the touched behavior with `-run` and race that selection. If you changed code that runs concurrently, include the tests that exercise it, not only the tests you edited:
+
+```bash
+go test -race -count=1 -run 'TestRedirect' ./internal/proxy
+go test -race -count=1 -tags enterprise -run 'TestRedirect' ./internal/proxy
+```
+
+Don't race a whole heavy tree locally. On a pull request, CI runs every test without the race detector in both build modes and races the test functions the pull request changes while its time budget lasts; changed tests in packages that only edited existing tests can go unraced when that budget runs out. The full OSS and enterprise race suites run on pushes to `main`, and pull requests that change the Go toolchain also run the Go 1.27 race suites ([Pull Requests](#pull-requests) has the details).
+
+Choose the packages and tests for your change; the examples aren't fixed lists. For workflow, script, or documentation changes, run the relevant policy checks instead of unrelated Go tests. Required CI checks must pass before merge.
+
+Full-repository checks are optional locally. `make test` races the heavy trees too, so it takes a long time and needs a machine with plenty of memory:
+
+```bash
+make test
+make test-sharded-enterprise
+golangci-lint run ./...
+golangci-lint run --build-tags enterprise ./...
+```
+
+### Native Go fuzzing
+
+`make fuzz` runs the targets in [`.github/fuzz-targets.json`](.github/fuzz-targets.json) for 30 seconds each. Add new native Go fuzz functions to that manifest; `python3 -m unittest scripts.test_go_fuzz_workflow` checks that every function is listed and that the Makefile and workflow use the same list.
+
+The advisory pull-request workflow runs each target in a separate job on Go 1.27, because Go 1.26's fuzzer can report a clean run as failed when `-fuzztime` expires ([go.dev/issue/75804](https://go.dev/issue/75804)). Use Go 1.27 or later to reproduce CI results. Each job starts from checked-in `testdata/fuzz` corpora and `f.Add` seeds, with fresh Go cache storage and no downloads from earlier runs. Any failure of the fuzz step, including a crash, fails the job; the job then uploads the target's `testdata/fuzz` directory for debugging when Go wrote a failing input there (a crash on an `f.Add` seed writes none). Debug artifacts are never restored as input, and newly discovered interesting inputs do not persist between CI runs. This uses Go's native fuzz engine without libFuzzer or sanitizer instrumentation.
+
+## Pull Requests
+
+1. Fill in a clear description of what changed and why
+2. CI requires eight GitHub Actions contexts: **security-scan**, **test (1.26)**, **test (1.27)**, **test-macos**, **lint**, **build**, **govulncheck**, and **codeql**. The advisory **Pipelock CI Summary** rolls them up for readability but isn't a required context. On a pull request, **test (1.26)** runs every test package without the race detector under both the OSS and enterprise build tags. A package whose code and test inputs match main's last saved run reports Go's cached result instead of running again. The race detector suite starts after merge, on each push to `main`, as **race (1.26)**. A new main run cancels the previous in-progress run, so superseded commits may have incomplete race results. Rerunning an older main commit can also cancel a newer run. Release proof must use a successful main-push run on the exact candidate commit; rerun a cancelled candidate while main is quiet. **test (1.27)** runs the replay harness on every pull request; its OSS and enterprise race matrices also run for changes to the Go toolchain, as decided by [scripts/ci_go_toolchain.py](scripts/ci_go_toolchain.py): go.mod or go.sum, a setup-go step or its matrix in a workflow, a `GOTOOLCHAIN` setting, or the scripts that check Go versions. Shard plans, test weights, test runners, the Makefile, and coverage settings are covered by the script unit tests on every pull request and by **race (1.26)** after merge. A pull request that changes only Markdown that no Go code can reach skips the Go build, test, lint, and platform jobs. Security scanning, repository policy checks (including documentation checks), config-example validation, and the replay harness still run; aggregate checks verify that the skips are allowed. The [release workflow](.github/workflows/release.yaml) starts after a release tag is pushed and runs the race suites on both pinned Go versions before publishing artifacts.
+3. Address reviewer feedback and automated review comments. Automated review, if used, is advisory. It doesn't replace human review of security-sensitive changes. See [Review Standard](#review-standard).
+4. PRs are squash-merged
+
+### Review Standard
+
+Every change to `main` goes through a pull request and requires approval from a
+human code owner other than the author. The main-branch ruleset dismisses stale
+approvals after a push, requires approval of the latest revision, requires all
+review threads to be resolved, and blocks merging until the required status
+checks pass.
+
+Reviewers check:
+
+- whether the change is useful, scoped, and compatible with documented behavior;
+- correctness at normal, boundary, malformed, concurrent, and failure inputs;
+- fail-open versus fail-closed behavior at security boundaries;
+- tests for changed behavior and regression coverage for fixed defects;
+- documentation and example-config accuracy, including transport-specific limits;
+- secret handling, authorization, path/network trust boundaries, and dependency risk;
+- backward compatibility, operator lifecycle, and recovery behavior where applicable.
+
+A change is acceptable only when the reviewer can explain the behavior, required
+tests and checks pass, security-relevant claims are supported by code or
+reproduction, no unresolved blocking feedback remains, and the latest revision
+has a human approval. Bot review may provide evidence but cannot replace that
+approval.
+
+## Testing
+
+### Requirements
+
+- Local race tests use `-race -count=1`; pull-request CI uses the fast suite, while main and release CI run the race suites.
+- Target **95%+ coverage** on new code (`make test-cover` for local report)
+- Table-driven tests where there are 3+ cases
+
+### Patterns
+
+Disable SSRF in unit tests to avoid DNS lookups:
+
+```go
+cfg := config.Defaults()
+cfg.Internal = nil // disables configured DNS SSRF checks; the literal-IP core floor stays active
+```
+
+CLI tests capture output via `SetOut`, never `os.Pipe`:
+
+```go
+var buf strings.Builder
+cmd.SetOut(&buf)
+```
+
+Build fake credentials at runtime to avoid gitleaks false positives:
+
+```go
+key := "sk-ant-" + "api03-" + "XXXXXXXXXXXX"
+```
+
+### Benchmarks
+
+```bash
+make bench
+```
+
+See [docs/benchmarks.md](docs/benchmarks.md) for methodology and results.
+
+## Code Style
+
+- **gofumpt** formatting, not just gofmt (CI enforces this)
+- Error wrapping: `fmt.Errorf("context: %w", err)`
+- No stutter: `proxy.Option` not `proxy.ProxyOption`
+- `cmd.OutOrStdout()` for CLI output, `cmd.ErrOrStderr()` for diagnostics
+- File permissions: `0o600` not `0600`
+- HTTP methods: `http.MethodGet` not `"GET"`
+- Source files need copyright and license headers. Use Apache-2.0 for core sources; files under `enterprise/` or with the `enterprise` build tag need the Elastic License 2.0 notice and Elastic-2.0 SPDX identifier, including integration files under `cmd/` and `internal/`. Run `make source-header-check` to verify them.
+- Run `make docs-check` for documentation accuracy and local links.
+- See [.golangci.yml](.golangci.yml) for all 19 enabled linters
+
+## Python dependencies
+
+A small amount of Python lives in the repo: the cross-implementation
+verifier fixture at `testdata/python_verifier_fixture/` and the
+script-test dependency at `.github/requirements-scripts-test.txt`.
+
+Generated Python lockfiles (`requirements*.txt`) use exact `==` versions and `--hash` entries. Source manifests (`requirements*.in`) may use version ranges; generated lockfiles may not use `>=`, `<=`, `~=`, `>`, `<`, or `===`.
+
+Exact versions and hashes make installs reproducible and let `pip install --require-hashes` reject missing pins or unexpected distributions. Exact pins also let dependency scanners assess the selected version rather than a range.
+
+The lockfile pattern, modeled on `.github/requirements-scripts-test.txt`:
+
+```text
+package==X.Y.Z \
+    --hash=sha256:<hash-1> \
+    --hash=sha256:<hash-2>
+```
+
+For larger sets of deps with transitive resolution (e.g. the verifier
+fixture), use `pip-compile` from `pip-tools` with a source `.in` file.
+See `testdata/python_verifier_fixture/README.md` for the regen
+command.
+
+Renovate watches both Python paths and auto-opens PRs to bump the
+locks when a new advisory drops or a fresh patch ships. Routine
+bumps wait out a 10-day cooldown; vulnerability-fix releases
+fast-track. Merge those PRs after CI is green.
+
+CI lint enforces the rule: `scripts/check-python-pins.sh` runs in the
+`lint` job and exits non-zero on any `requirements*.txt` line that
+contains a non-`==` operator outside of the autogenerated pip-compile
+header.
+
+## Building
+
+```bash
+make build    # Build with version metadata
+make test     # Run tests
+make lint     # Lint
+make docker   # Build Docker image
+make reproducible-build-check # Compare two byte-identical OSS builds
+```
+
+See [Reproducible Builds](docs/reproducible-builds.md) for the fixed inputs,
+release integration, and the exact scope of the reproducibility claim.
+
+## Project Structure
+
+```text
+cmd/pipelock/          CLI entry point
+internal/
+  cli/                 Cobra commands (run, check, reload, report, tls, mcp, audit, generate, ...)
+  config/              YAML config loading, validation, defaults, hot-reload (fsnotify)
+  scanner/             Ordered URL scanning pipeline + response injection detection
+  checker/             Versioned content-assessment protocol and HTTP client; no runtime integration
+  audit/               Structured JSON audit logging (zerolog) + event emission dispatch
+  proxy/               HTTP proxy: fetch, forward (CONNECT), WebSocket, TLS interception
+  certgen/             ECDSA P-256 CA + leaf certificate generation, cache
+  mcp/                 MCP proxy + bidirectional scanning + tool poisoning + chains
+  report/              HTML/JSON audit report generation from JSONL event logs
+  killswitch/          Emergency deny-all (7 sources) + port-isolated API
+  emit/                Event emission (webhook + syslog + OTLP sinks)
+  metrics/             Prometheus metrics + JSON stats endpoint
+  normalize/           Unicode normalization (NFKC, confusables, combining marks)
+  hitl/                Human-in-the-loop terminal approval
+  integrity/           File integrity monitoring (SHA256 manifests)
+  signing/             Ed25519 key management, file signing, signature verification
+  gitprotect/          Git diff scanning for secrets
+  projectscan/         Project directory scanner for audit command
+  receipt/             Action receipt signing + hash-chained evidence
+  receiptcontent/      Typed receipt content projections and exact clean-text caching
+  recorder/            Durable append tickets, run history and parallel group lifecycle
+  addressprotect/      Blockchain address validation and poisoning detection
+  seedprotect/         BIP-39 seed phrase detection (dictionary, checksum)
+  shield/              Airlock, browser shield, posture capsule
+  rules/               Community rule bundle loading, verification, and CLI
+enterprise/            Multi-agent features (ELv2, see enterprise/LICENSE)
+configs/               7 preset config files (balanced, strict, audit, claude-code, cursor, generic-agent, hostile-model)
+docs/                  Guides, OWASP mapping, comparison
+```
+
+## Architecture
+
+See [Architecture in AGENTS.md](AGENTS.md#architecture) for the scanner pipeline, MCP proxy, configuration reload behavior, and coding conventions.
+
+## Adding Features
+
+### New CLI command
+
+1. Add the command to the appropriate `internal/cli/` subpackage, following nearby Cobra command constructors.
+2. Register the constructor in `rootCmd()` in `internal/cli/root.go`. Enterprise commands use the existing `RegisterCommand` integration.
+3. Add tests beside the implementation and cover command output through Cobra's configured writers.
+
+### New scanner layer
+
+1. Add the check function in `internal/scanner/`
+2. Wire into `Scanner.Scan()` pipeline
+3. Add metrics counter in `internal/metrics/`
+4. Add audit event in `internal/audit/`
+5. Add benchmarks in `internal/scanner/scanner_bench_test.go`
+
+### New DLP pattern
+
+1. Add the pattern to the canonical list in `internal/config/dlp_patterns.go`
+2. Add URL and text test cases in `internal/scanner/scanner_test.go` and `internal/scanner/text_dlp_test.go`
+3. Run `go generate ./internal/config` to regenerate preset patterns in `configs/` and check the generated diff
+
+## Dependencies
+
+Pipelock keeps its direct dependency set intentionally small. Any new dependency must be justified in the PR description. We prefer the standard library.
+
+## Security
+
+- **Vulnerabilities**: Report via [GitHub Security Advisories](https://github.com/pipelab-org/pipelock/security/advisories), NOT public issues
+- **Preserve capability separation:** give the proxy only the environment and file access its configured functions need. Leak detection may retain selected environment and configured secret-file values in memory; treat those values as sensitive.
+- **Don't bypass fail-closed defaults:** if in doubt, block
+- See [SECURITY.md](SECURITY.md) for the full policy
+
+## Reporting Issues
+
+- **Security issues**: See [SECURITY.md](SECURITY.md)
+- **Bugs**: Open a GitHub issue with steps to reproduce
+- **Features**: Open a GitHub issue describing the use case
+- **Suspected scanner bypasses**: Report privately using [SECURITY.md](SECURITY.md#vulnerability-reporting); don't open a public issue.
+- **Questions and community discussion**: Join the Discord community at https://discord.gg/badNfhGKTc
+
+## Contributor License Agreement
+
+We use a [Contributor License Agreement](https://cla-assistant.io/luckyPipewrench/pipelock) (CLA) for all contributions. When you open your first PR, the CLA Assistant bot will ask you to sign electronically. This is a one-time process that takes about 30 seconds.
+
+The CLA is based on the [Apache Individual Contributor License Agreement](https://www.apache.org/licenses/icla.pdf). It grants the project the right to use your contribution under the project's license terms while you retain ownership of your work.
+
+## License
+
+Pipelock uses two licenses:
+
+- **Apache License 2.0** for the core (files without the `enterprise` build tag)
+- **Elastic License 2.0 (ELv2)** for paid multi-agent features (files with the `//go:build enterprise` build tag, primarily in `enterprise/` with integration code in `cmd/` and `internal/`)
+
+By contributing to the core, you agree that your contributions will be licensed under the [Apache License 2.0](LICENSE). Contributions to enterprise-licensed code are licensed under the [Elastic License 2.0](enterprise/LICENSE).
+
+Each file's license is indicated by its header. When in doubt, check the file's build tag and license notice.

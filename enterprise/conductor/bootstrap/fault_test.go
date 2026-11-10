@@ -1,0 +1,321 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package bootstrap
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	conductorcore "github.com/luckyPipewrench/pipelock/enterprise/conductor"
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor/auditbatcher"
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor/controlplane"
+)
+
+func freshMaterial(t *testing.T) (Layout, Options, controlplane.FollowerIdentity, *materialSet) {
+	t.Helper()
+	dir := privateFleetDir(t)
+	opts := Options{Dir: dir}
+	normalize(&opts)
+	layout, err := newLayout(opts.Dir)
+	if err != nil {
+		t.Fatalf("newLayout: %v", err)
+	}
+	id := controlplane.FollowerIdentity{OrgID: opts.OrgID, FleetID: opts.FleetID, InstanceID: opts.InstanceID, Environment: opts.Environment}
+	m, err := generateMaterial(layout, opts, id)
+	if err != nil {
+		t.Fatalf("generateMaterial: %v", err)
+	}
+	return layout, opts, id, m
+}
+
+// TestStartConductor_FailsClosed covers the fail-closed branches: a missing
+// operator token or trust domain must abort startup rather than serve an
+// unauthenticated or unidentifiable control plane.
+func TestStartConductor_FailsClosed(t *testing.T) {
+	cases := []struct {
+		name   string
+		tamper func(*Options, *materialSet)
+	}{
+		{"empty publisher token", func(_ *Options, m *materialSet) { m.publisherToken = "" }},
+		{"empty auditor token", func(_ *Options, m *materialSet) { m.auditorToken = "" }},
+		{"empty admin token", func(_ *Options, m *materialSet) { m.adminToken = "" }},
+		{"empty trust domain", func(o *Options, _ *materialSet) { o.TrustDomain = "" }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			layout, opts, _, m := freshMaterial(t)
+			c.tamper(&opts, m)
+			scratch, err := os.MkdirTemp(layout.Dir, ".proof-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := startConductor(context.Background(), layout, filepath.Join(scratch, "conductor"), opts, m); err == nil {
+				t.Fatalf("startConductor (%s) should fail closed", c.name)
+			}
+		})
+	}
+}
+
+func TestRemoteKillProofHelpersFailClosed(t *testing.T) {
+	layout, opts, identity, material := freshMaterial(t)
+	now := opts.Now().UTC()
+
+	resolver, err := bootstrapRemoteKillKeyResolver(layout)
+	if err != nil {
+		t.Fatalf("bootstrapRemoteKillKeyResolver: %v", err)
+	}
+	if _, err := resolver("unknown-kill-key"); err == nil {
+		t.Fatal("remote-kill resolver accepted an unknown key")
+	}
+
+	missingPublic := layout
+	missingPublic.RemoteKillSecondPubPath = filepath.Join(layout.Dir, "missing-second.pub")
+	if _, err := bootstrapRemoteKillKeyResolver(missingPublic); err == nil {
+		t.Fatal("remote-kill resolver accepted missing threshold key")
+	}
+	scratch := filepath.Join(layout.Dir, "missing-key-proof")
+	if _, err := startConductor(context.Background(), missingPublic, scratch, opts, material); err == nil {
+		t.Fatal("Conductor proof started without the second remote-kill key")
+	}
+
+	if _, err := bootstrapRosterKeyResolver(layout, "wrong-root-fingerprint", now); err == nil {
+		t.Fatal("roster resolver accepted the wrong root fingerprint")
+	}
+	rosterResolver, err := bootstrapRosterKeyResolver(layout, material.rootFingerprint, now)
+	if err != nil {
+		t.Fatalf("bootstrapRosterKeyResolver: %v", err)
+	}
+	if _, err := rosterResolver("unknown-kill-key"); err == nil {
+		t.Fatal("roster resolver accepted an unknown key")
+	}
+
+	keys, err := loadBootstrapRemoteKillKeys(layout)
+	if err != nil {
+		t.Fatalf("loadBootstrapRemoteKillKeys: %v", err)
+	}
+	defer func() {
+		for _, key := range keys {
+			zeroPrivateKey(key.private)
+		}
+	}()
+	message, err := bootstrapRemoteKillMessage(identity, conductorcore.KillSwitchActive, 1, "wrong-audience", "negative test", now, keys)
+	if err != nil {
+		t.Fatalf("bootstrapRemoteKillMessage: %v", err)
+	}
+	wrongIdentity := identity
+	wrongIdentity.InstanceID = "other-instance"
+	if err := verifyBootstrapRemoteKillForFollower(message, wrongIdentity, now, rosterResolver); err == nil {
+		t.Fatal("follower verification accepted a remote kill for another instance")
+	}
+
+	missingPrivate := layout
+	missingPrivate.RemoteKillSecondKeyPath = filepath.Join(layout.Dir, "missing-second.key")
+	if _, err := loadBootstrapRemoteKillKeys(missingPrivate); err == nil {
+		t.Fatal("remote-kill loader accepted one private signer")
+	}
+	missingFirst := layout
+	missingFirst.RemoteKillKeyPath = filepath.Join(layout.Dir, "missing-first.key")
+	if err := proveRemoteKillLifecycle(context.Background(), missingFirst, opts, identity, material.rootFingerprint, material.adminToken, &proofCaller{}); err == nil {
+		t.Fatal("remote-kill lifecycle accepted missing signer material")
+	}
+	if err := proveRemoteKillLifecycle(context.Background(), layout, opts, identity, "wrong-root-fingerprint", material.adminToken, &proofCaller{}); err == nil {
+		t.Fatal("remote-kill lifecycle accepted the wrong roster root")
+	}
+
+	accepting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer accepting.Close()
+	acceptingCaller := &proofCaller{client: accepting.Client(), baseURL: accepting.URL}
+	if err := proveRemoteKillLifecycle(context.Background(), layout, opts, identity, material.rootFingerprint, material.adminToken, acceptingCaller); err == nil || !strings.Contains(err.Error(), "one-signer remote kill was accepted") {
+		t.Fatalf("remote-kill lifecycle accepted one signer: %v", err)
+	}
+
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "rejected", http.StatusUnauthorized)
+	}))
+	defer rejecting.Close()
+	caller := &proofCaller{client: rejecting.Client(), baseURL: rejecting.URL}
+	if err := caller.publishRemoteKill(context.Background(), material.adminToken, message); err == nil || !strings.Contains(err.Error(), "status 401") {
+		t.Fatalf("publishRemoteKill rejection error = %v", err)
+	}
+	oversized := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(strings.Repeat("x", (1<<16)+1)))
+	}))
+	defer oversized.Close()
+	oversizedCaller := &proofCaller{client: oversized.Client(), baseURL: oversized.URL}
+	if err := oversizedCaller.publishRemoteKill(context.Background(), material.adminToken, message); err == nil || !strings.Contains(err.Error(), "response exceeds") {
+		t.Fatalf("publishRemoteKill oversized response error = %v", err)
+	}
+	if err := proveRemoteKillLifecycle(context.Background(), layout, opts, identity, material.rootFingerprint, material.adminToken, caller); err == nil || !strings.Contains(err.Error(), "publish remote kill") {
+		t.Fatalf("remote-kill lifecycle publish error = %v", err)
+	}
+
+	badCaller := &proofCaller{client: http.DefaultClient, baseURL: "://bad-url"}
+	if err := badCaller.publishRemoteKill(context.Background(), material.adminToken, message); err == nil {
+		t.Fatal("publishRemoteKill accepted an invalid endpoint")
+	}
+
+	// Keep the imported purpose bound to the behavior this test exercises.
+	if _, err := loadDeploymentSigningKey(layout.RemoteKillKeyPath, remoteKillKeyID); err != nil {
+		t.Fatalf("load first remote-kill signer: %v", err)
+	}
+}
+
+// TestProduceSignedBatch_FailsOnUnwritableQueue: a queue directory path that is
+// actually a file makes the durable queue open fail; production must surface
+// the error rather than silently drop audit evidence.
+func TestProduceSignedBatch_FailsOnUnwritableQueue(t *testing.T) {
+	_, opts, id, _ := freshMaterial(t)
+	dir := opts.Dir
+	qfile := filepath.Join(dir, "queue-is-a-file")
+	if err := os.WriteFile(qfile, []byte("not a dir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := produceSignedBatch(context.Background(), qfile, filepath.Join(dir, "r"), opts, id, priv, pub); err == nil {
+		t.Fatal("produceSignedBatch with an unusable queue dir should error")
+	}
+}
+
+// TestProduceSignedBatch_HonorsCancelledContext: a cancelled bootstrap must not
+// produce or persist audit material (fail-closed on context cancellation).
+func TestProduceSignedBatch_HonorsCancelledContext(t *testing.T) {
+	_, opts, id, _ := freshMaterial(t)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := produceSignedBatch(ctx, filepath.Join(opts.Dir, "q"), filepath.Join(opts.Dir, "r"), opts, id, priv, pub); err == nil {
+		t.Fatal("produceSignedBatch with a cancelled context should fail closed")
+	}
+}
+
+func TestProduceSignedBatch_FailsWhenQueueKeyringCannotBeCreated(t *testing.T) {
+	_, opts, id, _ := freshMaterial(t)
+	queueParent := filepath.Join(opts.Dir, "proof")
+	if err := os.MkdirAll(queueParent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(queueParent, "queue-secrets"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := produceSignedBatch(context.Background(), filepath.Join(queueParent, "queue"), filepath.Join(opts.Dir, "recorder"), opts, id, priv, pub); err == nil || !strings.Contains(err.Error(), "load or initialize proof audit queue keyring") {
+		t.Fatalf("produceSignedBatch with unusable keyring parent error = %v, want keyring initialization failure", err)
+	}
+}
+
+func TestProduceSignedBatch_FailsWhenQueueKeyringCannotBeSaved(t *testing.T) {
+	_, opts, id, _ := freshMaterial(t)
+	queueParent := filepath.Join(opts.Dir, "proof-save")
+	keyringTarget := filepath.Join(queueParent, "queue-secrets", "keyring.json")
+	if err := os.MkdirAll(keyringTarget, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := produceSignedBatch(context.Background(), filepath.Join(queueParent, "queue"), filepath.Join(opts.Dir, "recorder"), opts, id, priv, pub); err == nil || !strings.Contains(err.Error(), "load or initialize proof audit queue keyring") {
+		t.Fatalf("produceSignedBatch with directory keyring target error = %v, want keyring initialization failure", err)
+	}
+}
+
+func TestProduceSignedBatchReusesDurableQueueKeyring(t *testing.T) {
+	_, opts, id, _ := freshMaterial(t)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queueDir := filepath.Join(opts.Dir, "proof-reuse", "queue")
+	recorderDir := filepath.Join(opts.Dir, "proof-reuse", "recorder")
+	if _, err := produceSignedBatch(context.Background(), queueDir, recorderDir, opts, id, priv, pub); err != nil {
+		t.Fatal(err)
+	}
+	keyringPath := filepath.Join(filepath.Dir(queueDir), "queue-secrets", "keyring.json")
+	before, err := auditbatcher.LoadKeyring(keyringPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := produceSignedBatch(context.Background(), queueDir, recorderDir, opts, id, priv, pub); err != nil {
+		t.Fatal(err)
+	}
+	after, err := auditbatcher.LoadKeyring(keyringPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ActiveKeyID() != before.ActiveKeyID() {
+		t.Fatalf("bootstrap replaced durable queue key %q with %q", before.ActiveKeyID(), after.ActiveKeyID())
+	}
+}
+
+func TestLoadMaterialRejectsMissingQueueKeyring(t *testing.T) {
+	layout, _, _, _ := freshMaterial(t)
+	if err := os.Remove(layout.FollowerQueueKeyring); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadMaterial(layout); err == nil || !strings.Contains(err.Error(), "load follower audit queue keyring") {
+		t.Fatalf("loadMaterial with missing queue keyring error = %v, want queue keyring load failure", err)
+	}
+}
+
+func TestGenerateMaterialFailsWhenQueueKeyringTargetIsDirectory(t *testing.T) {
+	dir := privateFleetDir(t)
+	opts := Options{Dir: dir}
+	normalize(&opts)
+	layout, err := newLayout(opts.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(layout.FollowerQueueKeyring, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	id := controlplane.FollowerIdentity{
+		OrgID:       opts.OrgID,
+		FleetID:     opts.FleetID,
+		InstanceID:  opts.InstanceID,
+		Environment: opts.Environment,
+	}
+	if _, err := generateMaterial(layout, opts, id); err == nil || !strings.Contains(err.Error(), "write follower audit queue keyring") {
+		t.Fatalf("generateMaterial with keyring directory target error = %v, want queue keyring write failure", err)
+	}
+}
+
+// TestVerifyBatchOffline_RejectsWrongKey: the offline verifier must reject a
+// batch when checked against the wrong audit public key.
+func TestVerifyBatchOffline_RejectsWrongKey(t *testing.T) {
+	h := newHarness(t)
+	batch := h.signedBatch(t)
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyBatchOffline(batch.Envelope, otherPub); err == nil {
+		t.Fatal("offline verification accepted a batch against the wrong key")
+	}
+	// Sanity: the right key still verifies.
+	if err := verifyBatchOffline(batch.Envelope, h.auditPub); err != nil {
+		t.Fatalf("offline verification rejected a valid batch: %v", err)
+	}
+}

@@ -1,0 +1,36 @@
+name: Test exclude-paths input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project to scan
+        run: |
+          mkdir -p /tmp/pl-clean-project/vendor /tmp/pl-alt-temp
+          printf '# Clean project\n\nNothing sensitive here.\n' > /tmp/pl-clean-project/README.md
+          printf 'def add(a, b):\n    return a + b\n' > /tmp/pl-clean-project/main.py
+          printf 'def helper():\n    return 1\n' > /tmp/pl-clean-project/vendor/lib.py
+      - id: action
+        uses: .
+        env:
+          # act's artifact server rejects upload-artifact v7 requests; keep reports
+          # out of runner.temp so the upload step finds no files and is ignored.
+          RUNNER_TEMP: /tmp/pl-alt-temp
+        with:
+          directory: /tmp/pl-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          exclude-paths: |
+            vendor/
+              *.generated.go
+      - name: Assert audit ran with excludes
+        env:
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "audit_failed=$AUDIT_FAILED findings=$FINDINGS"
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit failed with exclude flags"; exit 1; fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then echo "FAIL: findings-count not integer"; exit 1; fi
+          echo "PASS"

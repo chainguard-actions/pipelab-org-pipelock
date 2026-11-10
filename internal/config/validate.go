@@ -1,0 +1,6485 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"math/big"
+	"mime"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"golang.org/x/net/idna"
+	"golang.org/x/net/publicsuffix"
+	"gopkg.in/yaml.v3"
+
+	"github.com/luckyPipewrench/pipelock/internal/datalabel"
+	"github.com/luckyPipewrench/pipelock/internal/destination"
+	"github.com/luckyPipewrench/pipelock/internal/emitformat"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/identitykey"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/media"
+	"github.com/luckyPipewrench/pipelock/internal/secperm"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+var containmentGeometryPattern = regexp.MustCompile(`^[1-9][0-9]{0,4}x[1-9][0-9]{0,4}$`)
+
+// ValidateTrustedDomains validates and normalizes a slice of trusted domain
+// entries. Each entry is lowercased, trimmed, and checked for: empty values,
+// URL/host:port formats, bare wildcards, over-broad wildcards (e.g. *.com),
+// non-prefix wildcards, and trailing dots. The slice is modified in-place
+// with normalized values. The label parameter identifies the config section
+// for error messages (e.g. "trusted_domains" or "agent \"foo\" trusted_domains").
+func ValidateTrustedDomains(domains []string, label string) error {
+	for i, raw := range domains {
+		// Normalize early through the shared normalizer, which strips EVERY
+		// trailing dot. The old local TrimSuffix removed one, so "*.com.."
+		// was accepted and rewritten IN PLACE to "*.com.", and MatchDomain
+		// then strips that last dot and matches every .com host. The raw
+		// two-dot form matches nothing, so half-normalizing it here is what
+		// made it dangerous. This list exempts hosts from the SSRF internal-IP
+		// check, which is why it gets the same normalizer as everything else
+		// rather than its own copy of the rule.
+		// ORDER MATTERS, and getting it wrong regressed a message once. The
+		// bare wildcard is checked FIRST because its own message names what
+		// this list controls, and "disables all SSRF protection" tells the
+		// operator something the generic shape error cannot. Routing through
+		// the shared entry point before this check replaced that message with
+		// the generic one, which an existing test caught.
+		d := NormalizeHostPattern(raw)
+		if d == "" {
+			return fmt.Errorf("%s[%d] is empty", label, i)
+		}
+		if d == "*" {
+			return fmt.Errorf("%s[%d]: bare wildcard disables all SSRF protection", label, i)
+		}
+		// Then the shared entry point, which rejects raw non-ASCII before case
+		// folding and validates shape.
+		if _, err := NormalizeAndCheckHostPattern(raw); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+		// Everything else goes through the ONE shared breadth predicate. This
+		// list previously carried a DUPLICATE of the rule rather than calling
+		// it, so it did not inherit the public-suffix fix: both copies counted
+		// dots and both accepted "*.co.uk", and fixing one left the other
+		// behind. That is the cost of a second implementation, and it is why
+		// this list calls the predicate instead of restating it.
+		if err := HostPatternBreadthError(d); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+		domains[i] = d
+	}
+	return nil
+}
+
+func validateUnscannablePassthrough(entries []UnscannablePassthroughEntry) error {
+	for i := range entries {
+		field := fmt.Sprintf("response_scanning.unscannable_passthrough[%d]", i)
+		host := []string{entries[i].Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		entries[i].Host = host[0]
+		entries[i].Reason = strings.TrimSpace(entries[i].Reason)
+		if entries[i].Reason == "" {
+			return fmt.Errorf("%s.reason is required", field)
+		}
+		if len(entries[i].Reason) > 200 {
+			return fmt.Errorf("%s.reason must be 200 characters or fewer", field)
+		}
+		if strings.IndexFunc(entries[i].Reason, unicode.IsControl) >= 0 {
+			return fmt.Errorf("%s.reason must not contain control characters", field)
+		}
+		if len(entries[i].PathPrefixes) > 0 {
+			return fmt.Errorf("%s.path_prefixes is not supported for unscannable passthrough; use exact paths", field)
+		}
+		if len(entries[i].Paths) == 0 {
+			return fmt.Errorf("%s.paths must contain at least one exact path", field)
+		}
+		for j, rawPath := range entries[i].Paths {
+			trimmed := strings.TrimSpace(rawPath)
+			if trimmed == "" {
+				return fmt.Errorf("%s.paths[%d] is empty", field, j)
+			}
+			if !strings.HasPrefix(trimmed, "/") {
+				return fmt.Errorf("%s.paths[%d] %q must start with /", field, j, rawPath)
+			}
+			canonicalPath, ok := CanonicalUnscannablePassthroughPath(trimmed)
+			if !ok {
+				return fmt.Errorf("%s.paths[%d] %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, j, rawPath)
+			}
+			entries[i].Paths[j] = canonicalPath
+		}
+		if len(entries[i].ContentTypes) == 0 {
+			return fmt.Errorf("%s.content_types must contain at least one non-textual media type", field)
+		}
+		for j, raw := range entries[i].ContentTypes {
+			ct := strings.TrimSpace(strings.ToLower(raw))
+			if ct == "" {
+				return fmt.Errorf("%s.content_types[%d] is empty", field, j)
+			}
+			mediaType, _, err := mime.ParseMediaType(ct)
+			if err != nil {
+				return fmt.Errorf("%s.content_types[%d] %q is invalid: %w", field, j, raw, err)
+			}
+			if isTextualUnscannablePassthroughType(mediaType) {
+				return fmt.Errorf("%s.content_types[%d] %q is textual/scannable and cannot be used for unscannable passthrough", field, j, raw)
+			}
+			entries[i].ContentTypes[j] = mediaType
+		}
+		for _, dateField := range []struct {
+			name  string
+			value string
+		}{
+			{name: "added", value: entries[i].Added},
+			{name: "expires", value: entries[i].Expires},
+		} {
+			if strings.TrimSpace(dateField.value) == "" {
+				if dateField.name == "expires" {
+					return fmt.Errorf("%s.expires is required", field)
+				}
+				continue
+			}
+			parsed, err := time.Parse("2006-01-02", strings.TrimSpace(dateField.value))
+			if err != nil {
+				return fmt.Errorf("%s.%s %q must be YYYY-MM-DD: %w", field, dateField.name, dateField.value, err)
+			}
+			if dateField.name == "expires" && parsed.Before(todayUTC()) {
+				return fmt.Errorf("%s.expires %q is already expired", field, dateField.value)
+			}
+		}
+		entries[i].Added = strings.TrimSpace(entries[i].Added)
+		entries[i].Expires = strings.TrimSpace(entries[i].Expires)
+	}
+	return nil
+}
+
+// validateCoreObserveExceptions checks every declared floor-observe entry.
+//
+// Each field is required and every failure refuses the config, because this is
+// the only mechanism that withholds a block on the immutable response floor.
+// The host must be one exact host: a wildcard here would hand back the breadth
+// of exempt_domains that this valve exists to replace, so it is refused the
+// same way the passthrough and credential-route entries refuse one.
+func validateCoreObserveExceptions(entries []CoreObserveException) error {
+	type identity struct{ host, pattern string }
+	seen := make(map[identity]int, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		field := fmt.Sprintf("response_scanning.core_observe_exceptions[%d]", i)
+
+		host := []string{entry.Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		if strings.ContainsAny(host[0], "*?[]") {
+			return fmt.Errorf("%s.host must be one exact host without wildcards; this entry withholds a block on the immutable response floor, so it may not cover a whole subtree", field)
+		}
+		entry.Host = canonicalCoreObserveHost(host[0])
+
+		entry.Pattern = strings.TrimSpace(entry.Pattern)
+		if entry.Pattern == "" {
+			return fmt.Errorf("%s.pattern is required; name exactly one core response pattern", field)
+		}
+		if !IsCoreResponsePatternName(entry.Pattern) {
+			return fmt.Errorf("%s.pattern %q is not a core response pattern; only the immutable floor needs this valve, and a configured pattern already has response_scanning.suppress. Valid names: %s", field, entry.Pattern, strings.Join(CoreResponsePatternNames(), ", "))
+		}
+
+		for _, text := range []struct {
+			name  string
+			value *string
+		}{
+			{name: "reason", value: &entry.Reason},
+			{name: "owner", value: &entry.Owner},
+		} {
+			*text.value = strings.TrimSpace(*text.value)
+			if *text.value == "" {
+				return fmt.Errorf("%s.%s is required", field, text.name)
+			}
+			if len(*text.value) > 200 {
+				return fmt.Errorf("%s.%s must be 200 characters or fewer", field, text.name)
+			}
+			if strings.IndexFunc(*text.value, unicode.IsControl) >= 0 {
+				return fmt.Errorf("%s.%s must not contain control characters", field, text.name)
+			}
+		}
+
+		entry.Expires = strings.TrimSpace(entry.Expires)
+		if entry.Expires == "" {
+			return fmt.Errorf("%s.expires is required", field)
+		}
+		// Startup reaches this through Validate, which does not run
+		// ValidateExpiryAuthorizations, so the horizon is enforced here as well.
+		if err := validateTemporaryExpiryDate(field+".expires", entry.Expires, MaxCoreObserveExceptionHorizon); err != nil {
+			return err
+		}
+
+		key := identity{host: entry.Host, pattern: strings.ToLower(entry.Pattern)}
+		if prior, ok := seen[key]; ok {
+			return fmt.Errorf("%s duplicates response_scanning.core_observe_exceptions[%d] for host %q and pattern %q; declare one entry with the expiry you mean", field, prior, entry.Host, entry.Pattern)
+		}
+		seen[key] = i
+	}
+	return nil
+}
+
+func validateUnscannablePassthroughExpiryHorizons(entries []UnscannablePassthroughEntry) error {
+	for i, entry := range entries {
+		field := fmt.Sprintf("response_scanning.unscannable_passthrough[%d].expires", i)
+		if err := validateTemporaryExpiryDate(field, entry.Expires, MaxUnscannablePassthroughHorizon); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRequestBodyEntropyWarnRoutes(cfg *RequestBodyScanning) error {
+	if len(cfg.ContentEntropyWarnRoutes) == 0 {
+		return nil
+	}
+	if !cfg.Enabled || !cfg.ContentEntropyEnabled || cfg.ContentEntropyAction != ActionBlock {
+		return fmt.Errorf("request_body_scanning.content_entropy_warn_routes requires enabled request body scanning with content entropy action block")
+	}
+
+	for i := range cfg.ContentEntropyWarnRoutes {
+		entry := &cfg.ContentEntropyWarnRoutes[i]
+		field := fmt.Sprintf("request_body_scanning.content_entropy_warn_routes[%d]", i)
+		host := []string{entry.Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		if strings.ContainsAny(host[0], "*?[]") {
+			return fmt.Errorf("%s.host must be one exact host without wildcards", field)
+		}
+		entry.Host = host[0]
+
+		hasPath := strings.TrimSpace(entry.Path) != ""
+		hasPrefix := strings.TrimSpace(entry.PathPrefix) != ""
+		switch {
+		case hasPath && hasPrefix:
+			return fmt.Errorf("%s sets both path and path_prefix; name exactly one", field)
+		case !hasPath && !hasPrefix:
+			return fmt.Errorf("%s requires exactly one of path or path_prefix", field)
+		case hasPath:
+			path, ok := CanonicalUnscannablePassthroughPath(strings.TrimSpace(entry.Path))
+			if !ok {
+				return fmt.Errorf("%s.path %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.Path)
+			}
+			entry.Path = path
+			// A whitespace-only path_prefix counted as absent above; clear it so
+			// the runtime matcher, which requires the unused field to be empty,
+			// does not treat the accepted route as having both.
+			entry.PathPrefix = ""
+		default:
+			entry.Path = ""
+			prefix := strings.TrimSpace(entry.PathPrefix)
+			if err := validateEntropyPathPrefixShape(field, entry.PathPrefix, prefix); err != nil {
+				return err
+			}
+			// The runtime compares against the request path in the form
+			// CanonicalUnscannablePassthroughPath produces, so the stored prefix
+			// must be in that same form. The trailing slash is load-bearing and
+			// is carried across the canonicalization.
+			canonical, ok := CanonicalUnscannablePassthroughPath(strings.TrimSuffix(prefix, "/"))
+			if !ok {
+				return fmt.Errorf("%s.path_prefix %q must be a non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.PathPrefix)
+			}
+			if strings.HasSuffix(prefix, "/") {
+				canonical += "/"
+			}
+			entry.PathPrefix = canonical
+		}
+		// An exact-path route keeps the original rule: only non-textual bodies,
+		// because the textual scanners are what the route must not blind. A
+		// prefix route exists for service-issued textual payloads, and still
+		// downgrades entropy findings only.
+		allowTextual := hasPrefix
+
+		if len(entry.ContentTypes) == 0 {
+			if allowTextual {
+				return fmt.Errorf("%s.content_types must contain at least one media type", field)
+			}
+			return fmt.Errorf("%s.content_types must contain at least one non-textual media type", field)
+		}
+		for j, raw := range entry.ContentTypes {
+			mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(strings.ToLower(raw)))
+			if err != nil || mediaType == "" {
+				return fmt.Errorf("%s.content_types[%d] %q is invalid", field, j, raw)
+			}
+			if !allowTextual && isTextualUnscannablePassthroughType(mediaType) {
+				return fmt.Errorf("%s.content_types[%d] %q is textual/scannable and cannot downgrade entropy enforcement", field, j, raw)
+			}
+			entry.ContentTypes[j] = mediaType
+		}
+
+		for j, raw := range entry.Methods {
+			method := strings.ToUpper(strings.TrimSpace(raw))
+			if !validHTTPMethod(method) {
+				return fmt.Errorf("%s.methods[%d] %q is not a supported HTTP method", field, j, raw)
+			}
+			entry.Methods[j] = method
+		}
+
+		entry.Reason = strings.TrimSpace(entry.Reason)
+		entry.Owner = strings.TrimSpace(entry.Owner)
+		for _, textField := range []struct {
+			name  string
+			value string
+			max   int
+		}{{"reason", entry.Reason, 200}, {"owner", entry.Owner, 100}} {
+			if textField.value == "" {
+				return fmt.Errorf("%s.%s is required", field, textField.name)
+			}
+			if len(textField.value) > textField.max {
+				return fmt.Errorf("%s.%s must be %d characters or fewer", field, textField.name, textField.max)
+			}
+			if strings.IndexFunc(textField.value, unicode.IsControl) >= 0 {
+				return fmt.Errorf("%s.%s must not contain control characters", field, textField.name)
+			}
+		}
+
+		entry.Expires = strings.TrimSpace(entry.Expires)
+		if err := validateLapsingExpiryDate(field+".expires", entry.Expires, MaxRequestBodyEntropyWarnRouteHorizon); err != nil {
+			return err
+		}
+
+		slices.Sort(entry.ContentTypes)
+		entry.ContentTypes = slices.Compact(entry.ContentTypes)
+		slices.Sort(entry.Methods)
+		entry.Methods = slices.Compact(entry.Methods)
+		for j := range i {
+			previous := cfg.ContentEntropyWarnRoutes[j]
+			methodsOverlap := len(previous.Methods) == 0 || len(entry.Methods) == 0 || sortedStringsOverlap(previous.Methods, entry.Methods)
+			if previous.Host == entry.Host && entropyRoutePathsOverlap(previous, *entry) && methodsOverlap && sortedStringsOverlap(previous.ContentTypes, entry.ContentTypes) {
+				return fmt.Errorf("%s overlaps content_entropy_warn_routes[%d]; route exceptions must have one unambiguous owner and reason", field, j)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRequestBodySigV4CredentialRoutes(cfg *RequestBodyScanning) error {
+	if len(cfg.SigV4CredentialRoutes) == 0 {
+		return nil
+	}
+	if !cfg.Enabled {
+		return fmt.Errorf("request_body_scanning.sigv4_credential_routes requires enabled request body scanning")
+	}
+
+	for i := range cfg.SigV4CredentialRoutes {
+		entry := &cfg.SigV4CredentialRoutes[i]
+		field := fmt.Sprintf("request_body_scanning.sigv4_credential_routes[%d]", i)
+		host := []string{entry.Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		if strings.ContainsAny(host[0], "*?[]") {
+			return fmt.Errorf("%s.host must be one exact host without wildcards", field)
+		}
+		entry.Host = host[0]
+
+		path, ok := CanonicalUnscannablePassthroughPath(strings.TrimSpace(entry.Path))
+		if !ok {
+			return fmt.Errorf("%s.path %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.Path)
+		}
+		entry.Path = path
+
+		if len(entry.ContentTypes) == 0 {
+			return fmt.Errorf("%s.content_types must contain at least one media type", field)
+		}
+		for j, raw := range entry.ContentTypes {
+			mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(strings.ToLower(raw)))
+			if err != nil || mediaType == "" {
+				return fmt.Errorf("%s.content_types[%d] %q is invalid", field, j, raw)
+			}
+			entry.ContentTypes[j] = mediaType
+		}
+
+		if len(entry.Methods) == 0 {
+			return fmt.Errorf("%s.methods must contain at least one HTTP method", field)
+		}
+		for j, raw := range entry.Methods {
+			method := strings.ToUpper(strings.TrimSpace(raw))
+			if !validHTTPMethod(method) {
+				return fmt.Errorf("%s.methods[%d] %q is not a supported HTTP method", field, j, raw)
+			}
+			entry.Methods[j] = method
+		}
+
+		entry.Reason = strings.TrimSpace(entry.Reason)
+		entry.Owner = strings.TrimSpace(entry.Owner)
+		for _, textField := range []struct {
+			name  string
+			value string
+			max   int
+		}{{"reason", entry.Reason, 200}, {"owner", entry.Owner, 100}} {
+			if textField.value == "" {
+				return fmt.Errorf("%s.%s is required", field, textField.name)
+			}
+			if len(textField.value) > textField.max {
+				return fmt.Errorf("%s.%s must be %d characters or fewer", field, textField.name, textField.max)
+			}
+			if strings.IndexFunc(textField.value, unicode.IsControl) >= 0 {
+				return fmt.Errorf("%s.%s must not contain control characters", field, textField.name)
+			}
+		}
+
+		entry.Expires = strings.TrimSpace(entry.Expires)
+		if err := validateLapsingExpiryDate(field+".expires", entry.Expires, MaxRequestBodySigV4CredentialRouteHorizon); err != nil {
+			return err
+		}
+
+		slices.Sort(entry.ContentTypes)
+		entry.ContentTypes = slices.Compact(entry.ContentTypes)
+		slices.Sort(entry.Methods)
+		entry.Methods = slices.Compact(entry.Methods)
+		for j := range i {
+			previous := cfg.SigV4CredentialRoutes[j]
+			if previous.Host == entry.Host && previous.Path == entry.Path &&
+				sortedStringsOverlap(previous.Methods, entry.Methods) && sortedStringsOverlap(previous.ContentTypes, entry.ContentTypes) {
+				return fmt.Errorf("%s overlaps sigv4_credential_routes[%d]; exact route exceptions must have one unambiguous owner and reason", field, j)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedStringsOverlap(left, right []string) bool {
+	for i, j := 0, 0; i < len(left) && j < len(right); {
+		switch {
+		case left[i] == right[j]:
+			return true
+		case left[i] < right[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return false
+}
+
+func todayUTC() time.Time {
+	y, m, d := time.Now().UTC().Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// Integer duration bounds leave room for runtime consumers that add a fixed
+// grace period or multiply the configured interval. Each bound is still more
+// than 97 years, so rejecting larger values cannot affect a useful timeout.
+const (
+	maxConfigDurationSeconds = int64((1<<63 - 1) / time.Second / 3)
+	maxConfigDurationMinutes = int64((1<<63 - 1) / time.Minute / 3)
+	maxConfigDurationDays    = int64((1<<63 - 1) / (24 * time.Hour) / 3)
+)
+
+type integerDurationBound struct {
+	name  string
+	value int
+	max   int64
+}
+
+func (c *Config) validateIntegerDurationBounds() error {
+	fields := []integerDurationBound{
+		{name: "conductor.created_skew_seconds", value: c.Conductor.CreatedSkewSeconds, max: maxConfigDurationSeconds},
+		{name: "mcp_input_scanning.response_timeout_seconds", value: c.MCPInputScanning.ResponseTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "fetch_proxy.timeout_seconds", value: c.FetchProxy.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "response_scanning.ask_timeout_seconds", value: c.ResponseScanning.AskTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "forward_proxy.max_tunnel_seconds", value: c.ForwardProxy.MaxTunnelSeconds, max: maxConfigDurationSeconds},
+		{name: "forward_proxy.idle_timeout_seconds", value: c.ForwardProxy.IdleTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "websocket_proxy.max_connection_seconds", value: c.WebSocketProxy.MaxConnectionSeconds, max: maxConfigDurationSeconds},
+		{name: "websocket_proxy.idle_timeout_seconds", value: c.WebSocketProxy.IdleTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "reverse_proxy.request_timeout_seconds", value: c.ReverseProxy.RequestTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "defer.timeout_seconds", value: c.Defer.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "session_profiling.cleanup_interval_seconds", value: c.SessionProfiling.CleanupIntervalSeconds, max: maxConfigDurationSeconds},
+		{name: "adaptive_enforcement.level_duration_seconds", value: c.AdaptiveEnforcement.LevelDurationSeconds, max: maxConfigDurationSeconds},
+		{name: "adaptive_enforcement.deescalation_check_seconds", value: c.AdaptiveEnforcement.DeescalationCheckSeconds, max: maxConfigDurationSeconds},
+		{name: "health_watchdog.interval_seconds", value: c.HealthWatchdog.IntervalSeconds, max: maxConfigDurationSeconds},
+		{name: "emit.otlp.timeout_seconds", value: c.Emit.OTLP.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "emit.forwarder.timeout_seconds", value: c.Emit.Forwarder.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "emit.webhook.timeout_seconds", value: c.Emit.Webhook.TimeoutSecs, max: maxConfigDurationSeconds},
+		{name: "tool_chain_detection.window_seconds", value: c.ToolChainDetection.WindowSeconds, max: maxConfigDurationSeconds},
+		{name: "mediation_envelope.created_skew_seconds", value: c.MediationEnvelope.CreatedSkewSeconds, max: maxConfigDurationSeconds},
+		{name: "airlock.timers.drain_timeout_seconds", value: c.Airlock.Timers.DrainTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "session_profiling.window_minutes", value: c.SessionProfiling.WindowMinutes, max: maxConfigDurationMinutes},
+		{name: "session_profiling.session_ttl_minutes", value: c.SessionProfiling.SessionTTLMinutes, max: maxConfigDurationMinutes},
+		{name: "cross_request_detection.entropy_budget.window_minutes", value: c.CrossRequestDetection.EntropyBudget.WindowMinutes, max: maxConfigDurationMinutes},
+		{name: "cross_request_detection.fragment_reassembly.window_minutes", value: c.CrossRequestDetection.FragmentReassembly.WindowMinutes, max: maxConfigDurationMinutes},
+		{name: "airlock.timers.soft_minutes", value: c.Airlock.Timers.SoftMinutes, max: maxConfigDurationMinutes},
+		{name: "airlock.timers.hard_minutes", value: c.Airlock.Timers.HardMinutes, max: maxConfigDurationMinutes},
+		{name: "airlock.timers.drain_minutes", value: c.Airlock.Timers.DrainMinutes, max: maxConfigDurationMinutes},
+		{name: "flight_recorder.retention_days", value: c.FlightRecorder.RetentionDays, max: maxConfigDurationDays},
+	}
+	for agentName, profile := range c.Agents {
+		fields = append(fields,
+			integerDurationBound{name: fmt.Sprintf("agents.%s.budget.window_minutes", agentName), value: profile.Budget.WindowMinutes, max: maxConfigDurationMinutes},
+			integerDurationBound{name: fmt.Sprintf("agents.%s.budget.max_wall_clock_minutes", agentName), value: profile.Budget.MaxWallClockMinutes, max: maxConfigDurationMinutes},
+		)
+	}
+	sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
+	for _, field := range fields {
+		if int64(field.value) > field.max {
+			return fmt.Errorf("%s is too large: must be at most %d", field.name, field.max)
+		}
+	}
+	return nil
+}
+
+func isTextualUnscannablePassthroughType(mediaType string) bool {
+	if strings.HasPrefix(mediaType, "text/") {
+		return true
+	}
+	// Every RFC 9239 section 6 JavaScript alias is refused here, not just
+	// the two spelled out below, so an opaque-download exception cannot
+	// admit the same content the browser shield already treats as
+	// JavaScript (internal/shield.mediaTypeToPipeline). Shared table:
+	// internal/media.JavaScriptMediaTypes.
+	if media.IsJavaScriptMediaType(mediaType) {
+		return true
+	}
+	switch mediaType {
+	case "application/json",
+		"application/ld+json",
+		"application/x-ndjson",
+		"application/xml",
+		"application/xhtml+xml",
+		"application/x-www-form-urlencoded",
+		"application/x-yaml",
+		"application/yaml",
+		"image/svg+xml":
+		return true
+	default:
+		return strings.HasSuffix(mediaType, "+json") || strings.HasSuffix(mediaType, "+xml")
+	}
+}
+
+// Warning is a non-fatal advisory surfaced during Validate. Callers render
+// these to operator output (cobra's ErrOrStderr, systemd journal, etc.).
+// See Config.ValidateWithWarnings for the accumulation path.
+type Warning struct {
+	Field   string
+	Message string
+}
+
+// Validate checks the config for errors. Must be called after ApplyDefaults.
+// Advisory warnings are discarded; callers that want them should use
+// ValidateWithWarnings instead.
+func (c *Config) Validate() error {
+	_, err := c.ValidateWithWarnings()
+	return err
+}
+
+// ModeAuditEnforcedWarnings reports a config whose mode name suggests
+// observation while blocking stays on. Runtime blocking follows enforce
+// (EnforceEnabled), not the mode name, so mode: audit with enforce left at its
+// default of true still blocks ordinary findings.
+func (c *Config) ModeAuditEnforcedWarnings() []Warning {
+	var warnings []Warning
+	add := func(mode string, enforce *bool, field, control string) {
+		effective := Config{Mode: mode, Enforce: enforce}
+		if effective.Mode != ModeAudit || !effective.EnforceEnabled() {
+			return
+		}
+		warnings = append(warnings, Warning{Field: field, Message: fmt.Sprintf("mode: audit does not turn off blocking. Effective enforce is true, so ordinary URL findings still block. Set %s: false to observe ordinary URL findings, or use the audit preset; core credentials, SSRF and independently configured protections can still block.", control)})
+	}
+	add(c.Mode, c.Enforce, "mode", "enforce")
+	names := make([]string, 0, len(c.Agents))
+	for name := range c.Agents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		profile := c.Agents[name]
+		if profile.Mode == "" && profile.Enforce == nil {
+			// Fully inherited: the top-level notice already covers it.
+			continue
+		}
+		mode, enforce := c.Mode, c.Enforce
+		if profile.Mode != "" {
+			mode = profile.Mode
+		}
+		if profile.Enforce != nil {
+			enforce = profile.Enforce
+		}
+		add(mode, enforce, "agents."+name+".mode", "agents."+name+".enforce")
+	}
+	return warnings
+}
+
+// MCPCompatibilityWarnings returns advisories for ambiguous legacy MCP settings.
+// These describe the loaded source, independently of later runtime resolution.
+func (c *Config) MCPCompatibilityWarnings() []Warning {
+	return append([]Warning(nil), c.mcpCompatibilityWarnings...)
+}
+
+// CopyMCPCompatibilityWarningsFrom preserves loaded-source advisories across
+// config transformations, independently of the effective profile settings.
+func (c *Config) CopyMCPCompatibilityWarningsFrom(src *Config) {
+	if src == nil {
+		c.mcpCompatibilityWarnings = nil
+		return
+	}
+	c.mcpCompatibilityWarnings = src.MCPCompatibilityWarnings()
+}
+
+// ValidateWithWarnings validates the config and returns any non-fatal
+// advisory warnings alongside the first hard error. Dispatch order matches
+// Validate() exactly. Warnings are returned even when err is non-nil, so
+// callers can surface every advisory emitted before the failing validator.
+func (c *Config) ValidateWithWarnings() ([]Warning, error) {
+	warnings := c.MCPCompatibilityWarnings()
+	if err := c.validateFiniteNumbers(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateIntegerDurationBounds(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMode(); err != nil {
+		return warnings, err
+	}
+	warnings = append(warnings, c.ModeAuditEnforcedWarnings()...)
+	c.validateAPIAllowlistWarnings(&warnings)
+	c.validateTrustedDomainTenancyWarnings(&warnings)
+	if err := c.validateLogging(); err != nil {
+		return warnings, err
+	}
+	c.validateLicenseIntermediate(&warnings)
+	if err := c.validateDLP(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateFetchProxy(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateResponseScanning(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPInputScanning(); err != nil {
+		return warnings, err
+	}
+	if err := validateMCPIdentities(c.MCPIdentities); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPToolScanning(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPDataClassLabels(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPToolPolicy(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateDefer(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateGitProtection(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateForwardProxy(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateWebSocketProxy(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateSessionProfiling(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateAdaptiveEnforcement(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPSessionBinding(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateA2AScanning(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateRequestBodyScanning(&warnings); err != nil {
+		return warnings, err
+	}
+	activeSigV4, activeWarn := 0, 0
+	now := time.Now()
+	for _, entry := range c.RequestBodyScanning.SigV4CredentialRoutes {
+		if ScannerExceptionActive(entry.Expires, now) {
+			activeSigV4++
+		}
+	}
+	for _, entry := range c.RequestBodyScanning.ContentEntropyWarnRoutes {
+		if ScannerExceptionActive(entry.Expires, now) {
+			activeWarn++
+		}
+	}
+	if activeSigV4 > 0 {
+		warnings = append(warnings, Warning{
+			Field:   "request_body_scanning.sigv4_credential_routes",
+			Message: fmt.Sprintf("%d exact HTTPS route(s) allow request bodies to carry structurally valid SigV4 presigned URLs; all malformed, bare, and out-of-route credentials remain blocked", activeSigV4),
+		})
+	}
+	if activeWarn > 0 {
+		warnings = append(warnings, Warning{
+			Field:   "request_body_scanning.content_entropy_warn_routes",
+			Message: fmt.Sprintf("%d HTTPS route(s) downgrade request-body entropy findings from block to warn; DLP, injection, address, size, and redirect controls remain enforced", activeWarn),
+		})
+	}
+	if err := c.validateRequestPolicy(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateSeedPhraseDetection(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateCrossRequestDetection(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateTLSInterception(); err != nil {
+		return warnings, err
+	}
+	c.validateTLSInterceptionCoverage(&warnings)
+	c.validateDoWPrincipalTrust(&warnings)
+	if err := c.validateToolChainDetection(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPWSListener(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateSuppress(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateKillSwitch(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMetricsListen(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateContainmentLoopbackServices(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateContainmentPublishedServices(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.Containment.Display.Validate(); err != nil {
+		return warnings, err
+	}
+	if err := c.Containment.Filesystem.Validate(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateEmit(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateAddressProtection(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateSentry(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateInternalCIDRs(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateSSRF(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateTrustedDomains(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateDNS(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateRules(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateFileSentry(); err != nil {
+		return warnings, err
+	}
+	c.validateUnboundAgentPolicyWarnings(&warnings)
+	if err := c.validateAgents(); err != nil {
+		return warnings, err
+	}
+	warnings = append(warnings, c.agentDLPKeywordWarnings()...)
+	if err := c.validateScanAPI(); err != nil {
+		return warnings, err
+	}
+	c.validateListenWarnings(&warnings)
+	if err := c.validateReverseProxy(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateSandbox(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateFlightRecorder(&warnings); err != nil {
+		return warnings, err
+	}
+	c.validateEvidenceProvenanceWarnings(&warnings)
+	if err := c.validateDashboardSnapshot(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPBinaryIntegrity(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMCPToolProvenance(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateBehavioralBaseline(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateAirlock(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateBrowserShield(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateTaint(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateDefaultAgentIdentity(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMediationEnvelope(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateConductor(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateMediaPolicy(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateRedaction(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateLearn(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateLearnLock(); err != nil {
+		return warnings, err
+	}
+	if err := c.validateGuard(); err != nil {
+		return warnings, err
+	}
+	if _, err := c.DestinationGrantSet(); err != nil {
+		return warnings, err
+	}
+	// Advisory only, and last: it reads across sections that the validators
+	// above have already accepted, and it can never fail a config.
+	c.validateActionDivergence(&warnings)
+	// Retain warnings after a loader has already removed the expired entries.
+	// The private copy lets validation report lapses without mutating policy.
+	candidate := c.Clone()
+	candidate.partitionScannerExceptions(time.Now())
+	warnings = append(warnings, candidate.LapsedScannerExceptionWarnings()...)
+	return warnings, nil
+}
+
+func (c *Config) validateUnboundAgentPolicyWarnings(warnings *[]Warning) {
+	names := make([]string, 0, len(c.Agents))
+	for name := range c.Agents {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		profile := c.Agents[name]
+		if name == "_default" || len(profile.Listeners) > 0 || len(profile.SourceCIDRs) > 0 {
+			continue
+		}
+		if c.BindDefaultAgentIdentity && name == c.DefaultAgentIdentity {
+			continue
+		}
+		if !agentProfileHasPolicyOverrides(profile) {
+			continue
+		}
+		*warnings = append(*warnings, Warning{
+			Field:   "agents." + name,
+			Message: "defines policy overrides without listeners or source_cidrs; X-Pipelock-Agent and ?agent= are attribution only and will use the fallback policy (_default or base, or the operator-bound default profile when configured), so bind this profile with a listener or source_cidrs, set default_agent_identity to this profile and enable bind_default_agent_identity, or select it with the operator-controlled MCP --agent flag",
+		})
+	}
+}
+
+func agentProfileHasPolicyOverrides(profile AgentProfile) bool {
+	budget := profile.Budget
+	return profile.Mode != "" || profile.Enforce != nil || len(profile.APIAllowlist) > 0 ||
+		profile.DLP != nil || profile.RateLimit != nil || profile.SessionProfiling != nil ||
+		profile.MCPToolPolicy != nil || budget.MaxRequestsPerSession != 0 ||
+		budget.MaxBytesPerSession != 0 || budget.MaxUniqueDomainsPerSession != 0 ||
+		budget.WindowMinutes != 0 || budget.MaxToolCallsPerSession != 0 ||
+		budget.MaxConcurrentToolCalls != 0 || budget.MaxWallClockMinutes != 0 ||
+		budget.MaxRetriesPerTool != 0 || budget.LoopDetectionWindow != 0 ||
+		len(budget.CostMultipliers) > 0 || budget.DoWAction != "" || budget.DoWMinSubjectTrust != "" ||
+		len(profile.AllowedAddresses) > 0 || profile.Sandbox != nil || len(profile.TrustedDomains) > 0
+}
+
+func (c *Config) validateEvidenceProvenanceWarnings(warnings *[]Warning) {
+	if c.EvidenceProvenance.CommitmentKeyringPath == "" {
+		return
+	}
+	*warnings = append(*warnings, Warning{
+		Field:   "evidence_provenance.commitment_keyring_path",
+		Message: "commitment keys are not consumed by an evidence producer yet; nothing is currently being committed with this keyring",
+	})
+}
+
+func (c *Config) validateAPIAllowlistWarnings(warnings *[]Warning) {
+	var messagingDomains []string
+	for _, raw := range c.APIAllowlist {
+		domain := strings.TrimSuffix(strings.TrimSpace(strings.ToLower(raw)), ".")
+		if isMessagingAPIAllowlistDomain(domain) {
+			messagingDomains = append(messagingDomains, domain)
+		}
+	}
+	if len(messagingDomains) == 0 {
+		return
+	}
+	*warnings = append(*warnings, Warning{
+		Field:   "api_allowlist",
+		Message: fmt.Sprintf("contains messaging/collaboration domains (%s); these are common exfiltration channels, so keep only deployment-required exact hosts and rely on DLP/content scanning for payload control", strings.Join(messagingDomains, ", ")),
+	})
+}
+
+// validateTrustedDomainTenancyWarnings warns about a wildcard on
+// trusted_domains whose base is a boundary in the public suffix list's PRIVATE
+// section. It WARNS rather than refusing, and which of those it does is the
+// whole decision here.
+//
+// Why it is worth saying anything. trusted_domains exempts a hostname from the
+// SSRF internal-IP check, and only loopback, RFC1918 and similar addresses are
+// exemptible - the cloud-metadata floor is never overridable. Several private
+// boundaries are dynamic-DNS services where a THIRD PARTY sets the address for
+// their own name: duckdns.org, no-ip.org, ddns.net, hopto.org and dynv6.net are
+// all private boundaries. So "*.duckdns.org" exempts every name any stranger
+// can point at an internal address. Reproduced: with that pattern trusted, a
+// host resolving to 127.0.0.1 was ALLOWED, while the same host with an
+// unrelated trust entry was blocked as "resolves to internal IP 127.0.0.1".
+//
+// Why it does NOT refuse, which was the first instinct and was wrong. The same
+// shape is a legitimate and EFFECTIVE entry elsewhere. Azure private endpoints
+// keep the public hostname - Microsoft's private-endpoint DNS documentation
+// says connection URLs do not change - so "myaccount.blob.core.windows.net"
+// resolves to a private VNet address, and blob.core.windows.net is itself a
+// private boundary. trusted_domains is this product's own documented remedy for
+// that case, so refusing the wildcard would break a common deployment on a
+// regulated-industry stack. An over-strict guard on a security product gets
+// switched off, which costs more than the warning buys.
+//
+// The distinction that matters is who controls the ADDRESS behind a matching
+// name, and the public suffix list does not record that. It marks who
+// administers a boundary and nothing else, so no predicate here can separate
+// the dynamic-DNS case from the private-endpoint case. That is precisely why
+// this is an advisory to a human rather than a rule.
+//
+// It fires on ZERO shipped configurations: every trusted_domains value in
+// configs/ and examples/ is a bare internal hostname.
+func (c *Config) validateTrustedDomainTenancyWarnings(warnings *[]Warning) {
+	var broad []string
+	for _, raw := range c.TrustedDomains {
+		normalized := NormalizeHostPattern(raw)
+		if !strings.HasPrefix(normalized, "*.") {
+			continue
+		}
+		base := normalized[2:]
+		// An ICANN boundary never reaches here: ValidateTrustedDomains refuses
+		// it outright, so this warning is about the private section only.
+		if suffix, icann := publicsuffix.PublicSuffix(base); !icann && suffix == base {
+			broad = append(broad, normalized)
+		}
+	}
+	if len(broad) == 0 {
+		return
+	}
+	*warnings = append(*warnings, Warning{
+		Field: "trusted_domains",
+		Message: fmt.Sprintf(
+			"%s covers every name under a shared service boundary, not only yours, and this list exempts a hostname from the internal-IP check; where that service lets other people choose their own subdomain and address, the exemption reaches their names too. Prefer the exact hosts you operate, or a pattern below the shared boundary.",
+			strings.Join(broad, ", ")),
+	})
+}
+
+func isMessagingAPIAllowlistDomain(domain string) bool {
+	return domain == "api.telegram.org" ||
+		domain == "telegram.org" ||
+		domain == "*.telegram.org" ||
+		strings.HasSuffix(domain, ".telegram.org") ||
+		domain == "t.me" ||
+		domain == "*.t.me" ||
+		strings.HasSuffix(domain, ".t.me") ||
+		domain == "gateway.discord.gg" ||
+		domain == "discord.gg" ||
+		domain == "*.discord.gg" ||
+		strings.HasSuffix(domain, ".discord.gg") ||
+		domain == "discord.com" ||
+		domain == "*.discord.com" ||
+		strings.HasSuffix(domain, ".discord.com") ||
+		domain == "slack.com" ||
+		domain == "*.slack.com" ||
+		strings.HasSuffix(domain, ".slack.com")
+}
+
+// validateLicenseIntermediate surfaces a configured intermediate certificate
+// that cannot anchor the license chain as an advisory WARNING, never a fatal
+// error. A licensing-tier misconfiguration must not block proxy startup: doing
+// so would take down free single-agent detection (violating the "never gate
+// detection behind a license" rule) and would crash-loop on the next restart
+// once a short-lived intermediate expires. The runtime license gate
+// (EnforceLicenseGate -> VerifyTokenWithOptionalIntermediate) already fails
+// closed on a bad cert by disabling agent profiles, so the safe degraded state
+// is reached without the early hard rejection.
+func (c *Config) validateLicenseIntermediate(warnings *[]Warning) {
+	// Require-intermediate misconfiguration surfaces as a WARNING, never a fatal
+	// error: a license-trust knob must not crash the free proxy (the runtime
+	// gate fails closed on paid surfaces at verify time). A malformed env value
+	// is reported; require-on with no cert configured is reported so the
+	// operator knows licensed features will be unavailable until they configure
+	// an intermediate.
+	if c.LicenseRequireIntermediateEnvError != "" {
+		*warnings = append(*warnings, Warning{
+			Field:   "license_require_intermediate",
+			Message: fmt.Sprintf("environment value %s could not be parsed (%s) — require-intermediate fails closed to ON (a malformed enable-toggle must not silently re-open the direct-root fallback); set license_require_intermediate in config or fix the env value", EnvLicenseRequireIntermediate, c.LicenseRequireIntermediateEnvError),
+		})
+	}
+	if c.LicenseRequireIntermediateResolved && len(c.LicenseIntermediateCert) == 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "license_require_intermediate",
+			Message: "is enabled but no license_intermediate_file is configured — licensed features will be disabled until an intermediate certificate is provided",
+		})
+	}
+	// A malformed/non-positive license_crl_max_age is a WARNING, never fatal: the
+	// resolver already clamped the effective window to DefaultCRLMaxAge (the
+	// freshness check stays ON), so the proxy keeps running and require mode keeps
+	// its floor — the operator just gets told their value did not take.
+	if c.LicenseCRLMaxAgeError != "" {
+		*warnings = append(*warnings, Warning{
+			Field:   "license_crl_max_age",
+			Message: fmt.Sprintf("could not be parsed (%s) — using the default %s freshness window instead", c.LicenseCRLMaxAgeError, c.LicenseCRLMaxAgeResolved),
+		})
+	}
+
+	if len(c.LicenseIntermediateCert) == 0 {
+		return
+	}
+	if c.LicenseIntermediateLoadError != "" {
+		*warnings = append(*warnings, Warning{
+			Field:   "license_intermediate_file",
+			Message: fmt.Sprintf("could not be loaded (%s) — licensed features will be disabled until the certificate is available", c.LicenseIntermediateLoadError),
+		})
+		return
+	}
+	pubKey := license.EmbeddedPublicKey()
+	if pubKey == nil {
+		if c.LicensePublicKey == "" {
+			*warnings = append(*warnings, Warning{
+				Field:   "license_intermediate_file",
+				Message: "configured but no license public key is available — agent profiles will be disabled until a key is provided",
+			})
+			return
+		}
+		keyBytes, err := hex.DecodeString(c.LicensePublicKey)
+		if err != nil || len(keyBytes) != ed25519.PublicKeySize {
+			*warnings = append(*warnings, Warning{
+				Field:   "license_intermediate_file",
+				Message: "configured but license_public_key is not a valid hex Ed25519 key — agent profiles will be disabled",
+			})
+			return
+		}
+		pubKey = ed25519.PublicKey(keyBytes)
+	}
+	if _, err := license.ParseAndVerifyIntermediate(c.LicenseIntermediateCert, pubKey, time.Now()); err != nil {
+		*warnings = append(*warnings, Warning{
+			Field:   "license_intermediate_file",
+			Message: fmt.Sprintf("rejected (%v) — agent profiles will be disabled until the certificate is valid", err),
+		})
+	}
+}
+
+// validateLearnLock enforces the schema for the lock runtime. When
+// learn_lock.enabled is true every other field is required; partial
+// configs are rejected at startup so a half-wired lock cannot silently
+// degrade to scanner-only and leave a customer thinking they are
+// enforcing a contract when they are not.
+func (c *Config) validateLearnLock() error {
+	l := c.LearnLock
+	if !l.Enabled {
+		return nil
+	}
+	if l.StoreDir == "" {
+		return fmt.Errorf("learn_lock.store_dir required when learn_lock.enabled is true")
+	}
+	if !filepath.IsAbs(l.StoreDir) {
+		return fmt.Errorf("learn_lock.store_dir must be an absolute path, got %q", l.StoreDir)
+	}
+	if l.RosterPath == "" {
+		return fmt.Errorf("learn_lock.roster_path required when learn_lock.enabled is true")
+	}
+	if !filepath.IsAbs(l.RosterPath) {
+		return fmt.Errorf("learn_lock.roster_path must be an absolute path, got %q", l.RosterPath)
+	}
+	if l.Environment.ID == "" {
+		return fmt.Errorf("learn_lock.environment.id required when learn_lock.enabled is true")
+	}
+	if err := validateLockMode(l.Mode); err != nil {
+		return err
+	}
+	if err := validateLockRootFingerprint(l.PinnedRootFingerprint); err != nil {
+		return err
+	}
+	if l.MinimumSignatures < 0 {
+		return fmt.Errorf("learn_lock.minimum_signatures must be >= 0, got %d", l.MinimumSignatures)
+	}
+	return nil
+}
+
+func validateLockMode(mode string) error {
+	switch mode {
+	case "", LockModeLive, LockModeShadow, LockModeCapture:
+		return nil
+	default:
+		return fmt.Errorf("learn_lock.mode must be one of live/shadow/capture, got %q", mode)
+	}
+}
+
+func validateLockRootFingerprint(fp string) error {
+	if fp == "" {
+		return fmt.Errorf("learn_lock.pinned_root_fingerprint required when learn_lock.enabled is true")
+	}
+	algorithm, digest, err := signing.ParseFingerprint(fp)
+	if err != nil {
+		return fmt.Errorf("learn_lock.pinned_root_fingerprint must be sha256:<64 lowercase hex>: %w", err)
+	}
+	canonical := algorithm + ":" + digest
+	if fp != canonical {
+		return fmt.Errorf("learn_lock.pinned_root_fingerprint must be lowercase canonical fingerprint %q, got %q", canonical, fp)
+	}
+	return nil
+}
+
+// validateRedaction delegates to the redact package's own schema
+// validator. The v1a startup gate that rejected enabled=true has been
+// removed now that the forward, intercept, and reverse proxy paths
+// invoke the redaction hook in scanRequestBody. A cross-check here
+// rejects the configuration where redaction is on but the body-scanning
+// path that hosts the hook is off, because that combination would
+// silently disable the feature - the exact footgun class the feature
+// is meant to prevent.
+func (c *Config) validateRedaction() error {
+	if err := c.Redaction.Validate(); err != nil {
+		return fmt.Errorf("redaction: %w", err)
+	}
+	if c.Redaction.Enabled && !c.RequestBodyScanning.Enabled {
+		return fmt.Errorf("redaction: enabled=true requires request_body_scanning.enabled=true (the redaction hook lives in the body-scan path)")
+	}
+	return nil
+}
+
+// validateLearn enforces the v2.4 learn-and-lock observation pipeline schema.
+// Schema-level checks only: PR 1.3 ships the surface, the privacy enforcer
+// (internal/contract/privacy) and recorder integration land in later commits.
+//
+// Rules:
+//   - When learn.enabled is true, learn.capture_dir must be non-empty.
+//   - learn.privacy.salt_source supports three resolver shapes: "${VAR}"
+//     (env var, validated at observe time), "file:/abs/path" (file
+//     contents, path validated here at config-load), and literal value
+//     (test/dev only). Empty string is accepted; the privacy enforcer
+//     fails closed at observe time when classification needs salt.
+//   - learn.inference.floors.min_* must each be non-negative.
+//
+// Note: validateLearnInferenceFloors duplicates the negative-rejection
+// shape of inference.Floors.Validate() on purpose. The inference package
+// emits API-facing errors keyed by short field names (min_sessions,
+// min_events, min_windows). The config validator must surface the full
+// YAML path the operator sees in pipelock.yaml
+// (learn.inference.floors.min_sessions, …). Keeping the validator local
+// also avoids importing inference here, mirroring the privacy package
+// layering - schema-level checks live in config; resolver semantics
+// live in the contract package.
+func (c *Config) validateLearn() error {
+	if c.Learn.Enabled && c.Learn.CaptureDir == "" {
+		return fmt.Errorf("learn.capture_dir required when learn.enabled is true")
+	}
+	if err := validateLearnSaltSource(c.Learn.Privacy.SaltSource); err != nil {
+		return err
+	}
+	if err := validateLearnInferenceFloors(c.Learn.Inference.Floors); err != nil {
+		return err
+	}
+	if err := validateLearnInferenceNormalization(c.Learn.Inference.Normalization); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateLearnInferenceNormalization rejects malformed normalization
+// configuration on the YAML wire layer. Algorithm must be the v2.4
+// canonical value; numeric fields must be non-negative; the entropy
+// threshold must fit the [0, 8.0] band that path inference can
+// reasonably operate in (>8 bits per single segment is a typo);
+// the tail-promotion threshold is a percentage in [0, 100]. Errors
+// emit the full YAML path the operator sees in pipelock.yaml.
+//
+// Mirrors validateLearnInferenceFloors's layering choice: no import on
+// internal/contract/inference/normalize; the validator inlines the
+// rules that the normalize package's CapConfig.Validate and
+// DecideConfig.Validate also enforce, because operator-facing error
+// messages must use the YAML field path.
+func validateLearnInferenceNormalization(n LearnInferenceNormalization) error {
+	if n.Algorithm != "" && n.Algorithm != LearnNormalizationAlgorithmV1 {
+		return fmt.Errorf("learn.inference.normalization.algorithm: %q: must be %q (only supported algorithm in v2.4)", n.Algorithm, LearnNormalizationAlgorithmV1)
+	}
+	if n.MinEvents < 0 {
+		return fmt.Errorf("learn.inference.normalization.min_events: %d: must be non-negative", n.MinEvents)
+	}
+	if n.MinDistinctValues < 0 {
+		return fmt.Errorf("learn.inference.normalization.min_distinct_values: %d: must be non-negative", n.MinDistinctValues)
+	}
+	if n.EntropyThresholdBits < 0 {
+		return fmt.Errorf("learn.inference.normalization.entropy_threshold_bits: %v: must be non-negative", n.EntropyThresholdBits)
+	}
+	if n.EntropyThresholdBits > 8.0 {
+		return fmt.Errorf("learn.inference.normalization.entropy_threshold_bits: %v: must not exceed 8.0 (more than 8 bits per single segment is implausible)", n.EntropyThresholdBits)
+	}
+	if n.CardinalityCapPerHost < 0 {
+		return fmt.Errorf("learn.inference.normalization.cardinality_cap_per_host: %d: must be non-negative", n.CardinalityCapPerHost)
+	}
+	if n.TailPromotionBlockPct < 0 {
+		return fmt.Errorf("learn.inference.normalization.tail_promotion_block_pct: %v: must be non-negative", n.TailPromotionBlockPct)
+	}
+	if n.TailPromotionBlockPct > 100.0 {
+		return fmt.Errorf("learn.inference.normalization.tail_promotion_block_pct: %v: must not exceed 100", n.TailPromotionBlockPct)
+	}
+	// Reserved-segments-extra must not contain empty strings (would shadow
+	// the canonical list lookup ambiguously).
+	for i, s := range n.ReservedSegmentsExtra {
+		if s == "" {
+			return fmt.Errorf("learn.inference.normalization.reserved_segments_extra[%d]: empty string not permitted", i)
+		}
+	}
+	return nil
+}
+
+// validateLearnInferenceFloors rejects negative exposure-floor counts on
+// the YAML wire layer. The fields are checked in declaration order
+// (sessions, events, windows) so a config with multiple negative values
+// always reports the first one - operators get a deterministic error
+// message regardless of map ordering or future field additions.
+func validateLearnInferenceFloors(f LearnInferenceFloors) error {
+	if f.MinSessions < 0 {
+		return fmt.Errorf("learn.inference.floors.min_sessions: %d: must be non-negative", f.MinSessions)
+	}
+	if f.MinEvents < 0 {
+		return fmt.Errorf("learn.inference.floors.min_events: %d: must be non-negative", f.MinEvents)
+	}
+	if f.MinWindows < 0 {
+		return fmt.Errorf("learn.inference.floors.min_windows: %d: must be non-negative", f.MinWindows)
+	}
+	return nil
+}
+
+// validateLearnSaltSource validates the salt_source field. file:-prefixed
+// values are resolved here so config-load fails loud if the file is
+// missing, traversal-bearing, relative, or world/group readable. Env-var
+// references are accepted as-is and resolved at observe time. Other values
+// are accepted as literal salts (test/dev only) - production deployments
+// should always use file: or ${VAR} so the salt never lives in config YAML.
+func validateLearnSaltSource(src string) error {
+	if src == "" {
+		return nil
+	}
+	if strings.HasPrefix(src, "${") && strings.HasSuffix(src, "}") {
+		name := strings.TrimSuffix(strings.TrimPrefix(src, "${"), "}")
+		if name == "" {
+			return fmt.Errorf("learn.privacy.salt_source: env var name must not be empty")
+		}
+		if strings.TrimSpace(name) != name {
+			return fmt.Errorf("learn.privacy.salt_source: env var name must not contain surrounding whitespace")
+		}
+		// env-var reference; resolved at observe time
+		return nil
+	}
+	if !strings.HasPrefix(src, "file:") {
+		// literal salt value (test/dev only)
+		return nil
+	}
+	rawPath := strings.TrimPrefix(src, "file:")
+	if !filepath.IsAbs(rawPath) {
+		return fmt.Errorf("learn.privacy.salt_source: file path must be absolute")
+	}
+	if filepath.Clean(rawPath) != rawPath {
+		return fmt.Errorf("learn.privacy.salt_source: file path must be in canonical form (no .., redundant separators, or trailing slash)")
+	}
+	cleanPath := filepath.Clean(rawPath)
+
+	// Lstat rejects symlinks at the directory entry level. The runtime
+	// resolver in internal/contract/privacy re-validates with O_NOFOLLOW on
+	// the open fd so a between-stat-and-open swap also fails closed.
+	li, err := os.Lstat(cleanPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("learn.privacy.salt_source: file does not exist")
+		}
+		return fmt.Errorf("learn.privacy.salt_source: lstat %s: %w", cleanPath, err)
+	}
+	if li.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("learn.privacy.salt_source: symlinks not permitted: %s", cleanPath)
+	}
+	if !li.Mode().IsRegular() {
+		return fmt.Errorf("learn.privacy.salt_source: file must be a regular file")
+	}
+
+	f, err := os.OpenFile(cleanPath, os.O_RDONLY|noFollowFlag, 0)
+	if err != nil {
+		if errors.Is(err, errELOOP) {
+			return fmt.Errorf("learn.privacy.salt_source: symlink raced into place: %s", cleanPath)
+		}
+		return fmt.Errorf("learn.privacy.salt_source: open %s: %w", cleanPath, err)
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("learn.privacy.salt_source: fstat %s: %w", cleanPath, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("learn.privacy.salt_source: file must be a regular file")
+	}
+	if secperm.TooPermissive(fi.Mode().Perm(), 0o077) {
+		return fmt.Errorf("learn.privacy.salt_source: file must have mode 0o600 or stricter (got: 0o%03o)", fi.Mode().Perm())
+	}
+	return nil
+}
+
+func (c *Config) validateMode() error {
+	switch c.Mode {
+	case ModeStrict, ModeBalanced, ModeAudit:
+		// valid
+	default:
+		return fmt.Errorf("invalid mode %q: must be strict, balanced, or audit", c.Mode)
+	}
+
+	if c.Mode == ModeStrict && len(c.APIAllowlist) == 0 {
+		return fmt.Errorf("strict mode requires at least one domain in api_allowlist")
+	}
+	// The RAW gate applies to the allowlist even though the BREADTH rule
+	// deliberately does not. Breadth is directional and this list's wildcard
+	// semantics are left alone on purpose. Retargeting is not directional: in
+	// strict mode the scanner copies these patterns into the enforced allowlist
+	// and MatchDomain folds case, so "*.<KELVIN>example.com" loads and then
+	// PERMITS sub.kexample.com. That is an egress grant for a host the operator
+	// never wrote, which is the fail-open direction on the list that decides
+	// what may leave at all.
+	if err := ValidateHostGrantList(c.APIAllowlist, "api_allowlist"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateHostMatchList validates an allowlist or blocklist entry's RAW
+// bytes and its SHAPE, without judging breadth. Breadth is directional and does
+// not belong here: a broad wildcard on one of these lists is the operator's
+// policy. The other two halves are not directional, and leaving either one out
+// has now produced a defect each:
+//
+//   - Raw bytes: a value that folds into a different host retargets the rule.
+//   - Shape: a malformed pattern is compared LITERALLY by MatchDomain, so it
+//     matches nothing. On the blocklist that is a deny rule that never denies -
+//     "example.com#disabled" is accepted and lets example.com straight through.
+//     On an allowlist it instead denies traffic the operator meant to permit.
+//
+// Wildcard semantics for every well-formed ASCII pattern are unchanged, and an
+// exact IP literal stays valid because MatchDomain compares an IP hostname for
+// equality. A WILDCARD over an IP such as "*.8.8.8.8" stays ACCEPTED: numeric
+// labels are legal DNS labels, and while the pattern is inert against real IP
+// traffic (MatchDomain takes an equality-only branch once the hostname parses
+// as an IP) it does match a domain like "foo.8.8.8.8". Refusing it here was
+// tried and reverted on an earlier round as over-strict rather than unsafe.
+//
+// Shared with the per-agent allowlists, which the enterprise merge REPLACES
+// rather than merges, so they never passed through the top-level check.
+func ValidateHostMatchList(hosts []string, label string) error {
+	for i, raw := range hosts {
+		normalized, err := NormalizeAndCheckHostPattern(raw)
+		if err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+		if err := matcherParityError(raw, normalized); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+	}
+	return nil
+}
+
+// ValidateHostGrantList is ValidateHostMatchList plus the wildcard BREADTH
+// rule, for a list that GRANTS reachability rather than matching or denying it.
+//
+// The split exists because the same shared checker serves three fields and only
+// two of them grant: the top-level and per-agent api_allowlist do, and
+// fetch_proxy.monitoring.blocklist does not. Breadth is directional, so adding
+// it inside the shared function would refuse a broad wildcard on a DENY list,
+// where breadth is the operator's policy rather than a mistake. An earlier
+// revision of this branch made exactly that error on request_policy routes.
+//
+// Why an allowlist needs it. In strict mode this list decides what may leave at
+// all, so "*.com" is not a broad grant but the absence of one: it permits every
+// host under an entire registry, which is strict mode spelled as if it were
+// enabled while behaving as if it were off. That is the same silent-no-op class
+// this file already refuses elsewhere, in its most consequential form, and two
+// independent reviews rated it high on this change.
+//
+// It is safe for shipped configuration BECAUSE breadth refuses only ICANN
+// boundaries. Every wildcard in this repository's presets and defaults is
+// either an ordinary registrable domain ("*.anthropic.com") or a PRIVATE
+// boundary ("*.googleapis.com", "*.githubusercontent.com"), and private ones
+// stay accepted. Verified by classifying all 84 wildcard patterns under
+// configs/, charts/, docs/ and examples/ against the list: the only ICANN-
+// boundary mentions are documentation prose describing the refusal.
+func ValidateHostGrantList(hosts []string, label string) error {
+	if err := ValidateHostMatchList(hosts, label); err != nil {
+		return err
+	}
+	for i, raw := range hosts {
+		normalized := NormalizeHostPattern(raw)
+		if !strings.HasPrefix(normalized, "*.") {
+			continue
+		}
+		if err := wildcardBaseBreadthError(normalized[2:]); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+	}
+	return nil
+}
+
+// matcherParityError refuses a pattern that VALIDATES as one host and MATCHES
+// as another. These lists store the operator's string verbatim and hand it to
+// destination.MatchDomain, which folds case and trims exactly ONE trailing dot
+// and nothing else. NormalizeHostPattern is stricter: it also trims surrounding
+// whitespace and every trailing dot. So a value both accept means the same
+// thing, and a value they read differently was approved on the strength of a
+// string the matcher will never see.
+//
+// "example.com.." is the reachable case and it was a fail-open on the deny
+// list: it validated as "example.com", stayed stored as typed, and the matcher
+// compared "example.com." to "example.com" and did not block. Leading or
+// trailing whitespace does the same. A single trailing dot is fine and stays
+// accepted, because the matcher removes it too.
+//
+// The repair belongs HERE rather than in MatchDomain. Making the matcher trim
+// all trailing dots would silently WIDEN every pattern already stored in that
+// shape: "*.com.." is inert today and would start matching every .com host.
+// Refusing the input keeps the fix from being a behavior change to traffic.
+func matcherParityError(raw, normalized string) error {
+	matcherView := strings.ToLower(strings.TrimSuffix(raw, "."))
+	if matcherView != normalized {
+		return fmt.Errorf(
+			"host pattern must be written as %q: as typed, matching would compare %q and never agree with the validated form",
+			normalized, matcherView)
+	}
+	return nil
+}
+
+// validateLiteralHostMatchList validates a host list whose runtime matcher
+// only folds case: it compares the operator's stored string against the
+// request hostname with no trimming at all.
+//
+// Two lists are in that shape, tls_interception.passthrough_domains and
+// forward_proxy.redirect_websocket_hosts, and until now neither had any
+// validator. Every malformed spelling loaded clean and then matched nothing,
+// so the entry was silently inert: a pinned-certificate host written
+// "vendor.example." or " vendor.example" was intercepted anyway, and the
+// operator saw accepted configuration. That is an availability failure rather
+// than a bypass, which is why the repair is to refuse the input and to store
+// the canonical form, not to loosen either matcher.
+//
+// BREADTH is judged for one of the two lists and not the other, because they
+// differ in what a wide wildcard costs.
+//
+// tls_interception.passthrough_domains SPLICES a matching host without
+// decrypting it, so "*.com" there turns body and response scanning off for
+// every .com destination. That is the same detector-off shape this repository
+// already breadth-checks on trusted_domains and the exempt lists, but
+// passthrough gets a STRICTER rule than those: a wildcard whose base is ANY
+// public suffix is refused here, private-section entries such as
+// "*.s3.amazonaws.com" included, because splicing turns every detector off
+// for every unrelated tenant under that boundary. The ordinary grant lists
+// still accept a private-section wildcard, because they go on scanning what
+// they exempt. See passthroughWildcardBaseBreadthError.
+//
+// forward_proxy.redirect_websocket_hosts is NOT the same: a wide wildcard
+// routes more traffic INTO the /ws proxy, which still scans it, so breadth
+// there is a routing preference rather than a hole.
+//
+// The admission cost was measured rather than assumed before adding this.
+// Nothing shipped is refused: the default is "*.googlevideo.com", every
+// preset ships an empty list, and the documented examples all survive the
+// predicate. An existing deployment that loads a public-suffix wildcard will
+// now fail validation and can be checked ahead of a restart with
+// `pipelock check --config`, which names the field, index and value.
+func validateLiteralHostMatchList(label string, entries []string, judgeBreadth bool) error {
+	if judgeBreadth {
+		// The only caller passing true is
+		// tls_interception.passthrough_domains, so this uses the stricter
+		// passthrough-only breadth rule (any public suffix, private section
+		// included) rather than the ordinary grant-list rule used by
+		// api_allowlist and the exempt/trusted lists. See
+		// passthroughWildcardBaseBreadthError for why the two differ.
+		if err := validatePassthroughHostGrantList(entries, label); err != nil {
+			return err
+		}
+	} else if err := ValidateHostMatchList(entries, label); err != nil {
+		return err
+	}
+	// Store the normalized form. These matchers do not trim a trailing dot,
+	// so "vendor.example." would otherwise stay stored as typed and never
+	// match a request for "vendor.example", even though the parity check
+	// above accepts that spelling for matchers that do trim one dot.
+	for i, raw := range entries {
+		entries[i] = NormalizeHostPattern(raw)
+	}
+	return nil
+}
+
+func (c *Config) validateLogging() error {
+	switch c.Logging.Format {
+	case DefaultLogFormat, "text":
+		// valid
+	default:
+		return fmt.Errorf("invalid logging format %q: must be json or text", c.Logging.Format)
+	}
+
+	switch c.Logging.Output {
+	case DefaultLogOutput, OutputFile, OutputBoth:
+		// valid
+	default:
+		return fmt.Errorf("invalid logging output %q: must be stdout, file, or both", c.Logging.Output)
+	}
+
+	if (c.Logging.Output == OutputFile || c.Logging.Output == OutputBoth) && c.Logging.File == "" {
+		return fmt.Errorf("logging.file is required when output is %q", c.Logging.Output)
+	}
+	return nil
+}
+
+func (c *Config) validateDLP(warnings *[]Warning) error {
+	if err := c.validateDLPPatternConfig(warnings); err != nil {
+		return err
+	}
+
+	// Validate secrets_file if configured
+	if c.DLP.SecretsFile != "" {
+		info, err := os.Stat(c.DLP.SecretsFile)
+		if err != nil {
+			return fmt.Errorf("secrets_file %q: %w", c.DLP.SecretsFile, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("secrets_file %q must be a regular file", c.DLP.SecretsFile)
+		}
+		// Reject group-write/execute and all other access. Group-read
+		// allowed for k8s Secret volume compatibility.
+		if secperm.TooPermissive(info.Mode().Perm(), 0o037) {
+			return fmt.Errorf("secrets_file %q has unsafe permissions (mode %04o): restrict to 0600 or 0640", c.DLP.SecretsFile, info.Mode().Perm())
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateDLPPatternConfig(warnings *[]Warning) error {
+	// dlp.action is not supported: DLP matches follow the calling surface's
+	// action (request_body_scanning.action, mcp_input_scanning.action, or
+	// enforce mode). The field exists so YAML doesn't silently drop it, and a
+	// non-empty value is rejected with an explicit error. A per-pattern
+	// action accepts only "warn", and never on a built-in pattern.
+	if c.DLP.Action != "" {
+		return fmt.Errorf("dlp.action %q is not supported; DLP match behavior depends on the calling surface (request_body_scanning.action for HTTP bodies/headers, mcp_input_scanning.action for MCP input, enforce/audit mode for URL scanning, and response_scanning.action only for inbound prompt-injection response scanning)", c.DLP.Action)
+	}
+	if err := validateDeclaredCredentialHostList(c.DLP.GitHubEnterpriseHosts, "dlp.github_enterprise_hosts"); err != nil {
+		return err
+	}
+	if err := validateDeclaredCredentialHostList(c.DLP.GitLabHosts, "dlp.gitlab_hosts"); err != nil {
+		return err
+	}
+	if warnings != nil && len(c.DLP.GitHubEnterpriseHosts) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "dlp.github_enterprise_hosts",
+			Message: fmt.Sprintf("dlp.github_enterprise_hosts %v receives GitHub Token and GitHub Fine-Grained PAT on an encrypted Authorization header; a declared host the operator does not control receives the credential by design", c.DLP.GitHubEnterpriseHosts),
+		})
+	}
+	if warnings != nil && len(c.DLP.GitLabHosts) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "dlp.gitlab_hosts",
+			Message: fmt.Sprintf("dlp.gitlab_hosts %v receives GitLab token classes on their compiled headers over an encrypted scheme; a declared host the operator does not control receives the credential by design", c.DLP.GitLabHosts),
+		})
+	}
+
+	// Validate DLP patterns compile as valid regexes
+	for i, p := range c.DLP.Patterns {
+		if err := p.ValidateKeywords(); err != nil {
+			return err
+		}
+		if len(p.Keywords) > 0 && warnings != nil {
+			*warnings = append(*warnings, Warning{Field: fmt.Sprintf("dlp.patterns[%d].keywords", i), Message: dlpKeywordAdvisory})
+		}
+		if p.Name == "" {
+			return fmt.Errorf("DLP pattern missing name")
+		}
+		if p.Regex == "" {
+			return fmt.Errorf("DLP pattern %q missing regex", p.Name)
+		}
+		if _, err := regexp.Compile(p.Regex); err != nil {
+			return fmt.Errorf("DLP pattern %q has invalid regex: %w", p.Name, err)
+		}
+		if p.Action != "" {
+			if p.Action != ActionWarn {
+				return fmt.Errorf("DLP pattern %q has unsupported action %q; only %q is allowed as a per-pattern action", p.Name, p.Action, ActionWarn)
+			}
+			// Gate on the pattern's OWN compiled audience, not on the name. A
+			// user pattern that reuses a built-in name with a custom regex is
+			// not the built-in: normalize clears its audience, so it never
+			// earns an audience allow and has no reason to be refused a warn
+			// action. Rejecting by name alone refuses a legitimate config.
+			if p.Compiled || len(p.CredentialAudienceHosts) > 0 {
+				return fmt.Errorf("DLP pattern %q is a built-in default and cannot be set to warn mode; built-in patterns always enforce", p.Name)
+			}
+		}
+		if p.Validator != "" {
+			valid := p.Validator == ValidatorLuhn || p.Validator == ValidatorMod97 || p.Validator == ValidatorABA || p.Validator == ValidatorWIF || p.Validator == ValidatorDEA || p.Validator == ValidatorNPI
+			if !valid {
+				return fmt.Errorf("DLP pattern %q has unknown validator %q (valid: %s, %s, %s, %s, %s, %s)",
+					p.Name, p.Validator, ValidatorLuhn, ValidatorMod97, ValidatorABA, ValidatorWIF, ValidatorDEA, ValidatorNPI)
+			}
+		}
+		if err := ValidateTrustedDomains(p.ExemptDomains, fmt.Sprintf("DLP pattern %q exempt_domains", p.Name)); err != nil {
+			return err
+		}
+		// The immutable floor ignores exemptions, so a pattern that reuses a
+		// core name with exempt_domains would document an allowance the scanner
+		// never grants. Refuse it at load and reload instead of shipping a knob
+		// that silently does nothing for that credential class.
+		if len(p.ExemptDomains) > 0 && IsCoreDLPPatternName(p.Name) {
+			return fmt.Errorf("DLP pattern %q is a core safety-floor pattern and cannot set exempt_domains; core credential destinations are controlled only by immutable compiled policy", p.Name)
+		}
+		// Gate on the pattern's OWN compiled audience, matching the warn-action
+		// branch above. exempt_domains never costs a pattern its audience: an
+		// entry the audience already covers is redundant and ignored, and an
+		// entry outside it is honored by the scanner for that host only. The
+		// second is a widening the operator is entitled to choose, so it warns
+		// and the config loads, as the suppress and disable_patterns widenings do.
+		if len(p.ExemptDomains) > 0 && len(p.CredentialAudienceHosts) > 0 && warnings != nil {
+			// The scanner's audience includes declared enterprise hosts, so
+			// classify against the same set it enforces.
+			audienceHosts := AppendDeclaredCredentialAudienceHosts(p.Name, p.CredentialAudienceHosts, c.DLP.GitHubEnterpriseHosts, c.DLP.GitLabHosts)
+			var inside, outside []string
+			for _, domain := range p.ExemptDomains {
+				if credentialAudienceDomainSubset([]string{domain}, audienceHosts) {
+					inside = append(inside, domain)
+				} else {
+					outside = append(outside, domain)
+				}
+			}
+			field := fmt.Sprintf("dlp.patterns[%d].exempt_domains", i)
+			if len(inside) > 0 {
+				*warnings = append(*warnings, Warning{
+					Field:   field,
+					Message: fmt.Sprintf("%s %v is a redundant subset of the compiled credential audience for %q and is ignored; remove it", field, inside, p.Name),
+				})
+			}
+			if len(outside) > 0 {
+				*warnings = append(*warnings, Warning{
+					Field:   field,
+					Message: fmt.Sprintf("%s %v is outside the compiled credential audience %v for %q: the pattern is skipped for those destinations, so the credential can leave for a host its vendor does not own", field, outside, audienceHosts, p.Name),
+				})
+			}
+		}
+		// A pattern that reuses a built-in name replaces the built-in, and a
+		// changed regex, severity, validator or action costs it the compiled
+		// credential audience. A blocking replacement then blocks at the
+		// vendor's own destinations too, which looks like an outage to the
+		// operator and otherwise says nothing about why.
+		if warnings != nil && p.Bundle == "" && len(p.CredentialAudienceHosts) == 0 {
+			if builtIn, ok := builtInAudiencePattern(p.Name); ok {
+				if changed := changedFromBuiltIn(p, builtIn); len(changed) > 0 {
+					// The hostile preset intentionally ships these severity-only
+					// overrides without an audience. Recognize that exact shipped
+					// identity rather than warning on a supported preset. Custom
+					// regexes, actions, validators and exemptions still warn.
+					if len(changed) == 1 && changed[0] == "severity" &&
+						p.Severity == hostileDLPSeverityOverrides[p.Name] && len(p.ExemptDomains) == 0 {
+						continue
+					}
+					*warnings = append(*warnings, Warning{
+						Field:   fmt.Sprintf("dlp.patterns[%d]", i),
+						Message: fmt.Sprintf("dlp.patterns[%d] %q replaces the built-in pattern of the same name and changes its %s, so its compiled credential audience %v no longer applies; matches follow the configured action and exemptions instead of receiving the built-in destination-and-carrier allowance; keep the shipped regex, severity, validator and action to keep the audience, or give the pattern a different name", i, p.Name, strings.Join(changed, ", "), builtIn.CredentialAudienceHosts),
+					})
+				}
+			}
+		}
+	}
+
+	if err := validateCanaryTokens(c); err != nil {
+		return fmt.Errorf("canary_tokens: %w", err)
+	}
+	return nil
+}
+
+// validateDeclaredCredentialHostList accepts only exact DNS hostnames.
+// Wildcards, IP literals, URLs, and host:port values are rejected. The
+// encrypted-scheme requirement is enforced when the request is matched.
+func validateDeclaredCredentialHostList(hosts []string, field string) error {
+	seen := make(map[string]struct{}, len(hosts))
+	for i := range hosts {
+		normalized, err := NormalizeAndCheckHostPattern(hosts[i])
+		if err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", field, i, hosts[i], err)
+		}
+		if strings.Contains(normalized, "*") {
+			return fmt.Errorf("%s[%d] %q: wildcards are not allowed; name the exact host", field, i, hosts[i])
+		}
+		if net.ParseIP(normalized) != nil {
+			return fmt.Errorf("%s[%d] %q: IP literals are not allowed", field, i, hosts[i])
+		}
+		if _, dup := seen[normalized]; dup {
+			return fmt.Errorf("%s[%d] %q duplicates %q", field, i, hosts[i], normalized)
+		}
+		seen[normalized] = struct{}{}
+		hosts[i] = normalized
+	}
+	return nil
+}
+
+func (c *Config) validateFetchProxy() error {
+	_, proxyPort, err := net.SplitHostPort(c.FetchProxy.Listen)
+	if err != nil {
+		return fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, err)
+	}
+	if err := c.validateTCPPort("fetch_proxy.listen", proxyPort); err != nil {
+		return err
+	}
+
+	// Validate blocklist patterns are well-formed. The RAW and SHAPE gates
+	// apply here even though the BREADTH rule deliberately does not: breadth is
+	// directional, because a broad wildcard on a deny list is a policy, but a
+	// retargeted or unmatchable pattern is wrong in EVERY direction. See
+	// ValidateHostMatchList for both failure directions.
+	for _, b := range c.FetchProxy.Monitoring.Blocklist {
+		if b == "" {
+			return fmt.Errorf("empty blocklist entry")
+		}
+	}
+	if err := ValidateHostMatchList(c.FetchProxy.Monitoring.Blocklist, "fetch_proxy.monitoring.blocklist"); err != nil {
+		return err
+	}
+
+	if err := validateHostnamePatternList("subdomain_entropy_exclusions", c.FetchProxy.Monitoring.SubdomainEntropyExclusions); err != nil {
+		return err
+	}
+
+	// Validate query entropy exclusions with the same hostname-pattern rules
+	// as subdomain entropy exclusions. Kept as a separate list so operators
+	// can grant per-host bypass for the query stage (S3 pre-signed URLs)
+	// without weakening the subdomain or path entropy gates on that host.
+	if err := validateHostnamePatternList("query_entropy_exclusions", c.FetchProxy.Monitoring.QueryEntropyExclusions); err != nil {
+		return err
+	}
+	if err := validatePathEntropyExclusions(c.FetchProxy.Monitoring.PathEntropyExclusions); err != nil {
+		return err
+	}
+	if err := validateQueryEntropyParamExclusions(c.FetchProxy.Monitoring.QueryEntropyParamExclusions); err != nil {
+		return err
+	}
+
+	if err := validateOAuthAuthorizationEndpoints(c); err != nil {
+		return err
+	}
+	if err := validateIssuedRedirectDelegations(c); err != nil {
+		return err
+	}
+
+	// Validate global rate limits are non-negative
+	if c.FetchProxy.Monitoring.MaxReqPerMinute < 0 {
+		return fmt.Errorf("fetch_proxy.monitoring.max_requests_per_minute must be >= 0")
+	}
+	if c.FetchProxy.Monitoring.MaxDataPerMinute < 0 {
+		return fmt.Errorf("fetch_proxy.monitoring.max_data_per_minute must be >= 0")
+	}
+	return nil
+}
+
+func validateHostnamePatternList(field string, entries []string) error {
+	for i, raw := range entries {
+		// The RAW value is gated before folding; see RawHostASCIIError. Then
+		// the trailing dot is normalized before the breadth check, so a
+		// trailing-dot input like "*.com." cannot pass and then normalize down
+		// to the over-broad "*.com".
+		if err := RawHostASCIIError(raw); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", field, i, raw, err)
+		}
+		d := NormalizeHostPattern(raw)
+		if d == "" {
+			return fmt.Errorf("%s[%d] is empty", field, i)
+		}
+		if err := HostPatternBreadthError(d); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", field, i, raw, err)
+		}
+		entries[i] = d
+	}
+	return nil
+}
+
+// NormalizeHostPattern lowercases a host pattern and strips surrounding space
+// and EVERY trailing DNS dot. The dots must go BEFORE any breadth check, or
+// "*.com." passes the check and then normalizes down to the over-broad
+// "*.com".
+//
+// TrimRight rather than TrimSuffix, and that is the whole point: TrimSuffix
+// removes ONE dot, so "*.com.." became "*.com.", whose breadth test counts the
+// remaining dot as a domain label and accepts it. Runtime matching then strips
+// that dot and matched every .com host. Repeated trailing dots are the same
+// host by DNS rules, so collapsing them all is the correct reading and not a
+// special case for one input.
+func NormalizeHostPattern(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(strings.ToLower(raw)), ".")
+}
+
+// HostPatternBreadthError reports why a normalized host pattern is too broad or
+// malformed to use as a scoped match, or nil when it is acceptable. It returns
+// the reason without a field prefix so both config validation and a runtime
+// compiler can use one predicate.
+//
+// This is exported because the scanner needs the SAME answer at the point of
+// use. A Config can reach the scanner without having been validated, and a
+// runtime compiler that re-implements a subset of these rules drifts from them:
+// the path-entropy builder did exactly that, dropping an empty host, a bare
+// root prefix and a cleartext scheme while still installing "*.com", which
+// MatchDomain then matched against every .com host. One predicate, two callers.
+//
+// Breadth is measured against the published public suffix list, not by counting
+// dots. The dot count remains only as a floor for a single-label base.
+func HostPatternBreadthError(normalized string) error {
+	// SHAPE FIRST, from the one shape predicate, so the two cannot diverge.
+	// They did diverge once: both returned early after the "*." prefix and so
+	// both accepted an interior wildcard like "*.example*.com". Layering means
+	// a shape rule added for one surface protects the other for free.
+	if err := HostPatternSyntaxError(normalized); err != nil {
+		return err
+	}
+	if strings.HasPrefix(normalized, "*.") {
+		return wildcardBaseBreadthError(normalized[2:])
+	}
+	return nil
+}
+
+// RawHostASCIIError rejects a host value carrying non-ASCII BEFORE any case
+// folding. It is separate and exported because the ORDER is the security
+// property, not a style choice: a check applied after folding is not the same
+// check. Five call sites reach it directly, one of them the scanner's
+// unvalidated-config builder in another package, and four more reach it through
+// NormalizeAndCheckHostPattern. Counting them by eye went wrong four separate
+// times in this area, so count them rather than trusting this sentence:
+//
+//	grep -rn 'RawHostASCIIError(' --include='*.go' internal/ enterprise/
+//
+// U+212A KELVIN SIGN lowercases to ASCII "k", so "Kexample.com" written with
+// that rune folds to "kexample.com". A validator that folds first then tests
+// for ASCII sees a clean ASCII hostname and installs an exemption for a
+// DIFFERENT host than the operator typed. The first repair for this covered
+// only three surfaces and left five entropy-exemption lists, the scanner's
+// defensive builder and the query-parameter host validator still folding
+// first, which is what this function exists to stop recurring.
+//
+// An ASCII A-label such as "xn--..." is unaffected: configuration stores that
+// spelling while runtime matching canonicalizes it with the same IDNA profile.
+func RawHostASCIIError(raw string) error {
+	if strings.IndexFunc(raw, func(r rune) bool { return r > unicode.MaxASCII }) >= 0 {
+		return errors.New("host must be ASCII; write an internationalized name in its xn-- A-label form")
+	}
+	return nil
+}
+
+// NormalizeAndCheckHostPattern normalizes a RAW host pattern and validates its
+// shape, returning the normalized value. It is the entry point every caller
+// should use, and it exists because doing these two steps separately has
+// produced two defects in this area already.
+//
+// ORDER IS LOAD-BEARING. The raw value is checked for non-ASCII BEFORE case
+// folding, because some non-ASCII runes fold INTO ASCII: U+212A KELVIN SIGN
+// lowercases to "k", so "*.Kexample.com" written with that rune would fold to
+// "*.kexample.com" and pass an ASCII check applied afterwards. That is not
+// rejecting non-ASCII, it is silently retargeting the operator's rule at a
+// different host. An ASCII A-label such as "xn--..." is unaffected and stays
+// supported.
+func NormalizeAndCheckHostPattern(raw string) (string, error) {
+	if err := RawHostASCIIError(raw); err != nil {
+		return "", err
+	}
+	normalized := NormalizeHostPattern(raw)
+	if err := HostPatternSyntaxError(normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
+// HostPatternSyntaxError reports whether a normalized host pattern is
+// well-formed, WITHOUT judging how much of the internet it covers. Use it for
+// DENY and MATCH surfaces, where breadth is the operator's intent rather than a
+// mistake: a request_policy route that blocks "*.co.uk" is a policy, not a
+// misconfiguration, and refusing it would remove the ability to express one.
+//
+// The DNS label grammar applies to an exact host as well as to a wildcard base.
+// Scoping it to wildcards only was a defect: "vendor.example#disabled" loaded
+// as an exact route host, and the matcher compares hostnames for equality, so
+// no request could equal it and a block rule carrying it denied nothing. An IP
+// literal is the one exception, because an exact IP host is legitimate and this
+// repository's own route tests block by address.
+func HostPatternSyntaxError(normalized string) error {
+	if normalized == "" {
+		return errors.New("host pattern is empty")
+	}
+	// The exact-IP exception is tested FIRST, before the host:port rejection,
+	// because an IPv6 literal is made of colons: "2001:db8::1" read as a
+	// host:port and was refused while the comment below and the documentation
+	// both promised an exact IP literal was valid. That was invisible until
+	// three more lists were routed through this predicate. An address with a
+	// port or brackets does not parse as an IP and still falls through to the
+	// rejection.
+	if net.ParseIP(normalized) != nil {
+		return nil
+	}
+	if strings.Contains(normalized, "://") || strings.Contains(normalized, "/") || strings.Contains(normalized, ":") {
+		return errors.New("use a hostname pattern, not a URL or host:port")
+	}
+	if strings.HasPrefix(normalized, "*.") {
+		base := normalized[2:]
+		if base == "" {
+			return errors.New("wildcard must name a domain, as in *.example.com")
+		}
+		return hostLabelGrammarError(base, "wildcard base")
+	}
+	if strings.ContainsAny(normalized, "*?[]") {
+		return errors.New("only exact hosts and *.example.com wildcards are supported")
+	}
+	return hostLabelGrammarError(normalized, "host")
+}
+
+func hostLabelGrammarError(base, what string) error {
+	if strings.ContainsAny(base, "*?[]") {
+		return fmt.Errorf("wildcard may appear only as the leading *., not inside %q", base)
+	}
+	if strings.IndexFunc(base, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || r > unicode.MaxASCII
+	}) >= 0 {
+		return fmt.Errorf("%s must contain only ASCII DNS label characters", what)
+	}
+	// No IP-literal rejection here, deliberately. It was tried and was
+	// OVER-STRICT: the reqpolicy matcher compares `host == base` as well as a
+	// suffix, so "*.8.8.8.8" does match the address itself, and refusing it
+	// made validation disagree with the runtime contract. Aligning the
+	// validator to the matcher is the smaller change; giving the matcher
+	// explicit IP semantics would be a runtime behaviour change and belongs in
+	// its own decision. An IP's labels are digits, so the grammar below accepts
+	// it without a special case.
+	if len(base) > 253 {
+		return fmt.Errorf("%s must be 253 bytes or shorter", what)
+	}
+	for _, label := range strings.Split(base, ".") {
+		if label == "" {
+			return fmt.Errorf("%s contains an empty DNS label", what)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("%s DNS labels must be 63 bytes or shorter", what)
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("%s labels must not start or end with '-'", what)
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return fmt.Errorf("%s must contain only DNS label characters", what)
+		}
+	}
+	if _, err := destination.LookupASCII(base); err != nil {
+		return fmt.Errorf("%s must be valid under IDNA lookup processing: %w", what, err)
+	}
+	return nil
+}
+
+// wildcardBaseBreadthError reports why `*.base` is too broad to be a scoped
+// match, or nil when it is acceptable.
+//
+// TWO rules, and both are needed. The single-label test catches "*.com" and
+// "*.example": a base with no dot is a whole top-level namespace. The
+// public-suffix test catches what counting dots cannot, because a registry
+// suffix can be several labels: "*.co.uk" has a dot and is every UK commercial
+// domain. Before this, the dot count alone accepted it, and the pattern then
+// exempted every host under that suffix from whichever gate the list governs,
+// including the SSRF internal-IP check that trusted_domains controls.
+//
+// The ICANN flag is the discriminator, and using it is the difference between a
+// fix and a regression. publicsuffix reports icann=true for registry-operated
+// suffixes (com, co.uk, com.au) and icann=false for suffixes in the list's
+// PRIVATE section (s3.amazonaws.com, github.io, cloudfront.net). The private
+// section says who ADMINISTERS the boundary and nothing about tenancy:
+// github.io and blogspot.com sit above content owned by unrelated people. Rejecting every bare public suffix would therefore refuse
+// "*.s3.amazonaws.com", which is a pattern an operator legitimately writes.
+// Rejecting only the ICANN ones refuses what has no legitimate use and accepts
+// what does.
+//
+// A private-suffix wildcard is broad without being wrong, and rejecting the
+// whole class was tried and REPRODUCED AS A BREAK: five patterns this
+// repository itself ships are private PSL boundaries, including
+// "*.googleapis.com" and "*.githubusercontent.com" in configs/claude-code.yaml
+// and the DLP exempt lists in defaults.go, plus "*.ngrok.io",
+// "*.ngrok-free.app" and "*.readthedocs.io". A rule that refuses Pipelock's own
+// presets is worse than the weakness it replaces. The principled objection is
+// real (a PSL boundary marks a REGISTRATION boundary, not an ownership one, so
+// "*.googleapis.com" is every Google-hosted API namespace and not just yours).
+// Surfacing breadth as an advisory rather than refusing it is the direction
+// this leans, and nothing here does that yet.
+//
+// THIS RULE IS FOR ALLOW, TRUST AND DETECTOR-BYPASS SURFACES ONLY. A DENY or
+// MATCH surface must use HostPatternSyntaxError instead, because there a broad
+// wildcard is the POINT: "*.co.uk" as a trust exemption gives away every UK
+// commercial domain, while the same pattern as a request_policy block is a
+// legitimate policy. The domain blocklist was already validated for nothing but
+// emptiness. Getting this wrong is not hypothetical: an earlier revision of
+// this change applied the breadth rule to request_policy route hosts, which
+// support `block`, and so refused a legitimate broad block.
+// The caller guarantees a non-empty base: NormalizeHostPattern collapses "*."
+// and "*.." to "*", which the wildcard-character branch above rejects before
+// this is reached. An explicit empty check here would be unreachable, and an
+// unreachable branch cannot be tested, so the invariant is written down instead.
+// Should it ever be reached, the single-label test below refuses it anyway.
+func wildcardBaseBreadthError(base string) error {
+	if !strings.Contains(base, ".") {
+		return fmt.Errorf("wildcard must target a concrete domain like *.example.com, not the whole %q namespace", base)
+	}
+	if suffix, icann := publicsuffix.PublicSuffix(base); icann && suffix == base {
+		return fmt.Errorf("wildcard must target a registrable domain like *.example.%s, not the public suffix %q, which would match every domain registered under it", base, base)
+	}
+	return nil
+}
+
+// passthroughWildcardBaseBreadthError is wildcardBaseBreadthError's stricter
+// sibling for tls_interception.passthrough_domains ONLY. It refuses a
+// wildcard over ANY public-suffix boundary, ICANN section and PRIVATE section
+// alike, where wildcardBaseBreadthError accepts a private-section base such
+// as "*.github.io" or "*.s3.amazonaws.com".
+//
+// The two lists differ in what the wildcard actually turns off, and that
+// difference is why they get different rules rather than sharing one. An
+// ordinary grant list (api_allowlist, an exempt/trusted list) still scans
+// what it lets through; the breadth question there is only "how much may
+// reach the scanner." tls_interception.passthrough_domains is not a grant
+// onto a scanned path — it SPLICES the TLS connection without decrypting it,
+// so a matching host gets no body or response scanning at all. A wildcard
+// over a private-suffix boundary there does not merely widen who is exempt
+// from one detector; it turns off every detector for every unrelated tenant
+// under that boundary (every github.io project, every S3 bucket under that
+// suffix), which is the same fail-open shape the ICANN refusal already
+// exists to prevent and public-suffix status does not distinguish.
+func passthroughWildcardBaseBreadthError(base string) error {
+	if !strings.Contains(base, ".") {
+		return fmt.Errorf("wildcard must target a concrete domain like *.example.com, not the whole %q namespace", base)
+	}
+	if suffix, icann := publicsuffix.PublicSuffix(base); suffix == base {
+		section := "a registry-operated (ICANN) public suffix"
+		if !icann {
+			section = "a PRIVATE-section public suffix"
+		}
+		return fmt.Errorf("wildcard must not target %s %q: tls_interception.passthrough_domains splices the connection without decrypting it, so this would turn off body and response scanning for every unrelated tenant under that boundary, which is a stricter bar than an ordinary exemption list; list exact hosts such as mybucket.s3.amazonaws.com in tls_interception.passthrough_domains instead; if the host set is unbounded, no passthrough equivalent exists, so intercept the traffic with tls_interception and a trusted local CA or constrain it to a fixed host set", section, base)
+	}
+	return nil
+}
+
+// validatePassthroughHostGrantList is ValidateHostGrantList with the
+// passthrough-only breadth rule above instead of the shared one, for
+// tls_interception.passthrough_domains.
+func validatePassthroughHostGrantList(hosts []string, label string) error {
+	if err := ValidateHostMatchList(hosts, label); err != nil {
+		return err
+	}
+	for i, raw := range hosts {
+		normalized := NormalizeHostPattern(raw)
+		if !strings.HasPrefix(normalized, "*.") {
+			continue
+		}
+		if err := passthroughWildcardBaseBreadthError(normalized[2:]); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+	}
+	return nil
+}
+
+// validateEntropyPathPrefixShape holds the path-prefix checks shared by every
+// entropy exception that names a prefix (path_entropy_exclusions and
+// content_entropy_warn_routes[].path_prefix), so neither carries a weaker copy.
+// raw is the operator's spelling, for messages; prefix is it trimmed.
+func validateEntropyPathPrefixShape(field, raw, prefix string) error {
+	if !strings.HasPrefix(prefix, "/") {
+		return fmt.Errorf("%s.path_prefix %q must start with /", field, raw)
+	}
+	if prefix == "/" {
+		return fmt.Errorf("%s.path_prefix %q exempts every path on the host; use subdomain_entropy_exclusions deliberately if that is the intent", field, raw)
+	}
+	if strings.Contains(prefix, "://") {
+		return fmt.Errorf("%s.path_prefix %q must be a path, not a URL", field, raw)
+	}
+	// Reuse the sibling exemption's path normalizer rather than repeating a
+	// weaker check beside it. It refuses an encoded slash or backslash, a
+	// query or fragment delimiter, a wildcard, a control character, a dot
+	// segment, and any non-canonical escape spelling. Those all matter here
+	// because the scanner compares a prefix against the request's ESCAPED
+	// path: a prefix carrying %2f could never match a canonical request, so
+	// accepting one would hand the operator a silently inert exemption.
+	// The trailing slash is trimmed first because it is load-bearing for
+	// prefix matching (it stops /document/de matching /document/d) while
+	// path.Clean treats it as non-canonical and would reject it.
+	// normalizeQueryEntropyParamPath now accepts one trailing slash itself, so
+	// trimming here as well would let a doubled slash ("/assets//") through.
+	if _, err := normalizeQueryEntropyParamPath(prefix); err != nil {
+		return fmt.Errorf("%s.path_prefix %q is not a canonical path: %w", field, raw, err)
+	}
+	return nil
+}
+
+// validatePathEntropyExclusions rejects an entry that would widen the path
+// entropy exemption beyond one route. An empty host or an empty path prefix
+// makes the entry match everything, which is a host-wide (or global) exemption
+// wearing a scoped name, and the operator would not see that from the YAML.
+func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
+	seen := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		field := fmt.Sprintf("fetch_proxy.monitoring.path_entropy_exclusions[%d]", i)
+		entry := &entries[i]
+
+		scheme := strings.TrimSpace(strings.ToLower(entry.Scheme))
+		if scheme == "" {
+			scheme = QueryEntropyParamDefaultScheme
+		}
+		// An omitted scheme stays https. An explicit http entry is a separate
+		// exemption for that cleartext route. Query-parameter exclusions stay
+		// https-only in validateQueryEntropyParamExclusions.
+		if scheme != schemeHTTPS && scheme != schemeHTTP {
+			return fmt.Errorf("%s.scheme %q must be http or https", field, entry.Scheme)
+		}
+
+		if err := RawHostASCIIError(entry.Host); err != nil {
+			return fmt.Errorf("%s.host %q: %w", field, entry.Host, err)
+		}
+		// One normalizer, so this cannot accidentally trim a second dot that
+		// validateHostnamePatternList also trims. That double-trim is what made
+		// validation reject "*.com.." while the single-normalizing runtime
+		// builder accepted it: the two paths disagreed by an implementation
+		// detail rather than by intent.
+		host := NormalizeHostPattern(entry.Host)
+		if host == "" {
+			return fmt.Errorf("%s.host is required; an entry without a host would exempt every host", field)
+		}
+		hosts := []string{host}
+		if err := validateHostnamePatternList(field+".host", hosts); err != nil {
+			return err
+		}
+		host = hosts[0]
+
+		prefix := strings.TrimSpace(entry.PathPrefix)
+		if prefix == "" {
+			return fmt.Errorf("%s.path_prefix is required; an entry without a prefix would exempt every path on the host", field)
+		}
+		if err := validateEntropyPathPrefixShape(field, entry.PathPrefix, prefix); err != nil {
+			return err
+		}
+
+		expires := strings.TrimSpace(entry.Expires)
+		if expires != "" {
+			if err := validateLapsingExpiryDate(field+".expires", expires, MaxPathEntropyExclusionHorizon); err != nil {
+				return err
+			}
+		}
+
+		key := scheme + "|" + host + "|" + prefix
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("%s duplicates an earlier entry for %s%s", field, host, prefix)
+		}
+		seen[key] = struct{}{}
+
+		entry.Scheme = scheme
+		entry.Host = host
+		entry.PathPrefix = prefix
+		entry.Expires = expires
+	}
+	return nil
+}
+
+func validateQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) error {
+	return validateQueryEntropyParamExclusionsAt(entries, "fetch_proxy.monitoring.query_entropy_param_exclusions", true)
+}
+
+// validateQueryEntropyParamExclusionsAt names errors after the field the
+// operator wrote. withParam is false for a list whose entries carry no param.
+func validateQueryEntropyParamExclusionsAt(entries []QueryEntropyParamExclusion, fieldName string, withParam bool) error {
+	seen := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		field := fmt.Sprintf("%s[%d]", fieldName, i)
+		entry := &entries[i]
+
+		scheme := strings.TrimSpace(strings.ToLower(entry.Scheme))
+		if scheme == "" {
+			scheme = QueryEntropyParamDefaultScheme
+		}
+		if scheme == schemeHTTP {
+			return fmt.Errorf("%s.scheme %q is not supported; query entropy parameter exclusions are https-only", field, entry.Scheme)
+		}
+		if scheme != schemeHTTPS {
+			return fmt.Errorf("%s.scheme %q must be https", field, entry.Scheme)
+		}
+
+		host, err := normalizeQueryEntropyParamHost(entry.Host)
+		if err != nil {
+			return fmt.Errorf("%s.host %q is invalid: %w", field, entry.Host, err)
+		}
+		pathValue, err := normalizeQueryEntropyParamPath(entry.Path)
+		if err != nil {
+			return fmt.Errorf("%s.path %q is invalid: %w", field, entry.Path, err)
+		}
+		param, err := normalizeQueryEntropyParamName(entry.Param)
+		if err != nil {
+			return fmt.Errorf("%s.param %q is invalid: %w", field, entry.Param, err)
+		}
+		expires := strings.TrimSpace(entry.Expires)
+		if expires != "" {
+			if err := validateLapsingExpiryDate(field+".expires", expires, MaxQueryEntropyParamExclusionHorizon); err != nil {
+				return err
+			}
+		}
+
+		entry.Scheme = scheme
+		entry.Host = host
+		entry.Path = pathValue
+		entry.Param = param
+		entry.Reason = strings.TrimSpace(entry.Reason)
+		entry.Owner = strings.TrimSpace(entry.Owner)
+		entry.Expires = expires
+
+		tuple := strings.Join([]string{scheme, host, pathValue, param}, "\x00")
+		if _, ok := seen[tuple]; ok {
+			if !withParam {
+				return fmt.Errorf("%s duplicates normalized endpoint %s://%s%s", field, scheme, host, pathValue)
+			}
+			return fmt.Errorf("%s duplicates normalized query entropy parameter exclusion tuple %s://%s%s?%s", field, scheme, host, pathValue, param)
+		}
+		seen[tuple] = struct{}{}
+	}
+	return nil
+}
+
+func normalizeQueryEntropyParamHost(raw string) (string, error) {
+	if strings.IndexFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return "", errors.New("host must not contain spaces or control characters")
+	}
+	if err := RawHostASCIIError(raw); err != nil {
+		return "", err
+	}
+	host := NormalizeHostPattern(raw)
+	if host == "" {
+		return "", errors.New("host is required")
+	}
+	if strings.Contains(host, "://") || strings.ContainsAny(host, "/:*?[]") {
+		return "", errors.New("use an exact DNS hostname without URL syntax, port, or wildcard")
+	}
+	if strings.IndexFunc(host, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || r > unicode.MaxASCII
+	}) >= 0 {
+		return "", errors.New("host must contain only ASCII DNS label characters")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return "", errors.New("IP literal hosts are not supported")
+	}
+	if len(host) > 253 {
+		return "", errors.New("host must be 253 bytes or shorter")
+	}
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return "", errors.New("host must be a concrete DNS hostname, not a bare public suffix")
+	}
+	for _, label := range labels {
+		if label == "" {
+			return "", errors.New("host contains an empty DNS label")
+		}
+		if len(label) > 63 {
+			return "", errors.New("host DNS labels must be 63 bytes or shorter")
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return "", errors.New("host labels must not start or end with '-'")
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return "", errors.New("host must contain only DNS label characters")
+		}
+	}
+	ascii, err := idna.Lookup.ToASCII(host)
+	if err != nil {
+		return "", fmt.Errorf("host must be valid under IDNA lookup processing: %w", err)
+	}
+	if strings.TrimSuffix(strings.ToLower(ascii), ".") != host {
+		return "", errors.New("host must use canonical ASCII IDNA spelling")
+	}
+	suffix, _ := publicsuffix.PublicSuffix(host)
+	if suffix == host {
+		return "", errors.New("host must be a concrete DNS hostname, not a bare public suffix")
+	}
+	if _, err := publicsuffix.EffectiveTLDPlusOne(host); err != nil {
+		return "", fmt.Errorf("host must be registrable: %w", err)
+	}
+	return host, nil
+}
+
+func normalizeQueryEntropyParamPath(raw string) (string, error) {
+	if strings.IndexFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return "", errors.New("path must not contain spaces or control characters")
+	}
+	p := raw
+	if p == "" {
+		return "", errors.New("path is required")
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", errors.New("path must start with /")
+	}
+	if p == "/" {
+		return "", errors.New("path must be more specific than /")
+	}
+	if strings.ContainsAny(p, "?#*\\;") {
+		return "", errors.New("path must not contain query, fragment, wildcard, backslash, or path-parameter characters")
+	}
+	if strings.IndexFunc(p, unicode.IsControl) >= 0 {
+		return "", errors.New("path must not contain control characters")
+	}
+	lower := strings.ToLower(p)
+	if strings.Contains(lower, "%2f") || strings.Contains(lower, "%5c") {
+		return "", errors.New("path must not contain encoded slash or backslash")
+	}
+	decoded, err := url.PathUnescape(p)
+	if err != nil {
+		return "", fmt.Errorf("path escapes must be valid: %w", err)
+	}
+	// The raw check above rejects a literal ? or #; this rejects their encoded
+	// forms, which reach here decoded. Omitting them let `/document%3Fprivate`
+	// through: it passed as a canonical escaped path, so a configured exemption
+	// could hinge on a character that a path parser may treat as the start of a
+	// query or fragment. Where two parsers disagree about where the path ends,
+	// an exemption means two different things, so refuse the spelling instead.
+	if strings.ContainsAny(decoded, "?#*\\;") || strings.IndexFunc(decoded, unicode.IsControl) >= 0 {
+		return "", errors.New("decoded path must not contain query, fragment, wildcard, backslash, path-parameter, or control characters")
+	}
+	// A route may end in one slash (a framework with trailing-slash routing
+	// serves /_next/image/), and the scanner matches the escaped request path
+	// exactly, slash included. Clean the path without that slash so the
+	// validator accepts the spelling the matcher can match. "//" and "/a//"
+	// still fail: a trimmed remainder of "/" or an empty one is not a route.
+	cleanable := strings.TrimSuffix(decoded, "/")
+	if decoded == "/" || cleanable == "" || cleanable == "/" || path.Clean(cleanable) != cleanable {
+		return "", errors.New("path must be canonical and must not contain traversal")
+	}
+	canonical := (&url.URL{Path: decoded}).EscapedPath()
+	if canonical != p {
+		return "", fmt.Errorf("path must use canonical escaped spelling %q", canonical)
+	}
+	return p, nil
+}
+
+func normalizeQueryEntropyParamName(raw string) (string, error) {
+	if strings.IndexFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return "", errors.New("param must contain only visible ASCII characters without spaces")
+	}
+	param := raw
+	if param == "" {
+		return "", errors.New("param is required")
+	}
+	if strings.ContainsAny(param, "%&=*?[]+;") {
+		return "", errors.New("param must be an exact raw query key without reserved query characters")
+	}
+	if strings.IndexFunc(param, func(r rune) bool { return r > unicode.MaxASCII }) >= 0 {
+		return "", errors.New("param must contain only visible ASCII characters without spaces")
+	}
+	if decoded, err := url.QueryUnescape(param); err != nil || decoded != param {
+		if err != nil {
+			return "", fmt.Errorf("param must be representable as its exact raw query key: %w", err)
+		}
+		return "", errors.New("param must be representable as its exact raw query key")
+	}
+	return param, nil
+}
+
+func (c *Config) validateResponseScanning(warnings *[]Warning) error {
+	if err := c.validatePromptInjectionDetection(); err != nil {
+		return err
+	}
+	if notice := c.PromptInjectionNotice(); notice != "" {
+		*warnings = append(*warnings, Warning{Field: "prompt_injection_detection", Message: notice})
+	}
+	// Validate response scanning config
+	if c.ResponseScanning.Enabled {
+		switch c.ResponseScanning.Action {
+		case ActionStrip, ActionWarn, ActionBlock, ActionAsk:
+			// valid
+		default:
+			return fmt.Errorf("invalid response_scanning action %q: must be strip, warn, block, or ask", c.ResponseScanning.Action)
+		}
+		for _, p := range c.ResponseScanning.Patterns {
+			if p.Name == "" {
+				return fmt.Errorf("response scanning pattern missing name")
+			}
+			if p.Regex == "" {
+				return fmt.Errorf("response scanning pattern %q missing regex", p.Name)
+			}
+			if _, err := regexp.Compile(p.Regex); err != nil {
+				return fmt.Errorf("response scanning pattern %q has invalid regex: %w", p.Name, err)
+			}
+		}
+	}
+
+	// Validate exempt_domains regardless of whether response scanning is enabled.
+	// Prevents dormant bad config from activating silently on reload.
+	if err := ValidateTrustedDomains(c.ResponseScanning.ExemptDomains, "response_scanning.exempt_domains"); err != nil {
+		return err
+	}
+	if err := ValidateTrustedDomains(c.ResponseScanning.SizeExemptDomains, "response_scanning.size_exempt_domains"); err != nil {
+		return err
+	}
+	if c.ResponseScanning.SizeExemptScanMaxBytes <= 0 {
+		return fmt.Errorf("response_scanning.size_exempt_scan_max_bytes must be > 0")
+	}
+	if int64(c.ResponseScanning.SizeExemptScanMaxBytes) == math.MaxInt64 {
+		return fmt.Errorf("response_scanning.size_exempt_scan_max_bytes must leave room for one probe byte")
+	}
+	if c.ResponseScanning.SizeExemptScanMaxInflightBytes <= 0 {
+		return fmt.Errorf("response_scanning.size_exempt_scan_max_inflight_bytes must be > 0")
+	}
+	if c.ResponseScanning.SizeExemptScanMaxInflightBytes < c.ResponseScanning.SizeExemptScanMaxBytes {
+		return fmt.Errorf("response_scanning.size_exempt_scan_max_inflight_bytes must be >= response_scanning.size_exempt_scan_max_bytes")
+	}
+	if err := validateUnscannablePassthrough(c.ResponseScanning.UnscannablePassthrough); err != nil {
+		return err
+	}
+	if err := c.ResponseScanning.validateSizeExemptScanLimits(warnings, time.Now()); err != nil {
+		return err
+	}
+	if err := validateCoreObserveExceptions(c.ResponseScanning.CoreObserveExceptions); err != nil {
+		return err
+	}
+	for i, entry := range c.ResponseScanning.UnscannablePassthrough {
+		if !hostMatchesResponseSizeExemptDomain(entry.Host, c.ResponseScanning.SizeExemptDomains) {
+			return fmt.Errorf("response_scanning.unscannable_passthrough[%d].host %q must match response_scanning.size_exempt_domains", i, entry.Host)
+		}
+	}
+	if err := validateUnscannablePassthroughExpiryHorizons(c.ResponseScanning.UnscannablePassthrough); err != nil {
+		return err
+	}
+	if err := validateAuthenticatedArtifacts(c.ResponseScanning.AuthenticatedArtifacts); err != nil {
+		return err
+	}
+	if !c.ResponseScanning.Enabled && len(c.ResponseScanning.ExemptDomains) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "response_scanning.exempt_domains",
+			Message: "configured while response_scanning is disabled — the full-trust streaming bypass is inactive, but immutable core response findings may still be treated as warn-only for matching hosts, and the full-trust bypass activates for ALL responses from these hosts once scanning is enabled",
+		})
+	}
+	seenMCPServers := make(map[string]struct{}, len(c.ResponseScanning.MCPServers))
+	for i, entry := range c.ResponseScanning.MCPServers {
+		field := fmt.Sprintf("response_scanning.mcp_servers[%d]", i)
+		if err := validateMCPServerName(entry.Server, field+".server"); err != nil {
+			return err
+		}
+		if _, ok := seenMCPServers[entry.Server]; ok {
+			return fmt.Errorf("%s.server %q duplicates an earlier MCP response trust entry", field, entry.Server)
+		}
+		seenMCPServers[entry.Server] = struct{}{}
+		switch entry.Trust {
+		case ResponseTrustUntrusted, ResponseTrustReasoning:
+			// valid
+		default:
+			return fmt.Errorf("%s.trust %q: must be %q or %q", field, entry.Trust, ResponseTrustUntrusted, ResponseTrustReasoning)
+		}
+	}
+	if !c.ResponseScanning.Enabled && len(c.ResponseScanning.MCPServers) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "response_scanning.mcp_servers",
+			Message: "configured but response_scanning is disabled — MCP response trust classes are inert until enabled",
+		})
+	}
+
+	// Generic SSE streaming sub-section. Validated regardless of the
+	// parent response_scanning.enabled flag so dormant bad config can't
+	// activate silently on reload.
+	sse := c.ResponseScanning.SSEStreaming
+	if sse.Enabled {
+		switch sse.Action {
+		case "", ActionBlock, ActionWarn:
+			// valid (empty falls back to block downstream)
+		default:
+			return fmt.Errorf("invalid response_scanning.sse_streaming action %q: must be block or warn", sse.Action)
+		}
+		if sse.MaxEventBytes < 0 {
+			return fmt.Errorf("response_scanning.sse_streaming.max_event_bytes must be >= 0 (0 means use default), got %d", sse.MaxEventBytes)
+		}
+	}
+	return nil
+}
+
+func validateAuthenticatedArtifacts(entries []AuthenticatedArtifactEntry) error {
+	seen := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		field := fmt.Sprintf("response_scanning.authenticated_artifacts[%d]", i)
+		host, err := normalizeQueryEntropyParamHost(entry.Host)
+		if err != nil {
+			return fmt.Errorf("%s.host must be one exact registrable DNS host: %w", field, err)
+		}
+		pathValue, err := normalizeQueryEntropyParamPath(entry.Path)
+		if err != nil {
+			return fmt.Errorf("%s.path must be one canonical non-root path: %w", field, err)
+		}
+		if !authenticatedArtifactBundleNameRE.MatchString(entry.BundleName) {
+			return fmt.Errorf("%s.bundle_name must be 3-64 lowercase alphanumeric characters or hyphens without edge hyphens", field)
+		}
+		entry.Host, entry.Path = host, pathValue
+		key := entry.Host + "\x00" + entry.Path
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("%s duplicates an earlier authenticated artifact", field)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// Keep this syntax identical to the authoritative bundle-name contract in
+// internal/rules. Config cannot import that package because rules imports
+// config, so an external-package parity test pins the contract boundaries.
+var authenticatedArtifactBundleNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
+
+func hostMatchesResponseSizeExemptDomain(host string, domains []string) bool {
+	return hostMatchesPassthrough(host, domains)
+}
+
+func (c *Config) validateMCPInputScanning() error {
+	// Validate MCP input scanning config
+	if c.MCPInputScanning.Enabled {
+		switch c.MCPInputScanning.Action {
+		case ActionWarn, ActionBlock:
+			// valid (ask not supported for input scanning - no terminal interaction on request path)
+		default:
+			return fmt.Errorf("invalid mcp_input_scanning action %q: must be warn or block", c.MCPInputScanning.Action)
+		}
+	}
+	switch c.MCPInputScanning.OnParseError {
+	case ActionBlock, ActionForward:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_input_scanning on_parse_error %q: must be block or forward", c.MCPInputScanning.OnParseError)
+	}
+	if c.MCPInputScanning.ResponseTimeoutSeconds < 0 {
+		return fmt.Errorf("invalid mcp_input_scanning response_timeout_seconds %d: must be non-negative", c.MCPInputScanning.ResponseTimeoutSeconds)
+	}
+	return nil
+}
+
+func (c *Config) validateMCPToolScanning(warnings *[]Warning) error {
+	c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = nil
+	c.MCPToolScanning.AcknowledgmentKeyBytes = nil
+	if err := validateMCPAcknowledgedFindings(c.MCPToolScanning.AcknowledgedFindings, c.MCPIdentities, time.Now().UTC()); err != nil {
+		return err
+	}
+	// The key is resolved once here and pinned. With entries and no usable
+	// key the configuration is refused: there is no unkeyed fallback.
+	if c.MCPToolScanning.AcknowledgmentKey != "" || len(c.MCPToolScanning.AcknowledgedFindings) > 0 {
+		if c.MCPToolScanning.AcknowledgmentKey == "" {
+			return errors.New("mcp_tool_scanning.acknowledged_findings requires mcp_tool_scanning.acknowledgment_key")
+		}
+		key, err := resolveMCPAckKey(c.MCPToolScanning.AcknowledgmentKey)
+		if err != nil {
+			return err
+		}
+		c.MCPToolScanning.AcknowledgmentKeyBytes = key
+	}
+	if len(c.MCPToolScanning.AcknowledgedFindings) > 0 && !c.MCPToolScanning.Enabled && warnings != nil {
+		*warnings = append(*warnings, Warning{
+			Field:   "mcp_tool_scanning.acknowledged_findings",
+			Message: "acknowledged_findings has no effect while mcp_tool_scanning is disabled",
+		})
+	}
+	if c.NewToolActionAliasWarning != "" && warnings != nil {
+		*warnings = append(*warnings, Warning{
+			Field:   "mcp_tool_scanning.new_tool_action",
+			Message: c.NewToolActionAliasWarning,
+		})
+	}
+	// Validate new-tool admission independently of whether scanning is enabled.
+	// Runtime MCP mode can enable an otherwise unset tool-scanning section, so
+	// accepting an invalid value while disabled would let it reach enforcement.
+	switch c.MCPToolScanning.NewToolAdmission {
+	case "", NewToolAdmit, NewToolWithhold:
+		// valid; "" is filled to admit by normalize when scanning is enabled
+	default:
+		return fmt.Errorf("invalid mcp_tool_scanning new_tool_admission %q: must be admit or withhold", c.MCPToolScanning.NewToolAdmission)
+	}
+
+	// Validate MCP tool scanning config.
+	if c.MCPToolScanning.Enabled {
+		switch c.MCPToolScanning.Action {
+		case ActionWarn, ActionBlock:
+			// valid
+		default:
+			return fmt.Errorf("invalid mcp_tool_scanning action %q: must be warn or block", c.MCPToolScanning.Action)
+		}
+		// New-tool admission is evaluated only inside the drift-detection
+		// path, so this pair leaves the control inert. Warn rather than
+		// reject: refusing would turn an existing running configuration into
+		// a startup failure on upgrade, and an operator who set withhold has
+		// asked for more checking, not for the process to stop. Silence is
+		// the one option that is wrong, because it reads as policy applied.
+		if c.MCPToolScanning.NewToolAdmission == NewToolWithhold && !c.MCPToolScanning.DetectDrift && warnings != nil {
+			*warnings = append(*warnings, Warning{
+				Field:   "mcp_tool_scanning.new_tool_admission",
+				Message: "new_tool_admission: withhold has no effect while mcp_tool_scanning.detect_drift is false, because new-tool admission is only evaluated during drift detection; set detect_drift: true for it to apply",
+			})
+		}
+	}
+	resetFile := c.MCPToolScanning.ListenerDriftResetFile
+	resetKey := c.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile
+	resetTarget := c.MCPToolScanning.ListenerDriftResetTarget
+	if resetFile == "" && (resetKey != "" || resetTarget != "") {
+		return errors.New("mcp_tool_scanning listener drift reset authority requires listener_drift_reset_file")
+	}
+	if resetFile != "" {
+		if resetKey == "" || resetTarget == "" {
+			return errors.New("mcp_tool_scanning listener drift reset requires listener_drift_reset_authority_public_key_file and listener_drift_reset_target")
+		}
+		publicKey, err := signing.LoadPublicKey(resetKey)
+		if err != nil {
+			return fmt.Errorf("load mcp_tool_scanning listener drift reset authority public key: %w", err)
+		}
+		if strings.TrimSpace(resetTarget) == "" || len(resetTarget) > 512 || strings.ContainsAny(resetTarget, "\r\n\x00") {
+			return errors.New("invalid mcp_tool_scanning listener_drift_reset_target")
+		}
+		c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), publicKey...)
+	}
+	return nil
+}
+
+func (c *Config) validateMCPDataClassLabels() error {
+	// Fail closed on enable until derivation is wired. This is a reserved
+	// config surface with no runtime effect yet: nothing derives or attaches
+	// data-class labels. Accepting enabled: true would let an operator believe
+	// MCP receipt labeling is active when no labels are produced. Reject it so
+	// the knob cannot advertise protection it does not provide.
+	if c.MCPDataClassLabels.Enabled {
+		return fmt.Errorf("mcp_data_class_labels.enabled is not supported yet: data-class label derivation is not wired; leave it unset until a release enables it")
+	}
+	if c.MCPDataClassLabels.UnknownClass != string(datalabel.DataClassSecret) {
+		return fmt.Errorf("invalid mcp_data_class_labels.unknown_class %q: must be secret", c.MCPDataClassLabels.UnknownClass)
+	}
+	return nil
+}
+
+func (c *Config) validateMCPToolPolicy() error {
+	// Validate MCP tool policy config
+	if !c.MCPToolPolicy.Enabled {
+		return nil
+	}
+	if len(c.MCPToolPolicy.Rules) == 0 {
+		return fmt.Errorf("mcp_tool_policy is enabled but has no rules; add rules or set enabled: false")
+	}
+	switch c.MCPToolPolicy.Action {
+	case ActionWarn, ActionBlock, ActionRedirect, ActionDefer:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_tool_policy action %q: must be warn, block, redirect, or defer", c.MCPToolPolicy.Action)
+	}
+	if c.MCPToolPolicy.Action == ActionDefer && !c.Defer.Enabled {
+		return fmt.Errorf("invalid mcp_tool_policy action %q: defer.enabled must be true", c.MCPToolPolicy.Action)
+	}
+	switch c.MCPToolPolicy.OnIncompleteCheck {
+	case "", ActionWarn, ActionBlock:
+		// valid; empty means warn
+	default:
+		return fmt.Errorf("invalid mcp_tool_policy on_incomplete_check %q: must be warn or block", c.MCPToolPolicy.OnIncompleteCheck)
+	}
+	// Validate redirect profiles.
+	for name, profile := range c.MCPToolPolicy.RedirectProfiles {
+		if len(profile.Exec) == 0 || profile.Exec[0] == "" {
+			return fmt.Errorf("mcp_tool_policy redirect_profile %q has empty exec", name)
+		}
+		if profile.MatchAbsPath && !filepath.IsAbs(profile.Exec[0]) {
+			return fmt.Errorf("mcp_tool_policy redirect_profile %q: match_abs_path is true but exec[0] %q is not absolute", name, profile.Exec[0])
+		}
+	}
+	for name, profile := range c.MCPToolPolicy.DeferResolverProfiles {
+		if len(profile.Exec) == 0 || profile.Exec[0] == "" {
+			return fmt.Errorf("mcp_tool_policy defer_resolver_profile %q has empty exec", name)
+		}
+		if profile.MatchAbsPath && !filepath.IsAbs(profile.Exec[0]) {
+			return fmt.Errorf("mcp_tool_policy defer_resolver_profile %q: match_abs_path is true but exec[0] %q is not absolute", name, profile.Exec[0])
+		}
+	}
+	for i, r := range c.MCPToolPolicy.Rules {
+		if r.Name == "" {
+			return fmt.Errorf("mcp_tool_policy rule %d missing name", i)
+		}
+		if r.ToolPattern == "" {
+			return fmt.Errorf("mcp_tool_policy rule %q missing tool_pattern", r.Name)
+		}
+		if _, err := regexp.Compile(r.ToolPattern); err != nil {
+			return fmt.Errorf("mcp_tool_policy rule %q has invalid tool_pattern: %w", r.Name, err)
+		}
+		if r.ArgPattern != "" {
+			if _, err := regexp.Compile(r.ArgPattern); err != nil {
+				return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_pattern: %w", r.Name, err)
+			}
+		}
+		hasStructuralValidators := r.hasStructuralArgValidators()
+		if r.ArgKey != "" {
+			if r.ArgPattern == "" && !hasStructuralValidators {
+				return fmt.Errorf("mcp_tool_policy rule %q has arg_key without arg_pattern", r.Name)
+			}
+			if _, err := regexp.Compile(r.ArgKey); err != nil {
+				return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_key: %w", r.Name, err)
+			}
+		} else if hasStructuralValidators {
+			return fmt.Errorf("mcp_tool_policy rule %q has structural argument validators but no arg_key", r.Name)
+		}
+		if err := validateToolPolicyArgSource(r); err != nil {
+			return err
+		}
+		if err := validateToolPolicyStructuralArgs(r); err != nil {
+			return err
+		}
+		if r.Action != "" {
+			switch r.Action {
+			case ActionWarn, ActionBlock, ActionRedirect, ActionDefer:
+				// valid
+			default:
+				return fmt.Errorf("mcp_tool_policy rule %q has invalid action %q: must be warn, block, redirect, or defer", r.Name, r.Action)
+			}
+			if r.Action == ActionDefer && !c.Defer.Enabled {
+				return fmt.Errorf("mcp_tool_policy rule %q has action=defer but defer.enabled is false", r.Name)
+			}
+		}
+		// Redirect rules must reference an existing redirect profile.
+		effectiveAction := r.Action
+		if effectiveAction == "" {
+			effectiveAction = c.MCPToolPolicy.Action
+		}
+		if effectiveAction == ActionRedirect {
+			if r.RedirectProfile == "" {
+				return fmt.Errorf("mcp_tool_policy rule %q has action=redirect but no redirect_profile", r.Name)
+			}
+			if _, ok := c.MCPToolPolicy.RedirectProfiles[r.RedirectProfile]; !ok {
+				return fmt.Errorf("mcp_tool_policy rule %q references unknown redirect_profile %q", r.Name, r.RedirectProfile)
+			}
+		}
+		if effectiveAction == ActionDefer && r.ResolutionPolicy != nil {
+			if r.ResolutionPolicy.AllowOn.PolicyPermits {
+				return fmt.Errorf("mcp_tool_policy rule %q has resolution_policy.allow_on.policy_permits but policy_reload cannot fire on supported defer transports yet", r.Name)
+			}
+			approvalRequested := r.ResolutionPolicy.AllowOn.Approval || r.ResolutionPolicy.StepUpOn.ApprovalRequestsHuman
+			if approvalRequested {
+				if r.ResolutionPolicy.ResolverProfile == "" {
+					return fmt.Errorf("mcp_tool_policy rule %q uses approval resolution but has no resolution_policy.resolver_profile", r.Name)
+				}
+				if _, ok := c.MCPToolPolicy.DeferResolverProfiles[r.ResolutionPolicy.ResolverProfile]; !ok {
+					return fmt.Errorf("mcp_tool_policy rule %q references unknown defer resolver profile %q", r.Name, r.ResolutionPolicy.ResolverProfile)
+				}
+			}
+		}
+		if effectiveAction == ActionDefer {
+			if r.ResolutionPolicy == nil || !r.ResolutionPolicy.HasAffirmativeSignal() {
+				return fmt.Errorf("mcp_tool_policy rule %q has action=defer but no affirmative resolution_policy", r.Name)
+			}
+		}
+	}
+	return nil
+}
+
+func validateToolPolicyArgSource(r ToolPolicyRule) error {
+	if r.ArgSource != "" && r.ArgSource != ToolPolicyArgSourcePatchTargets {
+		return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_source %q", r.Name, r.ArgSource)
+	}
+	if r.ArgSource != "" && r.ArgPattern == "" {
+		return fmt.Errorf("mcp_tool_policy rule %q has arg_source without arg_pattern", r.Name)
+	}
+	return nil
+}
+
+func (r ToolPolicyRule) hasStructuralArgValidators() bool {
+	return r.ArgType != "" ||
+		r.ArgNumberGT != nil ||
+		r.ArgNumberLT != nil ||
+		r.ArgLenGT != nil ||
+		r.ArgLenLT != nil ||
+		len(r.ArgValueIn) > 0
+}
+
+func validateToolPolicyStructuralArgs(r ToolPolicyRule) error {
+	switch r.ArgType {
+	case "", "string", "number", "integer", "boolean", "array", "object":
+		// valid
+	default:
+		return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_type %q: must be string, number, integer, boolean, array, or object", r.Name, r.ArgType)
+	}
+	if err := validateToolPolicyStructuralTypeCompatibility(r); err != nil {
+		return err
+	}
+	var gt, lt *big.Rat
+	if r.ArgNumberGT != nil {
+		var ok bool
+		if gt, ok = ParseBoundedJSONNumber(*r.ArgNumberGT); !ok {
+			return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_number_gt %q", r.Name, r.ArgNumberGT.String())
+		}
+	}
+	if r.ArgNumberLT != nil {
+		var ok bool
+		if lt, ok = ParseBoundedJSONNumber(*r.ArgNumberLT); !ok {
+			return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_number_lt %q", r.Name, r.ArgNumberLT.String())
+		}
+	}
+	if gt != nil && lt != nil && gt.Cmp(lt) >= 0 {
+		return fmt.Errorf("mcp_tool_policy rule %q has unsatisfiable numeric range: arg_number_gt must be less than arg_number_lt", r.Name)
+	}
+	if r.ArgLenGT != nil && *r.ArgLenGT < 0 {
+		return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_len_gt %d: must be non-negative", r.Name, *r.ArgLenGT)
+	}
+	if r.ArgLenLT != nil && *r.ArgLenLT < 0 {
+		return fmt.Errorf("mcp_tool_policy rule %q has invalid arg_len_lt %d: must be non-negative", r.Name, *r.ArgLenLT)
+	}
+	if r.ArgLenGT != nil && r.ArgLenLT != nil && *r.ArgLenGT >= *r.ArgLenLT {
+		return fmt.Errorf("mcp_tool_policy rule %q has unsatisfiable length range: arg_len_gt must be less than arg_len_lt", r.Name)
+	}
+	return nil
+}
+
+func validateToolPolicyStructuralTypeCompatibility(r ToolPolicyRule) error {
+	if r.ArgType == "" {
+		return nil
+	}
+	hasNumberBound := r.ArgNumberGT != nil || r.ArgNumberLT != nil
+	if hasNumberBound && r.ArgType != "number" && r.ArgType != "integer" {
+		return fmt.Errorf("mcp_tool_policy rule %q has arg_type %q with numeric bounds: arg_type must be number or integer", r.Name, r.ArgType)
+	}
+	hasLengthBound := r.ArgLenGT != nil || r.ArgLenLT != nil
+	if hasLengthBound && r.ArgType != "string" && r.ArgType != "array" {
+		return fmt.Errorf("mcp_tool_policy rule %q has arg_type %q with length bounds: arg_type must be string or array", r.Name, r.ArgType)
+	}
+	return nil
+}
+
+// ParseBoundedJSONNumber parses a JSON number into an exact big.Rat, rejecting
+// values that are empty, over-long, malformed, or whose exponent magnitude
+// exceeds a safe bound. The exponent is bounded BEFORE any big-number
+// construction, so an attacker-supplied value like 1e1000000 (a few bytes) is
+// rejected in microseconds rather than forcing a multi-megabyte allocation. It
+// deliberately never calls big.Rat.SetString on the raw string, because
+// SetString eagerly expands a large exponent (10^1000000 → ~17ms) before any
+// bound can apply. Shared by config validation and the MCP tool-policy engine
+// so the parse+bounds logic has a single source of truth.
+func ParseBoundedJSONNumber(n json.Number) (*big.Rat, bool) {
+	return jsonnumber.Parse(n)
+}
+
+func (c *Config) validateDefer(warnings *[]Warning) error {
+	if c.Defer.TimeoutSeconds <= 0 {
+		return fmt.Errorf("defer.timeout_seconds must be positive")
+	}
+	if c.Defer.MaxPending <= 0 {
+		return fmt.Errorf("defer.max_pending must be positive")
+	}
+	if c.Defer.MaxPendingPerSession <= 0 {
+		return fmt.Errorf("defer.max_pending_per_session must be positive")
+	}
+	if c.Defer.MaxPendingBytes <= 0 {
+		return fmt.Errorf("defer.max_pending_bytes must be positive")
+	}
+	if c.Defer.MaxCascadeDepth < 0 {
+		return fmt.Errorf("defer.max_cascade_depth must be >= 0")
+	}
+	if warnings != nil && !c.Defer.Enabled && c.deferFieldExplicit("max_cascade_depth") {
+		*warnings = append(*warnings, Warning{
+			Field:   "defer.max_cascade_depth",
+			Message: "is set while defer.enabled is false; the cascade-depth bound is inert until defer is enabled",
+		})
+	}
+	return nil
+}
+
+func (c *Config) deferFieldExplicit(field string) bool {
+	// No raw YAML means the config was built programmatically (Defaults(),
+	// tests, SDK callers); nothing was explicitly set by an operator, so the
+	// inert-field warning would be spurious noise.
+	if len(c.rawBytes) == 0 {
+		return false
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(c.rawBytes, &root); err != nil {
+		return false
+	}
+	if len(root.Content) == 0 {
+		return false
+	}
+	doc := root.Content[0]
+	if doc.Kind != yaml.MappingNode {
+		return false
+	}
+	deferNode := mappingValue(doc, "defer")
+	if deferNode == nil || deferNode.Kind != yaml.MappingNode {
+		return false
+	}
+	return mappingValue(deferNode, field) != nil
+}
+
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// validReqPolicyName bounds request_policy rule names to a metric-label-safe
+// charset and length so they can be used as Prometheus label values without
+// unbounded-cardinality risk.
+var validReqPolicyName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// validateRequestPolicy validates the request_policy section. Rules are
+// validated even when the section is disabled (regexes compiled, enums
+// checked) so dormant bad config cannot activate silently on reload. Hosts and
+// methods are normalized in place. Visibility advisories are emitted only when
+// the section is enabled, because they describe what enforcement an operator
+// will and will not actually get.
+func (c *Config) validateRequestPolicy(warnings *[]Warning) error {
+	rp := &c.RequestPolicy
+	if err := validateRequestPolicyFailureAction("on_parse_error", rp.OnParseError); err != nil {
+		return err
+	}
+	if err := validateRequestPolicyFailureAction("on_opaque_operation", rp.OnOpaqueOperation); err != nil {
+		return err
+	}
+	if rp.Enabled && len(rp.Rules) == 0 {
+		return fmt.Errorf("request_policy is enabled but has no rules; add rules or set enabled: false")
+	}
+	for i := range rp.Rules {
+		r := &rp.Rules[i]
+		if r.Name == "" {
+			return fmt.Errorf("request_policy rule %d missing name", i)
+		}
+		if !validReqPolicyName.MatchString(r.Name) {
+			return fmt.Errorf("request_policy rule %q: name must be 1-64 chars of [A-Za-z0-9_-] (it is used as a metric label)", r.Name)
+		}
+		switch r.Action {
+		case ActionBlock, ActionWarn:
+			// valid
+		default:
+			return fmt.Errorf("request_policy rule %q has invalid action %q: must be block or warn", r.Name, r.Action)
+		}
+		if err := validateRequestPolicyRoute(&r.Route, fmt.Sprintf("request_policy rule %q", r.Name)); err != nil {
+			return err
+		}
+		if r.GraphQL != nil {
+			if err := validateRequestPolicyGraphQL(r.Name, r.GraphQL); err != nil {
+				return err
+			}
+		}
+		if r.Discriminator != nil {
+			if err := validateRequestPolicyDiscriminator(r.Name, r.Discriminator); err != nil {
+				return err
+			}
+		}
+		if r.Except != nil {
+			if r.Action != ActionBlock || r.Shadow || r.GraphQL != nil || r.Discriminator != nil ||
+				len(r.Route.Hosts) == 0 || len(r.Route.Methods) == 0 ||
+				(len(r.Route.PathPrefixes) == 0 && len(r.Route.PathPatterns) == 0) {
+				return fmt.Errorf("request_policy rule %q except requires an enforced block rule scoped by host, method, and path without another predicate", r.Name)
+			}
+			for _, method := range r.Route.Methods {
+				switch method {
+				case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, methodQuery:
+				default:
+					return fmt.Errorf("request_policy rule %q except requires a body-carrying HTTP method", r.Name)
+				}
+			}
+			if err := validateRequestPolicyException(r.Name, r.Except); err != nil {
+				return err
+			}
+		}
+		if rp.Enabled {
+			c.warnRequestPolicyVisibility(r, warnings)
+		}
+	}
+	for i := range rp.Batch {
+		if err := validateRequestPolicyRoute(&rp.Batch[i].Route, fmt.Sprintf("request_policy batch %d", i)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateRequestPolicyRoute validates and normalizes a request_policy route in
+// place: it requires at least one constraint, checks host SHAPE only because a
+// route may deny and a broad wildcard there is a policy, uppercases and
+// validates methods, compiles path_patterns,
+// rejects empty prefixes, and normalizes content types. label prefixes every
+// error (e.g. `request_policy rule "x"` or `request_policy batch 0`) so rule
+// and batch routes share one validator without drifting.
+func validateRequestPolicyRoute(route *RequestPolicyRoute, label string) error {
+	if len(route.Hosts) == 0 && len(route.Methods) == 0 &&
+		len(route.PathPrefixes) == 0 && len(route.PathPatterns) == 0 &&
+		len(route.ContentTypes) == 0 {
+		return fmt.Errorf("%s has no route constraints; set at least one of hosts/methods/path_prefixes/path_patterns/content_types", label)
+	}
+	// A request_policy route MATCHES traffic and its action may be `block`, so
+	// its hosts get shape validation only. Running the breadth rule here
+	// refused a legitimate broad block, which is why the two validators exist.
+	for i := range route.Hosts {
+		normalized, err := NormalizeAndCheckHostPattern(route.Hosts[i])
+		if err != nil {
+			return fmt.Errorf("%s hosts[%d] %q: %w", label, i, route.Hosts[i], err)
+		}
+		route.Hosts[i] = normalized
+	}
+	for j, m := range route.Methods {
+		up := strings.ToUpper(strings.TrimSpace(m))
+		if !validHTTPMethod(up) {
+			return fmt.Errorf("%s method %q is not a valid HTTP method", label, m)
+		}
+		route.Methods[j] = up
+	}
+	for _, p := range route.PathPatterns {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("%s has empty path_pattern", label)
+		}
+		if _, err := regexp.Compile(p); err != nil {
+			return fmt.Errorf("%s has invalid path_pattern %q: %w", label, p, err)
+		}
+	}
+	for _, p := range route.PathPrefixes {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("%s has empty path_prefix", label)
+		}
+	}
+	for j, ct := range route.ContentTypes {
+		normalized := normalizeRequestPolicyContentType(ct)
+		if normalized == "" {
+			return fmt.Errorf("%s has empty content_type", label)
+		}
+		route.ContentTypes[j] = normalized
+	}
+	return nil
+}
+
+// validateRequestPolicyGraphQL validates and normalizes a rule's GraphQL
+// operation predicate. Operation types are lowercased in place so the runtime
+// predicate (which also lowercases) and validation agree.
+func validateRequestPolicyGraphQL(rule string, g *RequestPolicyGraphQL) error {
+	if len(g.OperationTypes) == 0 && len(g.RootFieldPatterns) == 0 {
+		return fmt.Errorf("request_policy rule %q graphql predicate must set operation_types or root_field_patterns", rule)
+	}
+	for i, t := range g.OperationTypes {
+		switch norm := strings.ToLower(strings.TrimSpace(t)); norm {
+		case "query", "mutation", "subscription":
+			g.OperationTypes[i] = norm
+		default:
+			return fmt.Errorf("request_policy rule %q graphql operation_type %q must be query, mutation, or subscription", rule, t)
+		}
+	}
+	for i, p := range g.RootFieldPatterns {
+		pat := strings.TrimSpace(p)
+		if pat == "" {
+			return fmt.Errorf("request_policy rule %q has empty graphql root_field_pattern", rule)
+		}
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("request_policy rule %q has invalid graphql root_field_pattern %q: %w", rule, p, err)
+		}
+		// Persist the trimmed pattern so the runtime predicate compiles the same
+		// value: surrounding whitespace would otherwise compile into the regex
+		// and silently under-match, weakening the rule.
+		g.RootFieldPatterns[i] = pat
+	}
+	return nil
+}
+
+// validateRequestPolicyDiscriminator validates and normalizes a rule's JSON
+// discriminator predicate. The field name and value patterns are trimmed in
+// place so the runtime predicate (which also trims) and validation agree;
+// surrounding whitespace would otherwise compile into a value regex and
+// silently under-match, weakening the rail. At least one value pattern is
+// required: a discriminator with no patterns can never match a string value.
+func validateRequestPolicyDiscriminator(rule string, d *RequestPolicyDiscriminator) error {
+	d.Field = strings.TrimSpace(d.Field)
+	if d.Field == "" {
+		return fmt.Errorf("request_policy rule %q discriminator field must be set", rule)
+	}
+	if len(d.ValuePatterns) == 0 {
+		return fmt.Errorf("request_policy rule %q discriminator must set value_patterns", rule)
+	}
+	for i, p := range d.ValuePatterns {
+		pat := strings.TrimSpace(p)
+		if pat == "" {
+			return fmt.Errorf("request_policy rule %q has empty discriminator value_pattern", rule)
+		}
+		if _, err := regexp.Compile(pat); err != nil {
+			return fmt.Errorf("request_policy rule %q has invalid discriminator value_pattern %q: %w", rule, p, err)
+		}
+		d.ValuePatterns[i] = pat
+	}
+	return nil
+}
+
+func validateRequestPolicyException(rule string, e *RequestPolicyException) error {
+	e.Field = strings.TrimSpace(e.Field)
+	if len(e.Requests) > 0 {
+		if e.Field != "" || len(e.Values) != 0 {
+			return fmt.Errorf("request_policy rule %q except cannot combine requests and field/values", rule)
+		}
+		for _, request := range e.Requests {
+			if err := ValidateRequestPolicyExactRequest(request); err != nil {
+				return fmt.Errorf("request_policy rule %q: %w", rule, err)
+			}
+		}
+		return nil
+	}
+	if e.Field == "" || len(e.Values) == 0 {
+		return fmt.Errorf("request_policy rule %q except requires a field and at least one exact value", rule)
+	}
+	for _, value := range e.Values {
+		if value == "" || strings.TrimSpace(value) != value {
+			return fmt.Errorf("request_policy rule %q except values must be non-empty exact strings without surrounding whitespace", rule)
+		}
+	}
+	return nil
+}
+
+// methodQuery is the HTTP QUERY method (draft-ietf-httpbis-safe-method-w-body).
+// Go's net/http has no constant for it. It is a safe method that carries a
+// request body, so operators may want to name it in request_policy rules and
+// reverse_proxy allow-lists.
+const methodQuery = "QUERY"
+
+// CanonicalExactRequestURL returns the comparison form of an exact-request URL:
+// lowercase scheme and host, the https default port elided, and the path and
+// query spelled exactly as given. The scheme-based normalization is RFC 3986
+// section 6.2.3 and RFC 9110 section 4.2.3. Transports spell the same request
+// differently (an intercepted tunnel always carries host:443), so both the
+// configured URL and the observed target go through this before comparison.
+func CanonicalExactRequestURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+		u.Opaque != "" || u.Path == "" || u.Fragment != "" {
+		return "", false
+	}
+	host := strings.ToLower(u.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port := u.Port(); port != "" && port != "443" {
+		host += ":" + port
+	}
+	out := "https://" + host + u.EscapedPath()
+	if u.RawQuery != "" || u.ForceQuery {
+		out += "?" + u.RawQuery
+	}
+	return out, true
+}
+
+// ValidateRequestPolicyExactRequest validates an operator's exact-request
+// exception. Expired entries remain valid configuration but never grant relief.
+func ValidateRequestPolicyExactRequest(r RequestPolicyExactRequest) error {
+	u, err := url.Parse(r.URL)
+	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil ||
+		u.Opaque != "" || u.Path == "" || strings.ContainsAny(r.URL, "*#\r\n\t ") {
+		return fmt.Errorf("exact request requires an absolute HTTPS URL without userinfo, fragment, whitespace, or wildcards")
+	}
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, methodQuery:
+	default:
+		return fmt.Errorf("exact request requires an uppercase body-carrying method")
+	}
+	digest, err := hex.DecodeString(r.BodySHA256)
+	if err != nil || len(digest) != sha256.Size || strings.ToLower(r.BodySHA256) != r.BodySHA256 {
+		return fmt.Errorf("exact request body_sha256 must be a lowercase SHA-256 hex digest")
+	}
+	if _, err := time.Parse(time.RFC3339, r.ExpiresAt); err != nil {
+		return fmt.Errorf("exact request expires_at must be an RFC3339 timestamp")
+	}
+	if strings.TrimSpace(r.Owner) == "" || strings.TrimSpace(r.Reason) == "" {
+		return fmt.Errorf("exact request requires owner and reason")
+	}
+	return nil
+}
+
+func validHTTPMethod(m string) bool {
+	switch m {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodConnect,
+		http.MethodOptions, http.MethodTrace,
+		// The HTTP QUERY method (draft-ietf-httpbis-safe-method-w-body) is a
+		// safe method that carries a request body; recognize it so operators
+		// can write request_policy rules that target QUERY requests.
+		methodQuery,
+		// State-changing WebDAV methods (RFC 4918), used by package-registry
+		// publish and relocate flows. Needed so a fetch-only registry recipe
+		// can name them in request_policy without failing validation. LOCK and
+		// UNLOCK belong here for the same reason the others do: both write
+		// server state, so a recipe that cannot name them cannot refuse them.
+		// PROPFIND is deliberately absent, being a read.
+		"MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeRequestPolicyContentType(ct string) string {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(ct))
+}
+
+// warnRequestPolicyVisibility advises when a rule targets a host whose inner
+// HTTP method/path/body pipelock cannot see - TLS interception off, or the host
+// in passthrough_domains. Host-only tunnel rules are still enforceable at the
+// CONNECT boundary, so warnings are emitted only when a rule needs inner HTTP
+// metadata.
+func (c *Config) warnRequestPolicyVisibility(r *RequestPolicyRule, warnings *[]Warning) {
+	if !requestPolicyRuleNeedsInnerHTTP(r) {
+		return
+	}
+	if len(r.Route.Hosts) == 0 {
+		if !c.TLSInterception.Enabled {
+			*warnings = append(*warnings, Warning{
+				Field:   fmt.Sprintf("request_policy rule %q", r.Name),
+				Message: "has method/path/content-type or operation constraints but no host constraint and tls_interception is disabled; pipelock cannot see inner HTTPS method/path/body on CONNECT - only the tunnel host/port are visible",
+			})
+		}
+		return
+	}
+	for _, h := range r.Route.Hosts {
+		if !c.TLSInterception.Enabled {
+			*warnings = append(*warnings, Warning{
+				Field:   fmt.Sprintf("request_policy rule %q", r.Name),
+				Message: fmt.Sprintf("targets host %q but tls_interception is disabled; pipelock cannot see inner HTTPS method/path/body on CONNECT - only the tunnel host/port are visible", h),
+			})
+			continue
+		}
+		if hostMatchesPassthrough(h, c.TLSInterception.PassthroughDomains) {
+			*warnings = append(*warnings, Warning{
+				Field:   fmt.Sprintf("request_policy rule %q", r.Name),
+				Message: fmt.Sprintf("targets host %q which is in tls_interception.passthrough_domains; pipelock cannot see inner method/path/body for passthrough hosts - only host/port", h),
+			})
+		}
+	}
+}
+
+func validateRequestPolicyFailureAction(field, action string) error {
+	switch action {
+	case ActionAllow, ActionWarn, ActionBlock:
+		return nil
+	default:
+		return fmt.Errorf("request_policy %s has invalid action %q: must be allow, warn, or block", field, action)
+	}
+}
+
+func requestPolicyRuleNeedsInnerHTTP(r *RequestPolicyRule) bool {
+	if r.GraphQL != nil || r.Discriminator != nil || r.Except != nil {
+		return true
+	}
+	return requestPolicyRouteNeedsInnerHTTP(r.Route)
+}
+
+func requestPolicyRouteNeedsInnerHTTP(route RequestPolicyRoute) bool {
+	return len(route.Methods) > 0 ||
+		len(route.PathPrefixes) > 0 ||
+		len(route.PathPatterns) > 0 ||
+		len(route.ContentTypes) > 0
+}
+
+func hostMatchesPassthrough(host string, patterns []string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	for _, p := range patterns {
+		p = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(p), "."))
+		if p == host {
+			return true
+		}
+		if strings.HasPrefix(p, "*.") && (host == p[2:] || strings.HasSuffix(host, p[1:])) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Config) validateGitProtection() error {
+	// Validate git protection config
+	if !c.GitProtection.Enabled {
+		return nil
+	}
+	for _, pattern := range c.GitProtection.AllowedBranches {
+		if pattern == "" {
+			return fmt.Errorf("empty allowed_branches pattern")
+		}
+		if _, err := filepath.Match(pattern, "test"); err != nil {
+			return fmt.Errorf("invalid allowed_branches glob pattern %q: %w", pattern, err)
+		}
+	}
+	for _, cmd := range c.GitProtection.BlockedCommands {
+		if cmd == "" {
+			return fmt.Errorf("empty blocked_commands entry")
+		}
+	}
+	for _, rawRepo := range c.GitProtection.AllowedPushRepos {
+		repo := strings.TrimSpace(rawRepo)
+		if repo == "" {
+			return fmt.Errorf("empty allowed_push_repos entry")
+		}
+		parts := strings.Split(repo, "/")
+		hostWideRepoPattern := len(parts) == 2 && parts[1] == "*"
+		if len(parts) != 3 && !hostWideRepoPattern {
+			return fmt.Errorf("allowed_push_repos entry %q must be host/owner/repo or host/*", rawRepo)
+		}
+		for _, part := range parts {
+			if part == "" {
+				return fmt.Errorf("allowed_push_repos entry %q must be host/owner/repo or host/* with no empty segments", rawRepo)
+			}
+		}
+		if _, err := filepath.Match(repo, "github.com/acme/project"); err != nil {
+			return fmt.Errorf("invalid allowed_push_repos glob pattern %q: %w", repo, err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateForwardProxy() error {
+	// Validate forward proxy config
+	if err := validateLiteralHostMatchList(
+		"forward_proxy.redirect_websocket_hosts", c.ForwardProxy.RedirectWebSocketHosts, false); err != nil {
+		return err
+	}
+	if !c.ForwardProxy.Enabled {
+		return nil
+	}
+	if c.ForwardProxy.SNIRequireTLSEnabled() && !c.ForwardProxy.SNIVerificationEnabled() {
+		return fmt.Errorf("forward_proxy.sni_require_tls requires forward_proxy.sni_verification")
+	}
+	if c.ForwardProxy.MaxTunnelSeconds <= 0 {
+		return fmt.Errorf("forward_proxy.max_tunnel_seconds must be positive")
+	}
+	if c.ForwardProxy.IdleTimeoutSeconds <= 0 {
+		return fmt.Errorf("forward_proxy.idle_timeout_seconds must be positive")
+	}
+	return nil
+}
+
+func (c *Config) validateWebSocketProxy(warnings *[]Warning) error {
+	// Validate WebSocket proxy config
+	if err := validateEntropyHostExclusions("websocket_proxy.content_entropy_exclusions", c.WebSocketProxy.ContentEntropyExclusions); err != nil {
+		return err
+	}
+	if !c.WebSocketProxy.Enabled {
+		return nil
+	}
+	if c.WebSocketProxy.MaxMessageBytes <= 0 {
+		return fmt.Errorf("websocket_proxy.max_message_bytes must be positive")
+	}
+	if c.WebSocketProxy.MaxConcurrentConnections <= 0 {
+		return fmt.Errorf("websocket_proxy.max_concurrent_connections must be positive")
+	}
+	if c.WebSocketProxy.MaxConnectionSeconds <= 0 {
+		return fmt.Errorf("websocket_proxy.max_connection_seconds must be positive")
+	}
+	if c.WebSocketProxy.IdleTimeoutSeconds <= 0 {
+		return fmt.Errorf("websocket_proxy.idle_timeout_seconds must be positive")
+	}
+	if c.WebSocketProxy.CrossMessageFieldLimit < 0 || c.WebSocketProxy.CrossMessageFieldLimit > MaxWebSocketCrossMessageFieldLimit {
+		return fmt.Errorf("websocket_proxy.cross_message_field_limit must be between 0 and %d", MaxWebSocketCrossMessageFieldLimit)
+	}
+	switch c.WebSocketProxy.OriginPolicy {
+	case OriginPolicyRewrite, OriginPolicyForward, ActionStrip:
+		// valid
+	default:
+		return fmt.Errorf("invalid websocket_proxy.origin_policy %q: must be rewrite, forward, or strip", c.WebSocketProxy.OriginPolicy)
+	}
+	// Compression must stay stripped; scanning requires uncompressed frame payloads.
+	if c.WebSocketProxy.StripCompression != nil && !*c.WebSocketProxy.StripCompression {
+		return fmt.Errorf("websocket_proxy.strip_compression must be true: scanning requires uncompressed frames")
+	}
+	// Warn about memory budget
+	memBudget := int64(c.WebSocketProxy.MaxConcurrentConnections) * int64(c.WebSocketProxy.MaxMessageBytes) * 2
+	if memBudget > 1<<30 { // 1GB
+		*warnings = append(*warnings, Warning{
+			Field:   "websocket_proxy",
+			Message: fmt.Sprintf("memory budget is %dMB (max_concurrent_connections * max_message_bytes * 2) - consider reducing", memBudget/(1<<20)),
+		})
+	}
+	return nil
+}
+
+func (c *Config) validateSessionProfiling() error {
+	// Validate session profiling config
+	if c.SessionProfiling.Enabled {
+		switch c.SessionProfiling.AnomalyAction {
+		case ActionWarn, ActionBlock:
+			// valid
+		default:
+			return fmt.Errorf("invalid session_profiling.anomaly_action %q: must be warn or block", c.SessionProfiling.AnomalyAction)
+		}
+		if c.SessionProfiling.DomainBurst <= 0 {
+			return fmt.Errorf("session_profiling.domain_burst must be positive")
+		}
+		if c.SessionProfiling.WindowMinutes <= 0 {
+			return fmt.Errorf("session_profiling.window_minutes must be positive")
+		}
+	}
+	if c.SessionProfiling.MaxSessions <= 0 {
+		return fmt.Errorf("session_profiling.max_sessions must be positive")
+	}
+	if c.SessionProfiling.SessionTTLMinutes <= 0 {
+		return fmt.Errorf("session_profiling.session_ttl_minutes must be positive")
+	}
+	if c.SessionProfiling.CleanupIntervalSeconds <= 0 {
+		return fmt.Errorf("session_profiling.cleanup_interval_seconds must be positive")
+	}
+	return nil
+}
+
+func (c *Config) validateAdaptiveEnforcement(warnings *[]Warning) error {
+	// Validate adaptive enforcement config
+	if c.AdaptiveEnforcement.Enabled {
+		if !c.SessionProfiling.Enabled {
+			return fmt.Errorf("adaptive_enforcement.enabled requires session_profiling.enabled")
+		}
+		if c.AdaptiveEnforcement.EscalationThreshold <= 0 {
+			return fmt.Errorf("adaptive_enforcement.escalation_threshold must be positive")
+		}
+		if c.AdaptiveEnforcement.DecayPerCleanRequest <= 0 {
+			return fmt.Errorf("adaptive_enforcement.decay_per_clean_request must be positive")
+		}
+		if c.AdaptiveEnforcement.LevelDurationSeconds <= 0 {
+			return fmt.Errorf("adaptive_enforcement.level_duration_seconds must be positive")
+		}
+		if c.AdaptiveEnforcement.DeescalationCheckSeconds <= 0 {
+			return fmt.Errorf("adaptive_enforcement.deescalation_check_seconds must be positive")
+		}
+		if c.AdaptiveEnforcement.CleanRequestsToDeescalate < 0 {
+			return fmt.Errorf("adaptive_enforcement.clean_requests_to_deescalate must be non-negative")
+		}
+		// Validate escalation level actions.
+		if err := validateEscalationActions("elevated", &c.AdaptiveEnforcement.Levels.Elevated); err != nil {
+			return err
+		}
+		if err := validateEscalationActions("high", &c.AdaptiveEnforcement.Levels.High); err != nil {
+			return err
+		}
+		if err := validateEscalationActions("critical", &c.AdaptiveEnforcement.Levels.Critical); err != nil {
+			return err
+		}
+		// Monotonic check: higher levels must not be weaker than lower levels.
+		if err := validateEscalationMonotonic(&c.AdaptiveEnforcement.Levels); err != nil {
+			return err
+		}
+	}
+
+	// Validate adaptive enforcement exempt_domains regardless of enabled state.
+	if err := ValidateTrustedDomains(c.AdaptiveEnforcement.ExemptDomains, "adaptive_enforcement.exempt_domains"); err != nil {
+		return err
+	}
+	if !c.AdaptiveEnforcement.Enabled && len(c.AdaptiveEnforcement.ExemptDomains) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "adaptive_enforcement.exempt_domains",
+			Message: "configured but adaptive_enforcement is disabled — these will take effect when enabled",
+		})
+	}
+	return nil
+}
+
+func (c *Config) validateMCPSessionBinding() error {
+	// Validate MCP session binding config
+	if !c.MCPSessionBinding.Enabled {
+		return nil
+	}
+	if !c.MCPToolScanning.Enabled {
+		return fmt.Errorf("mcp_session_binding.enabled requires mcp_tool_scanning.enabled (binding needs tool scanning for baseline capture)")
+	}
+	switch c.MCPSessionBinding.UnknownToolAction {
+	case ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_session_binding.unknown_tool_action %q: must be warn or block", c.MCPSessionBinding.UnknownToolAction)
+	}
+	switch c.MCPSessionBinding.NoBaselineAction {
+	case ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_session_binding.no_baseline_action %q: must be warn or block", c.MCPSessionBinding.NoBaselineAction)
+	}
+	return nil
+}
+
+func (c *Config) validateA2AScanning() error {
+	// Validate trusted keys regardless of Enabled so malformed entries and
+	// require_signed_agent_cards-without-keys fail fast at load, not only on a
+	// later reload that turns A2A on. This also normalizes accepted entries.
+	if err := c.validateA2ATrustedCardKeys(); err != nil {
+		return err
+	}
+	if !c.A2AScanning.Enabled {
+		return nil
+	}
+	switch c.A2AScanning.Action {
+	case ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid a2a_scanning action %q: must be warn or block", c.A2AScanning.Action)
+	}
+	if c.A2AScanning.MaxContextMessages <= 0 {
+		c.A2AScanning.MaxContextMessages = 100
+	}
+	if c.A2AScanning.MaxContexts <= 0 {
+		c.A2AScanning.MaxContexts = 1000
+	}
+	if c.A2AScanning.MaxRawSize <= 0 {
+		c.A2AScanning.MaxRawSize = 1 << 20
+	}
+	return nil
+}
+
+// validateA2ATrustedCardKeys enforces the trust shape for Agent Card signature
+// verification: every pinned key needs a unique non-empty key_id, a parseable
+// Ed25519 public key, at least one well-formed origin, and no two keys may share
+// the same public key. require_signed_agent_cards is meaningless (it would block
+// every card) without at least one trusted key, so that combination is rejected.
+func (c *Config) validateA2ATrustedCardKeys() error {
+	keys := c.A2AScanning.TrustedAgentCardKeys
+	if c.A2AScanning.RequireSignedAgentCards && len(keys) == 0 {
+		return fmt.Errorf("a2a_scanning.require_signed_agent_cards requires at least one trusted_agent_card_keys entry")
+	}
+	seenID := make(map[string]struct{}, len(keys))
+	seenFP := make(map[string]string, len(keys))
+	for i, k := range keys {
+		id := strings.TrimSpace(k.KeyID)
+		if id == "" {
+			return fmt.Errorf("a2a_scanning.trusted_agent_card_keys[%d]: key_id is required", i)
+		}
+		c.A2AScanning.TrustedAgentCardKeys[i].KeyID = id
+		if _, dup := seenID[id]; dup {
+			return fmt.Errorf("a2a_scanning.trusted_agent_card_keys: duplicate key_id %q", id)
+		}
+		seenID[id] = struct{}{}
+
+		pub, err := signing.ParsePublicKey(k.PublicKey)
+		if err != nil {
+			return fmt.Errorf("a2a_scanning.trusted_agent_card_keys[%q]: invalid public_key: %w", id, err)
+		}
+		fp, err := signing.Fingerprint(pub)
+		if err != nil {
+			return fmt.Errorf("a2a_scanning.trusted_agent_card_keys[%q]: %w", id, err)
+		}
+		c.A2AScanning.TrustedAgentCardKeys[i].PublicKey = signing.EncodePublicKey(pub)
+		if other, dup := seenFP[fp]; dup {
+			return fmt.Errorf("a2a_scanning.trusted_agent_card_keys: key_id %q and %q share the same public key", other, id)
+		}
+		seenFP[fp] = id
+
+		if len(k.AllowedOrigins) == 0 {
+			return fmt.Errorf("a2a_scanning.trusted_agent_card_keys[%q]: allowed_origins is required", id)
+		}
+		for j, o := range k.AllowedOrigins {
+			origin, ok := canonicalCardOrigin(o)
+			if !ok {
+				return fmt.Errorf("a2a_scanning.trusted_agent_card_keys[%q]: invalid origin %q (want scheme://host[:port], no path)", id, o)
+			}
+			c.A2AScanning.TrustedAgentCardKeys[i].AllowedOrigins[j] = origin
+		}
+	}
+	return nil
+}
+
+// canonicalCardOrigin reports whether s is a well-formed Agent Card origin and
+// returns its normalized scheme://host[:port] form.
+//
+// This is intentionally STRICTER than mcp.CardOriginFromURL (which normalizes an
+// arbitrary fetch URL down to its origin by discarding the path). A configured
+// allowed_origins entry must already BE an origin, so anything carrying a path,
+// query, fragment, or userinfo is a likely operator mistake and is rejected here
+// rather than silently normalized away.
+func canonicalCardOrigin(s string) (string, bool) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", false
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", false
+	}
+	if u.Host == "" || u.Hostname() == "" || u.User != nil {
+		return "", false
+	}
+	if !validOptionalCardOriginPort(u.Host, u.Port()) {
+		return "", false
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", false
+		}
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+	if port != "" {
+		host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	return scheme + "://" + host, true
+}
+
+func validOptionalCardOriginPort(hostport, port string) bool {
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.LastIndex(hostport, "]")
+		if end < 0 || end == len(hostport)-1 {
+			return end == len(hostport)-1
+		}
+		return strings.HasPrefix(hostport[end+1:], ":") && port != ""
+	}
+	if strings.Count(hostport, ":") == 0 {
+		return true
+	}
+	if strings.Count(hostport, ":") > 1 {
+		return false
+	}
+	return port != ""
+}
+
+func (c *Config) validateRequestBodyScanning(warnings *[]Warning) error {
+	if err := validateRequestBodySigV4CredentialRoutes(&c.RequestBodyScanning); err != nil {
+		return err
+	}
+	// Validated whether or not request-body scanning is enabled, so a dormant
+	// bad entry cannot activate silently when scanning is switched on.
+	if err := ValidateTrustedDomains(c.RequestBodyScanning.TrustedHosts, "request_body_scanning.trusted_hosts"); err != nil {
+		return err
+	}
+	knownPatterns := c.effectiveBodyDLPPatternNames()
+	disabledPatterns := make(map[string]struct{}, len(c.RequestBodyScanning.DisablePatterns))
+	for i, pattern := range c.RequestBodyScanning.DisablePatterns {
+		if pattern == "" {
+			return fmt.Errorf("request_body_scanning.disable_patterns[%d] must not be empty", i)
+		}
+		if _, ok := knownPatterns[pattern]; !ok {
+			return fmt.Errorf("request_body_scanning.disable_patterns[%d] %q does not match any effective DLP pattern", i, pattern)
+		}
+		if IsCoreDLPPatternName(pattern) {
+			return fmt.Errorf("request_body_scanning.disable_patterns[%d] %q targets immutable core DLP and cannot be disabled", i, pattern)
+		}
+		if IsCredentialAudiencePatternName(pattern) {
+			// An operator may knowingly allow a provider credential to a
+			// destination its vendor does not own, most often an internal
+			// relay. Warn rather than refuse: rejecting here stops a
+			// PREVIOUSLY VALID config from loading on upgrade and takes the
+			// proxy down. The core DLP floor above stays a hard error; it is
+			// immutable and predates credential audiences.
+			if warnings != nil {
+				*warnings = append(*warnings, Warning{
+					Field:   fmt.Sprintf("request_body_scanning.disable_patterns[%d]", i),
+					Message: fmt.Sprintf("%q has compiled credential audience hosts %v; disabling it stops enforcing that credential's destination entirely", pattern, credentialAudienceHostsForPattern(pattern)),
+				})
+			}
+		}
+		disabledPatterns[pattern] = struct{}{}
+	}
+	for pattern, action := range c.RequestBodyScanning.PatternActions {
+		if pattern == "" {
+			return fmt.Errorf("request_body_scanning.pattern_actions contains an empty pattern name")
+		}
+		if _, ok := knownPatterns[pattern]; !ok {
+			return fmt.Errorf("request_body_scanning.pattern_actions[%q] does not match any effective DLP pattern", pattern)
+		}
+		switch action {
+		case ActionWarn, ActionBlock:
+			// valid
+		default:
+			return fmt.Errorf("request_body_scanning.pattern_actions[%q] has invalid action %q: must be warn or block", pattern, action)
+		}
+		if action == ActionWarn && IsCoreDLPPatternName(pattern) {
+			return fmt.Errorf("request_body_scanning.pattern_actions[%q] cannot downgrade immutable core DLP to warn", pattern)
+		}
+		if action == ActionWarn && IsCredentialAudiencePatternName(pattern) {
+			// An operator may knowingly allow a provider credential to a
+			// destination its vendor does not own, most often an internal
+			// relay. Warn rather than refuse: rejecting here stops a
+			// PREVIOUSLY VALID config from loading on upgrade and takes the
+			// proxy down. The core DLP floor above stays a hard error; it is
+			// immutable and predates credential audiences.
+			if warnings != nil {
+				*warnings = append(*warnings, Warning{
+					Field:   fmt.Sprintf("request_body_scanning.pattern_actions[%q]", pattern),
+					Message: fmt.Sprintf("%q has compiled credential audience hosts %v; warn delivers the request instead of blocking a credential bound elsewhere", pattern, credentialAudienceHostsForPattern(pattern)),
+				})
+			}
+		}
+		if _, disabled := disabledPatterns[pattern]; disabled {
+			return fmt.Errorf("request_body_scanning.pattern_actions[%q] is inert because the pattern is also listed in request_body_scanning.disable_patterns", pattern)
+		}
+	}
+
+	// Validate request body scanning config
+	if c.RequestBodyScanning.Enabled {
+		switch c.RequestBodyScanning.Action {
+		case ActionWarn, ActionBlock:
+			// valid
+		default:
+			return fmt.Errorf("invalid request_body_scanning.action %q: must be warn or block", c.RequestBodyScanning.Action)
+		}
+	}
+	if c.RequestBodyScanning.ContentEntropyThreshold < 0 {
+		return fmt.Errorf("request_body_scanning.content_entropy_threshold must be non-negative")
+	}
+	if c.RequestBodyScanning.ContentEntropyThreshold > 8 {
+		return fmt.Errorf("request_body_scanning.content_entropy_threshold must not exceed 8")
+	}
+	if c.RequestBodyScanning.ContentEntropyAction != "" {
+		switch c.RequestBodyScanning.ContentEntropyAction {
+		case ActionWarn, ActionBlock:
+			// valid
+		default:
+			return fmt.Errorf("invalid request_body_scanning.content_entropy_action %q: must be warn or block", c.RequestBodyScanning.ContentEntropyAction)
+		}
+	}
+	if c.RequestBodyScanning.ContentEntropyEnabled {
+		if c.RequestBodyScanning.ContentEntropyAction == "" {
+			return fmt.Errorf("request_body_scanning.content_entropy_action must be set when content entropy is enabled")
+		}
+		if c.RequestBodyScanning.ContentEntropyThreshold <= 0 {
+			return fmt.Errorf("request_body_scanning.content_entropy_threshold must be positive when content entropy is enabled")
+		}
+		if c.RequestBodyScanning.ContentEntropyMinLength <= 0 {
+			return fmt.Errorf("request_body_scanning.content_entropy_min_length must be positive when content entropy is enabled")
+		}
+	}
+	if c.RequestBodyScanning.ContentEntropyMinLength < 0 {
+		return fmt.Errorf("request_body_scanning.content_entropy_min_length must be non-negative")
+	}
+	if err := validateEntropyHostExclusions("request_body_scanning.content_entropy_exclusions", c.RequestBodyScanning.ContentEntropyExclusions); err != nil {
+		return err
+	}
+	if err := validateRequestBodyEntropyWarnRoutes(&c.RequestBodyScanning); err != nil {
+		return err
+	}
+	if !c.RequestBodyScanning.Enabled {
+		return nil
+	}
+	if c.RequestBodyScanning.MaxBodyBytes <= 0 {
+		return fmt.Errorf("request_body_scanning.max_body_bytes must be positive")
+	}
+	switch c.RequestBodyScanning.HeaderMode {
+	case HeaderModeSensitive, HeaderModeAll:
+		// valid
+	default:
+		return fmt.Errorf("invalid request_body_scanning.header_mode %q: must be sensitive or all", c.RequestBodyScanning.HeaderMode)
+	}
+	return nil
+}
+
+func (c *Config) effectiveBodyDLPPatternNames() map[string]struct{} {
+	names := make(map[string]struct{}, len(c.DLP.Patterns)+len(c.CanaryTokens.Tokens)+8)
+	for _, pattern := range CoreDLPPatterns() {
+		names[pattern.Name] = struct{}{}
+	}
+	for _, pattern := range c.DLP.Patterns {
+		if pattern.Name != "" {
+			names[pattern.Name] = struct{}{}
+		}
+	}
+	if c.SeedPhraseDetection.Enabled == nil || *c.SeedPhraseDetection.Enabled {
+		names["BIP-39 Seed Phrase"] = struct{}{}
+	}
+	names["Hostname Exfiltration"] = struct{}{}
+	if c.DLP.ScanEnv {
+		names["Environment Variable Leak"] = struct{}{}
+	}
+	if c.DLP.SecretsFile != "" {
+		names["Known Secret Leak"] = struct{}{}
+	}
+	if c.CanaryTokens.Enabled {
+		for _, token := range c.CanaryTokens.Tokens {
+			if token.Name != "" {
+				names["Canary Token ("+token.Name+")"] = struct{}{}
+			}
+		}
+	}
+	return names
+}
+
+func (c *Config) validateSeedPhraseDetection() error {
+	// Validate seed phrase detection config
+	if c.SeedPhraseDetection.Enabled == nil || *c.SeedPhraseDetection.Enabled {
+		if c.SeedPhraseDetection.MinWords == 0 {
+			c.SeedPhraseDetection.MinWords = 12
+		}
+		validMinWords := map[int]bool{12: true, 15: true, 18: true, 21: true, 24: true}
+		if !validMinWords[c.SeedPhraseDetection.MinWords] {
+			return fmt.Errorf("invalid seed_phrase_detection.min_words %d: must be 12, 15, 18, 21, or 24", c.SeedPhraseDetection.MinWords)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateCrossRequestDetection(warnings *[]Warning) error {
+	// Validate cross-request detection config
+	if c.CrossRequestDetection.Enabled {
+		if !c.CrossRequestDetection.EntropyBudget.Enabled && !c.CrossRequestDetection.FragmentReassembly.Enabled {
+			return fmt.Errorf("cross_request_detection.enabled is true but both entropy_budget and fragment_reassembly are disabled (silent no-op)")
+		}
+		switch c.CrossRequestDetection.Action {
+		case ActionBlock, ActionWarn:
+			// valid
+		default:
+			return fmt.Errorf("invalid cross_request_detection.action %q: must be block or warn", c.CrossRequestDetection.Action)
+		}
+		if c.CrossRequestDetection.EntropyBudget.Enabled {
+			switch c.CrossRequestDetection.EntropyBudget.Action {
+			case ActionBlock, ActionWarn:
+				// valid
+			default:
+				return fmt.Errorf("invalid cross_request_detection.entropy_budget.action %q: must be block or warn", c.CrossRequestDetection.EntropyBudget.Action)
+			}
+			if c.CrossRequestDetection.EntropyBudget.BitsPerWindow <= 0 {
+				return fmt.Errorf("cross_request_detection.entropy_budget.bits_per_window must be > 0")
+			}
+			if c.CrossRequestDetection.EntropyBudget.WindowMinutes <= 0 {
+				return fmt.Errorf("cross_request_detection.entropy_budget.window_minutes must be > 0")
+			}
+		}
+		if c.CrossRequestDetection.FragmentReassembly.Enabled {
+			if c.CrossRequestDetection.FragmentReassembly.MaxBufferBytes <= 0 {
+				return fmt.Errorf("cross_request_detection.fragment_reassembly.max_buffer_bytes must be > 0")
+			}
+			if c.CrossRequestDetection.FragmentReassembly.WindowMinutes <= 0 {
+				return fmt.Errorf("cross_request_detection.fragment_reassembly.window_minutes must be > 0")
+			}
+			// The session ledger is the control the capacity block names, so a
+			// value that cannot hold a working set turns cross-request detection
+			// into blanket denial. An omitted value takes the default; an
+			// EXPLICIT non-positive one is an operator mistake and is refused
+			// rather than quietly replaced, which is what the sibling fields
+			// above do by coercion and what made this rule unreachable before.
+			if ms := c.CrossRequestDetection.FragmentReassembly.MaxSessions; ms != nil && *ms <= 0 {
+				return fmt.Errorf("cross_request_detection.fragment_reassembly.max_sessions must be > 0")
+			}
+		}
+	}
+
+	// Validate CEE entropy budget exempt_domains regardless of enabled state.
+	if err := ValidateTrustedDomains(c.CrossRequestDetection.EntropyBudget.ExemptDomains, "cross_request_detection.entropy_budget.exempt_domains"); err != nil {
+		return err
+	}
+	if !c.CrossRequestDetection.Enabled && len(c.CrossRequestDetection.EntropyBudget.ExemptDomains) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "cross_request_detection.entropy_budget.exempt_domains",
+			Message: "configured but cross_request_detection is disabled — these will take effect when enabled",
+		})
+	}
+	return nil
+}
+
+func (c *Config) validateTLSInterception() error {
+	// Validate TLS interception config
+	if err := validateLiteralHostMatchList(
+		"tls_interception.passthrough_domains", c.TLSInterception.PassthroughDomains, true); err != nil {
+		return err
+	}
+	if !c.TLSInterception.Enabled {
+		return nil
+	}
+	ttl, err := time.ParseDuration(c.TLSInterception.CertTTL)
+	if err != nil {
+		return fmt.Errorf("tls_interception.cert_ttl: %w", err)
+	}
+	if ttl <= 0 {
+		return errors.New("tls_interception.cert_ttl must be positive")
+	}
+	if c.TLSInterception.CertCacheSize <= 0 {
+		return errors.New("tls_interception.cert_cache_size must be > 0")
+	}
+	if c.TLSInterception.MaxResponseBytes <= 0 {
+		return errors.New("tls_interception.max_response_bytes must be > 0")
+	}
+	certPath, keyPath, resolveErr := c.ResolveCAPath()
+	if resolveErr != nil {
+		return fmt.Errorf("tls_interception: %w", resolveErr)
+	}
+	if _, err := os.Stat(certPath); err != nil {
+		return fmt.Errorf("CA cert not found at %s (run 'pipelock tls init'): %w%s", certPath, err, c.caPathMismatchHint(certPath))
+	}
+	keyInfo, err := os.Stat(keyPath)
+	if err != nil {
+		return fmt.Errorf("CA key not found at %s (run 'pipelock tls init'): %w%s", keyPath, err, c.caPathMismatchHint(certPath))
+	}
+	// Reject world-readable, any writable, or any executable bits. Allow
+	// group-read (0o040) because Kubernetes fsGroup sets it on secret volumes.
+	if secperm.TooPermissive(keyInfo.Mode().Perm(), 0o137) {
+		return fmt.Errorf("CA key %s is too permissive (mode %04o): restrict to 0600 or 0640", keyPath, keyInfo.Mode().Perm())
+	}
+	return nil
+}
+
+// tlsInterceptionCoverageMessage is the shared advisory text for the HTTPS
+// content-visibility gap. It is honest in both directions: it names what content
+// scanning cannot see for HTTPS, lists only the controls that can be evaluated
+// from CONNECT metadata or tunnel accounting as still-enforced, and states that
+// request_policy and contract rules matching inner HTTPS content require
+// interception (they run on the CONNECT host, not the decrypted request).
+const tlsInterceptionCoverageMessage = "TLS interception is disabled while the forward proxy accepts CONNECT tunnels. " +
+	"HTTPS traffic is not decrypted, so content scanning (request_body_scanning, response_scanning, path/query entropy, and body DLP) " +
+	"does not inspect HTTPS request paths, bodies, or responses. Pipelock still enforces controls that evaluate from CONNECT metadata " +
+	"or tunnel accounting (destination allowlist/blocklist, SSRF on the CONNECT host, rate limits, data budget, CONNECT handshake-header DLP, " +
+	"kill switch, and receipt gates); request_policy and contract rules that match inner HTTPS method, path, query, headers, or body require " +
+	"tls_interception. Enable tls_interception (and distribute its CA) to scan HTTPS content, or accept tunnel-level-only visibility for " +
+	"HTTPS content as a deliberate posture."
+
+// TLSInterceptionCoverageAdvisory returns an operator advisory, and true, when
+// the forward proxy accepts CONNECT tunnels but TLS interception is off. Without
+// interception, HTTPS over CONNECT is an opaque tunnel: Pipelock sees the CONNECT
+// host and handshake, but not the inner HTTPS request path, query, body, or
+// response. Every content-dependent control (request/response body scanning,
+// path/query entropy, body DLP, and any request_policy/contract rule matching
+// inner HTTPS content) is therefore blind, so the advisory fires whenever the
+// forward proxy is on and interception is off, not only for body/response
+// scanners. Shared by the startup/reload warning and the `check`/`doctor`
+// advisory so both surfaces stay in sync.
+func (c *Config) TLSInterceptionCoverageAdvisory() (string, bool) {
+	if !c.ForwardProxy.Enabled || c.TLSInterception.Enabled {
+		return "", false
+	}
+	return tlsInterceptionCoverageMessage, true
+}
+
+// DoWPrincipalTrustAdvisory returns an operator advisory, and true, when a
+// budget demands principal-grade subject identification.
+//
+// No shipped runtime path resolves an authenticated MCP principal yet: the seam
+// exists (MCPProxyOpts.DoWAuthenticatedPrincipal) but nothing sets it, so every
+// request currently grades below principal. A budget pinned to that grade
+// therefore refuses every tool call, which reads as a total outage rather than
+// as the posture the operator chose. Config validation cannot see runtime
+// wiring, so this is an advisory rather than an error: it must fire at load,
+// where an operator can act on it, instead of surfacing one refusal at a time.
+func (c *Config) DoWPrincipalTrustAdvisory() (string, bool) {
+	for name, ap := range c.Agents {
+		if ap.Budget.MinSubjectTrust() != DoWTrustPrincipal {
+			continue
+		}
+		return fmt.Sprintf(
+			"agents.%s.budget.dow_min_subject_trust is %q, but no authenticated MCP principal source is wired in this build, so every request grades below it and every tool call under this budget will be refused. Use %q or %q unless an authenticated principal is supplied by a deployment-specific integration.",
+			name, DoWTrustPrincipal, DoWTrustNetwork, DoWTrustAgent), true
+	}
+	return "", false
+}
+
+// validateDoWPrincipalTrust surfaces DoWPrincipalTrustAdvisory as a non-fatal
+// Validate warning. It changes no enforcement behavior.
+func (c *Config) validateDoWPrincipalTrust(warnings *[]Warning) {
+	if msg, ok := c.DoWPrincipalTrustAdvisory(); ok {
+		*warnings = append(*warnings, Warning{Field: "agents.budget.dow_min_subject_trust", Message: msg})
+	}
+}
+
+// validateTLSInterceptionCoverage surfaces TLSInterceptionCoverageAdvisory as a
+// non-fatal Validate warning. It changes no enforcement behavior.
+func (c *Config) validateTLSInterceptionCoverage(warnings *[]Warning) {
+	if msg, ok := c.TLSInterceptionCoverageAdvisory(); ok {
+		*warnings = append(*warnings, Warning{Field: "tls_interception", Message: msg})
+	}
+}
+
+func (c *Config) validateToolChainDetection() error {
+	// Validate tool chain detection config
+	if !c.ToolChainDetection.Enabled {
+		return nil
+	}
+	switch c.ToolChainDetection.Action {
+	case ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid tool_chain_detection.action %q: must be warn or block", c.ToolChainDetection.Action)
+	}
+	if c.ToolChainDetection.WindowSize <= 0 {
+		return fmt.Errorf("tool_chain_detection.window_size must be positive")
+	}
+	if c.ToolChainDetection.WindowSeconds <= 0 {
+		return fmt.Errorf("tool_chain_detection.window_seconds must be positive")
+	}
+	if c.ToolChainDetection.MaxGap != nil && *c.ToolChainDetection.MaxGap < 0 {
+		return fmt.Errorf("tool_chain_detection.max_gap must be non-negative")
+	}
+	for i, p := range c.ToolChainDetection.CustomPatterns {
+		if p.Name == "" {
+			return fmt.Errorf("tool_chain_detection.custom_patterns[%d] missing name", i)
+		}
+		if len(p.Sequence) < 2 {
+			return fmt.Errorf("tool_chain_detection.custom_patterns[%d] %q: sequence must have at least 2 steps", i, p.Name)
+		}
+		switch p.Severity {
+		case SeverityMedium, SeverityHigh, SeverityCritical:
+			// valid
+		default:
+			return fmt.Errorf("tool_chain_detection.custom_patterns[%d] %q: invalid severity %q: must be medium, high, or critical", i, p.Name, p.Severity)
+		}
+		if p.Action != "" {
+			switch p.Action {
+			case ActionWarn, ActionBlock:
+				// valid
+			default:
+				return fmt.Errorf("tool_chain_detection.custom_patterns[%d] %q: invalid action %q: must be warn or block", i, p.Name, p.Action)
+			}
+		}
+	}
+	for name, action := range c.ToolChainDetection.PatternOverrides {
+		switch action {
+		case ActionWarn, ActionBlock:
+			// valid
+		default:
+			return fmt.Errorf("tool_chain_detection.pattern_overrides[%q]: invalid action %q: must be warn or block", name, action)
+		}
+	}
+	// Keep these label strings in lockstep with the chains package
+	// (internal/mcp/chains/classify.go: SensitivityUntrustedSource,
+	// SensitivitySensitiveSource, SensitivityExternalSink). The
+	// duplication is deliberate - importing chains from config would
+	// create a cycle since chains imports config for ToolChainDetection.
+	for label, patterns := range c.ToolChainDetection.SensitivityLabels {
+		switch label {
+		case "untrusted_source", "sensitive_source", "external_sink":
+			// valid
+		default:
+			return fmt.Errorf("tool_chain_detection.sensitivity_labels[%q]: invalid label: must be untrusted_source, sensitive_source, or external_sink", label)
+		}
+		if len(patterns) == 0 {
+			return fmt.Errorf("tool_chain_detection.sensitivity_labels[%q]: must contain at least one pattern (use absent label to disable instead)", label)
+		}
+		for i, rawPat := range patterns {
+			pat := strings.TrimSpace(rawPat)
+			if pat == "" {
+				return fmt.Errorf("tool_chain_detection.sensitivity_labels[%q][%d] is empty", label, i)
+			}
+			if _, err := filepath.Match(pat, "probe"); err != nil {
+				return fmt.Errorf("tool_chain_detection.sensitivity_labels[%q][%d] %q: invalid glob pattern: %w", label, i, pat, err)
+			}
+			// Persist the trimmed form so the matcher uses the normalized
+			// pattern at runtime (slice is a reference, so writing here
+			// updates the value stored on the Config).
+			patterns[i] = pat
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateMCPWSListener() error {
+	// Validate MCP WS listener config
+	if c.MCPWSListener.MaxConnections <= 0 {
+		return fmt.Errorf("mcp_ws_listener.max_connections must be positive")
+	}
+	for i, origin := range c.MCPWSListener.AllowedOrigins {
+		if origin == "" {
+			return fmt.Errorf("mcp_ws_listener.allowed_origins[%d] is empty", i)
+		}
+		u, parseErr := url.Parse(origin)
+		if parseErr != nil || u.Host == "" {
+			return fmt.Errorf("mcp_ws_listener.allowed_origins[%d] %q: must be a valid origin (e.g. https://example.com)", i, origin)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateSuppress(warnings *[]Warning) error {
+	// Validate suppress entries have required fields
+	for i, s := range c.Suppress {
+		if s.Rule == "" {
+			return fmt.Errorf("suppress entry %d missing required field \"rule\"", i)
+		}
+		if IsCoreDLPPatternName(s.Rule) {
+			return fmt.Errorf("suppress entry %d rule %q targets a core floor pattern; core floor patterns cannot be suppressed: dlp.patterns[].exempt_domains applies only to configurable URL DLP patterns, so fix this core pattern's precision", i, s.Rule)
+		}
+		if IsCoreResponsePatternName(s.Rule) {
+			return fmt.Errorf("suppress entry %d rule %q targets a core floor pattern; core floor patterns cannot be suppressed: tighten the response pattern to fix the false positive", i, s.Rule)
+		}
+		if s.Path == "" {
+			return fmt.Errorf("suppress entry %d (%s) missing required field \"path\"", i, s.Rule)
+		}
+		// Validate glob syntax so misconfigured patterns fail fast
+		// instead of silently never matching at runtime.
+		if strings.ContainsAny(s.Path, "*?[") {
+			if _, err := path.Match(toSlash(s.Path), "x"); err != nil {
+				return fmt.Errorf("suppress entry %d (%s) has invalid path pattern %q: %w", i, s.Rule, s.Path, err)
+			}
+		}
+		if IsCredentialAudiencePatternName(s.Rule) {
+			if credentialAudienceSuppressPathSubset(s.Path, credentialAudienceHostsForPattern(s.Rule)) {
+				if warnings != nil {
+					*warnings = append(*warnings, Warning{
+						Field:   fmt.Sprintf("suppress[%d].path", i),
+						Message: fmt.Sprintf("suppress[%d].path is a redundant subset of the compiled credential audience for %q and is ignored; remove suppress[%d]", i, s.Rule, i),
+					})
+				}
+				continue
+			}
+			// A suppress entry that reaches beyond the compiled audience is
+			// the operator deliberately allowing a provider credential to a
+			// destination the vendor does not own. That is a real decision an
+			// operator is entitled to make, most often for an internal relay
+			// that forwards the credential on their behalf, so it warns loudly
+			// rather than refusing the config.
+			//
+			// Failure direction, chosen knowingly: this permits a widened
+			// audience instead of denying it. Refusing here would stop a
+			// PREVIOUSLY VALID config from loading on upgrade, taking the whole
+			// proxy down on a security product where every request depends on
+			// it, and the remedy the operator is given would be to delete a
+			// suppression they may genuinely need. An over-strict control that
+			// gets routed around by disabling something broader is the outcome
+			// this avoids. The widening stays visible: the entry is named here
+			// and each match is audited.
+			if warnings != nil {
+				*warnings = append(*warnings, Warning{
+					Field:   fmt.Sprintf("suppress[%d].path", i),
+					Message: fmt.Sprintf("suppress[%d] widens the compiled credential audience for %q beyond %v; the credential is allowed to leave for a destination its vendor does not own, and every match is audited", i, s.Rule, credentialAudienceHostsForPattern(s.Rule)),
+				})
+			}
+			continue
+		}
+	}
+	return nil
+}
+
+// ValidateSuppressions validates the suppression surface independently of the
+// full config. Runtime boundaries use it when callers provide an in-memory
+// config that did not pass through Load.
+func (c *Config) ValidateSuppressions() error {
+	return c.validateSuppress(nil)
+}
+
+// LapsedContainmentGrants returns the declared loopback and published service
+// entries that LapseExpiredContainmentGrants removed from the effective set.
+func (c *Config) LapsedContainmentGrants() []LapsedContainmentGrant {
+	return append([]LapsedContainmentGrant(nil), c.Containment.lapsed...)
+}
+
+// LapseExpiredContainmentGrants treats an expired containment.loopback_services
+// or containment.published_services entry as a lapsed grant rather than a
+// broken file: it removes only the expired entries from the effective lists,
+// so they are never exposed or rendered, and records them for reporting. Every
+// other defect (malformed, duplicate, proxy-port or published-port collision)
+// still returns an error and leaves the config untouched. It is idempotent and
+// returns every grant recorded so far. Call it on a config no other goroutine
+// is reading: Load, NewServer, and Reload each hold the candidate privately.
+func (c *Config) LapseExpiredContainmentGrants(now time.Time) ([]LapsedContainmentGrant, error) {
+	if len(c.Containment.LoopbackServices) == 0 && len(c.Containment.PublishedServices) == 0 {
+		return c.LapsedContainmentGrants(), nil
+	}
+	proxyPort, err := c.containmentProxyPort()
+	if err != nil {
+		return nil, err
+	}
+	activeLoopback, lapsedLoopback, err := ResolveContainmentLoopbackServices(c.Containment.LoopbackServices, proxyPort, now)
+	if err != nil {
+		return nil, err
+	}
+	activePublished, lapsedPublished, err := ResolveContainmentPublishedServices(c.Containment.PublishedServices, c.Containment.LoopbackServices, proxyPort, now)
+	if err != nil {
+		return nil, err
+	}
+	if len(lapsedLoopback) > 0 {
+		if activeLoopback == nil {
+			activeLoopback = []ContainmentLoopbackService{}
+		}
+		c.Containment.LoopbackServices = activeLoopback
+	}
+	if len(lapsedPublished) > 0 {
+		if activePublished == nil {
+			activePublished = []ContainmentPublishedService{}
+		}
+		c.Containment.PublishedServices = activePublished
+	}
+	// Build a fresh slice so a Config copy that shares the old one never sees
+	// it change.
+	merged := append([]LapsedContainmentGrant(nil), c.Containment.lapsed...)
+	merged = append(merged, lapsedLoopback...)
+	merged = append(merged, lapsedPublished...)
+	c.Containment.lapsed = merged
+	return c.LapsedContainmentGrants(), nil
+}
+
+// warnLapsedContainmentGrants appends one warning per lapsed grant of kind,
+// whether this call found it or an earlier LapseExpiredContainmentGrants
+// already dropped it, so the warning survives the second validation a
+// startup or reload performs after Load.
+func (c *Config) warnLapsedContainmentGrants(kind string, found []LapsedContainmentGrant, warnings *[]Warning) {
+	if warnings == nil {
+		return
+	}
+	for _, grant := range append(append([]LapsedContainmentGrant(nil), c.Containment.lapsed...), found...) {
+		if grant.Kind != kind {
+			continue
+		}
+		*warnings = append(*warnings, Warning{
+			Field:   ContainmentGrantField(kind),
+			Message: grant.Message + "; the entry is dropped from the effective set and grants nothing until it is renewed or removed",
+		})
+	}
+}
+
+func (c *Config) containmentProxyPort() (int, error) {
+	_, proxyPort, err := net.SplitHostPort(c.FetchProxy.Listen)
+	if err != nil {
+		return 0, fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, err)
+	}
+	port, err := strconv.Atoi(proxyPort)
+	if err != nil {
+		return 0, fmt.Errorf("invalid fetch_proxy.listen port %q: %w", proxyPort, err)
+	}
+	return port, nil
+}
+
+func (c *Config) validateContainmentPublishedServices(warnings *[]Warning) error {
+	if c.Containment.AgentListener != "" {
+		_, proxyPortText, err := net.SplitHostPort(c.FetchProxy.Listen)
+		if err != nil {
+			return fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, err)
+		}
+		proxyPort, err := strconv.Atoi(proxyPortText)
+		if err != nil {
+			return fmt.Errorf("invalid fetch_proxy.listen port %q: %w", proxyPortText, err)
+		}
+		if err := validateContainmentAgentListener(c.Containment.AgentListener, c.Agents, c.LicenseDisabledAgents, c.LicenseDisabledReason, proxyPort); err != nil {
+			return err
+		}
+	}
+	if len(c.Containment.PublishedServices) == 0 {
+		c.warnLapsedContainmentGrants(ContainmentGrantPublishedService, nil, warnings)
+		return nil
+	}
+	port, err := c.containmentProxyPort()
+	if err != nil {
+		return err
+	}
+	_, lapsed, err := ResolveContainmentPublishedServices(c.Containment.PublishedServices, c.Containment.LoopbackServices, port, time.Now())
+	if err != nil {
+		return err
+	}
+	c.warnLapsedContainmentGrants(ContainmentGrantPublishedService, lapsed, warnings)
+	return nil
+}
+
+// credentialAudienceDomainSubset reports whether every candidate domain is
+// contained by at least one compiled audience domain. Inputs have already
+// passed ValidateTrustedDomains, so only exact hosts and leading-wildcard
+// domain patterns reach this comparison.
+func credentialAudienceDomainSubset(candidates, audience []string) bool {
+	for _, candidate := range candidates {
+		contained := false
+		for _, allowed := range audience {
+			if credentialAudienceDomainContains(allowed, candidate) {
+				contained = true
+				break
+			}
+		}
+		if !contained {
+			return false
+		}
+	}
+	return true
+}
+
+// credentialAudienceDomainContains reports whether the candidate host pattern
+// can name only hosts named by allowed. A wildcard candidate includes its base
+// domain, so it is contained only when its base is the allowed base or a
+// dot-bounded subdomain of it.
+func credentialAudienceDomainContains(allowed, candidate string) bool {
+	if !strings.HasPrefix(allowed, "*.") {
+		return allowed == candidate
+	}
+	allowedBase := strings.TrimPrefix(allowed, "*.")
+	if !strings.HasPrefix(candidate, "*.") {
+		return destination.MatchDomain(candidate, allowed)
+	}
+	candidateBase := strings.TrimPrefix(candidate, "*.")
+	return candidateBase == allowedBase || strings.HasSuffix(candidateBase, "."+allowedBase)
+}
+
+// credentialAudienceSuppressPathSubset recognizes the two suppress forms that
+// can prove their hostname scope: the legacy host glob and an HTTP(S) URL
+// pattern. Other suppress syntax can match a URL path, basename, or query, so
+// it cannot prove that the suppression is limited to the compiled audience.
+func credentialAudienceSuppressPathSubset(raw string, audience []string) bool {
+	p := strings.ToLower(strings.TrimSpace(toSlash(raw)))
+	if isHostDomainGlob(p) {
+		domain := strings.TrimPrefix(strings.Trim(p, "*"), ".")
+		return credentialAudienceDomainSubset([]string{"*." + domain}, audience)
+	}
+	u, err := url.Parse(p)
+	if err != nil || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.User != nil || u.Hostname() == "" {
+		return false
+	}
+	hosts := []string{u.Hostname()}
+	if err := ValidateTrustedDomains(hosts, "suppress path host"); err != nil {
+		return false
+	}
+	return credentialAudienceDomainSubset(hosts, audience)
+}
+
+func (c *Config) validateKillSwitch() error {
+	if err := c.validateKillSwitchTokenSource(); err != nil {
+		return err
+	}
+	// Validate kill switch allowlist CIDRs are parseable
+	for _, cidr := range c.KillSwitch.AllowlistIPs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid kill_switch.allowlist_ips CIDR %q: %w", cidr, err)
+		}
+	}
+
+	// Validate kill switch API listen address (if set)
+	if c.KillSwitch.APIListen != "" {
+		_, apiPort, err := net.SplitHostPort(c.KillSwitch.APIListen)
+		if err != nil {
+			return fmt.Errorf("invalid kill_switch.api_listen %q: %w", c.KillSwitch.APIListen, err)
+		}
+		if err := c.validateTCPPort("kill_switch.api_listen", apiPort); err != nil {
+			return err
+		}
+		_, proxyPort, proxyErr := net.SplitHostPort(c.FetchProxy.Listen)
+		if proxyErr != nil {
+			return fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, proxyErr)
+		}
+		if apiPort == proxyPort {
+			return fmt.Errorf("kill_switch.api_listen port %s collides with fetch_proxy.listen port %s", apiPort, proxyPort)
+		}
+		if c.KillSwitch.APIToken == "" && c.KillSwitch.APITokenFile == "" && os.Getenv(EnvKillSwitchAPIToken) == "" {
+			return fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token, api_token_file or %s to be set", EnvKillSwitchAPIToken)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateContainmentLoopbackServices(warnings *[]Warning) error {
+	if len(c.Containment.LoopbackServices) == 0 {
+		c.warnLapsedContainmentGrants(ContainmentGrantLoopbackService, nil, warnings)
+		return nil
+	}
+	port, err := c.containmentProxyPort()
+	if err != nil {
+		return err
+	}
+	_, lapsed, err := ResolveContainmentLoopbackServices(c.Containment.LoopbackServices, port, time.Now())
+	if err != nil {
+		return err
+	}
+	c.warnLapsedContainmentGrants(ContainmentGrantLoopbackService, lapsed, warnings)
+	return nil
+}
+
+func (c *Config) validateMetricsListen() error {
+	// Validate metrics listen address (if set)
+	if c.MetricsListen == "" {
+		return nil
+	}
+	_, metricsPort, err := net.SplitHostPort(c.MetricsListen)
+	if err != nil {
+		return fmt.Errorf("invalid metrics_listen %q: %w", c.MetricsListen, err)
+	}
+	if err := c.validateTCPPort("metrics_listen", metricsPort); err != nil {
+		return err
+	}
+	_, proxyPort, proxyErr := net.SplitHostPort(c.FetchProxy.Listen)
+	if proxyErr != nil {
+		return fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, proxyErr)
+	}
+	if metricsPort == proxyPort {
+		return fmt.Errorf("metrics_listen port %s collides with fetch_proxy.listen port %s", metricsPort, proxyPort)
+	}
+	if c.KillSwitch.APIListen != "" {
+		_, apiPort, _ := net.SplitHostPort(c.KillSwitch.APIListen)
+		if metricsPort == apiPort {
+			return fmt.Errorf("metrics_listen port %s collides with kill_switch.api_listen port %s", metricsPort, apiPort)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateTCPPort(field, port string) error {
+	n, err := strconv.Atoi(port)
+	// In-process tests construct Defaults() and use :0 so the kernel can choose
+	// collision-free listeners. Operator configuration always comes through
+	// Load(), which records rawBytes; reject :0 there so enforcement, emergency
+	// control, and metrics endpoints remain discoverable.
+	if err == nil && n == 0 && (c.rawBytes == nil || c.allowEphemeralListeners) {
+		return nil
+	}
+	if err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("%s port must be between 1 and 65535", field)
+	}
+	return nil
+}
+
+// AllowEphemeralListenersForTesting permits programmatic :0 listener
+// overrides after a config file has been loaded. It is intentionally absent
+// from YAML and exists only for internal test harnesses.
+func (c *Config) AllowEphemeralListenersForTesting() {
+	c.allowEphemeralListeners = true
+}
+
+func (c *Config) validateEmit() error {
+	// Validate emit config
+	if err := c.validateEmitCorrelationHeader(); err != nil {
+		return err
+	}
+	if err := validateEmitFilterValues("emit.filter.actions", c.Emit.Filter.Actions); err != nil {
+		return err
+	}
+	if err := validateEmitFilterValues("emit.filter.decision_types", c.Emit.Filter.DecisionTypes); err != nil {
+		return err
+	}
+	if err := validateEmitFilterValues("emit.filter.agents", c.Emit.Filter.Agents); err != nil {
+		return err
+	}
+
+	if c.Emit.Webhook.URL != "" {
+		u, urlErr := url.Parse(c.Emit.Webhook.URL)
+		if urlErr != nil || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
+			return fmt.Errorf("invalid emit.webhook.url %q: must be http:// or https:// with a host", c.Emit.Webhook.URL)
+		}
+		switch c.Emit.Webhook.MinSeverity {
+		case SeverityInfo, SeverityWarn, SeverityCritical:
+			// valid
+		default:
+			return fmt.Errorf("invalid emit.webhook.min_severity %q: must be info, warn, or critical", c.Emit.Webhook.MinSeverity)
+		}
+		if c.Emit.Webhook.TimeoutSecs <= 0 {
+			return fmt.Errorf("emit.webhook.timeout_seconds must be positive")
+		}
+		if c.Emit.Webhook.QueueSize <= 0 {
+			return fmt.Errorf("emit.webhook.queue_size must be positive")
+		}
+		if c.Emit.Webhook.Format != "" && !emitformat.Supported(c.Emit.Webhook.Format) {
+			return fmt.Errorf("invalid emit.webhook.format %q: must be %s", c.Emit.Webhook.Format, emitformat.AllowedSet())
+		}
+	}
+	if c.Emit.Syslog.Address != "" {
+		sysU, sysErr := url.Parse(c.Emit.Syslog.Address)
+		if sysErr != nil || (sysU.Scheme != "udp" && sysU.Scheme != "tcp") || sysU.Host == "" {
+			return fmt.Errorf("invalid emit.syslog.address %q: must be udp:// or tcp:// with host:port", c.Emit.Syslog.Address)
+		}
+		if _, _, splitErr := net.SplitHostPort(sysU.Host); splitErr != nil {
+			return fmt.Errorf("invalid emit.syslog.address %q: must include port (e.g. udp://host:514): %w", c.Emit.Syslog.Address, splitErr)
+		}
+		switch c.Emit.Syslog.MinSeverity {
+		case SeverityInfo, SeverityWarn, SeverityCritical:
+			// valid
+		default:
+			return fmt.Errorf("invalid emit.syslog.min_severity %q: must be info, warn, or critical", c.Emit.Syslog.MinSeverity)
+		}
+		if c.Emit.Syslog.Facility != "" {
+			validFacilities := map[string]bool{
+				"kern": true, "user": true, "mail": true, "daemon": true,
+				"auth": true, "syslog": true, "lpr": true, "news": true,
+				"uucp": true, "local0": true, "local1": true, "local2": true,
+				"local3": true, "local4": true, "local5": true, "local6": true,
+				"local7": true,
+			}
+			if !validFacilities[strings.ToLower(c.Emit.Syslog.Facility)] {
+				return fmt.Errorf("invalid emit.syslog.facility %q", c.Emit.Syslog.Facility)
+			}
+		}
+		if !emitformat.Supported(c.Emit.Syslog.Format) {
+			return fmt.Errorf("invalid emit.syslog.format %q: must be %s", c.Emit.Syslog.Format, emitformat.AllowedSet())
+		}
+	}
+
+	// Validate OTLP config
+	if c.Emit.OTLP.Endpoint != "" {
+		u, otlpErr := url.Parse(c.Emit.OTLP.Endpoint)
+		if otlpErr != nil || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
+			return fmt.Errorf("invalid emit.otlp.endpoint %q: must be http:// or https:// with a host", c.Emit.OTLP.Endpoint)
+		}
+		switch c.Emit.OTLP.MinSeverity {
+		case SeverityInfo, SeverityWarn, SeverityCritical:
+			// valid
+		default:
+			return fmt.Errorf("invalid emit.otlp.min_severity %q: must be info, warn, or critical", c.Emit.OTLP.MinSeverity)
+		}
+		if c.Emit.OTLP.TimeoutSeconds <= 0 {
+			return fmt.Errorf("emit.otlp.timeout_seconds must be positive")
+		}
+		if c.Emit.OTLP.QueueSize <= 0 {
+			return fmt.Errorf("emit.otlp.queue_size must be positive")
+		}
+	}
+	if c.Emit.Forwarder.URL != "" {
+		u, forwardErr := url.Parse(c.Emit.Forwarder.URL)
+		if forwardErr != nil || u.Host == "" || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) {
+			return fmt.Errorf("invalid emit.forwarder.url %q: must be http:// or https:// with a host", c.Emit.Forwarder.URL)
+		}
+		if u.User != nil || u.Fragment != "" {
+			return fmt.Errorf("emit.forwarder.url must not contain userinfo or a fragment")
+		}
+		host := canonicalForwarderHost(u.Hostname())
+		allowed := false
+		for _, entry := range c.Emit.Forwarder.DestinationAllowlist {
+			normalized := canonicalForwarderHost(entry)
+			if normalized == "" || (destination.ParseIPLiteral(normalized) == nil && strings.ContainsAny(normalized, "*/:@[]%")) {
+				return fmt.Errorf("invalid emit.forwarder.destination_allowlist entry %q: exact hostnames only", entry)
+			}
+			allowed = allowed || normalized == host
+		}
+		if !allowed {
+			return fmt.Errorf("emit.forwarder.url host %q must be exactly present in destination_allowlist", host)
+		}
+		if c.Emit.Forwarder.SpoolFile == "" || c.Emit.Forwarder.CursorFile == "" {
+			return fmt.Errorf("emit.forwarder.spool_file and cursor_file are required when forwarding is configured")
+		}
+		switch c.Emit.Forwarder.MinSeverity {
+		case SeverityInfo, SeverityWarn, SeverityCritical:
+		default:
+			return fmt.Errorf("invalid emit.forwarder.min_severity %q: must be info, warn, or critical", c.Emit.Forwarder.MinSeverity)
+		}
+		if c.Emit.Forwarder.TimeoutSeconds <= 0 || c.Emit.Forwarder.QueueSize <= 0 {
+			return fmt.Errorf("emit.forwarder.timeout_seconds and queue_size must be positive")
+		}
+		if u.Scheme == schemeHTTP && !forwarderHostIsLoopback(host) {
+			if c.Emit.Forwarder.AuthToken != "" {
+				return fmt.Errorf("emit.forwarder.auth_token requires an https:// url: a plaintext http:// destination would expose the bearer token on the wire (loopback destinations are exempt)")
+			}
+			if !c.Emit.Forwarder.AllowInsecureHTTP {
+				return fmt.Errorf("emit.forwarder.url uses plaintext http:// to non-loopback host %q: use https://, or set emit.forwarder.allow_insecure_http: true to accept cleartext forwarding", host)
+			}
+		}
+	}
+	return nil
+}
+
+// forwarderHostIsLoopback reports whether an already-normalized forwarder host
+// refers to the local machine, where plaintext http is acceptable. Named
+// localhost resolution is revalidated and pinned by the runtime forwarder.
+func forwarderHostIsLoopback(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := destination.ParseIPLiteral(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
+// canonicalForwarderHost normalizes a forwarder host for allowlist comparison,
+// mirroring the scanner's IP-literal canonicalization on the config side so
+// validation and runtime agree on what a given host resolves to.
+func canonicalForwarderHost(host string) string {
+	if ip := destination.ParseIPLiteral(host); ip != nil {
+		return ip.String()
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+}
+
+func validateEmitFilterValues(name string, values []string) error {
+	for i, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s[%d] is empty", name, i)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateAddressProtection() error {
+	// Validate address protection config
+	if !c.AddressProtection.Enabled {
+		return nil
+	}
+	switch c.AddressProtection.Action {
+	case ActionBlock, ActionWarn:
+		// valid
+	default:
+		return fmt.Errorf("invalid address_protection.action %q: must be block or warn", c.AddressProtection.Action)
+	}
+	switch c.AddressProtection.UnknownAction {
+	case ActionAllow, ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid address_protection.unknown_action %q: must be allow, warn, or block", c.AddressProtection.UnknownAction)
+	}
+	if c.AddressProtection.Similarity.PrefixLength <= 0 {
+		return fmt.Errorf("address_protection.similarity.prefix_length must be positive")
+	}
+	if c.AddressProtection.Similarity.SuffixLength <= 0 {
+		return fmt.Errorf("address_protection.similarity.suffix_length must be positive")
+	}
+	// Require at least one chain enabled. All chains disabled means the
+	// feature is a silent no-op, which is a config error when enabled: true.
+	eth := c.AddressProtection.Chains.ETH == nil || *c.AddressProtection.Chains.ETH
+	btc := c.AddressProtection.Chains.BTC == nil || *c.AddressProtection.Chains.BTC
+	sol := c.AddressProtection.Chains.SOL != nil && *c.AddressProtection.Chains.SOL
+	bnb := c.AddressProtection.Chains.BNB == nil || *c.AddressProtection.Chains.BNB
+	if !eth && !btc && !sol && !bnb {
+		return fmt.Errorf("address_protection.enabled is true but all chains are disabled (silent no-op)")
+	}
+	return nil
+}
+
+func (c *Config) validateSentry() error {
+	// Validate Sentry config
+	sr := c.Sentry.EffectiveSampleRate()
+	if math.IsNaN(sr) {
+		return fmt.Errorf("invalid sentry.sample_rate: NaN not allowed")
+	}
+	if sr < 0 || sr > 1 {
+		return fmt.Errorf("invalid sentry.sample_rate %f: must be between 0.0 and 1.0", sr)
+	}
+	if c.Sentry.IsEnabled() && c.Sentry.SampleRate != nil && sr == 0 {
+		return fmt.Errorf("invalid sentry.sample_rate 0.0: sentry-go treats 0.0 as 1.0; disable crash reporting with sentry.enabled: false or an empty DSN")
+	}
+	return nil
+}
+
+func (c *Config) validateInternalCIDRs() error {
+	// Validate internal CIDRs are parseable
+	for _, cidr := range c.Internal {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("invalid internal CIDR %q: %w", cidr, err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateTrustedDomains() error {
+	// Validate trusted_domains entries.
+	return ValidateTrustedDomains(c.TrustedDomains, "trusted_domains")
+}
+
+func (c *Config) validateSSRF() error {
+	for _, cidr := range c.SSRF.IPAllowlist {
+		ip, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("invalid ssrf.ip_allowlist CIDR %q: %w", cidr, err)
+		}
+		// Reject catch-all prefixes (/0) - they disable SSRF protection entirely.
+		ones, _ := ipNet.Mask.Size()
+		if ones == 0 {
+			return fmt.Errorf("ssrf.ip_allowlist CIDR %q is a catch-all (/0) and would disable SSRF protection", cidr)
+		}
+		// Reject non-canonical CIDRs where host bits are set (e.g., 10.0.0.5/24
+		// silently becomes 10.0.0.0/24). Operators must specify the network address
+		// to avoid accidentally allowlisting a wider range than intended.
+		if !ip.Equal(ipNet.IP) {
+			return fmt.Errorf("ssrf.ip_allowlist CIDR %q has host bits set (did you mean %q?)", cidr, ipNet.String())
+		}
+		// Reject entries that overlap a non-overridable SSRF class (cloud
+		// metadata, link-local, multicast, unspecified). These are a credential-
+		// theft / infrastructure boundary that the allowlist must never open;
+		// the scanner enforces this at runtime too (IsIPAllowlisted refuses to
+		// exempt them), but rejecting at load gives the operator a loud, early
+		// error instead of a silently-inert entry.
+		if bad := overlappingNonOverridableSSRFRange(ipNet); bad != "" {
+			return fmt.Errorf("ssrf.ip_allowlist CIDR %q overlaps the non-overridable %s range and cannot be allowlisted (metadata, link-local, and multicast addresses are never exemptable)", cidr, bad)
+		}
+	}
+	return nil
+}
+
+// nonOverridableSSRFRanges are the address classes ssrf.ip_allowlist must never
+// exempt: cloud instance-metadata endpoints, link-local (which contains the
+// IPv4 metadata address), multicast, and the unspecified address. Loopback and
+// ordinary private ranges are intentionally absent — exempting a specific
+// loopback or internal service IP is the allowlist's whole purpose. Mirrors
+// scanner.IsNonOverridableSSRFTarget; keep the two in sync.
+var nonOverridableSSRFRanges = func() []*net.IPNet {
+	cidrs := []string{
+		"169.254.0.0/16",     // IPv4 link-local (contains 169.254.169.254 IMDS)
+		"168.63.129.16/32",   // Azure WireServer metadata
+		"100.100.100.200/32", // Alibaba Cloud ECS metadata
+		"fd00:ec2::254/128",  // AWS IMDSv6
+		"fe80::/10",          // IPv6 link-local
+		"224.0.0.0/4",        // IPv4 multicast
+		"ff00::/8",           // IPv6 multicast
+		"0.0.0.0/32",         // IPv4 unspecified
+		"::/128",             // IPv6 unspecified
+	}
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			// These are compile-time constants; a parse failure is a programming
+			// bug. Fail loudly at init rather than silently shrinking this
+			// security-critical floor (mirrors scanner.initCoreScanner).
+			panic(fmt.Sprintf("BUG: non-overridable SSRF CIDR %q failed to parse: %v", c, err))
+		}
+		nets = append(nets, n)
+	}
+	return nets
+}()
+
+// overlappingNonOverridableSSRFRange returns the string form of the first
+// non-overridable range that overlaps allow, or "" if none. Two CIDRs overlap
+// when either contains the other's network address.
+func overlappingNonOverridableSSRFRange(allow *net.IPNet) string {
+	// Normalize an IPv4-mapped IPv6 network (e.g. ::ffff:169.254.0.0/112) to its
+	// 4-byte IPv4 form. The bidirectional Contains check below already catches
+	// these via To4 coercion on the reverse clause, but net.IPNet.Contains does
+	// NOT coerce the target up when the network is 16-byte, so normalizing keeps
+	// the overlap detection robust and independent of that asymmetry rather than
+	// relying on it on a security-validation path.
+	if v4 := allow.IP.To4(); v4 != nil && len(allow.IP) == net.IPv6len {
+		if ones, bits := allow.Mask.Size(); bits == 128 && ones >= 96 {
+			allow = &net.IPNet{IP: v4, Mask: net.CIDRMask(ones-96, 32)}
+		}
+	}
+	for _, n := range nonOverridableSSRFRanges {
+		if allow.Contains(n.IP) || n.Contains(allow.IP) {
+			return n.String()
+		}
+	}
+	return ""
+}
+
+func (c *Config) validateDNS() error {
+	seenHosts := make(map[string]string, len(c.DNS.HostOverrides))
+	for host, ips := range c.DNS.HostOverrides {
+		normalizedHost := strings.TrimSuffix(strings.TrimSpace(strings.ToLower(host)), ".")
+		if normalizedHost == "" {
+			return fmt.Errorf("dns.host_overrides: hostname key must be non-empty")
+		}
+		if strings.Contains(normalizedHost, "://") || strings.ContainsAny(normalizedHost, "/*?[]:") {
+			return fmt.Errorf("dns.host_overrides: %q must be a hostname, not a URL, wildcard, IP, or host:port", host)
+		}
+		// An empty label means the key can never be reached. The resolver's
+		// own key normalizer removes ONE trailing dot, so "pin.example.com.."
+		// loaded clean, was stored as "pin.example.com." and no lookup for
+		// "pin.example.com" ever matched it: the pin was silently inert while
+		// the operator saw accepted configuration.
+		// The test is against the ONCE-TRIMMED value, which is what the
+		// resolver stores, so a residual trailing dot here means the operator
+		// wrote two.
+		if strings.HasPrefix(normalizedHost, ".") || strings.HasSuffix(normalizedHost, ".") ||
+			strings.Contains(normalizedHost, "..") {
+			return fmt.Errorf("dns.host_overrides: %q has an empty DNS label", host)
+		}
+		// Reject IP-literal keys: the override path is hostname-only, and
+		// allowing an IP-literal key would suggest the operator can rewrite
+		// "127.0.0.1" → some other IP, which the resolver does not do.
+		if net.ParseIP(normalizedHost) != nil {
+			return fmt.Errorf("dns.host_overrides: %q is an IP literal; only hostnames may have overrides", host)
+		}
+		if previous, ok := seenHosts[normalizedHost]; ok {
+			return fmt.Errorf("dns.host_overrides: %q duplicates %q after hostname normalization", host, previous)
+		}
+		seenHosts[normalizedHost] = host
+		if len(ips) == 0 {
+			return fmt.Errorf("dns.host_overrides[%q]: must provide at least one IP", host)
+		}
+		for i, ip := range ips {
+			if net.ParseIP(ip) == nil {
+				return fmt.Errorf("dns.host_overrides[%q][%d]: invalid IP %q", host, i, ip)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateRules() error {
+	// Validate community rules config
+	switch c.Rules.MinConfidence {
+	case ConfidenceHigh, ConfidenceMedium, ConfidenceLow:
+		// valid
+	default:
+		return fmt.Errorf("rules: min_confidence %q must be high, medium, or low", c.Rules.MinConfidence)
+	}
+	for i, d := range c.Rules.Disabled {
+		d = strings.TrimSpace(d)
+		if d == "" {
+			return fmt.Errorf("rules: disabled[%d] must be non-empty", i)
+		}
+		c.Rules.Disabled[i] = d
+		if strings.Contains(d, ":") {
+			// Namespaced ID like "community:rule-name" - validate structure.
+			parts := strings.SplitN(d, ":", 2)
+			if parts[0] == "" || parts[1] == "" {
+				return fmt.Errorf("rules: disabled[%d] %q must be bundle:rule or a glob pattern", i, d)
+			}
+			continue
+		}
+		if strings.ContainsAny(d, "*?") {
+			// Glob pattern like "community:*" or "test-*" - valid.
+			continue
+		}
+		return fmt.Errorf("rules: disabled[%d] %q must contain ':' (namespaced) or be a glob pattern with * or ?", i, d)
+	}
+	for i, k := range c.Rules.TrustedKeys {
+		if k.Name == "" {
+			return fmt.Errorf("rules: trusted_keys[%d] name must be non-empty", i)
+		}
+		if len(k.PublicKey) != 64 {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must be exactly 64 hex chars", i, k.Name)
+		}
+		if k.PublicKey != strings.ToLower(k.PublicKey) {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must be lowercase hex", i, k.Name)
+		}
+		decoded, err := hex.DecodeString(k.PublicKey)
+		if err != nil {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key invalid hex: %w", i, k.Name, err)
+		}
+		if len(decoded) != 32 {
+			return fmt.Errorf("rules: trusted_keys[%d] %q public_key must decode to 32 bytes", i, k.Name)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateFileSentry() error {
+	// Validate file sentry config
+	if !c.FileSentry.Enabled {
+		return nil
+	}
+	if len(c.FileSentry.WatchPaths) == 0 {
+		return fmt.Errorf("file_sentry: watch_paths must be non-empty when enabled")
+	}
+	for i, wp := range c.FileSentry.WatchPaths {
+		if wp.Path == "" {
+			return fmt.Errorf("file_sentry: watch_paths[%d] must not be empty", i)
+		}
+	}
+	switch c.FileSentry.Action {
+	case "", ActionWarn, ActionBlock:
+	default:
+		return fmt.Errorf("invalid file_sentry.action %q: must be warn or block", c.FileSentry.Action)
+	}
+	if c.FileSentry.MaxFileBytes < 0 {
+		return fmt.Errorf("file_sentry: max_file_bytes must be non-negative, got %d", c.FileSentry.MaxFileBytes)
+	}
+	return nil
+}
+
+// reservedControlActorNames are the actor identities pipelock stamps on its own
+// receipts: "pipelock" for session-control receipts and "anonymous" for
+// unattributed request traffic. Allowing an agent profile keyed to one of these
+// would let a named agent's receipts carry a reserved actor, folding its traffic
+// into the control actor's (or the unattributed) coverage story. Reserving the
+// names at config load fails closed. Match is case-insensitive and trimmed so a
+// confusing near-variant is also rejected and the guard survives any later
+// agent-name normalization.
+var reservedControlActorNames = map[string]struct{}{
+	"pipelock":  {},
+	"anonymous": {},
+}
+
+// reservedControlActorName reports the reserved actor name that agentName
+// collides with (trimmed, case-insensitive), or "" when it is registerable.
+func reservedControlActorName(agentName string) string {
+	normalized := strings.ToLower(strings.TrimSpace(agentName))
+	if _, ok := reservedControlActorNames[normalized]; ok {
+		return normalized
+	}
+	return ""
+}
+
+// ReservedControlActorName reports the reserved actor name that agentName
+// collides with (trimmed, case-insensitive), or "" when it is registerable.
+func ReservedControlActorName(agentName string) string {
+	return reservedControlActorName(agentName)
+}
+
+func (c *Config) validateAgents() error {
+	// Validate budget dow_action for all agent profiles (OSS + enterprise).
+	for name, ap := range c.Agents {
+		if reserved := reservedControlActorName(name); reserved != "" {
+			return fmt.Errorf("agents.%s: %q is a reserved control-actor identity and cannot be used as an agent name", name, reserved)
+		}
+		if identitykey.IsFoldedBaselineKey(name) {
+			return fmt.Errorf("agents.%s: agent name is reserved for folded behavioral-baseline client identities", name)
+		}
+		if err := ap.Budget.ValidateDoW(); err != nil {
+			return fmt.Errorf("agents.%s.budget: %w", name, err)
+		}
+	}
+	// A per-agent best_effort override carries the same authorization the
+	// top-level block requires. The loader also runs this before license gating
+	// so an unlicensed named profile cannot hide a malformed override until a
+	// license arrives.
+	if err := c.validateAgentSandboxOverrides(time.Now()); err != nil {
+		return err
+	}
+	// Validate agent profiles (enterprise hook; nil in OSS).
+	if ValidateAgentsFunc != nil {
+		if err := ValidateAgentsFunc(c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateScanAPI() error {
+	// Validate scan API config
+	if c.ScanAPI.Listen == "" {
+		return nil
+	}
+	if len(c.ScanAPI.Auth.BearerTokens) == 0 {
+		return fmt.Errorf("scan_api.auth.bearer_tokens required when scan_api.listen is set")
+	}
+	for i, tok := range c.ScanAPI.Auth.BearerTokens {
+		if strings.TrimSpace(tok) == "" {
+			return fmt.Errorf("scan_api.auth.bearer_tokens[%d] must be non-empty", i)
+		}
+	}
+	// Validate timeouts: must parse as valid durations and be positive.
+	// Zero or negative timeouts would disable deadlines or expire instantly.
+	validatePositiveDuration := func(name, value string) error {
+		if value == "" {
+			return nil
+		}
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("%s must be positive", name)
+		}
+		return nil
+	}
+	if err := validatePositiveDuration("scan_api.timeouts.scan", c.ScanAPI.Timeouts.Scan); err != nil {
+		return err
+	}
+	if err := validatePositiveDuration("scan_api.timeouts.read", c.ScanAPI.Timeouts.Read); err != nil {
+		return err
+	}
+	if err := validatePositiveDuration("scan_api.timeouts.write", c.ScanAPI.Timeouts.Write); err != nil {
+		return err
+	}
+	if c.ScanAPI.ConnectionLimit < 0 {
+		return fmt.Errorf("scan_api.connection_limit must be >= 0")
+	}
+	if c.ScanAPI.MaxBodyBytes < 0 {
+		return fmt.Errorf("scan_api.max_body_bytes must be >= 0")
+	}
+	return nil
+}
+
+// validateListenWarnings emits advisories for proxy listeners reachable from
+// the network. Metrics have their own explicitly configured listener, so these
+// warnings concern the proxy itself.
+func (c *Config) validateListenWarnings(warnings *[]Warning) {
+	host, _, err := net.SplitHostPort(c.FetchProxy.Listen)
+	if err != nil {
+		return
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && !ip.IsLoopback() {
+		*warnings = append(*warnings, Warning{
+			Field:   "fetch_proxy.listen",
+			Message: fmt.Sprintf("listen address %s is not loopback - other hosts on that network can use the proxy; restrict access with network controls", c.FetchProxy.Listen),
+		})
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		*warnings = append(*warnings, Warning{
+			Field:   "fetch_proxy.listen",
+			Message: fmt.Sprintf("listen address %s binds to all interfaces - consider using 127.0.0.1 for local-only access", c.FetchProxy.Listen),
+		})
+	}
+}
+
+func (c *Config) validateReverseProxy() error {
+	// Reverse proxy: validate upstream URL when enabled.
+	if !c.ReverseProxy.Enabled {
+		return nil
+	}
+	if c.ReverseProxy.Upstream == "" {
+		return fmt.Errorf("reverse_proxy.upstream is required when reverse_proxy is enabled")
+	}
+	u, uErr := url.Parse(c.ReverseProxy.Upstream)
+	if uErr != nil || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
+		return fmt.Errorf("reverse_proxy.upstream %q must be http:// or https:// with a host", c.ReverseProxy.Upstream)
+	}
+	if c.ReverseProxy.Listen == "" {
+		return fmt.Errorf("reverse_proxy.listen is required when reverse_proxy is enabled")
+	}
+	if c.ReverseProxy.MaxInflightScanBytes <= 0 {
+		return fmt.Errorf("reverse_proxy.max_inflight_scan_bytes must be positive when reverse_proxy is enabled")
+	}
+	if c.RequestBodyScanning.Enabled && c.ReverseProxy.MaxInflightScanBytes < c.RequestBodyScanning.MaxBodyBytes {
+		return fmt.Errorf("reverse_proxy.max_inflight_scan_bytes must be >= request_body_scanning.max_body_bytes when request body scanning is enabled")
+	}
+	return c.validateReverseProxyProfile(u)
+}
+
+// ReverseProxyProfileSubmit is the constrained profile selector for the
+// reverse proxy listener. Empty profile (the default) preserves the
+// generic behavior; "submit" enables the full submission-profile gate.
+const ReverseProxyProfileSubmit = "submit"
+
+// validateReverseProxyProfile enforces the per-profile config rules.
+// u is the already-parsed upstream URL from validateReverseProxy.
+func (c *Config) validateReverseProxyProfile(u *url.URL) error {
+	rp := c.ReverseProxy
+	switch rp.Profile {
+	case "":
+		// Generic reverse proxy. No additional fields required, but if any
+		// submit-profile-only fields ARE set, fail loudly rather than let
+		// the operator believe submit semantics are in effect.
+		if hasSubmitProfileFields(rp) {
+			return fmt.Errorf("reverse_proxy: allowed_methods/allowed_paths/trusted_upstream/max_body_bytes/request_timeout_seconds are only valid when profile is %q; set profile or remove these fields", ReverseProxyProfileSubmit)
+		}
+		return nil
+	case ReverseProxyProfileSubmit:
+		return c.validateReverseProxySubmit(u)
+	default:
+		return fmt.Errorf("reverse_proxy.profile %q is not a known profile (allowed: \"\" or %q)", rp.Profile, ReverseProxyProfileSubmit)
+	}
+}
+
+// hasSubmitProfileFields reports whether any submit-profile-only fields are
+// set on a generic reverse_proxy config. Used to reject silent misconfig
+// where an operator typo'd or removed `profile: submit` but left the
+// submit-only fields populated.
+func hasSubmitProfileFields(rp ReverseProxy) bool {
+	switch {
+	case len(rp.AllowedMethods) > 0:
+		return true
+	case len(rp.AllowedPaths) > 0:
+		return true
+	case rp.TrustedUpstream != (ReverseProxyTrustedUpstream{}):
+		return true
+	case rp.MaxBodyBytes != 0:
+		return true
+	case rp.RequestTimeoutSeconds != 0:
+		return true
+	}
+	return false
+}
+
+// validateReverseProxySubmit enforces submit-profile config rules. See the
+// design doc at projects/pipelock/sprints/pipelock-submit-mode-design.md
+// for the per-rule rationale.
+func (c *Config) validateReverseProxySubmit(u *url.URL) error {
+	rp := c.ReverseProxy
+	tu := rp.TrustedUpstream
+
+	if tu == (ReverseProxyTrustedUpstream{}) {
+		return fmt.Errorf("reverse_proxy.trusted_upstream is required when profile is %q", ReverseProxyProfileSubmit)
+	}
+	tu.Host = normalizeReverseProxySubmitHost(tu.Host)
+	if tu.Host == "" {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.host is required when profile is %q", ReverseProxyProfileSubmit)
+	}
+	c.ReverseProxy.TrustedUpstream.Host = tu.Host
+	if tu.Port <= 0 || tu.Port > 65535 {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.port must be 1-65535, got %d", tu.Port)
+	}
+	// Reason is required for auditability. Trim first so a config of
+	// "   " or "\t" cannot satisfy the required guard with no actual
+	// audit content. Persist the trimmed value so downstream callers
+	// (logs, doctor output) get the canonical form.
+	if strings.TrimSpace(tu.Reason) == "" {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.reason is required so the trust grant is auditable")
+	}
+	c.ReverseProxy.TrustedUpstream.Reason = strings.TrimSpace(tu.Reason)
+	if strings.TrimSpace(tu.Added) == "" {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.added is required (date the entry was created)")
+	}
+	if _, err := time.Parse("2006-01-02", tu.Added); err != nil {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.added %q must be YYYY-MM-DD: %w", tu.Added, err)
+	}
+	if tu.Expires != "" {
+		expiresAt, err := time.Parse("2006-01-02", tu.Expires)
+		if err != nil {
+			return fmt.Errorf("reverse_proxy.trusted_upstream.expires %q must be YYYY-MM-DD: %w", tu.Expires, err)
+		}
+		// End-of-day in UTC for the day named. An entry whose Expires is
+		// "2026-05-26" stays valid through 2026-05-26 23:59:59 UTC.
+		expiresEnd := expiresAt.Add(24*time.Hour - time.Second)
+		if expiresEnd.Before(time.Now().UTC()) {
+			return fmt.Errorf("reverse_proxy.trusted_upstream.expires %q is in the past", tu.Expires)
+		}
+	}
+
+	// IP literals on the trusted_upstream host defeat the "narrow,
+	// auditable, hostname-bound" intent. Match the existing scanner
+	// constraint that trusted destinations must be hostnames.
+	if net.ParseIP(tu.Host) != nil {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.host %q is an IP literal; use a hostname", tu.Host)
+	}
+
+	upstreamHost, upstreamPortStr, splitErr := net.SplitHostPort(u.Host)
+	if splitErr != nil {
+		// No explicit port. Submit profile requires explicit port so the
+		// trusted_upstream binding is unambiguous.
+		return fmt.Errorf("reverse_proxy.upstream %q must include an explicit port for profile %q", rp.Upstream, ReverseProxyProfileSubmit)
+	}
+	upstreamHost = normalizeReverseProxySubmitHost(upstreamHost)
+	if upstreamHost != tu.Host {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.host %q does not match upstream host %q", tu.Host, upstreamHost)
+	}
+	upstreamPort, portErr := strconv.Atoi(upstreamPortStr)
+	if portErr != nil {
+		return fmt.Errorf("reverse_proxy.upstream port %q is not a valid number: %w", upstreamPortStr, portErr)
+	}
+	if upstreamPort != tu.Port {
+		return fmt.Errorf("reverse_proxy.trusted_upstream.port %d does not match upstream port %d", tu.Port, upstreamPort)
+	}
+
+	if len(rp.AllowedPaths) == 0 {
+		return fmt.Errorf("reverse_proxy.allowed_paths is required when profile is %q", ReverseProxyProfileSubmit)
+	}
+	for i, p := range rp.AllowedPaths {
+		if p.Exact == "" {
+			return fmt.Errorf("reverse_proxy.allowed_paths[%d].exact is required (no other matcher kind supported in v1)", i)
+		}
+		if !strings.HasPrefix(p.Exact, "/") {
+			return fmt.Errorf("reverse_proxy.allowed_paths[%d].exact %q must start with /", i, p.Exact)
+		}
+		// Strict canonicality: reject path entries whose canonical decoded
+		// form differs from the operator's literal value, so the matcher
+		// at request time has only one shape to compare against.
+		if cleaned := path.Clean(p.Exact); cleaned != p.Exact {
+			return fmt.Errorf("reverse_proxy.allowed_paths[%d].exact %q is not canonical (use %q)", i, p.Exact, cleaned)
+		}
+	}
+
+	for i, m := range rp.AllowedMethods {
+		switch strings.ToUpper(m) {
+		case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+			http.MethodPatch, http.MethodDelete, http.MethodOptions, methodQuery:
+		default:
+			return fmt.Errorf("reverse_proxy.allowed_methods[%d] %q is not a recognized HTTP method", i, m)
+		}
+	}
+
+	if rp.MaxBodyBytes <= 0 {
+		return fmt.Errorf("reverse_proxy.max_body_bytes must be positive when profile is %q", ReverseProxyProfileSubmit)
+	}
+	if rp.RequestTimeoutSeconds <= 0 {
+		return fmt.Errorf("reverse_proxy.request_timeout_seconds must be positive when profile is %q", ReverseProxyProfileSubmit)
+	}
+
+	return nil
+}
+
+func normalizeReverseProxySubmitHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+}
+
+// Expiry classification at validation time.
+//
+// | Field | Class | Maximum / reason |
+// | sandbox.best_effort_expiry | temporary | 30 days: cooperative proxy-only egress cannot replace kernel isolation for a release cycle. |
+// | response_scanning.unscannable_passthrough[].expires | temporary | 90 days: an opaque download needs a scanned or authenticated delivery path. |
+// | response_scanning.size_exempt_scan_limits[].expires | temporary | 90 days: a larger fully scanned download needs a bounded remediation window, matching unscannable_passthrough without relaxing a detection floor. |
+// | fetch_proxy.monitoring.path_entropy_exclusions[].expires | temporary | 180 days: an incident exemption needs time to prove the narrow route or move to policy. |
+// | fetch_proxy.monitoring.query_entropy_param_exclusions[].expires | temporary | 180 days: an incident exemption needs time to prove the parameter contract or move to policy. |
+// | fetch_proxy.monitoring.issued_redirect_delegations[].expires | durable | uncapped: a reviewed trust assertion about one named route and its listed origins, renewed on review rather than churned through a cap. |
+// | request_body_scanning.content_entropy_warn_routes[].expires | temporary | 90 days: a block-to-warn route needs a bounded remediation window. |
+// | request_body_scanning.content_entropy_exclusions[].expires, websocket_proxy.content_entropy_exclusions[].expires | temporary | 90 days: a host-wide block-to-allow exception needs a bounded remediation window; the plain host string stays permanent. |
+// | request_body_scanning.sigv4_credential_routes[].expires | temporary | 30 days: this narrowly relaxes a credential floor while the integration changes. |
+// | response_scanning.core_observe_exceptions[].expires | temporary | 30 days: this narrowly relaxes the immutable response floor for one host and one pattern. |
+// | reverse_proxy.trusted_upstream.expires | durable | uncapped: an authenticated, host-and-port-bound upstream is reviewed, not churned through expiry. |.
+const (
+	// MaxBestEffortConfigHorizon bounds a configuration-sourced cooperative
+	// egress override; command-line durations are anchored per launch.
+	MaxBestEffortConfigHorizon = 30 * 24 * time.Hour
+
+	MaxUnscannablePassthroughHorizon          = 90 * 24 * time.Hour
+	MaxResponseSizeScanLimitHorizon           = MaxUnscannablePassthroughHorizon
+	MaxPathEntropyExclusionHorizon            = 180 * 24 * time.Hour
+	MaxQueryEntropyParamExclusionHorizon      = 180 * 24 * time.Hour
+	MaxRequestBodyEntropyWarnRouteHorizon     = 90 * 24 * time.Hour
+	MaxRequestBodySigV4CredentialRouteHorizon = 30 * 24 * time.Hour
+
+	// MaxCoreObserveExceptionHorizon matches the SigV4 credential-route
+	// horizon rather than the 90-day unscannable-passthrough one that shares
+	// its config block. The table above sets the length by what the exception
+	// RELAXES, not by where it lives: 30 days is what a narrow relaxation of a
+	// floor gets, and this relaxes the immutable response floor.
+	MaxCoreObserveExceptionHorizon = 30 * 24 * time.Hour
+)
+
+func validateTemporaryExpiryDate(field, value string, maximum time.Duration) error {
+	expires, err := time.Parse("2006-01-02", value)
+	if err != nil {
+		return fmt.Errorf("%s %q must be YYYY-MM-DD: %w", field, value, err)
+	}
+	today := todayUTC()
+	if expires.Before(today) {
+		return fmt.Errorf("%s %q is already expired", field, value)
+	}
+	latest := today.Add(maximum)
+	if expires.After(latest) {
+		return fmt.Errorf("%s %q exceeds the maximum temporary horizon of %d days (latest allowed date %q); shorten it or, if the condition is permanent, use the documented durable mechanism instead", field, value, int(maximum.Hours()/24), latest.Format("2006-01-02"))
+	}
+	return nil
+}
+
+// ValidateExpiryAuthorizations applies the expiry-specific validation that the
+// hot-reload activation boundary needs before it can preserve restart-only
+// settings. Startup uses Validate, but direct Reload callers bypass Load.
+func (c *Config) ValidateExpiryAuthorizations() error {
+	now := time.Now().UTC()
+	if c.Sandbox.BestEffort {
+		if err := validateBestEffortAuthorization("sandbox", c.Sandbox.BestEffortReason, c.Sandbox.BestEffortExpiry, now); err != nil {
+			return err
+		}
+	}
+	if err := c.validateAgentSandboxOverrides(now); err != nil {
+		return err
+	}
+	if err := validateUnscannablePassthroughExpiryHorizons(c.ResponseScanning.UnscannablePassthrough); err != nil {
+		return err
+	}
+	if err := validateResponseSizeScanLimitExpiryHorizons(c.ResponseScanning.SizeExemptScanLimits, now); err != nil {
+		return err
+	}
+	// Direct reload callers bypass Load, so validate grant shape before any
+	// runtime state can change. Validation normalizes entries; keep the caller
+	// unchanged if an entry is malformed.
+	grantCandidate := c.Clone()
+	var grantWarnings []Warning
+	if err := grantCandidate.ResponseScanning.validateSizeExemptScanLimits(&grantWarnings, now); err != nil {
+		return err
+	}
+	// Validate on a private copy: normalization and nested route sorting must
+	// not mutate the caller when a later declaration is malformed.
+	if err := c.Clone().validateScannerExceptions(); err != nil {
+		return err
+	}
+	for i, entry := range c.ResponseScanning.CoreObserveExceptions {
+		field := fmt.Sprintf("response_scanning.core_observe_exceptions[%d].expires", i)
+		if err := validateTemporaryExpiryDate(field, strings.TrimSpace(entry.Expires), MaxCoreObserveExceptionHorizon); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateBestEffortAuthorization checks the reason and expiry that must
+// accompany a configuration-sourced best_effort override. field names the
+// YAML block in error text ("sandbox" or "agents.<name>.sandbox"). The rules
+// are the same at both levels so a per-agent override cannot be looser than
+// the top-level one: a non-blank reason, an RFC3339 expiry (never a duration,
+// which filesystem metadata could re-anchor), not yet expired, and no further
+// than MaxBestEffortConfigHorizon after now. Every branch refuses the config.
+func validateBestEffortAuthorization(field, reason, expiry string, now time.Time) error {
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("%s: best_effort_reason is required when best_effort is true", field)
+	}
+	if strings.TrimSpace(expiry) == "" {
+		return fmt.Errorf("%s: best_effort_expiry is required when best_effort is true", field)
+	}
+	if _, err := time.ParseDuration(expiry); err == nil {
+		return fmt.Errorf("%s: best_effort_expiry in configuration must be an RFC3339 timestamp; durations are command-line only", field)
+	}
+	expiresAt, timestampErr := time.Parse(time.RFC3339, expiry)
+	if timestampErr != nil {
+		return fmt.Errorf("%s: best_effort_expiry must be an RFC3339 timestamp", field)
+	}
+	if !expiresAt.After(now) {
+		return fmt.Errorf("%s: best_effort_expiry has expired", field)
+	}
+	if expiresAt.After(now.Add(MaxBestEffortConfigHorizon)) {
+		return fmt.Errorf("%s: best_effort_expiry %s is more than %s after now; a configuration override may not be authorized further ahead than that in one edit", field, expiry, MaxBestEffortConfigHorizon)
+	}
+	return nil
+}
+
+// validateAgentSandboxOverrides checks every profile against the effective
+// top-level sandbox state that profile inherits.
+func (c *Config) validateAgentSandboxOverrides(now time.Time) error {
+	for name, ap := range c.Agents {
+		if err := validateAgentSandboxOverride(name, c.Sandbox, ap.Sandbox, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateAgentSandboxOverride applies the top-level best_effort authorization
+// rules to one agent profile's sandbox override. The profile must carry its
+// own reason and expiry; inheriting them from the top-level block would let a
+// per-agent override ride on an authorization written for a different scope.
+// Reason and expiry without an enabling best_effort are refused too, so a
+// profile cannot look authorized while the override is actually off.
+func validateAgentSandboxOverride(name string, base Sandbox, override *AgentSandboxOverride, now time.Time) error {
+	if override == nil {
+		return nil
+	}
+	field := fmt.Sprintf("agents.%s.sandbox", name)
+	bestEffort := base.BestEffort
+	if override.BestEffort != nil {
+		bestEffort = *override.BestEffort
+	}
+	strict := base.Strict
+	if override.Strict != nil {
+		strict = *override.Strict
+	}
+	if bestEffort && strict {
+		return fmt.Errorf("%s: best_effort and strict are mutually exclusive", field)
+	}
+	if override.BestEffort != nil && *override.BestEffort {
+		return validateBestEffortAuthorization(field, override.BestEffortReason, override.BestEffortExpiry, now)
+	}
+	if strings.TrimSpace(override.BestEffortReason) != "" || strings.TrimSpace(override.BestEffortExpiry) != "" {
+		return fmt.Errorf("%s: best_effort_reason and best_effort_expiry require best_effort: true in the same profile", field)
+	}
+	return nil
+}
+
+func (c *Config) validateSandbox() error {
+	// Sandbox: best_effort and strict are mutually exclusive.
+	if c.Sandbox.BestEffort && c.Sandbox.Strict {
+		return fmt.Errorf("sandbox: best_effort and strict are mutually exclusive")
+	}
+	if c.Sandbox.BestEffort {
+		if err := validateBestEffortAuthorization("sandbox", c.Sandbox.BestEffortReason, c.Sandbox.BestEffortExpiry, time.Now()); err != nil {
+			return err
+		}
+	}
+
+	// Sandbox: validate filesystem paths even when disabled (CLI can override enabled).
+	if c.Sandbox.FS != nil {
+		for _, p := range c.Sandbox.FS.AllowRead {
+			if p == "" {
+				return fmt.Errorf("sandbox filesystem allow_read contains empty path")
+			}
+		}
+		for _, p := range c.Sandbox.FS.AllowWrite {
+			if p == "" {
+				return fmt.Errorf("sandbox filesystem allow_write contains empty path")
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateFlightRecorder(warnings *[]Warning) error {
+	c.FlightRecorder.PostureSignerPublicKey = nil
+	if len(c.FlightRecorder.ReceiptGroupPriorSignerKeys) > 32 {
+		return errors.New("flight_recorder.receipt_group_prior_signer_keys supports at most 32 keys")
+	}
+	seenPriorSigners := make(map[string]struct{}, len(c.FlightRecorder.ReceiptGroupPriorSignerKeys))
+	for _, key := range c.FlightRecorder.ReceiptGroupPriorSignerKeys {
+		decoded, err := hex.DecodeString(key)
+		if err != nil || len(decoded) != ed25519.PublicKeySize || key != strings.ToLower(key) {
+			return errors.New("flight_recorder.receipt_group_prior_signer_keys must contain lowercase 64-character Ed25519 public keys")
+		}
+		if _, exists := seenPriorSigners[key]; exists {
+			return errors.New("flight_recorder.receipt_group_prior_signer_keys contains a duplicate key")
+		}
+		seenPriorSigners[key] = struct{}{}
+	}
+	if c.FlightRecorder.ReceiptChains < 0 || c.FlightRecorder.ReceiptChains > 32 {
+		return fmt.Errorf("flight_recorder.receipt_chains must be between 0 and 32 (0 uses one chain)")
+	}
+	if err := c.validateFlightRecorderAnchor(warnings); err != nil {
+		return err
+	}
+	if c.FlightRecorder.RequireReceipts || c.FlightRecorder.RequireContainmentEvidence {
+		requirement := "flight_recorder.require_receipts"
+		if c.FlightRecorder.RequireContainmentEvidence {
+			requirement = "flight_recorder.require_containment_evidence"
+		}
+		switch {
+		case !c.FlightRecorder.Enabled:
+			return fmt.Errorf("%s requires flight_recorder.enabled", requirement)
+		case c.FlightRecorder.Dir == "":
+			return fmt.Errorf("%s requires flight_recorder.dir", requirement)
+		case c.FlightRecorder.SigningKeyPath == "":
+			return fmt.Errorf("%s requires flight_recorder.signing_key_path", requirement)
+		}
+	}
+	if c.FlightRecorder.RequireContainmentEvidence {
+		if strings.TrimSpace(c.FlightRecorder.PostureSignerKey) == "" {
+			return errors.New("flight_recorder.require_containment_evidence requires flight_recorder.posture_signer_key")
+		}
+		publicKey, err := signing.LoadPublicKey(c.FlightRecorder.PostureSignerKey)
+		if err != nil {
+			return fmt.Errorf("load flight_recorder.posture_signer_key: %w", err)
+		}
+		c.FlightRecorder.PostureSignerPublicKey = append([]byte(nil), publicKey...)
+	}
+	if !c.FlightRecorder.Enabled {
+		return nil
+	}
+	if c.FlightRecorder.Dir == "" {
+		// Enabled is on by default, but a recorder is only built when a dir is
+		// configured (server.go gates on Dir != ""). Treat enabled-without-dir
+		// as an inert no-op rather than a hard error: making it fatal would
+		// break every config that omits flight_recorder.dir the moment the
+		// default flipped on, and the recorder is evidence, never enforcement.
+		// `pipelock init` populates dir + signing key; without them the server
+		// prints a one-time notice that receipts are inert.
+		return nil
+	}
+	if c.FlightRecorder.ReceiptChainCount() > 1 {
+		if c.FlightRecorder.SigningKeyPath == "" {
+			return errors.New("flight_recorder.receipt_chains greater than one requires flight_recorder.signing_key_path")
+		}
+		if !c.FlightRecorder.SignCheckpoints {
+			return errors.New("flight_recorder.receipt_chains greater than one requires flight_recorder.sign_checkpoints: true")
+		}
+		if c.FlightRecorder.AnchorConfigured() {
+			return errors.New("flight_recorder.receipt_chains greater than one cannot use single-chain auto-anchoring")
+		}
+	}
+	if c.FlightRecorder.CheckpointInterval < 0 {
+		return fmt.Errorf("flight_recorder.checkpoint_interval must be non-negative")
+	}
+	if c.FlightRecorder.RetentionDays < 0 {
+		return fmt.Errorf("flight_recorder.retention_days must be non-negative")
+	}
+	if c.FlightRecorder.MaxEntriesPerFile < 0 {
+		return fmt.Errorf("flight_recorder.max_entries_per_file must be non-negative")
+	}
+	if c.FlightRecorder.Completeness.HeartbeatInterval != "" {
+		interval, err := time.ParseDuration(c.FlightRecorder.Completeness.HeartbeatInterval)
+		if err != nil {
+			return fmt.Errorf("flight_recorder.completeness.heartbeat_interval must parse as a duration: %w", err)
+		}
+		if interval <= 0 {
+			return fmt.Errorf("flight_recorder.completeness.heartbeat_interval must be positive; omit the field to use the 60s default")
+		}
+		if interval > 24*time.Hour {
+			return fmt.Errorf("flight_recorder.completeness.heartbeat_interval must be <= 24h")
+		}
+	}
+	if c.FlightRecorder.EvidenceHealth.SelfAuditInterval != "" {
+		interval, err := time.ParseDuration(c.FlightRecorder.EvidenceHealth.SelfAuditInterval)
+		if err != nil {
+			return fmt.Errorf("flight_recorder.evidence_health.self_audit_interval must parse as a duration: %w", err)
+		}
+		if interval < 5*time.Second || interval > 10*time.Minute {
+			return fmt.Errorf("flight_recorder.evidence_health.self_audit_interval must be between 5s and 10m")
+		}
+	}
+	if c.FlightRecorder.EvidenceHealth.MaxAnchorLag != "" {
+		lag, err := time.ParseDuration(c.FlightRecorder.EvidenceHealth.MaxAnchorLag)
+		if err != nil {
+			return fmt.Errorf("flight_recorder.evidence_health.max_anchor_lag must parse as a duration: %w", err)
+		}
+		if lag < 0 {
+			return fmt.Errorf("flight_recorder.evidence_health.max_anchor_lag must be non-negative")
+		}
+	}
+	switch c.FlightRecorder.FileMode {
+	case 0, 0o600, 0o640, 0o660:
+	default:
+		return fmt.Errorf("flight_recorder.file_mode must be 0600, 0640, or 0660 when set")
+	}
+	if c.FlightRecorder.RawEscrow {
+		if c.FlightRecorder.EscrowPublicKey == "" {
+			return fmt.Errorf("flight_recorder.escrow_public_key is required when raw_escrow is enabled")
+		}
+		if len(c.FlightRecorder.EscrowPublicKey) != 64 {
+			return fmt.Errorf("flight_recorder.escrow_public_key must be exactly 64 hex characters")
+		}
+		if _, err := hex.DecodeString(c.FlightRecorder.EscrowPublicKey); err != nil {
+			return fmt.Errorf("flight_recorder.escrow_public_key must be hex: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) validateFlightRecorderAnchor(warnings *[]Warning) error {
+	anchorCfg := c.FlightRecorder.Anchor
+	rekorConfigured := strings.TrimSpace(anchorCfg.RekorURL) != ""
+	localConfigured := strings.TrimSpace(anchorCfg.LocalLog) != ""
+	if rekorConfigured && localConfigured {
+		return fmt.Errorf("flight_recorder.anchor.rekor_url and flight_recorder.anchor.local_log are mutually exclusive")
+	}
+	if rekorConfigured && strings.TrimSpace(anchorCfg.RekorKeyPath) == "" {
+		return fmt.Errorf("flight_recorder.anchor.rekor_key_path is required when flight_recorder.anchor.rekor_url is set")
+	}
+	if rekorConfigured {
+		parsed, err := url.Parse(strings.TrimSpace(anchorCfg.RekorURL))
+		if err != nil {
+			return fmt.Errorf("flight_recorder.anchor.rekor_url must be a valid URL: %w", err)
+		}
+		if parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
+			return fmt.Errorf("flight_recorder.anchor.rekor_url must use http or https and include a host")
+		}
+		if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return fmt.Errorf("flight_recorder.anchor.rekor_url must not contain userinfo, query, or fragment components")
+		}
+		if parsed.Scheme == "http" && !strings.EqualFold(parsed.Hostname(), "localhost") {
+			ip := net.ParseIP(parsed.Hostname())
+			if ip == nil || !ip.IsLoopback() {
+				return fmt.Errorf("flight_recorder.anchor.rekor_url must use https unless the host is a local test endpoint")
+			}
+		}
+	}
+	if anchorCfg.Interval != "" {
+		interval, err := time.ParseDuration(strings.TrimSpace(anchorCfg.Interval))
+		if err != nil {
+			return fmt.Errorf("flight_recorder.anchor.interval must parse as a duration: %w", err)
+		}
+		if interval < 0 {
+			return fmt.Errorf("flight_recorder.anchor.interval must be non-negative")
+		}
+	}
+	if (rekorConfigured || localConfigured) &&
+		c.FlightRecorder.AnchorIntervalDuration() == 0 &&
+		c.FlightRecorder.AnchorReceiptThreshold() == 0 {
+		return fmt.Errorf("flight_recorder auto-anchor configured with no trigger: interval and receipt_threshold are both disabled")
+	}
+	if !rekorConfigured && !localConfigured && c.flightRecorderAnchorHasExplicitSettings() && warnings != nil {
+		*warnings = append(*warnings, Warning{
+			Field:   "flight_recorder.anchor",
+			Message: "has settings but no anchor point; set rekor_url or local_log to activate auto-anchoring",
+		})
+	}
+	return nil
+}
+
+func (c *Config) flightRecorderAnchorHasExplicitSettings() bool {
+	if len(c.rawBytes) == 0 {
+		return false
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(c.rawBytes, &root); err != nil || len(root.Content) == 0 {
+		return false
+	}
+	doc := root.Content[0]
+	flightRecorderNode := mappingValue(doc, "flight_recorder")
+	anchorNode := mappingValue(flightRecorderNode, "anchor")
+	return anchorNode != nil && anchorNode.Kind == yaml.MappingNode && len(anchorNode.Content) > 0
+}
+
+func (c *Config) validateDashboardSnapshot() error {
+	raw := strings.TrimSpace(c.DashboardSnapshot.Interval)
+	if raw != "" {
+		interval, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("dashboard_snapshot.interval must parse as a duration: %w", err)
+		}
+		if interval < time.Second {
+			return fmt.Errorf("dashboard_snapshot.interval must be >= 1s")
+		}
+	}
+	if c.DashboardSnapshot.EnabledWithRecorderDir(c.FlightRecorder.Dir) &&
+		c.DashboardSnapshot.PathWithRecorderDir(c.FlightRecorder.Dir) == "" {
+		return fmt.Errorf("dashboard_snapshot.path is required when dashboard_snapshot.enabled is true and flight_recorder.dir is empty")
+	}
+	return nil
+}
+
+func (c *Config) validateMCPBinaryIntegrity() error {
+	if !c.MCPBinaryIntegrity.Enabled {
+		return nil
+	}
+	if c.MCPBinaryIntegrity.ManifestPath == "" {
+		return fmt.Errorf("mcp_binary_integrity.manifest_path is required when enabled")
+	}
+	if c.MCPBinaryIntegrity.RequireSignature && strings.TrimSpace(c.MCPBinaryIntegrity.TrustedSigner) == "" {
+		return fmt.Errorf("mcp_binary_integrity.trusted_signer is required when require_signature is true")
+	}
+	switch c.MCPBinaryIntegrity.Action {
+	case ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_binary_integrity.action %q: must be warn or block", c.MCPBinaryIntegrity.Action)
+	}
+	return nil
+}
+
+func (c *Config) validateMCPToolProvenance() error {
+	if !c.MCPToolProvenance.Enabled {
+		return nil
+	}
+	switch c.MCPToolProvenance.Action {
+	case ActionWarn, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_tool_provenance.action %q: must be warn or block", c.MCPToolProvenance.Action)
+	}
+	switch c.MCPToolProvenance.Mode {
+	case ProvenanceModePipelock, ProvenanceModeSigstore, ProvenanceModeAny:
+		// valid
+	default:
+		return fmt.Errorf("invalid mcp_tool_provenance.mode %q: must be pipelock, sigstore, or any", c.MCPToolProvenance.Mode)
+	}
+	return nil
+}
+
+func (c *Config) validateBehavioralBaseline() error {
+	if !c.BehavioralBaseline.Enabled {
+		return nil
+	}
+	if !c.SessionProfiling.Enabled {
+		return fmt.Errorf("behavioral_baseline.enabled requires session_profiling.enabled")
+	}
+	if c.BehavioralBaseline.ProfileDir == "" {
+		return fmt.Errorf("behavioral_baseline.profile_dir is required when enabled")
+	}
+	switch c.BehavioralBaseline.DeviationAction {
+	case ActionWarn, ActionAsk, ActionBlock:
+		// valid
+	default:
+		return fmt.Errorf("invalid behavioral_baseline.deviation_action %q: must be warn, ask, or block", c.BehavioralBaseline.DeviationAction)
+	}
+	if c.BehavioralBaseline.LearningWindow < 0 {
+		return fmt.Errorf("behavioral_baseline.learning_window must be non-negative")
+	}
+	if c.BehavioralBaseline.SensitivitySigma < 0 {
+		return fmt.Errorf("behavioral_baseline.sensitivity_sigma must be non-negative")
+	}
+	switch c.BehavioralBaseline.SeasonalityMode {
+	case "", SeasonalityModeNone, SeasonalityModeLabeled, SeasonalityModeTime:
+		// valid (empty defaults to SeasonalityModeNone)
+	default:
+		return fmt.Errorf("invalid behavioral_baseline.seasonality_mode %q: must be none, labeled, or time", c.BehavioralBaseline.SeasonalityMode)
+	}
+	return nil
+}
+
+func (c *Config) validateAirlock() error {
+	if c.Airlock.Triggers.OnSeverity != "" {
+		return fmt.Errorf("airlock.triggers.on_severity is not enforced; use on_elevated, on_high, and on_critical")
+	}
+	if c.Airlock.Triggers.AnomalyCount != 0 {
+		return fmt.Errorf("airlock.triggers.anomaly_count is not enforced; airlock fires from on_elevated, on_high, and on_critical")
+	}
+	if c.Airlock.Triggers.AnomalyWindowMinutes != 0 {
+		return fmt.Errorf("airlock.triggers.anomaly_window_minutes is not enforced; airlock fires from on_elevated, on_high, and on_critical")
+	}
+	if !c.Airlock.Enabled {
+		return nil
+	}
+	if !c.SessionProfiling.Enabled {
+		return fmt.Errorf("airlock.enabled requires session_profiling.enabled")
+	}
+
+	validTiers := map[string]bool{
+		AirlockTierNone: true, AirlockTierSoft: true,
+		AirlockTierHard: true, AirlockTierDrain: true,
+	}
+	tierOrder := map[string]int{
+		AirlockTierNone: 0, AirlockTierSoft: 1,
+		AirlockTierHard: 2, AirlockTierDrain: 3,
+	}
+
+	// Normalize empty tier strings to AirlockTierNone so runtime code never
+	// sees an empty string (which could bypass tier-based conditionals).
+	if c.Airlock.Triggers.OnElevated == "" {
+		c.Airlock.Triggers.OnElevated = AirlockTierNone
+	}
+	if c.Airlock.Triggers.OnHigh == "" {
+		c.Airlock.Triggers.OnHigh = AirlockTierNone
+	}
+	if c.Airlock.Triggers.OnCritical == "" {
+		c.Airlock.Triggers.OnCritical = AirlockTierNone
+	}
+
+	for _, pair := range []struct{ name, val string }{
+		{"on_elevated", c.Airlock.Triggers.OnElevated},
+		{"on_high", c.Airlock.Triggers.OnHigh},
+		{"on_critical", c.Airlock.Triggers.OnCritical},
+	} {
+		if !validTiers[pair.val] {
+			return fmt.Errorf("invalid airlock.triggers.%s %q: must be none, soft, hard, or drain", pair.name, pair.val)
+		}
+	}
+
+	// Monotonicity: elevated <= high <= critical (tier severity must not decrease).
+	elev := tierOrder[c.Airlock.Triggers.OnElevated]
+	high := tierOrder[c.Airlock.Triggers.OnHigh]
+	crit := tierOrder[c.Airlock.Triggers.OnCritical]
+	if elev > high || high > crit {
+		return fmt.Errorf("airlock.triggers must be monotonic: on_elevated (%s) <= on_high (%s) <= on_critical (%s)",
+			c.Airlock.Triggers.OnElevated, c.Airlock.Triggers.OnHigh, c.Airlock.Triggers.OnCritical)
+	}
+
+	if c.Airlock.Timers.SoftMinutes < 0 || c.Airlock.Timers.HardMinutes < 0 || c.Airlock.Timers.DrainMinutes < 0 {
+		return fmt.Errorf("airlock timer values must be non-negative")
+	}
+
+	// Drain timeout below the de-escalation sweep interval (30s) is effectively
+	// the same as 30s. Warn but don't reject.
+	if c.Airlock.Timers.DrainTimeoutSeconds < 0 {
+		return fmt.Errorf("airlock.timers.drain_timeout_seconds must be non-negative")
+	}
+
+	return nil
+}
+
+func (c *Config) validateBrowserShield() error {
+	if !c.BrowserShield.Enabled {
+		return nil
+	}
+
+	switch c.BrowserShield.Strictness {
+	case ShieldStrictnessMinimal, ShieldStrictnessStandard, ShieldStrictnessAggressive:
+		// valid
+	default:
+		return fmt.Errorf("invalid browser_shield.strictness %q: must be minimal, standard, or aggressive", c.BrowserShield.Strictness)
+	}
+
+	switch c.BrowserShield.OversizeAction {
+	case ShieldOversizeBlock, ShieldOversizeScanHead, ShieldOversizeWarn:
+		// valid
+	default:
+		return fmt.Errorf("invalid browser_shield.oversize_action %q: must be block, scan_head, or warn", c.BrowserShield.OversizeAction)
+	}
+
+	// warn is only appropriate for minimal strictness during rollout.
+	if c.BrowserShield.OversizeAction == ShieldOversizeWarn && c.BrowserShield.Strictness != ShieldStrictnessMinimal {
+		return fmt.Errorf("browser_shield.oversize_action \"warn\" is only allowed with strictness \"minimal\"")
+	}
+
+	if c.BrowserShield.MaxShieldBytes <= 0 {
+		return fmt.Errorf("browser_shield.max_shield_bytes must be positive")
+	}
+
+	if err := ValidateTrustedDomains(c.BrowserShield.ExemptDomains, "browser_shield.exempt_domains"); err != nil {
+		return err
+	}
+	// tracking_domains is a detection INCLUSION list, not a trust or bypass
+	// list, so the breadth rule is the wrong question for it: a broad entry
+	// here widens detection rather than granting anything. It also cannot take
+	// a wildcard at all. The shield merges each entry through
+	// regexp.QuoteMeta (internal/shield/shield.go), so "*.tracker.example"
+	// compiles to a regex for the LITERAL characters "*.tracker.example",
+	// which no URL contains; the entry is inert and the operator has no way to
+	// know. Refusing it is the only honest answer, and it matches the
+	// documented contract of "tracking hostnames".
+	for i, raw := range c.BrowserShield.TrackingDomains {
+		field := fmt.Sprintf("browser_shield.tracking_domains[%d]", i)
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("%s is empty", field)
+		}
+		if strings.HasPrefix(NormalizeHostPattern(raw), "*.") || strings.ContainsAny(raw, "*?[]") {
+			return fmt.Errorf("%s %q: wildcards are not supported here; the shield matches these entries literally, so list the exact hostnames", field, raw)
+		}
+		d, err := NormalizeAndCheckHostPattern(raw)
+		if err != nil {
+			return fmt.Errorf("%s %q: %w", field, raw, err)
+		}
+		c.BrowserShield.TrackingDomains[i] = d
+	}
+
+	return nil
+}
+
+// Default values for the RFC 9421 envelope signer. These are used at
+// load time to fill unset fields when sign: true so an operator can opt
+// in with the minimum viable surface (sign: true + signing_key_path).
+const (
+	DefaultEnvelopeSignKeyID           = "pipelock-mediation-v1"
+	DefaultEnvelopeSignCreatedSkewSecs = 60
+	DefaultEnvelopeSignMaxBodyBytes    = 1 << 20 // 1 MiB
+	DefaultEnvelopeActorFormat         = envelope.ActorFormatSPIFFE
+	DefaultEnvelopeTrustDomain         = "pipelock.local"
+	DefaultEnvelopeReplayWindow        = 5 * time.Minute
+	DefaultEnvelopeReplayMaxEntries    = 10000
+)
+
+// DefaultEnvelopeSignedComponents returns the RFC 9421 component set
+// pipelock declares when sign: true and signed_components is empty.
+// Callers must not mutate the returned slice - it is returned by copy so
+// each caller gets its own backing array.
+func DefaultEnvelopeSignedComponents() []string {
+	return []string{"@method", "@target-uri", "content-digest", "pipelock-mediation"}
+}
+
+func (c *Config) validateMediationEnvelope() error {
+	me := &c.MediationEnvelope
+
+	// Sign: true requires Enabled: true. Allowing sign without enabled
+	// would silently produce signatures that no transport ever attaches
+	// (the inject code paths are gated on Enabled). That is a
+	// configuration error, not a runtime fallback.
+	if me.Sign && !me.Enabled {
+		return fmt.Errorf("mediation_envelope.sign requires mediation_envelope.enabled")
+	}
+
+	// Normalize signing-related fields unconditionally, even when
+	// sign is currently off. ValidateReload compares old.MediationEnvelope
+	// vs updated.MediationEnvelope for narrowing/downgrade warnings; if
+	// normalization only fires on the sign-true branch, warning behavior
+	// depends on whether validation had previously seen sign-true, not on
+	// operator intent. Run normalization first so both sides of every
+	// reload comparison are in canonical effective form.
+	if err := normalizeMediationEnvelope(me); err != nil {
+		return err
+	}
+
+	if me.Sign {
+		if _, err := mediationEnvelopeSignatureExpires(me.SignatureExpires, DefaultEnvelopeReplayWindow); err != nil {
+			return err
+		}
+	}
+
+	if !me.Sign {
+		// Signing disabled - normalization is enough; skip the
+		// keyfile load that's only meaningful when signing is on.
+		return c.validateInboundMediationEnvelopeTrust()
+	}
+
+	// Require a signing key path. Fail closed: a missing key path with
+	// sign: true is an explicit misconfiguration, not a soft fallback.
+	if strings.TrimSpace(me.SigningKeyPath) == "" {
+		return fmt.Errorf("mediation_envelope.signing_key_path is required when mediation_envelope.sign is true")
+	}
+
+	// Load the key once at validate time so the pipelock binary refuses
+	// to start against an unreadable or malformed key rather than
+	// spawning a signer that cannot sign. The key material itself is
+	// discarded - runtime wiring re-reads the file on every reload so
+	// operators can rotate without touching the config file.
+	if _, err := signing.LoadPrivateKeyFile(me.SigningKeyPath); err != nil {
+		return fmt.Errorf("mediation_envelope.signing_key_path %q: %w", me.SigningKeyPath, err)
+	}
+
+	return c.validateInboundMediationEnvelopeTrust()
+}
+
+func (c *Config) validateInboundMediationEnvelopeTrust() error {
+	verify := c.MediationEnvelope.VerifyInbound
+	if !verify.Enabled {
+		return nil
+	}
+	if len(verify.TrustList) == 0 {
+		return fmt.Errorf("mediation_envelope.verify_inbound.trust_list must contain at least one trusted key")
+	}
+	seen := make(map[string]int, len(verify.TrustList))
+	for i, key := range verify.TrustList {
+		keyID := strings.TrimSpace(key.KeyID)
+		if keyID == "" {
+			return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].key_id is required", i)
+		}
+		if prior, dup := seen[keyID]; dup {
+			return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].key_id %q duplicates trust_list[%d]", i, keyID, prior)
+		}
+		seen[keyID] = i
+		if strings.TrimSpace(key.PublicKey) == "" {
+			return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].public_key is required", i)
+		}
+		if _, err := signing.ParsePublicKey(key.PublicKey); err != nil {
+			return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].public_key: %w", i, err)
+		}
+		if key.WellKnownURL != "" {
+			u, err := url.Parse(key.WellKnownURL)
+			if err != nil || u.Scheme != schemeHTTPS || u.Host == "" {
+				return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].well_known_url must be an https URL", i)
+			}
+		}
+		for j, td := range key.TrustDomains {
+			normalized := strings.ToLower(strings.TrimSpace(td))
+			if normalized == "" {
+				return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].trust_domains[%d] must not be empty", i, j)
+			}
+			if !envelope.IsValidTrustDomain(normalized) {
+				return fmt.Errorf("mediation_envelope.verify_inbound.trust_list[%d].trust_domains[%d] %q must be a DNS-shaped label with no scheme, slashes, userinfo, or port", i, j, td)
+			}
+		}
+	}
+	window, err := mediationEnvelopeReplayWindow(verify.ReplayCache.Window)
+	if err != nil {
+		return err
+	}
+	if verify.ReplayCache.MaxEntries < 0 {
+		return fmt.Errorf("mediation_envelope.verify_inbound.replay_cache.max_entries must be >= 0")
+	}
+	// Signer expiry must not exceed the replay window - otherwise a
+	// captured signature stays valid after its nonce is evicted from
+	// the cache, defeating replay protection. When signature_expires
+	// is empty, the runtime defaults the signer's lifetime to window
+	// so the constraint holds by construction.
+	if expires, err := mediationEnvelopeSignatureExpires(c.MediationEnvelope.SignatureExpires, window); err != nil {
+		return err
+	} else if expires > window {
+		return fmt.Errorf("mediation_envelope.signature_expires (%s) must be <= mediation_envelope.verify_inbound.replay_cache.window (%s)", expires, window)
+	}
+	return nil
+}
+
+func mediationEnvelopeReplayWindow(raw string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return DefaultEnvelopeReplayWindow, nil
+	}
+	window, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("mediation_envelope.verify_inbound.replay_cache.window: %w", err)
+	}
+	if window <= 0 {
+		return 0, fmt.Errorf("mediation_envelope.verify_inbound.replay_cache.window must be > 0")
+	}
+	return window, nil
+}
+
+// mediationEnvelopeSignatureExpires parses the operator-supplied signer
+// lifetime. Empty falls back to the supplied window so the signer and
+// verifier agree by default - the validator then accepts the value by
+// construction (window <= window). Operators who set an explicit value
+// must keep it <= window or validation rejects.
+func mediationEnvelopeSignatureExpires(raw string, window time.Duration) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return window, nil
+	}
+	expires, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("mediation_envelope.signature_expires: %w", err)
+	}
+	if expires <= 0 {
+		return 0, fmt.Errorf("mediation_envelope.signature_expires must be > 0")
+	}
+	return expires, nil
+}
+
+func (c *Config) validateDefaultAgentIdentity() error {
+	identity := strings.TrimSpace(c.DefaultAgentIdentity)
+	if c.BindDefaultAgentIdentity && identity == "" {
+		return fmt.Errorf("bind_default_agent_identity requires default_agent_identity")
+	}
+	if c.DefaultAgentIdentity != "" && identity != c.DefaultAgentIdentity {
+		return fmt.Errorf("default_agent_identity must not contain leading or trailing whitespace")
+	}
+	if reserved := reservedControlActorName(identity); reserved != "" {
+		return fmt.Errorf("default_agent_identity %q is a reserved control-actor identity and cannot be used", reserved)
+	}
+	if identitykey.IsFoldedBaselineKey(identity) {
+		return fmt.Errorf("default_agent_identity %q is reserved for folded behavioral-baseline client identities", identity)
+	}
+	return nil
+}
+
+func (c *Config) validateTaint() error {
+	switch c.Taint.Policy {
+	case "", ModeBalanced, ModeStrict, ModePermissive:
+	default:
+		return fmt.Errorf("invalid taint.policy %q: must be %s, %s, or %s", c.Taint.Policy, ModeStrict, ModeBalanced, ModePermissive)
+	}
+	if c.Taint.RecentSources < 0 {
+		return fmt.Errorf("taint.recent_sources must be >= 0")
+	}
+	if err := ValidateTrustedDomains(c.Taint.AllowlistedDomains, "taint.allowlisted_domains"); err != nil {
+		return err
+	}
+	if err := validateMCPServerNameList(c.Taint.TrustedMCPServers, "taint.trusted_mcp_servers"); err != nil {
+		return err
+	}
+	if err := validatePathGlobs(c.Taint.ProtectedPaths, "taint.protected_paths"); err != nil {
+		return err
+	}
+	if err := validatePathGlobs(c.Taint.ElevatedPaths, "taint.elevated_paths"); err != nil {
+		return err
+	}
+	for i, override := range c.Taint.TrustOverrides {
+		if override.Scope == "" {
+			return fmt.Errorf("taint.trust_overrides[%d].scope is required", i)
+		}
+		switch override.Scope {
+		case "action":
+			if override.ActionMatch == "" {
+				return fmt.Errorf("taint.trust_overrides[%d].action_match is required for scope=action", i)
+			}
+		case "source":
+			if override.SourceMatch == "" {
+				return fmt.Errorf("taint.trust_overrides[%d].source_match is required for scope=source", i)
+			}
+		default:
+			return fmt.Errorf("invalid taint.trust_overrides[%d].scope %q: must be action or source", i, override.Scope)
+		}
+		if override.ExpiresAt.IsZero() {
+			return fmt.Errorf("taint.trust_overrides[%d].expires_at is required", i)
+		}
+	}
+	return nil
+}
+
+func validateMCPServerNameList(serverNames []string, label string) error {
+	seen := make(map[string]struct{}, len(serverNames))
+	for i, serverName := range serverNames {
+		field := fmt.Sprintf("%s[%d]", label, i)
+		if err := validateMCPServerName(serverName, field); err != nil {
+			return err
+		}
+		if _, ok := seen[serverName]; ok {
+			return fmt.Errorf("%s %q duplicates an earlier MCP server entry", field, serverName)
+		}
+		seen[serverName] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateMCPServerName applies the MCP server-name rules to a launch-supplied
+// name, so a name given on the command line is held to the same rules as one
+// written in configuration.
+func ValidateMCPServerName(serverName, field string) error {
+	return validateMCPServerName(serverName, field)
+}
+
+func validateMCPServerName(serverName, field string) error {
+	if serverName == "" {
+		return fmt.Errorf("%s is empty", field)
+	}
+	if strings.Contains(serverName, "://") || strings.ContainsAny(serverName, "/\\") {
+		return fmt.Errorf("%s %q: use the MCP --server-name value without URL syntax or slashes", field, serverName)
+	}
+	for _, r := range serverName {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("%s %q: use the MCP --server-name value without URL syntax or whitespace/control characters", field, serverName)
+		}
+	}
+	return nil
+}
+
+func validatePathGlobs(patterns []string, label string) error {
+	for i, pattern := range patterns {
+		if pattern == "" {
+			return fmt.Errorf("%s[%d] must not be empty", label, i)
+		}
+		if _, err := path.Match(pattern, "probe"); err != nil {
+			return fmt.Errorf("%s[%d] %q: invalid glob: %w", label, i, pattern, err)
+		}
+	}
+	return nil
+}
+
+// validateMediaPolicy checks media_policy settings for consistency.
+// Runs on every Load() and hot reload. Validation is deliberately strict on
+// explicit values but permissive on unset/default (nil bool, zero int, empty
+// slice) - Defaults() and the getters handle those cases so operators who
+// partially configure don't hit spurious errors.
+//
+// Structural validation runs regardless of whether the master switch is
+// enabled. "media_policy.enabled: false" cannot be a license to load
+// malformed values that would apply the moment the feature is re-enabled
+// on a subsequent reload.
+func (c *Config) validateMediaPolicy() error {
+	// MaxImageBytes: reject explicit negative values. Zero is allowed and
+	// means "use DefaultMaxImageBytes" via EffectiveMaxImageBytes().
+	if c.MediaPolicy.MaxImageBytes < 0 {
+		return fmt.Errorf("media_policy.max_image_bytes must be non-negative (0 = default %d)", DefaultMaxImageBytes)
+	}
+
+	// AllowedImageTypes must contain only image/* media types. Empty list
+	// falls through to DefaultAllowedImageTypes via the getter. SVG is
+	// rejected here because it is active content, not a raster image -
+	// the browser shield pipeline handles SVG separately.
+	//
+	// Canonicalization uses the same helper that EffectiveAllowedImageTypes
+	// applies at read time, so validation and runtime matching can never
+	// disagree on whether an entry like " image/png " or
+	// "image/jpeg; charset=binary" is accepted.
+	for _, raw := range c.MediaPolicy.AllowedImageTypes {
+		canon := canonicalizeMediaTypeEntry(raw)
+		if canon == "" {
+			return fmt.Errorf("media_policy.allowed_image_types contains an empty or unparseable entry: %q", raw)
+		}
+		if !strings.HasPrefix(canon, "image/") {
+			return fmt.Errorf("media_policy.allowed_image_types entry %q must be an image/* media type", raw)
+		}
+		// Require a concrete subtype. ImageTypeAllowed does exact string
+		// matching at runtime, so wildcard or whitespace-containing
+		// subtypes would pass validation but never match a real
+		// response. Reject them here so the validation/matching contract
+		// cannot diverge on ambiguous inputs.
+		subtype := strings.TrimPrefix(canon, "image/")
+		if subtype == "" || strings.ContainsAny(subtype, "*?/ ") {
+			return fmt.Errorf("media_policy.allowed_image_types entry %q must name a concrete subtype (no wildcards, whitespace, or nested slashes)", raw)
+		}
+		if canon == "image/svg+xml" {
+			return fmt.Errorf("media_policy.allowed_image_types must not include image/svg+xml: SVG is active content handled by browser_shield")
+		}
+	}
+	return nil
+}
+
+// ResolveCAPath returns resolved CA cert and key paths.
+// Empty config values resolve against the pipelock home directory: the
+// --home flag, then PIPELOCK_HOME, then ~/.pipelock. That is the precedence
+// `pipelock tls init` uses via signing.ResolveKeystoreDir, so the CA the
+// proxy loads is always the one the operator just generated.
+// Returns an error if the home directory cannot be determined and paths
+// are not set explicitly.
+func (c *Config) ResolveCAPath() (certPath, keyPath string, err error) {
+	certPath = c.TLSInterception.CACertPath
+	keyPath = c.TLSInterception.CAKeyPath
+	if certPath == "" || keyPath == "" {
+		dir, dirErr := signing.ResolveKeystoreDir("")
+		if dirErr != nil {
+			return "", "", fmt.Errorf("resolve CA path: %w (set ca_cert and ca_key explicitly)", dirErr)
+		}
+		if certPath == "" {
+			certPath = filepath.Join(dir, "ca.pem")
+		}
+		if keyPath == "" {
+			keyPath = filepath.Join(dir, "ca-key.pem")
+		}
+	}
+	return certPath, keyPath, nil
+}
+
+// caPathMismatchHint returns an extra sentence for a CA-not-found error when
+// the default dir resolved via --home/PIPELOCK_HOME and a CA also exists
+// under the bare ~/.pipelock (the directory `pipelock tls init` would have
+// used before --home/PIPELOCK_HOME was set). This is the case that used to
+// fail silently in the opposite direction: the proxy would find the OLD CA
+// at ~/.pipelock and sign with it while `tls show-ca` printed the NEW one.
+// Returns "" when ca_cert/ca_key are explicit, or no alternate CA exists.
+// resolvedPath is the cert path ResolveCAPath already produced, named
+// again in the hint so the operator sees both paths together.
+func (c *Config) caPathMismatchHint(resolvedPath string) string {
+	if c.TLSInterception.CACertPath != "" || c.TLSInterception.CAKeyPath != "" {
+		return ""
+	}
+	resolvedHome := signing.ResolvedHome()
+	if resolvedHome == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	altDir := filepath.Join(home, signing.DefaultPipelockDir)
+	if filepath.Clean(altDir) == filepath.Clean(resolvedHome) {
+		return ""
+	}
+	altCert := filepath.Join(altDir, "ca.pem")
+	if _, err := os.Stat(altCert); err != nil {
+		return ""
+	}
+	// Only offer "keep using it" for a usable pair: a lone certificate has
+	// no key to sign with.
+	if _, err := os.Stat(filepath.Join(altDir, "ca-key.pem")); err != nil {
+		return ""
+	}
+	return fmt.Sprintf(" (an existing CA is at %s, outside the pipelock home that resolved %s: set tls_interception.ca_cert and ca_key to keep using it, or run 'pipelock tls init' with that home to create a new CA that clients must then trust)",
+		altCert, resolvedPath)
+}
+
+// upgradeActionStrength returns a numeric strength for upgrade_warn/upgrade_ask values.
+// "block" (2) > "" (1) > nil-should-not-reach-here (0).
+// Called after ApplyDefaults, so nil fields are already filled.
+func upgradeActionStrength(v *string) int {
+	if v == nil {
+		return 0
+	}
+	if *v == ActionBlock {
+		return 2 // strongest: upgrade to block
+	}
+	return 1 // "" means no upgrade (weaker)
+}
+
+// validateEscalationActions checks that upgrade_warn and upgrade_ask contain
+// only valid values: nil (use default), "" (no upgrade), or "block".
+func validateEscalationActions(level string, a *EscalationActions) error {
+	if a.UpgradeWarn != nil && *a.UpgradeWarn != "" && *a.UpgradeWarn != ActionBlock {
+		return fmt.Errorf("adaptive_enforcement.levels.%s.upgrade_warn must be \"block\" or \"\" (got %q)", level, *a.UpgradeWarn)
+	}
+	if a.UpgradeAsk != nil && *a.UpgradeAsk != "" && *a.UpgradeAsk != ActionBlock {
+		return fmt.Errorf("adaptive_enforcement.levels.%s.upgrade_ask must be \"block\" or \"\" (got %q)", level, *a.UpgradeAsk)
+	}
+	return nil
+}
+
+// validateEscalationMonotonic verifies that higher escalation levels are not
+// weaker than lower ones. Runs after ApplyDefaults, so nil fields are filled.
+func validateEscalationMonotonic(levels *EscalationLevels) error {
+	// Compare elevated vs high: high must be >= elevated on every dimension.
+	// When the lower level has block_all=true it already denies all traffic,
+	// so per-action upgrades at the higher level are irrelevant - skip the
+	// strength comparison to avoid false monotonic violations.
+	elevatedBlockAll := levels.Elevated.BlockAll != nil && *levels.Elevated.BlockAll
+	if !elevatedBlockAll {
+		if upgradeActionStrength(levels.High.UpgradeWarn) < upgradeActionStrength(levels.Elevated.UpgradeWarn) {
+			return fmt.Errorf("adaptive_enforcement.levels: high.upgrade_warn is weaker than elevated.upgrade_warn (monotonic violation)")
+		}
+		if upgradeActionStrength(levels.High.UpgradeAsk) < upgradeActionStrength(levels.Elevated.UpgradeAsk) {
+			return fmt.Errorf("adaptive_enforcement.levels: high.upgrade_ask is weaker than elevated.upgrade_ask (monotonic violation)")
+		}
+	}
+	// block_all: if elevated has it, high must too.
+	if elevatedBlockAll &&
+		(levels.High.BlockAll == nil || !*levels.High.BlockAll) {
+		return fmt.Errorf("adaptive_enforcement.levels: high.block_all is weaker than elevated.block_all (monotonic violation)")
+	}
+
+	// Compare high vs critical: critical must be >= high on every dimension.
+	highBlockAll := levels.High.BlockAll != nil && *levels.High.BlockAll
+	if !highBlockAll {
+		if upgradeActionStrength(levels.Critical.UpgradeWarn) < upgradeActionStrength(levels.High.UpgradeWarn) {
+			return fmt.Errorf("adaptive_enforcement.levels: critical.upgrade_warn is weaker than high.upgrade_warn (monotonic violation)")
+		}
+		if upgradeActionStrength(levels.Critical.UpgradeAsk) < upgradeActionStrength(levels.High.UpgradeAsk) {
+			return fmt.Errorf("adaptive_enforcement.levels: critical.upgrade_ask is weaker than high.upgrade_ask (monotonic violation)")
+		}
+	}
+	// block_all: if high has it, critical must too.
+	if highBlockAll &&
+		(levels.Critical.BlockAll == nil || !*levels.Critical.BlockAll) {
+		return fmt.Errorf("adaptive_enforcement.levels: critical.block_all is weaker than high.block_all (monotonic violation)")
+	}
+	return nil
+}
+
+// guardAllowedProtocols is the closed set of protocols guard services accept.
+// UDP is documented as reserved in the schema; it will be added here when an
+// evaluator path grants it.
+var guardAllowedProtocols = map[string]bool{
+	"tcp": true,
+}
+
+// guardDangerousRWRoots are path prefixes that must never be writable.
+// Each entry has a human-readable reason for the rejection message.
+var guardDangerousRWRoots = []struct {
+	prefix string
+	reason string
+}{
+	{"/run/user/", "socket path"},
+	{"/var/run", "socket path"},
+	{"/run/", "socket path"},
+	{"/usr/bin", "PATH directory"},
+	{"/usr/local/bin", "PATH directory"},
+	{"/usr/sbin", "PATH directory"},
+	{"/usr/local/sbin", "PATH directory"},
+	{"/bin", "PATH directory"},
+	{"/sbin", "PATH directory"},
+	{"/etc/pipelock", "pipelock config root"},
+	{"/etc/systemd/system", "persistence path"},
+	{"/etc/init.d", "persistence path"},
+	{"/etc/cron.d", "persistence path"},
+	{"/etc/crontab", "persistence path"},
+	{"/etc/sudoers", "privilege path"},
+	{"/etc/sudoers.d", "privilege path"},
+	// Account databases: writing either is a direct route to a new root user,
+	// which defeats every other entry in this list.
+	{"/etc/passwd", "privilege path"},
+	{"/etc/shadow", "privilege path"},
+	{"/etc/group", "privilege path"},
+	{"/etc/gshadow", "privilege path"},
+	// Shared libraries and boot artifacts: a write here executes as whatever
+	// loads them, so they are code-execution paths even though no entry looks
+	// like a binary. /boot additionally survives a reboot.
+	{"/lib", "system library directory"},
+	{"/lib64", "system library directory"},
+	{"/usr/lib", "system library directory"},
+	{"/usr/lib64", "system library directory"},
+	{"/usr/local/lib", "system library directory"},
+	{"/boot", "boot directory"},
+}
+
+func (c *Config) validateGuard() error {
+	return c.ValidateGuardDeclaration()
+}
+
+// ValidateGuardDeclaration validates guard names, references, destinations,
+// path declarations, and compiled-floor constraints for Guard execution.
+func (c *Config) ValidateGuardDeclaration() error {
+	return c.validateGuardDeclaration(true)
+}
+
+// ValidateGuardStructure validates guard declarations except for compiled
+// path-floor refusals. Read-only explain commands use it so they can display a
+// refused grant and its exact floor rule instead of failing before diagnosis.
+// Runtime and normal config loading never use this path.
+func (c *Config) ValidateGuardStructure() error {
+	return c.validateGuardDeclaration(false)
+}
+
+func (c *Config) validateGuardDeclaration(checkPathFloor bool) error {
+	g := &c.Guard
+	if len(g.Services) == 0 && len(g.Profiles) == 0 && len(g.Manifests) == 0 {
+		return nil
+	}
+
+	// --- services ---
+	serviceNames := make(map[string]bool, len(g.Services))
+	serviceDests := make(map[string]bool, len(g.Services))
+	for i, svc := range g.Services {
+		label := fmt.Sprintf("guard.services[%d]", i)
+		if svc.Name == "" {
+			return fmt.Errorf("%s: name is required", label)
+		}
+		if serviceNames[svc.Name] {
+			return fmt.Errorf("%s: duplicate service name %q", label, svc.Name)
+		}
+		serviceNames[svc.Name] = true
+
+		if !guardAllowedProtocols[svc.Protocol] {
+			return fmt.Errorf("%s: unsupported protocol %q (allowed: tcp)", label, svc.Protocol)
+		}
+		if svc.Host == "" {
+			return fmt.Errorf("%s: host is required", label)
+		}
+		if strings.Contains(svc.Host, "*") {
+			return fmt.Errorf("%s: wildcard hosts are not allowed (got %q); use an exact hostname", label, svc.Host)
+		}
+		if strings.Contains(svc.Host, "/") {
+			return fmt.Errorf("%s: CIDR notation is not allowed (got %q); use an exact host", label, svc.Host)
+		}
+		if svc.Port == 0 {
+			return fmt.Errorf("%s: port must be non-zero", label)
+		}
+		normalizedHost := strings.ToLower(strings.TrimRight(svc.Host, "."))
+		dest := svc.Protocol + "://" + normalizedHost + ":" + strconv.FormatUint(uint64(svc.Port), 10)
+		if serviceDests[dest] {
+			return fmt.Errorf("%s: duplicate destination %s", label, dest)
+		}
+		serviceDests[dest] = true
+	}
+
+	// --- manifests ---
+	manifestNames := make(map[string]bool, len(g.Manifests))
+	for i, m := range g.Manifests {
+		label := fmt.Sprintf("guard.manifests[%d]", i)
+		if m.Name == "" {
+			return fmt.Errorf("%s: name is required", label)
+		}
+		if manifestNames[m.Name] {
+			return fmt.Errorf("%s: duplicate manifest name %q", label, m.Name)
+		}
+		manifestNames[m.Name] = true
+
+		pathFields := make(map[string]string, len(m.ReadOnly)+len(m.ReadOnlyDirectories)+len(m.ReadWrite)+len(m.ReadWriteDirectories))
+		for j, p := range m.ReadOnly {
+			if err := validateGuardManifestPath(label, "read_only", j, p, guardPathFile, pathFields); err != nil {
+				return err
+			}
+			if checkPathFloor {
+				if err := validateGuardROPath(label, "read_only", j, p); err != nil {
+					return err
+				}
+			}
+		}
+		for j, p := range m.ReadOnlyDirectories {
+			if err := validateGuardManifestPath(label, "read_only_directories", j, p, guardPathDirectory, pathFields); err != nil {
+				return err
+			}
+			if checkPathFloor {
+				if err := validateGuardROPath(label, "read_only_directories", j, p); err != nil {
+					return err
+				}
+			}
+		}
+		for j, p := range m.ReadWrite {
+			if err := validateGuardManifestPath(label, "read_write", j, p, guardPathFile, pathFields); err != nil {
+				return err
+			}
+			if checkPathFloor {
+				if err := validateGuardRWPath(label, "read_write", j, p); err != nil {
+					return err
+				}
+			}
+		}
+		for j, p := range m.ReadWriteDirectories {
+			if err := validateGuardManifestPath(label, "read_write_directories", j, p, guardPathDirectory, pathFields); err != nil {
+				return err
+			}
+			if checkPathFloor {
+				if err := validateGuardRWPath(label, "read_write_directories", j, p); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	// --- profiles ---
+	profileNames := make(map[string]bool, len(g.Profiles))
+	for i, p := range g.Profiles {
+		label := fmt.Sprintf("guard.profiles[%d]", i)
+		if p.Name == "" {
+			return fmt.Errorf("%s: name is required", label)
+		}
+		if profileNames[p.Name] {
+			return fmt.Errorf("%s: duplicate profile name %q", label, p.Name)
+		}
+		profileNames[p.Name] = true
+
+		for _, ref := range p.Manifests {
+			if !manifestNames[ref] {
+				return fmt.Errorf("%s: references unknown manifest %q", label, ref)
+			}
+		}
+	}
+
+	return nil
+}
+
+type guardPathType string
+
+const (
+	guardPathFile      guardPathType = "file"
+	guardPathDirectory guardPathType = "directory"
+)
+
+// validateGuardManifestPath validates the declared kind of one manifest path.
+// The declaration is intentionally lexical: it must produce the same verdict
+// whether or not the target exists on the host reading the configuration.
+func validateGuardManifestPath(label, fieldName string, idx int, rawPath string, pathType guardPathType, pathFields map[string]string) error {
+	field := fmt.Sprintf("%s.%s[%d]", label, fieldName, idx)
+	if !filepath.IsAbs(rawPath) {
+		return fmt.Errorf("%s: path must be absolute (got %q)", field, rawPath)
+	}
+	if pathType == guardPathFile && strings.HasSuffix(rawPath, string(filepath.Separator)) {
+		return fmt.Errorf("%s: file path %q must not end in a path separator; declare directories in %s_directories", field, rawPath, strings.TrimSuffix(fieldName, "_directories"))
+	}
+
+	// The conflict key is case folded, matching the credential floor's
+	// comparison policy. filepath.Clean does not normalize case, so on a
+	// case-insensitive volume two spellings of one object would each be
+	// recorded as a distinct declaration and the conflict would go unnoticed.
+	// The failure direction is the bad one: the same object declared read-only
+	// in one list and read-write in another resolves, once the evaluator
+	// consumes both, to the WIDER grant, silently turning an intended
+	// read-only grant into a writable one.
+	conflictKey := strings.ToLower(filepath.Clean(rawPath))
+	if earlierField, ok := pathFields[conflictKey]; ok {
+		return fmt.Errorf("%s: path %q conflicts with an earlier declaration in %s; a path may appear in only one grant list", field, rawPath, earlierField)
+	}
+	pathFields[conflictKey] = field
+	return nil
+}
+
+// validateGuardRWPath checks that a read-write path does not grant write
+// access to dangerous or trust-bearing locations.
+func validateGuardRWPath(label, fieldName string, idx int, rawPath string) error {
+	field := fmt.Sprintf("%s.%s[%d]", label, fieldName, idx)
+	decision, err := ExplainGuardPathFloor(rawPath, GuardAccessWrite)
+	if err != nil {
+		return fmt.Errorf("%s: %w", field, err)
+	}
+	if decision.Refused {
+		return fmt.Errorf("%s: %s", field, decision.Reason)
+	}
+	return nil
+}

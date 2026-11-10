@@ -1,0 +1,1780 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package enterprise
+
+import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+)
+
+func TestValidateAgents_ValidConfig(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"api.anthropic.com"}},
+		"_default":    {Mode: config.ModeBalanced},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("expected valid: %v", err)
+	}
+}
+
+func TestValidateAgents_NoAgents(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = nil
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("expected no error for nil agents: %v", err)
+	}
+}
+
+func TestValidateAgents_EmptyName(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"": {Mode: config.ModeBalanced},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for empty agent name")
+	}
+}
+
+func TestValidateAgents_InvalidName(t *testing.T) {
+	cfg := testConfig()
+	tests := []struct {
+		name    string
+		agent   string
+		wantErr bool
+	}{
+		{"spaces", "my agent", true},
+		{"reserved anonymous", "anonymous", true},
+		{"special chars", "agent!@#", true},
+		{"too long", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", true}, // 69 chars > 64
+		{"_default allowed", "_default", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg.Agents = map[string]config.AgentProfile{
+				tt.agent: {Mode: config.ModeBalanced},
+			}
+			err := ValidateAgents(cfg)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateAgents(%q) error = %v, wantErr %v", tt.agent, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateAgents_InvalidMode(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"bad-agent": {Mode: "invalid-mode"},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for invalid mode")
+	}
+}
+
+func TestValidateAgents_DuplicateListeners(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {Listeners: []string{":9001"}},
+		"agent-b": {Listeners: []string{":9001"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for duplicate listeners")
+	}
+}
+
+func TestValidateAgents_ListenerCollidesWithMain(t *testing.T) {
+	cfg := testConfig()
+	// Default fetch_proxy.listen is typically ":8888".
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {Listeners: []string{cfg.FetchProxy.Listen}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for listener colliding with main")
+	}
+}
+
+func TestValidateAgents_ListenerCollisionCanonical(t *testing.T) {
+	tests := []struct {
+		name          string
+		fetchListen   string
+		agentListener string
+		wantCollision bool
+	}{
+		// IPv4: empty host and 0.0.0.0 are both "all interfaces"
+		{"empty vs explicit ipv4", "0.0.0.0:8888", ":8888", true},
+		{"explicit ipv4 vs empty", ":8888", "0.0.0.0:8888", true},
+
+		// IPv6: [::] is "all interfaces" and conflicts with 0.0.0.0 on dual-stack
+		{"ipv6 all vs empty", ":8888", "[::]:8888", true},
+		{"ipv6 all vs ipv4 all", "0.0.0.0:8888", "[::]:8888", true},
+		{"ipv4 all vs ipv6 all", "[::]:8888", "0.0.0.0:8888", true},
+
+		// Verbose IPv6 zero forms
+		{"verbose ipv6 zero", "0.0.0.0:8888", "[0:0:0:0:0:0:0:0]:8888", true},
+
+		// Loopback addresses conflict with bind-all on the same port:
+		// 0.0.0.0 grabs all interfaces including loopback.
+		{"ipv4 loopback vs all", "0.0.0.0:8888", "127.0.0.1:8888", true},
+		{"ipv6 loopback vs all", "0.0.0.0:8888", "[::1]:8888", true},
+
+		// Different ports never collide
+		{"same host different port", "0.0.0.0:8888", "0.0.0.0:9999", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.FetchProxy.Listen = tt.fetchListen
+			cfg.Agents = map[string]config.AgentProfile{
+				"agent-a": {Listeners: []string{tt.agentListener}},
+			}
+			err := ValidateAgents(cfg)
+			if tt.wantCollision && err == nil {
+				t.Fatalf("expected collision: %s vs %s", tt.fetchListen, tt.agentListener)
+			}
+			if !tt.wantCollision && err != nil {
+				t.Fatalf("unexpected collision: %v", err)
+			}
+		})
+	}
+}
+
+func TestCanonicalizeAddr(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"empty host", ":8888", "0.0.0.0:8888"},
+		{"ipv4 all", "0.0.0.0:8888", "0.0.0.0:8888"},
+		{"ipv6 all", "[::]:8888", "0.0.0.0:8888"},
+		{"verbose ipv6 zero", "[0:0:0:0:0:0:0:0]:8888", "0.0.0.0:8888"},
+		{"ipv4 loopback", "127.0.0.1:8888", "127.0.0.1:8888"},
+		{"ipv6 loopback", "[::1]:8888", "[::1]:8888"},
+		{"non-canonical ipv6", "[0000::1]:8888", "[::1]:8888"},
+		{"invalid", "not-valid", "not-valid"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := canonicalizeAddr(tt.input)
+			if got != tt.want {
+				t.Errorf("canonicalizeAddr(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateAgents_WildcardVsSpecificCollision(t *testing.T) {
+	tests := []struct {
+		name          string
+		fetchListen   string
+		agentListener string
+		wantErr       bool
+	}{
+		// Wildcard main + specific agent: conflict
+		{"wildcard main loopback agent", "0.0.0.0:8888", "127.0.0.1:8888", true},
+		{"wildcard main ipv6 loopback agent", "0.0.0.0:8888", "[::1]:8888", true},
+		// Specific main + wildcard agent: conflict
+		{"loopback main wildcard agent", "127.0.0.1:8888", "0.0.0.0:8888", true},
+		// Different ports: no conflict
+		{"wildcard main loopback agent different port", "0.0.0.0:8888", "127.0.0.1:9999", false},
+		// Two specific addresses on same port: no conflict
+		{"two specific same port", "127.0.0.1:8888", "127.0.0.2:8888", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.FetchProxy.Listen = tt.fetchListen
+			cfg.Agents = map[string]config.AgentProfile{
+				"agent-a": {Listeners: []string{tt.agentListener}},
+			}
+			err := ValidateAgents(cfg)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected collision between %s and %s", tt.fetchListen, tt.agentListener)
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateAgents_WildcardVsSpecificBetweenAgents(t *testing.T) {
+	cfg := testConfig()
+	cfg.FetchProxy.Listen = "127.0.0.1:7777" // avoid collision with agents
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {Listeners: []string{"0.0.0.0:9001"}},
+		"agent-b": {Listeners: []string{"127.0.0.1:9001"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected collision: 0.0.0.0:9001 vs 127.0.0.1:9001")
+	}
+}
+
+func TestWildcardPortConflict(t *testing.T) {
+	tests := []struct {
+		name     string
+		canon    string
+		reserved map[string]string
+		wantHit  bool
+	}{
+		{
+			"wildcard vs specific same port",
+			"0.0.0.0:8888",
+			map[string]string{"127.0.0.1:8888": "main"},
+			true,
+		},
+		{
+			"specific vs wildcard same port",
+			"127.0.0.1:8888",
+			map[string]string{"0.0.0.0:8888": "main"},
+			true,
+		},
+		{
+			"different ports",
+			"0.0.0.0:8888",
+			map[string]string{"127.0.0.1:9999": "main"},
+			false,
+		},
+		{
+			"two wildcards same port (caught by exact match)",
+			"0.0.0.0:8888",
+			map[string]string{"0.0.0.0:8888": "main"},
+			false, // both wildcard, not a wildcard-vs-specific
+		},
+		{
+			"two specifics same port",
+			"127.0.0.1:8888",
+			map[string]string{"127.0.0.2:8888": "main"},
+			false,
+		},
+		{
+			"invalid canon",
+			"not-valid",
+			map[string]string{"0.0.0.0:8888": "main"},
+			false,
+		},
+		{
+			"empty reserved",
+			"0.0.0.0:8888",
+			map[string]string{},
+			false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := wildcardPortConflict(tt.canon, tt.reserved)
+			if tt.wantHit && got == "" {
+				t.Error("expected conflict, got none")
+			}
+			if !tt.wantHit && got != "" {
+				t.Errorf("unexpected conflict: %s", got)
+			}
+		})
+	}
+}
+
+func TestValidateAgents_InvalidListenerFormat(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {Listeners: []string{"not-a-valid-addr"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for invalid listener format")
+	}
+}
+
+func TestValidateAgents_NegativeBudget(t *testing.T) {
+	fields := []struct {
+		name   string
+		budget config.BudgetConfig
+	}{
+		{"max_requests", config.BudgetConfig{MaxRequestsPerSession: -1}},
+		{"max_bytes", config.BudgetConfig{MaxBytesPerSession: -1}},
+		{"max_domains", config.BudgetConfig{MaxUniqueDomainsPerSession: -1}},
+		{"window_minutes", config.BudgetConfig{WindowMinutes: -1}},
+	}
+	for _, tt := range fields {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Agents = map[string]config.AgentProfile{
+				"agent": {Budget: tt.budget},
+			}
+			if err := ValidateAgents(cfg); err == nil {
+				t.Fatalf("expected error for negative %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestValidateAgents_SourceCIDRsValid(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {SourceCIDRs: []string{"10.0.0.0/24"}},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("expected valid CIDRs: %v", err)
+	}
+}
+
+func TestValidateAgents_SourceCIDRsInvalid(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {SourceCIDRs: []string{"not-a-cidr"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for invalid CIDR")
+	}
+}
+
+func TestValidateAgents_SourceCIDRsOverlap(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {SourceCIDRs: []string{"10.0.0.0/24"}},
+		"agent-b": {SourceCIDRs: []string{"10.0.0.0/16"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for overlapping CIDRs across agents")
+	}
+}
+
+func TestValidateAgents_SourceCIDRsSameAgentAllowed(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent-a": {SourceCIDRs: []string{"10.0.0.0/24", "10.0.0.0/16"}},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("same-agent CIDR overlap should be allowed: %v", err)
+	}
+}
+
+func TestValidateAgents_InvalidDLPPattern(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			DLP: &config.AgentDLP{
+				Patterns: []config.DLPPattern{{Name: "bad", Regex: "[invalid"}},
+			},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for invalid DLP regex")
+	}
+}
+
+func TestValidateAgents_DLPMissingName(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			DLP: &config.AgentDLP{
+				Patterns: []config.DLPPattern{{Name: "", Regex: "foo"}},
+			},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for DLP pattern with missing name")
+	}
+}
+
+func TestValidateAgents_DLPMissingRegex(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			DLP: &config.AgentDLP{
+				Patterns: []config.DLPPattern{{Name: "test", Regex: ""}},
+			},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for DLP pattern with missing regex")
+	}
+}
+
+func TestValidateAgents_NegativeRateDataPerMinute(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			RateLimit: &config.AgentRateLimit{MaxDataPerMinute: -1},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for negative max_data_per_minute")
+	}
+}
+
+func TestValidateAgents_ValidDLPPatterns(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			DLP: &config.AgentDLP{
+				Patterns: []config.DLPPattern{
+					{Name: "custom-key", Regex: "sk-[a-z]+"},
+				},
+			},
+		},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("expected valid DLP patterns: %v", err)
+	}
+}
+
+func TestValidateAgents_NegativeRateLimits(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			RateLimit: &config.AgentRateLimit{MaxRequestsPerMinute: -1},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for negative rate limit")
+	}
+}
+
+func TestMergeAgentProfile_NilProfile(t *testing.T) {
+	cfg := testConfig()
+	merged, err := MergeAgentProfile(cfg, nil)
+	if err != nil {
+		t.Fatalf("MergeAgentProfile nil: %v", err)
+	}
+	if merged == cfg {
+		t.Error("expected deep copy, not same pointer")
+	}
+}
+
+func TestMergeAgentProfile_ModeOverride(t *testing.T) {
+	cfg := testConfig()
+	cfg.Mode = config.ModeBalanced
+	profile := &config.AgentProfile{Mode: config.ModeStrict}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Mode != config.ModeStrict {
+		t.Errorf("mode = %q, want strict", merged.Mode)
+	}
+	// Base should be unchanged.
+	if cfg.Mode != config.ModeBalanced {
+		t.Error("base config was mutated")
+	}
+}
+
+func TestMergeAgentProfile_DLPIncludeDefaults(t *testing.T) {
+	cfg := testConfig()
+	// cfg.DLP.Patterns has default patterns.
+	baseCount := len(cfg.DLP.Patterns)
+
+	profile := &config.AgentProfile{
+		DLP: &config.AgentDLP{
+			Patterns: []config.DLPPattern{{Name: "custom", Regex: "custom-.*"}},
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Should have base patterns + custom (include_defaults = nil means true).
+	if len(merged.DLP.Patterns) != baseCount+1 {
+		t.Errorf("expected %d patterns, got %d", baseCount+1, len(merged.DLP.Patterns))
+	}
+}
+
+func TestMergeAgentProfile_DLPReplaceDefaults(t *testing.T) {
+	cfg := testConfig()
+	f := false
+	profile := &config.AgentProfile{
+		DLP: &config.AgentDLP{
+			IncludeDefaults: &f,
+			Patterns:        []config.DLPPattern{{Name: "only", Regex: "only-.*"}},
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged.DLP.Patterns) != 1 {
+		t.Errorf("expected 1 pattern (replace mode), got %d", len(merged.DLP.Patterns))
+	}
+}
+
+func TestMergeAgentProfile_RestoresExactCredentialAudienceMetadata(t *testing.T) {
+	cfg := testConfig()
+	expected := make(map[string][]string)
+	var serialized []config.DLPPattern
+	for _, pattern := range config.DefaultDLPPatterns() {
+		if len(pattern.CredentialAudienceHosts) > 0 {
+			expected[pattern.Name] = append([]string(nil), pattern.CredentialAudienceHosts...)
+			pattern.CredentialAudienceHosts = nil // YAML profile form
+			serialized = append(serialized, pattern)
+		}
+	}
+	if len(expected) == 0 {
+		t.Fatal("built-in credential audience registry is empty")
+	}
+
+	profile := &config.AgentProfile{DLP: &config.AgentDLP{
+		Patterns: serialized,
+	}}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := make(map[string]bool, len(expected))
+	for _, pattern := range merged.DLP.Patterns {
+		want, ok := expected[pattern.Name]
+		if !ok {
+			continue
+		}
+		seen[pattern.Name] = true
+		if !slices.Equal(pattern.CredentialAudienceHosts, want) {
+			t.Errorf("merged %q audience = %#v, want %#v", pattern.Name, pattern.CredentialAudienceHosts, want)
+		}
+	}
+	if len(seen) != len(expected) {
+		t.Fatalf("restored %d of %d audience patterns", len(seen), len(expected))
+	}
+}
+
+func TestMergeAgentProfile_RestoresCredentialAudiencesWithoutDLPOverride(t *testing.T) {
+	tests := []struct {
+		name    string
+		profile *config.AgentProfile
+	}{
+		{name: "nil profile"},
+		{name: "listener-only profile", profile: &config.AgentProfile{Listeners: []string{"127.0.0.1:8889"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			merged, err := MergeAgentProfile(cfg, tt.profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var found bool
+			for _, pattern := range merged.DLP.Patterns {
+				if pattern.Name != "Slack App Token" {
+					continue
+				}
+				found = true
+				if !slices.Contains(pattern.CredentialAudienceHosts, "slack.com") {
+					t.Fatalf("Slack App Token audience = %#v, want slack.com", pattern.CredentialAudienceHosts)
+				}
+			}
+			if !found {
+				t.Fatal("Slack App Token pattern missing")
+			}
+		})
+	}
+}
+
+func TestMergeAgentProfile_CustomSameNameDoesNotGainCredentialAudience(t *testing.T) {
+	cfg := testConfig()
+	profile := &config.AgentProfile{DLP: &config.AgentDLP{Patterns: []config.DLPPattern{{
+		Name:     "Slack App Token",
+		Regex:    `custom-[A-Za-z]{20}`,
+		Severity: config.SeverityCritical,
+	}}}}
+
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, pattern := range merged.DLP.Patterns {
+		if pattern.Name == "Slack App Token" {
+			found = true
+			if len(pattern.CredentialAudienceHosts) != 0 {
+				t.Fatalf("custom same-name pattern gained audience %#v", pattern.CredentialAudienceHosts)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("custom Slack App Token pattern missing")
+	}
+}
+
+func TestValidateMergedAgent_StrictNoAllowlist(t *testing.T) {
+	cfg := testConfig()
+	cfg.Mode = config.ModeStrict
+	cfg.APIAllowlist = nil
+	if err := ValidateMergedAgent("test", cfg); err == nil {
+		t.Fatal("expected error for strict mode without allowlist")
+	}
+}
+
+func TestValidateMergedAgent_Valid(t *testing.T) {
+	cfg := testConfig()
+	cfg.Mode = config.ModeStrict
+	cfg.APIAllowlist = []string{"api.example.com"}
+	if err := ValidateMergedAgent("test", cfg); err != nil {
+		t.Fatalf("expected valid: %v", err)
+	}
+}
+
+func testLicenseKeyPair(t *testing.T) (token string, pubHex string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	lic := license.License{
+		ID:        "lic_test123",
+		Email:     "test@example.com",
+		IssuedAt:  now.Unix(),
+		Features:  []string{license.FeatureAgents},
+		ExpiresAt: now.Add(24 * time.Hour).Unix(),
+		Tier:      "pro",
+	}
+	tok, err := license.Issue(lic, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok, hex.EncodeToString(pub)
+}
+
+func testIntermediateLicenseBundle(t *testing.T, serial string, notBefore, notAfter time.Time) (rootPub ed25519.PublicKey, rootPriv ed25519.PrivateKey, token string, cert []byte) {
+	t.Helper()
+	rootPub, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intermediatePub, intermediatePriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	im, err := license.SignIntermediate(license.IntermediatePayload{
+		Serial:    serial,
+		Purpose:   license.PurposeLicenseSigning,
+		Algorithm: license.AlgorithmEd25519,
+		PublicKey: hex.EncodeToString(intermediatePub),
+		NotBefore: notBefore.Unix(),
+		NotAfter:  notAfter.Unix(),
+		IssuedAt:  notBefore.Unix(),
+	}, rootPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err = json.Marshal(im)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lic := license.License{
+		ID:        "lic_" + serial,
+		Email:     "test@example.com",
+		Features:  []string{license.FeatureAgents},
+		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
+	}
+	token, err = license.Issue(lic, intermediatePriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rootPub, rootPriv, token, cert
+}
+
+func testConfigWithNamedAgent() *config.Config {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	return cfg
+}
+
+func TestEnforceLicenseGate_NoAgents(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = nil
+	EnforceLicenseGate(cfg) // should not panic
+}
+
+func TestEnforceLicenseGate_OnlyDefault(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"_default": {Mode: config.ModeBalanced},
+	}
+	EnforceLicenseGate(cfg)
+	if cfg.Agents == nil {
+		t.Error("_default-only agents should not be disabled")
+	}
+}
+
+func TestEnforceLicenseGate_NoLicenseKey(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = ""
+	EnforceLicenseGate(cfg)
+	if len(cfg.Agents) != 0 {
+		t.Error("expected named agents disabled when no license key")
+	}
+	if cfg.LicenseAgentsFeature {
+		t.Error("LicenseAgentsFeature should stay false when no license key")
+	}
+}
+
+func TestEnforceLicenseGate_RecordsDisabledAgents(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noAgents, err := license.Issue(license.License{
+		ID:        "lic_nofeature",
+		Email:     "test@example.com",
+		Features:  []string{"some-other-feature"},
+		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		key        string
+		pubHex     string
+		wantReason string
+	}{
+		{name: "no key", wantReason: "no license key is configured"},
+		{name: "no public key", key: noAgents, wantReason: "no license public key is available"},
+		{name: "invalid token", key: "not-a-token", pubHex: hex.EncodeToString(pub), wantReason: "license verification failed: "},
+		{name: "missing feature", key: noAgents, pubHex: hex.EncodeToString(pub), wantReason: "license lic_nofeature does not include the agents feature"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Agents = map[string]config.AgentProfile{
+				"_default":        {Mode: config.ModeBalanced},
+				"contained-agent": {Listeners: []string{"127.0.0.1:8889"}},
+				"listenerless":    {Mode: config.ModeStrict},
+			}
+			cfg.LicenseKey = tc.key
+			cfg.LicensePublicKey = tc.pubHex
+			EnforceLicenseGate(cfg)
+			if _, ok := cfg.Agents["contained-agent"]; ok {
+				t.Fatal("named profile survived the license gate")
+			}
+			if _, ok := cfg.LicenseDisabledAgents["_default"]; ok {
+				t.Error("_default is never disabled and must not be recorded")
+			}
+			if got := cfg.LicenseDisabledAgents["contained-agent"]; !slices.Equal(got, []string{"127.0.0.1:8889"}) {
+				t.Errorf("recorded listeners = %v, want [127.0.0.1:8889]", got)
+			}
+			if _, ok := cfg.LicenseDisabledAgents["listenerless"]; !ok {
+				t.Error("listenerless profile was not recorded")
+			}
+			if !strings.HasPrefix(cfg.LicenseDisabledReason, tc.wantReason) {
+				t.Errorf("reason = %q, want prefix %q", cfg.LicenseDisabledReason, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestEnforceLicenseGate_NoLicenseKey_PreservesDefault(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"_default":    {Budget: config.BudgetConfig{MaxRetriesPerTool: 5}},
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = ""
+	EnforceLicenseGate(cfg)
+	if len(cfg.Agents) != 1 {
+		t.Fatalf("expected 1 agent (_default preserved), got %d", len(cfg.Agents))
+	}
+	def, ok := cfg.Agents["_default"]
+	if !ok {
+		t.Fatal("expected _default profile to survive license gate rejection")
+	}
+	if def.Budget.MaxRetriesPerTool != 5 {
+		t.Errorf("_default budget lost: MaxRetriesPerTool = %d, want 5", def.Budget.MaxRetriesPerTool)
+	}
+	if _, hasNamed := cfg.Agents["claude-code"]; hasNamed {
+		t.Error("named agent should have been stripped")
+	}
+}
+
+func TestEnforceLicenseGate_ValidLicense(t *testing.T) {
+	token, pubHex := testLicenseKeyPair(t)
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = token
+	cfg.LicensePublicKey = pubHex
+
+	EnforceLicenseGate(cfg)
+	fixture, err := license.DecodeUnverified(token)
+	if err != nil {
+		t.Fatalf("decode test license: %v", err)
+	}
+	if cfg.Agents == nil {
+		t.Error("expected agents to remain with valid license")
+	}
+	if cfg.LicenseExpiresAt != fixture.ExpiresAt {
+		t.Errorf("LicenseExpiresAt = %d, want fixture claim %d", cfg.LicenseExpiresAt, fixture.ExpiresAt)
+	}
+	if cfg.LicenseIssuedAt != fixture.IssuedAt {
+		t.Errorf("LicenseIssuedAt = %d, want fixture claim %d", cfg.LicenseIssuedAt, fixture.IssuedAt)
+	}
+	if cfg.LicenseTier != "pro" {
+		t.Errorf("LicenseTier = %q, want pro", cfg.LicenseTier)
+	}
+	if !cfg.LicenseAgentsFeature {
+		t.Error("expected LicenseAgentsFeature=true after valid agents license")
+	}
+}
+
+func TestEnforceLicenseGate_IntermediateChain(t *testing.T) {
+	now := time.Now().UTC()
+
+	t.Run("valid chain allows agents", func(t *testing.T) {
+		rootPub, _, token, cert := testIntermediateLicenseBundle(t, "im_agents_valid", now.Add(-time.Minute), now.Add(time.Hour))
+		cfg := testConfigWithNamedAgent()
+		cfg.LicenseKey = token
+		cfg.LicensePublicKey = hex.EncodeToString(rootPub)
+		cfg.LicenseIntermediateCert = cert
+
+		EnforceLicenseGate(cfg)
+		if cfg.Agents == nil {
+			t.Fatal("expected agents to remain with valid intermediate chain")
+		}
+	})
+
+	t.Run("expired intermediate denies", func(t *testing.T) {
+		rootPub, _, token, cert := testIntermediateLicenseBundle(t, "im_agents_expired", now.Add(-2*time.Hour), now.Add(-time.Hour))
+		cfg := testConfigWithNamedAgent()
+		cfg.LicenseKey = token
+		cfg.LicensePublicKey = hex.EncodeToString(rootPub)
+		cfg.LicenseIntermediateCert = cert
+
+		EnforceLicenseGate(cfg)
+		if cfg.Agents != nil {
+			t.Fatal("expected agents disabled with expired intermediate")
+		}
+	})
+
+	t.Run("malformed intermediate denies", func(t *testing.T) {
+		token, pubHex := testLicenseKeyPair(t)
+		cfg := testConfigWithNamedAgent()
+		cfg.LicenseKey = token
+		cfg.LicensePublicKey = pubHex
+		cfg.LicenseIntermediateCert = []byte("{bad json")
+
+		EnforceLicenseGate(cfg)
+		if cfg.Agents != nil {
+			t.Fatal("expected agents disabled with malformed intermediate")
+		}
+	})
+
+	t.Run("load error denies without direct root fallback", func(t *testing.T) {
+		token, pubHex := testLicenseKeyPair(t)
+		cfg := testConfigWithNamedAgent()
+		cfg.LicenseKey = token
+		cfg.LicensePublicKey = pubHex
+		cfg.LicenseIntermediateLoadError = "stat license_intermediate_file: no such file"
+
+		EnforceLicenseGate(cfg)
+		if cfg.Agents != nil {
+			t.Fatal("expected agents disabled when configured intermediate failed to load")
+		}
+		if cfg.LicenseID != "" {
+			t.Fatalf("license ID = %q, want empty for rejected intermediate load", cfg.LicenseID)
+		}
+		if cfg.LicenseRevoked {
+			t.Fatal("license should not be marked revoked for intermediate load failure")
+		}
+	})
+
+	t.Run("wrong root intermediate denies", func(t *testing.T) {
+		_, _, token, cert := testIntermediateLicenseBundle(t, "im_agents_wrong_root", now.Add(-time.Minute), now.Add(time.Hour))
+		wrongRootPub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := testConfigWithNamedAgent()
+		cfg.LicenseKey = token
+		cfg.LicensePublicKey = hex.EncodeToString(wrongRootPub)
+		cfg.LicenseIntermediateCert = cert
+
+		EnforceLicenseGate(cfg)
+		if cfg.Agents != nil {
+			t.Fatal("expected agents disabled with wrong-root intermediate")
+		}
+	})
+
+	t.Run("revoked intermediate denies", func(t *testing.T) {
+		const serial = "im_agents_revoked"
+		rootPub, rootPriv, token, cert := testIntermediateLicenseBundle(t, serial, now.Add(-time.Minute), now.Add(time.Hour))
+		cfg := testConfigWithNamedAgent()
+		cfg.LicenseKey = token
+		cfg.LicensePublicKey = hex.EncodeToString(rootPub)
+		cfg.LicenseIntermediateCert = cert
+
+		crl, err := license.SignCRL(license.CRLPayload{
+			Version:   license.CRLVersion,
+			IssuedAt:  now.Add(-time.Minute).Unix(),
+			ExpiresAt: now.Add(time.Hour).Unix(),
+			RevokedIntermediates: []license.RevokedIntermediate{{
+				Serial:    serial,
+				Reason:    "rotation",
+				RevokedAt: now.Unix(),
+			}},
+		}, rootPriv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		crlData, err := json.Marshal(crl)
+		if err != nil {
+			t.Fatal(err)
+		}
+		crlPath := filepath.Join(t.TempDir(), "crl.json")
+		if err := os.WriteFile(crlPath, crlData, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg.LicenseCRLFile = crlPath
+
+		EnforceLicenseGate(cfg)
+		if cfg.Agents != nil {
+			t.Fatal("expected agents disabled with revoked intermediate")
+		}
+	})
+}
+
+func TestEnforceLicenseGate_RevokedLicense(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	lic := license.License{
+		ID:        "lic_revoked_gate",
+		Email:     "test@example.com",
+		Features:  []string{license.FeatureAgents},
+		ExpiresAt: now.Add(24 * time.Hour).Unix(),
+	}
+	tok, err := license.Issue(lic, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crl, err := license.SignCRL(license.CRLPayload{
+		Version:   license.CRLVersion,
+		IssuedAt:  now.Add(-time.Hour).Unix(),
+		ExpiresAt: now.Add(24 * time.Hour).Unix(),
+		Revoked: []license.RevokedLicense{{
+			ID:        lic.ID,
+			Reason:    "subscription_canceled",
+			RevokedAt: now.Add(-time.Hour).Unix(),
+		}},
+	}, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(crl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	crlPath := filepath.Join(t.TempDir(), "crl.json")
+	if err := os.WriteFile(crlPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = tok
+	cfg.LicensePublicKey = hex.EncodeToString(pub)
+	cfg.LicenseCRLFile = crlPath
+
+	EnforceLicenseGate(cfg)
+	if cfg.Agents != nil {
+		t.Error("expected agents disabled with revoked license")
+	}
+	if !cfg.LicenseRevoked {
+		t.Error("expected LicenseRevoked=true")
+	}
+	if cfg.LicenseRevocationReason != "subscription_canceled" {
+		t.Errorf("LicenseRevocationReason = %q", cfg.LicenseRevocationReason)
+	}
+}
+
+func TestEnforceLicenseGate_InvalidToken(t *testing.T) {
+	_, pubHex := testLicenseKeyPair(t)
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = "invalid-token"
+	cfg.LicensePublicKey = pubHex
+
+	EnforceLicenseGate(cfg)
+	if cfg.Agents != nil {
+		t.Error("expected agents disabled with invalid token")
+	}
+}
+
+func TestEnforceLicenseGate_ExpiredLicense(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lic := license.License{
+		ID:        "lic_expired",
+		Email:     "test@example.com",
+		Features:  []string{license.FeatureAgents},
+		ExpiresAt: time.Now().Add(-24 * time.Hour).Unix(), // expired yesterday
+	}
+	tok, err := license.Issue(lic, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = tok
+	cfg.LicensePublicKey = hex.EncodeToString(pub)
+
+	EnforceLicenseGate(cfg)
+	if cfg.Agents != nil {
+		t.Error("expected agents disabled with expired license")
+	}
+}
+
+func TestEnforceLicenseGate_MissingFeature(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lic := license.License{
+		ID:        "lic_nofeature",
+		Email:     "test@example.com",
+		Features:  []string{"some-other-feature"}, // no "agents" feature
+		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
+	}
+	tok, err := license.Issue(lic, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = tok
+	cfg.LicensePublicKey = hex.EncodeToString(pub)
+
+	EnforceLicenseGate(cfg)
+	if cfg.Agents != nil {
+		t.Error("expected agents disabled when license lacks 'agents' feature")
+	}
+	if cfg.LicenseAgentsFeature {
+		t.Error("LicenseAgentsFeature should stay false when license lacks 'agents' feature")
+	}
+}
+
+func TestValidateMergedAgent_InvalidAnomalyAction(t *testing.T) {
+	cfg := testConfig()
+	cfg.SessionProfiling.Enabled = true
+	cfg.SessionProfiling.AnomalyAction = "invalid"
+	if err := ValidateMergedAgent("test", cfg); err == nil {
+		t.Fatal("expected error for invalid anomaly_action")
+	}
+}
+
+func TestValidateMergedAgent_ValidAnomalyAction(t *testing.T) {
+	cfg := testConfig()
+	cfg.SessionProfiling.Enabled = true
+	cfg.SessionProfiling.AnomalyAction = config.ActionWarn
+	if err := ValidateMergedAgent("test", cfg); err != nil {
+		t.Fatalf("expected valid: %v", err)
+	}
+}
+
+func TestValidateMergedAgent_InvalidMCPToolPolicyAction(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = "invalid"
+	if err := ValidateMergedAgent("test", cfg); err == nil {
+		t.Fatal("expected error for invalid mcp_tool_policy.action")
+	}
+}
+
+func TestValidateMergedAgent_ValidMCPToolPolicyAction(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionBlock
+	if err := ValidateMergedAgent("test", cfg); err != nil {
+		t.Fatalf("expected valid: %v", err)
+	}
+}
+
+func TestMergeAgentProfile_EnforceOverride(t *testing.T) {
+	cfg := testConfig()
+	cfg.Enforce = nil
+	enforceVal := true
+	profile := &config.AgentProfile{Enforce: &enforceVal}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Enforce == nil || !*merged.Enforce {
+		t.Error("expected enforce=true after merge")
+	}
+}
+
+func TestMergeAgentProfile_APIAllowlistOverride(t *testing.T) {
+	cfg := testConfig()
+	cfg.APIAllowlist = []string{"base.example.com"}
+	profile := &config.AgentProfile{APIAllowlist: []string{"agent.example.com"}}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged.APIAllowlist) != 1 || merged.APIAllowlist[0] != "agent.example.com" {
+		t.Errorf("expected agent allowlist, got %v", merged.APIAllowlist)
+	}
+}
+
+func TestMergeAgentProfile_RateLimitOverride(t *testing.T) {
+	cfg := testConfig()
+	profile := &config.AgentProfile{
+		RateLimit: &config.AgentRateLimit{
+			MaxRequestsPerMinute: 42,
+			MaxDataPerMinute:     1024,
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.FetchProxy.Monitoring.MaxReqPerMinute != 42 {
+		t.Errorf("max_req_per_minute = %d, want 42", merged.FetchProxy.Monitoring.MaxReqPerMinute)
+	}
+	if merged.FetchProxy.Monitoring.MaxDataPerMinute != 1024 {
+		t.Errorf("max_data_per_minute = %d, want 1024", merged.FetchProxy.Monitoring.MaxDataPerMinute)
+	}
+}
+
+func TestMergeAgentProfile_SessionProfilingOverride(t *testing.T) {
+	cfg := testConfig()
+	profile := &config.AgentProfile{
+		SessionProfiling: &config.AgentSessionProf{
+			DomainBurst:   10,
+			AnomalyAction: config.ActionBlock,
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.SessionProfiling.DomainBurst != 10 {
+		t.Errorf("domain_burst = %d, want 10", merged.SessionProfiling.DomainBurst)
+	}
+	if merged.SessionProfiling.AnomalyAction != config.ActionBlock {
+		t.Errorf("anomaly_action = %q, want block", merged.SessionProfiling.AnomalyAction)
+	}
+}
+
+func TestMergeAgentProfile_MCPToolPolicyOverride(t *testing.T) {
+	cfg := testConfig()
+	profile := &config.AgentProfile{
+		MCPToolPolicy: &config.MCPToolPolicy{
+			Enabled: true,
+			Action:  config.ActionBlock,
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged.MCPToolPolicy.Enabled {
+		t.Error("expected mcp_tool_policy.enabled=true")
+	}
+	if merged.MCPToolPolicy.Action != config.ActionBlock {
+		t.Errorf("action = %q, want block", merged.MCPToolPolicy.Action)
+	}
+}
+
+const testBaseWorkspace = "/base/workspace"
+
+func TestMergeAgentProfile_SandboxOverride(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sandbox.Enabled = false
+	cfg.Sandbox.Strict = false
+	cfg.Sandbox.Workspace = testBaseWorkspace
+	cfg.Sandbox.FS = &config.SandboxFilesystem{
+		AllowRead:  []string{"/base/read"},
+		AllowWrite: []string{"/base/write"},
+	}
+
+	enabled := true
+	strict := true
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{
+			Enabled:   &enabled,
+			Strict:    &strict,
+			Workspace: "/agent/workspace",
+			FS: &config.SandboxFilesystem{
+				AllowRead:  []string{"/agent/read"},
+				AllowWrite: []string{"/agent/write"},
+			},
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged.Sandbox.Enabled {
+		t.Error("expected sandbox.enabled=true after override")
+	}
+	if !merged.Sandbox.Strict {
+		t.Error("expected sandbox.strict=true after override")
+	}
+	if merged.Sandbox.Workspace != "/agent/workspace" {
+		t.Errorf("workspace = %q, want /agent/workspace", merged.Sandbox.Workspace)
+	}
+	// FS paths should be appended (base + agent), not replaced.
+	if len(merged.Sandbox.FS.AllowRead) != 2 {
+		t.Errorf("AllowRead len = %d, want 2 (base + agent)", len(merged.Sandbox.FS.AllowRead))
+	}
+	if len(merged.Sandbox.FS.AllowWrite) != 2 {
+		t.Errorf("AllowWrite len = %d, want 2 (base + agent)", len(merged.Sandbox.FS.AllowWrite))
+	}
+}
+
+func TestMergeAgentProfile_SandboxNilInherits(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sandbox.Enabled = true
+	cfg.Sandbox.Strict = true
+	cfg.Sandbox.Workspace = testBaseWorkspace
+
+	// Profile with nil Sandbox - should inherit everything from base.
+	profile := &config.AgentProfile{}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged.Sandbox.Enabled {
+		t.Error("expected sandbox.enabled=true (inherited)")
+	}
+	if !merged.Sandbox.Strict {
+		t.Error("expected sandbox.strict=true (inherited)")
+	}
+	if merged.Sandbox.Workspace != testBaseWorkspace {
+		t.Errorf("workspace = %q, want /base/workspace (inherited)", merged.Sandbox.Workspace)
+	}
+}
+
+func TestMergeAgentProfile_SandboxExplicitFalse(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sandbox.Enabled = true
+	cfg.Sandbox.Strict = true
+
+	disabled := false
+	notStrict := false
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{
+			Enabled: &disabled,
+			Strict:  &notStrict,
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Sandbox.Enabled {
+		t.Error("expected sandbox.enabled=false (explicit override)")
+	}
+	if merged.Sandbox.Strict {
+		t.Error("expected sandbox.strict=false (explicit override)")
+	}
+}
+
+func TestMergeAgentProfile_SandboxFSAppendToNilBase(t *testing.T) {
+	cfg := testConfig()
+	// Base has no FS config.
+	cfg.Sandbox.FS = nil
+
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{
+			FS: &config.SandboxFilesystem{
+				AllowRead: []string{"/agent/data"},
+			},
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Sandbox.FS == nil {
+		t.Fatal("expected non-nil FS after merge")
+	}
+	if len(merged.Sandbox.FS.AllowRead) != 1 || merged.Sandbox.FS.AllowRead[0] != "/agent/data" {
+		t.Errorf("AllowRead = %v, want [/agent/data]", merged.Sandbox.FS.AllowRead)
+	}
+}
+
+func TestMergeAgentProfile_SandboxBestEffortOverride(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sandbox.BestEffort = false
+
+	bestEffort := true
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{
+			BestEffort: &bestEffort,
+		},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged.Sandbox.BestEffort {
+		t.Error("expected sandbox.best_effort=true (explicit override)")
+	}
+}
+
+func TestMergeAgentProfile_SandboxBestEffortInherits(t *testing.T) {
+	cfg := testConfig()
+	cfg.Sandbox.BestEffort = true
+
+	// Profile with nil BestEffort - should inherit from base.
+	profile := &config.AgentProfile{
+		Sandbox: &config.AgentSandboxOverride{},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !merged.Sandbox.BestEffort {
+		t.Error("expected sandbox.best_effort=true (inherited from base)")
+	}
+}
+
+func TestResolvePublicKey_InvalidHex(t *testing.T) {
+	cfg := testConfig()
+	cfg.LicensePublicKey = "not-valid-hex"
+	key := resolvePublicKey(cfg)
+	if key != nil {
+		t.Error("expected nil for invalid hex")
+	}
+}
+
+func TestResolvePublicKey_WrongLength(t *testing.T) {
+	cfg := testConfig()
+	cfg.LicensePublicKey = hex.EncodeToString([]byte("too-short"))
+	key := resolvePublicKey(cfg)
+	if key != nil {
+		t.Error("expected nil for wrong key length")
+	}
+}
+
+func TestResolvePublicKey_Empty(t *testing.T) {
+	cfg := testConfig()
+	cfg.LicensePublicKey = ""
+	key := resolvePublicKey(cfg)
+	if key != nil {
+		t.Error("expected nil when no key configured")
+	}
+}
+
+func TestEnforceLicenseGate_NoPublicKey(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict},
+	}
+	cfg.LicenseKey = "some-token"
+	cfg.LicensePublicKey = ""
+	EnforceLicenseGate(cfg)
+	if cfg.Agents != nil {
+		t.Error("expected agents disabled when no public key")
+	}
+}
+
+func TestMergeAgentProfile_TrustedDomainsOverride(t *testing.T) {
+	cfg := testConfig()
+	cfg.TrustedDomains = []string{"base.example.com"}
+
+	profile := &config.AgentProfile{
+		TrustedDomains: []string{"agent.internal.corp", "*.dev.local"},
+	}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// TrustedDomains should be wholesale-replaced, not merged with base.
+	if len(merged.TrustedDomains) != 2 {
+		t.Fatalf("expected 2 trusted_domains (replaced), got %d", len(merged.TrustedDomains))
+	}
+	if merged.TrustedDomains[0] != "agent.internal.corp" {
+		t.Errorf("expected first domain 'agent.internal.corp', got %q", merged.TrustedDomains[0])
+	}
+	if merged.TrustedDomains[1] != "*.dev.local" {
+		t.Errorf("expected second domain '*.dev.local', got %q", merged.TrustedDomains[1])
+	}
+	// Verify base config is not mutated.
+	if len(cfg.TrustedDomains) != 1 || cfg.TrustedDomains[0] != "base.example.com" {
+		t.Error("base config TrustedDomains was mutated by merge")
+	}
+}
+
+func TestMergeAgentProfile_TrustedDomainsNilInherits(t *testing.T) {
+	cfg := testConfig()
+	cfg.TrustedDomains = []string{"inherited.example.com"}
+
+	// Profile with nil TrustedDomains - should inherit from base.
+	profile := &config.AgentProfile{}
+	merged, err := MergeAgentProfile(cfg, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged.TrustedDomains) != 1 || merged.TrustedDomains[0] != "inherited.example.com" {
+		t.Errorf("expected inherited trusted_domains, got %v", merged.TrustedDomains)
+	}
+}
+
+func TestDeepCopyConfig(t *testing.T) {
+	cfg := testConfig()
+	cfg.Mode = config.ModeStrict
+	cfg.LicenseIntermediateCert = []byte("intermediate-cert")
+	cfg.LicenseIntermediateLoadError = "load failed"
+	cfg.LicenseAgentsFeature = true
+
+	cloned, err := deepCopyConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned.Mode = config.ModeAudit
+	if cfg.Mode != config.ModeStrict {
+		t.Error("deep copy mutated original")
+	}
+	if string(cloned.LicenseIntermediateCert) != "intermediate-cert" {
+		t.Fatalf("runtime intermediate cert not preserved: %q", string(cloned.LicenseIntermediateCert))
+	}
+	if cloned.LicenseIntermediateLoadError != "load failed" {
+		t.Fatalf("runtime intermediate load error = %q", cloned.LicenseIntermediateLoadError)
+	}
+	if !cloned.LicenseAgentsFeature {
+		t.Fatal("runtime agents feature bit was not preserved")
+	}
+	cloned.LicenseIntermediateCert[0] = 'X'
+	if string(cfg.LicenseIntermediateCert) != "intermediate-cert" {
+		t.Fatal("deep copy aliased runtime intermediate cert bytes")
+	}
+}
+
+// --- ValidateMergedAgent edge cases ---
+
+func TestValidateMergedAgent_RedirectProfileEmptyExec(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionRedirect
+	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
+		"my-handler": {Exec: []string{}},
+	}
+	err := ValidateMergedAgent("test", cfg)
+	if err == nil {
+		t.Fatal("expected error for redirect_profile with empty exec")
+	}
+}
+
+func TestValidateMergedAgent_RedirectProfileEmptyFirstArg(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionRedirect
+	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
+		"my-handler": {Exec: []string{""}},
+	}
+	err := ValidateMergedAgent("test", cfg)
+	if err == nil {
+		t.Fatal("expected error for redirect_profile with empty first exec arg")
+	}
+}
+
+func TestValidateMergedAgent_RuleRedirectMissingProfile(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionBlock
+	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
+		{Name: "test-rule", Action: config.ActionRedirect, RedirectProfile: ""},
+	}
+	err := ValidateMergedAgent("test", cfg)
+	if err == nil {
+		t.Fatal("expected error for redirect rule with empty redirect_profile")
+	}
+}
+
+func TestValidateMergedAgent_RuleRedirectUnknownProfile(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionBlock
+	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
+		"known": {Exec: []string{"/bin/true"}},
+	}
+	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
+		{Name: "test-rule", Action: config.ActionRedirect, RedirectProfile: "unknown"},
+	}
+	err := ValidateMergedAgent("test", cfg)
+	if err == nil {
+		t.Fatal("expected error for redirect rule referencing unknown profile")
+	}
+}
+
+func TestValidateMergedAgent_RuleInheritsDefaultAction(t *testing.T) {
+	// When a rule has no action, it inherits from the policy default.
+	// If policy default is redirect and rule has no redirect_profile, error.
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionRedirect
+	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
+		{Name: "test-rule", Action: "", RedirectProfile: ""},
+	}
+	err := ValidateMergedAgent("test", cfg)
+	if err == nil {
+		t.Fatal("expected error when inherited action=redirect but no redirect_profile")
+	}
+}
+
+func TestValidateMergedAgent_ValidRedirectConfig(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionBlock
+	cfg.MCPToolPolicy.RedirectProfiles = map[string]config.RedirectProfile{
+		"my-handler": {Exec: []string{"/usr/bin/handler", "--flag"}},
+	}
+	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{
+		{Name: "test-rule", Action: config.ActionRedirect, RedirectProfile: "my-handler"},
+	}
+	err := ValidateMergedAgent("test", cfg)
+	if err != nil {
+		t.Fatalf("expected valid config: %v", err)
+	}
+}
+
+func TestValidateMergedAgent_SessionProfilingDisabledSkipsValidation(t *testing.T) {
+	cfg := testConfig()
+	cfg.SessionProfiling.Enabled = false
+	cfg.SessionProfiling.AnomalyAction = "garbage" // invalid but should be ignored
+	err := ValidateMergedAgent("test", cfg)
+	if err != nil {
+		t.Fatalf("expected no error when session profiling is disabled: %v", err)
+	}
+}
+
+func TestValidateMergedAgent_MCPToolPolicyDisabledSkipsValidation(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = false
+	cfg.MCPToolPolicy.Action = "garbage" // invalid but should be ignored
+	err := ValidateMergedAgent("test", cfg)
+	if err != nil {
+		t.Fatalf("expected no error when mcp_tool_policy is disabled: %v", err)
+	}
+}
+
+func TestValidateMergedAgent_MCPToolPolicyActionRedirect(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionRedirect
+	err := ValidateMergedAgent("test", cfg)
+	if err != nil {
+		t.Fatalf("redirect is a valid mcp_tool_policy action: %v", err)
+	}
+}
+
+func TestValidateMergedAgent_MCPToolPolicyActionWarn(t *testing.T) {
+	cfg := testConfig()
+	cfg.MCPToolPolicy.Enabled = true
+	cfg.MCPToolPolicy.Action = config.ActionWarn
+	err := ValidateMergedAgent("test", cfg)
+	if err != nil {
+		t.Fatalf("warn is a valid mcp_tool_policy action: %v", err)
+	}
+}
+
+func TestValidateAgents_EmptySandboxPaths(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			Sandbox: &config.AgentSandboxOverride{
+				FS: &config.SandboxFilesystem{
+					AllowRead: []string{""},
+				},
+			},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for empty sandbox allow_read path")
+	}
+}
+
+func TestValidateAgents_EmptySandboxWritePaths(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"agent": {
+			Sandbox: &config.AgentSandboxOverride{
+				FS: &config.SandboxFilesystem{
+					AllowWrite: []string{""},
+				},
+			},
+		},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Fatal("expected error for empty sandbox allow_write path")
+	}
+}
+
+func TestMergeAgentProfile_SandboxBestEffortCarriesAuthorization(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	expiry := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	cfg := config.Defaults()
+	cfg.Sandbox.BestEffort = false
+	cfg.Sandbox.BestEffortReason = "top-level reason that must not leak"
+	cfg.Sandbox.BestEffortExpiry = "2000-01-01T00:00:00Z"
+
+	enabling := config.AgentProfile{Sandbox: &config.AgentSandboxOverride{
+		BestEffort:       boolPtr(true),
+		BestEffortReason: "runner blocks user namespaces",
+		BestEffortExpiry: expiry,
+	}}
+	merged, err := MergeAgentProfile(cfg, &enabling)
+	if err != nil {
+		t.Fatalf("MergeAgentProfile: %v", err)
+	}
+	if !merged.Sandbox.BestEffort {
+		t.Fatal("profile best_effort: true must enable the override")
+	}
+	if merged.Sandbox.BestEffortReason != "runner blocks user namespaces" || merged.Sandbox.BestEffortExpiry != expiry {
+		t.Fatalf("merged authorization = (%q, %q), want the profile's own reason and expiry", merged.Sandbox.BestEffortReason, merged.Sandbox.BestEffortExpiry)
+	}
+
+	cfg.Sandbox.BestEffort = true
+	cfg.Sandbox.BestEffortReason = "top-level override"
+	cfg.Sandbox.BestEffortExpiry = expiry
+	disabling := config.AgentProfile{Sandbox: &config.AgentSandboxOverride{BestEffort: boolPtr(false)}}
+	merged, err = MergeAgentProfile(cfg, &disabling)
+	if err != nil {
+		t.Fatalf("MergeAgentProfile: %v", err)
+	}
+	if merged.Sandbox.BestEffort {
+		t.Fatal("profile best_effort: false must disable the override")
+	}
+	if merged.Sandbox.BestEffortReason != "" || merged.Sandbox.BestEffortExpiry != "" {
+		t.Fatalf("a disabled override must not keep the top-level authorization, got (%q, %q)", merged.Sandbox.BestEffortReason, merged.Sandbox.BestEffortExpiry)
+	}
+
+	inheriting := config.AgentProfile{Sandbox: &config.AgentSandboxOverride{Enabled: boolPtr(true)}}
+	merged, err = MergeAgentProfile(cfg, &inheriting)
+	if err != nil {
+		t.Fatalf("MergeAgentProfile: %v", err)
+	}
+	if !merged.Sandbox.BestEffort || merged.Sandbox.BestEffortReason != "top-level override" || merged.Sandbox.BestEffortExpiry != expiry {
+		t.Fatal("a profile that says nothing about best_effort must inherit the top-level override and its authorization")
+	}
+}
+
+// A per-agent api_allowlist REPLACES the base list instead of merging into it,
+// so it never passed through the top-level raw-host check. U+212A KELVIN SIGN
+// lowercases to ASCII "k", so "*.<KELVIN>example.com" is stored as typed and
+// then matched as "*.kexample.com" — in strict mode that is an egress grant for
+// a host the operator never wrote. Written as a Go escape on purpose: the same
+// input lost its rune to a shell heredoc once and silently became ASCII "K",
+// which is legitimately accepted and asserts nothing.
+// The other half of the per-agent contract. A malformed pattern is compared
+// literally by MatchDomain, so in strict mode it matches nothing and denies
+// traffic the operator meant to permit. The first repair here gated raw bytes
+// only, which left this accepted.
+func TestValidateAgents_APIAllowlistRefusesMalformedHost(t *testing.T) {
+	for _, pattern := range []string{
+		"example.com#disabled",
+		"bad_host.example.com",
+		"example.com:443",
+		"https://example.com",
+	} {
+		cfg := testConfig()
+		cfg.Agents = map[string]config.AgentProfile{
+			"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{pattern}},
+		}
+		err := ValidateAgents(cfg)
+		if err == nil {
+			t.Errorf("%q was accepted on a per-agent api_allowlist; it matches nothing and silently denies the traffic it names", pattern)
+			continue
+		}
+		if !strings.Contains(err.Error(), "api_allowlist") {
+			t.Errorf("error for %q does not name the field, so the operator cannot locate it: %v", pattern, err)
+		}
+	}
+}
+
+func TestValidateAgents_APIAllowlistRefusesFoldingHost(t *testing.T) {
+	const kelvin = "*.\u212Aexample.com" // U+212A KELVIN SIGN, written as an escape on purpose
+
+	// The rune must survive into the source, or every assertion below passes for
+	// the wrong reason: an earlier draft of a sibling test lost it to a shell
+	// heredoc and became a plain ASCII "K", which is legitimately accepted.
+	if !strings.ContainsFunc(kelvin, func(r rune) bool { return r > 127 }) {
+		t.Fatal("the test input is pure ASCII; the Kelvin sign was lost and this test would assert nothing")
+	}
+
+	// Control: the same shape in plain ASCII is accepted, so a rejection below
+	// is about the rune and not about the wildcard or the strict mode.
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"*.kexample.com"}},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("control failed: the ASCII spelling must be accepted: %v", err)
+	}
+
+	cfg = testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{kelvin}},
+	}
+	err := ValidateAgents(cfg)
+	if err == nil {
+		t.Fatal("a KELVIN SIGN host was accepted on a per-agent api_allowlist; it folds to an ASCII egress grant the operator never wrote")
+	}
+	if !strings.Contains(err.Error(), "ASCII") {
+		t.Errorf("rejected for an unexpected reason, so this may not be the folding gate: %v", err)
+	}
+}
+
+// A per-agent api_allowlist REPLACES the base list, so the breadth rule has to
+// reach it independently or an agent profile becomes the way around a check the
+// top level enforces. Same reasoning as the top-level case: in strict mode this
+// list decides what may leave at all.
+func TestValidateAgents_APIAllowlistRefusesRegistryWildcard(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"*.com"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Error("\"*.com\" was accepted on a per-agent api_allowlist; that grants egress to every host under a registry")
+	}
+
+	// Control: a private boundary stays accepted here too, matching the
+	// top-level rule and this repository's own presets.
+	cfg = testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"*.googleapis.com"}},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Errorf("a private-boundary wildcard must stay accepted on a per-agent allowlist: %v", err)
+	}
+}

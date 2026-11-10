@@ -1,0 +1,528 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"os"
+	"slices"
+)
+
+// RuntimeMode selects which runtime-time defaults ResolveRuntime applies.
+// It is an explicit CLI-surface value: the same loaded Config can produce
+// different effective policies depending on which command path consumes it
+// (forward proxy alone, forward proxy with an MCP listener, or `mcp proxy`
+// wrapper), and canonical policy hashes stamped on receipts/envelopes must
+// reflect the mode-specific defaults that actually ran.
+type RuntimeMode uint8
+
+const (
+	// RuntimeForward runs the forward / fetch proxy without an MCP listener.
+	RuntimeForward RuntimeMode = iota + 1
+
+	// RuntimeForwardWithMCPListener runs the forward / fetch proxy alongside
+	// an MCP HTTP listener (run --mcp-listen). MCP input scanning, tool
+	// scanning, and tool policy auto-enable with safe defaults when the
+	// operator did not configure them.
+	RuntimeForwardWithMCPListener
+
+	// RuntimeMCPProxy runs `pipelock mcp proxy` in stdio or HTTP wrapping
+	// mode. Same MCP auto-enable as the listener mode, plus a response
+	// scanning fallback that re-enables defaults if the operator disabled
+	// response scanning (response scanning is the MCP proxy's primary
+	// injection surface).
+	RuntimeMCPProxy
+
+	// RuntimeMCPScan runs `pipelock mcp scan`, the one-shot stdin-driven
+	// scanner for MCP responses. Response scanning is the command's sole
+	// purpose so the fallback still fires. The command does not wrap an
+	// upstream server, so request-side auto-enable (MCP input scanning,
+	// tool policy) does not apply - scan never sees a request. Tool
+	// scanning is response-side (it inspects tools/list definitions) and
+	// DOES auto-enable for this mode: see NeedsToolScanningAutoEnable.
+	RuntimeMCPScan
+)
+
+// WrapsMCP reports whether the mode routes MCP traffic through pipelock and
+// therefore needs the request-side MCP scanning auto-enable defaults (input
+// scanning, tool policy). Scan mode is excluded from those two: it consumes
+// responses from stdin without ever proxying a request.
+func (m RuntimeMode) WrapsMCP() bool {
+	return m == RuntimeForwardWithMCPListener || m == RuntimeMCPProxy
+}
+
+// NeedsToolScanningAutoEnable reports whether the mode should auto-enable MCP
+// tool-definition scanning when the operator left it unconfigured. Tool
+// scanning inspects response content (tools/list definitions), so every mode
+// that processes MCP responses needs it - including RuntimeMCPScan, which
+// WrapsMCP() deliberately excludes because it has no request side.
+func (m RuntimeMode) NeedsToolScanningAutoEnable() bool {
+	return m.WrapsMCP() || m == RuntimeMCPScan
+}
+
+// NeedsResponseScanningFallback reports whether the mode requires the
+// response-scanning defaults to be re-enabled when the operator disabled
+// them. Both `mcp proxy` and `mcp scan` process MCP responses and rely on
+// response scanning for injection detection.
+func (m RuntimeMode) NeedsResponseScanningFallback() bool {
+	return m == RuntimeMCPProxy || m == RuntimeMCPScan
+}
+
+// RuntimeResolveOpts controls how ResolveRuntime assembles the effective
+// runtime policy. Each field is independently optional; zero-value opts
+// still produce a valid clone (no bundle merge, no auto-enable, no
+// fallback).
+type RuntimeResolveOpts struct {
+	// Mode selects the runtime profile. A zero value skips mode-specific
+	// auto-enable and the MCP proxy response-scanning fallback.
+	Mode RuntimeMode
+
+	// MergeBundles, if non-nil, is invoked on the freshly cloned config
+	// before any mode-specific auto-enable runs. Callers use it to merge
+	// rule bundles into DLP and response scanning pattern lists without
+	// creating an import cycle on the rules package.
+	MergeBundles func(*Config)
+
+	// DefaultToolPolicyRules, if non-nil, is invoked when MCP tool policy
+	// auto-enables to populate MCPToolPolicy.Rules. Passed as a function
+	// (rather than a slice) so it is only evaluated when auto-enable
+	// actually fires, and so the config package does not import the
+	// mcp/policy package that owns the defaults.
+	DefaultToolPolicyRules func() []ToolPolicyRule
+}
+
+// ResolveRuntimeInfo captures which auto-enable and fallback branches
+// fired during ResolveRuntime. Callers log operator-facing messages based
+// on these flags: the config package does not print directly so it stays
+// free of an io.Writer dependency and so tests can verify the resolution
+// decisions without parsing stderr.
+type ResolveRuntimeInfo struct {
+	// ResponseScanningFallback is true when MCP proxy mode re-enabled
+	// default response scanning because the operator had disabled it.
+	ResponseScanningFallback bool
+
+	// MCPInputScanningAutoEnabled is true when input scanning was
+	// unconfigured and the runtime default was applied.
+	MCPInputScanningAutoEnabled bool
+
+	// MCPToolScanningAutoEnabled is true when tool scanning was
+	// unconfigured and the runtime default was applied.
+	MCPToolScanningAutoEnabled bool
+
+	// MCPToolPolicyAutoEnabled is true when tool policy was
+	// unconfigured and the runtime default was applied.
+	MCPToolPolicyAutoEnabled bool
+}
+
+// ResolveRuntime returns a cloned *Config with runtime-mode policy
+// resolution applied, plus a ResolveRuntimeInfo describing which defaults
+// fired. The receiver is never mutated; downstream runtime wiring
+// (scanner construction, emitters, proxy) must consume the returned
+// clone so any canonical policy hash stamped on receipts or envelopes
+// reflects the effective policy that was actually enforced.
+//
+// The resolution order is intentional: (1) deep clone, (2) MCP proxy
+// response-scanning fallback, (3) caller-supplied bundle merge,
+// (4) mode-aware MCP scanning auto-enable. The fallback runs before the
+// bundle merge because it replaces the entire ResponseScanning struct
+// with defaults; any bundle-appended ResponseScanning.Patterns applied
+// before the fallback would be wiped. Running the fallback first lets
+// the merge append its patterns on top of the default set.
+func (c *Config) ResolveRuntime(opts RuntimeResolveOpts) (*Config, ResolveRuntimeInfo) {
+	clone := c.Clone()
+	var info ResolveRuntimeInfo
+
+	if clone.KillSwitch.APITokenFile == "" {
+		clone.resolveKillSwitchAPIToken()
+	}
+
+	if opts.Mode.NeedsResponseScanningFallback() && !clone.ResponseScanning.Enabled {
+		// MCP proxy mode re-enables default response scanning if the
+		// operator disabled it. Response scanning is the primary injection
+		// defence on the MCP response path; silently running without it
+		// would leave tool responses unscanned. Runs before MergeBundles
+		// because this replaces the entire struct, which would otherwise
+		// wipe bundle-appended patterns.
+		clone.ResponseScanning = Defaults().ResponseScanning
+		info.ResponseScanningFallback = true
+	}
+
+	if opts.MergeBundles != nil {
+		opts.MergeBundles(clone)
+	}
+
+	if opts.Mode.WrapsMCP() {
+		applyMCPAutoEnable(clone, opts.DefaultToolPolicyRules, &info)
+	} else if opts.Mode.NeedsToolScanningAutoEnable() {
+		applyToolScanningAutoEnable(clone, &info)
+	}
+
+	return clone, info
+}
+
+// WithSIEMForwarderSSRFFloor returns a cloned config whose internal-address
+// policy contains Pipelock's immutable default ranges plus any operator-added
+// ranges. Forwarding deliberately does not inherit `internal: null`, which is
+// a supported escape hatch for the main request scanner but must not disable
+// the audit sink's SSRF floor.
+func (c *Config) WithSIEMForwarderSSRFFloor() *Config {
+	clone := c.Clone()
+	clone.Internal = append(append([]string(nil), Defaults().Internal...), c.Internal...)
+	return clone
+}
+
+func resolvedKillSwitchAPITokenValue(yamlToken string) string {
+	if envToken := os.Getenv(EnvKillSwitchAPIToken); envToken != "" {
+		return envToken
+	}
+	return yamlToken
+}
+
+func (c *Config) resolveKillSwitchAPIToken() {
+	c.resolvedKillSwitchAPIToken = resolvedKillSwitchAPITokenValue(c.KillSwitch.APIToken)
+	c.killSwitchAPITokenWasResolved = true
+}
+
+// EffectiveKillSwitchAPIToken returns the admin API bearer token after applying
+// the runtime's env-over-YAML precedence. Callers should use this instead of
+// reading KillSwitch.APIToken directly when wiring runtime surfaces.
+func (c *Config) EffectiveKillSwitchAPIToken() string {
+	if c == nil {
+		return ""
+	}
+	if c.killSwitchAPITokenWasResolved {
+		return c.resolvedKillSwitchAPIToken
+	}
+	return resolvedKillSwitchAPITokenValue(c.KillSwitch.APIToken)
+}
+
+// EffectiveKillSwitchAPITokenConfigured reports whether the resolved runtime
+// config has an admin API bearer token without exposing the token value.
+func (c *Config) EffectiveKillSwitchAPITokenConfigured() bool {
+	return c.EffectiveKillSwitchAPIToken() != ""
+}
+
+// applyMCPAutoEnable flips MCP scanning sections on when the operator did
+// not explicitly configure them. A section counts as unconfigured when
+// Enabled is false AND Action is empty. YAML and programmatic
+// configs use the same convention: false plus
+// a nonempty action disables, while the zero value permits defaults.
+// Tool policy also requires len(Rules)==0. Each auto-enable branch
+// records its decision on info so callers can print operator-facing
+// log messages without replicating the predicate.
+func applyMCPAutoEnable(c *Config, defaultToolPolicyRules func() []ToolPolicyRule, info *ResolveRuntimeInfo) {
+	if !c.MCPInputScanning.Enabled && c.MCPInputScanning.Action == "" {
+		c.MCPInputScanning.Enabled = true
+		c.MCPInputScanning.Action = ActionBlock
+		info.MCPInputScanningAutoEnabled = true
+	}
+	applyToolScanningAutoEnable(c, info)
+	if !c.MCPToolPolicy.Enabled && c.MCPToolPolicy.Action == "" && len(c.MCPToolPolicy.Rules) == 0 {
+		c.MCPToolPolicy.Enabled = true
+		c.MCPToolPolicy.Action = ActionWarn
+		if defaultToolPolicyRules != nil {
+			c.MCPToolPolicy.Rules = defaultToolPolicyRules()
+		}
+		info.MCPToolPolicyAutoEnabled = true
+	}
+}
+
+// applyToolScanningAutoEnable flips MCP tool-definition scanning on when the
+// operator left it unconfigured (Enabled false and Action empty - see
+// applyMCPAutoEnable's doc comment for the load-time normalization and
+// programmatic config convention). Split out of applyMCPAutoEnable so
+// RuntimeMCPScan can auto-enable tool scanning without also auto-enabling the
+// request-side sections (input scanning, tool policy) it has no request path
+// to enforce.
+func applyToolScanningAutoEnable(c *Config, info *ResolveRuntimeInfo) {
+	if !c.MCPToolScanning.Enabled && c.MCPToolScanning.Action == "" {
+		c.MCPToolScanning.Enabled = true
+		c.MCPToolScanning.Action = ActionWarn
+		c.MCPToolScanning.DetectDrift = true
+		if c.MCPToolScanning.NewToolAdmission == "" {
+			c.MCPToolScanning.NewToolAdmission = NewToolAdmit
+		}
+		info.MCPToolScanningAutoEnabled = true
+	}
+}
+
+// Clone returns a deep copy of c suitable for runtime mutation. The clone
+// has a fresh canonical hash cache, and policy-semantic slices (DLP
+// patterns, response scan patterns, tool policy rules) are independently
+// allocated so mutations to the clone never alias back into the receiver.
+//
+// rawBytes is copied verbatim so Hash() on the clone still reflects the
+// on-disk YAML bytes that were loaded - the receipt-audit fingerprint is
+// about "what YAML file was loaded", which does not change under bundle
+// merge or auto-enable. CanonicalPolicyHash recomputes from the clone's
+// current state the first time it is called.
+//
+// Nested slices inside DLPPattern (ExemptDomains) and other mutable
+// collections touched by ResolveRuntime are copied as well. Unmodified
+// nested collections (map fields in MCPToolPolicy, AgentProfile maps, and
+// similar) are shallow-copied; callers that mutate those directly outside
+// the ResolveRuntime pipeline are responsible for their own aliasing.
+func (c *Config) Clone() *Config {
+	if c == nil {
+		return nil
+	}
+	clone := *c
+	clone.RequestPolicy.Rules = slices.Clone(c.RequestPolicy.Rules)
+	for i := range clone.RequestPolicy.Rules {
+		if previous := c.RequestPolicy.Rules[i].Except; previous != nil {
+			except := *previous
+			except.Values = slices.Clone(previous.Values)
+			except.Requests = slices.Clone(previous.Requests)
+			clone.RequestPolicy.Rules[i].Except = &except
+		}
+	}
+	if c.PromptInjectionDetection != nil {
+		p := *c.PromptInjectionDetection
+		if p.Enabled != nil {
+			enabled := *p.Enabled
+			p.Enabled = &enabled
+		}
+		clone.PromptInjectionDetection = &p
+	}
+	clone.lapsedScannerExceptions = slices.Clone(c.lapsedScannerExceptions)
+	clone.FetchProxy.Monitoring.PathEntropyExclusions = slices.Clone(c.FetchProxy.Monitoring.PathEntropyExclusions)
+	clone.FetchProxy.Monitoring.QueryEntropyParamExclusions = slices.Clone(c.FetchProxy.Monitoring.QueryEntropyParamExclusions)
+	clone.FetchProxy.Monitoring.OAuthAuthorizationEndpoints = slices.Clone(c.FetchProxy.Monitoring.OAuthAuthorizationEndpoints)
+	clone.FetchProxy.Monitoring.IssuedRedirectDelegations = cloneIssuedRedirectDelegations(c.FetchProxy.Monitoring.IssuedRedirectDelegations)
+	clone.RequestBodyScanning.ContentEntropyExclusions = slices.Clone(c.RequestBodyScanning.ContentEntropyExclusions)
+	clone.WebSocketProxy.ContentEntropyExclusions = slices.Clone(c.WebSocketProxy.ContentEntropyExclusions)
+	clone.DestinationGrants = append([]DestinationGrant(nil), c.DestinationGrants...)
+
+	// The field is a *canonicalHashCacheHolder so the struct copy above
+	// duplicated the pointer, not the atomic.Value (atomic.Value forbids
+	// copying after first use). Allocate a fresh holder so the clone
+	// starts with an empty cache and computes against its own
+	// post-resolve state.
+	clone.canonicalHashCache = &canonicalHashCacheHolder{}
+	clone.canonicalRedactionKeyCache = &canonicalHashCacheHolder{}
+
+	// Copy rawBytes so mutations to the clone's byte buffer do not alias
+	// back to the receiver. Hash() on the clone continues to reflect the
+	// original on-disk YAML bytes.
+	if c.rawBytes != nil {
+		buf := make([]byte, len(c.rawBytes))
+		copy(buf, c.rawBytes)
+		clone.rawBytes = buf
+	}
+	if c.LicenseIntermediateCert != nil {
+		clone.LicenseIntermediateCert = append([]byte(nil), c.LicenseIntermediateCert...)
+	}
+	if c.LicenseDisabledAgents != nil {
+		clone.LicenseDisabledAgents = make(map[string][]string, len(c.LicenseDisabledAgents))
+		for name, listeners := range c.LicenseDisabledAgents {
+			clone.LicenseDisabledAgents[name] = append([]string(nil), listeners...)
+		}
+	}
+	if c.MCPToolScanning.AcknowledgmentKeyBytes != nil {
+		clone.MCPToolScanning.AcknowledgmentKeyBytes = append([]byte(nil), c.MCPToolScanning.AcknowledgmentKeyBytes...)
+	}
+	if c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey != nil {
+		clone.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey...)
+	}
+	if c.FlightRecorder.PostureSignerPublicKey != nil {
+		clone.FlightRecorder.PostureSignerPublicKey = append([]byte(nil), c.FlightRecorder.PostureSignerPublicKey...)
+	}
+	if c.FlightRecorder.ReceiptGroupPriorSignerKeys != nil {
+		clone.FlightRecorder.ReceiptGroupPriorSignerKeys = append([]string(nil), c.FlightRecorder.ReceiptGroupPriorSignerKeys...)
+	}
+
+	clone.DLP.Patterns = cloneDLPPatterns(c.DLP.Patterns)
+	if c.Agents != nil {
+		clone.Agents = make(map[string]AgentProfile, len(c.Agents))
+		for name, profile := range c.Agents {
+			if profile.DLP != nil {
+				dlp := *profile.DLP
+				dlp.Patterns = cloneDLPPatterns(profile.DLP.Patterns)
+				profile.DLP = &dlp
+			}
+			clone.Agents[name] = profile
+		}
+	}
+	if c.DLP.GitHubEnterpriseHosts != nil {
+		clone.DLP.GitHubEnterpriseHosts = append([]string(nil), c.DLP.GitHubEnterpriseHosts...)
+	}
+	if c.DLP.GitLabHosts != nil {
+		clone.DLP.GitLabHosts = append([]string(nil), c.DLP.GitLabHosts...)
+	}
+	clone.ResponseScanning.Patterns = cloneResponseScanPatterns(c.ResponseScanning.Patterns)
+	// ExemptDomains is a reload-sensitive exemption surface: operators
+	// remove entries via hot-reload and ValidateReload warns when the
+	// list is cleared. Without deep-copying the slice here, a runtime
+	// caller that appends to clone.ResponseScanning.ExemptDomains would
+	// alias back into the loaded config, breaking the frozen-after-Load
+	// guarantee for this field.
+	if c.ResponseScanning.ExemptDomains != nil {
+		clone.ResponseScanning.ExemptDomains = append([]string(nil), c.ResponseScanning.ExemptDomains...)
+	}
+	if c.ResponseScanning.SizeExemptDomains != nil {
+		clone.ResponseScanning.SizeExemptDomains = append([]string(nil), c.ResponseScanning.SizeExemptDomains...)
+	}
+	if c.ResponseScanning.SizeExemptScanLimits != nil {
+		clone.ResponseScanning.SizeExemptScanLimits = append([]ResponseSizeScanLimit(nil), c.ResponseScanning.SizeExemptScanLimits...)
+	}
+	if c.ResponseScanning.UnscannablePassthrough != nil {
+		clone.ResponseScanning.UnscannablePassthrough = cloneUnscannablePassthrough(c.ResponseScanning.UnscannablePassthrough)
+	}
+	if c.ResponseScanning.AuthenticatedArtifacts != nil {
+		clone.ResponseScanning.AuthenticatedArtifacts = append([]AuthenticatedArtifactEntry(nil), c.ResponseScanning.AuthenticatedArtifacts...)
+	}
+	if c.RequestBodyScanning.ContentEntropyWarnRoutes != nil {
+		clone.RequestBodyScanning.ContentEntropyWarnRoutes = cloneRequestBodyEntropyWarnRoutes(c.RequestBodyScanning.ContentEntropyWarnRoutes)
+	}
+	if c.RequestBodyScanning.SigV4CredentialRoutes != nil {
+		clone.RequestBodyScanning.SigV4CredentialRoutes = cloneRequestBodySigV4CredentialRoutes(c.RequestBodyScanning.SigV4CredentialRoutes)
+	}
+	if c.Taint.TrustedMCPServers != nil {
+		clone.Taint.TrustedMCPServers = append([]string(nil), c.Taint.TrustedMCPServers...)
+	}
+	clone.MCPIdentities = cloneMCPIdentities(c.MCPIdentities)
+	if c.Containment.MetricsExposure != nil {
+		exposure := *c.Containment.MetricsExposure
+		exposure.AllowedSourceCIDRs = append([]string(nil), c.Containment.MetricsExposure.AllowedSourceCIDRs...)
+		clone.Containment.MetricsExposure = &exposure
+	}
+	if c.Containment.LoopbackServices != nil {
+		clone.Containment.LoopbackServices = append([]ContainmentLoopbackService(nil), c.Containment.LoopbackServices...)
+	}
+	if c.Containment.PublishedServices != nil {
+		clone.Containment.PublishedServices = append([]ContainmentPublishedService(nil), c.Containment.PublishedServices...)
+	}
+	clone.MCPToolPolicy.Rules = cloneToolPolicyRules(c.MCPToolPolicy.Rules)
+	// Deep-copy the follower audience-labels map so a runtime caller that
+	// mutates clone.Conductor.Labels never aliases back into the loaded config,
+	// preserving the frozen-after-Load guarantee for conductor (restart-only)
+	// settings.
+	if c.Conductor.Labels != nil {
+		labels := make(map[string]string, len(c.Conductor.Labels))
+		for k, v := range c.Conductor.Labels {
+			labels[k] = v
+		}
+		clone.Conductor.Labels = labels
+	}
+
+	return &clone
+}
+
+func cloneRequestBodySigV4CredentialRoutes(entries []RequestBodySigV4CredentialRoute) []RequestBodySigV4CredentialRoute {
+	out := append([]RequestBodySigV4CredentialRoute(nil), entries...)
+	for i := range out {
+		out[i].ContentTypes = append([]string(nil), out[i].ContentTypes...)
+		out[i].Methods = append([]string(nil), out[i].Methods...)
+	}
+	return out
+}
+
+// CloneDLPPatterns isolates nested pattern controls across policy generations.
+func CloneDLPPatterns(src []DLPPattern) []DLPPattern { return cloneDLPPatterns(src) }
+
+// cloneDLPPatterns returns a deep copy of src. Runtime-only audience hosts are
+// copied with the operator-facing exempt domain list so reload snapshots cannot
+// mutate an immutable built-in policy through a shared backing array.
+func cloneDLPPatterns(src []DLPPattern) []DLPPattern {
+	if src == nil {
+		return nil
+	}
+	dst := make([]DLPPattern, len(src))
+	for i := range src {
+		dst[i] = src[i]
+		dst[i].Keywords = slices.Clone(src[i].Keywords)
+		if src[i].KeywordWindow != nil {
+			v := *src[i].KeywordWindow
+			dst[i].KeywordWindow = &v
+		}
+		if src[i].ExemptDomains != nil {
+			dst[i].ExemptDomains = slices.Clone(src[i].ExemptDomains)
+		}
+		if src[i].CredentialAudienceHosts != nil {
+			dst[i].CredentialAudienceHosts = slices.Clone(src[i].CredentialAudienceHosts)
+		}
+		if src[i].CredentialAudienceGitHosts != nil {
+			dst[i].CredentialAudienceGitHosts = slices.Clone(src[i].CredentialAudienceGitHosts)
+		}
+		if src[i].CredentialAudienceRegistryHosts != nil {
+			dst[i].CredentialAudienceRegistryHosts = slices.Clone(src[i].CredentialAudienceRegistryHosts)
+		}
+	}
+	return dst
+}
+
+func cloneUnscannablePassthrough(src []UnscannablePassthroughEntry) []UnscannablePassthroughEntry {
+	if src == nil {
+		return nil
+	}
+	dst := make([]UnscannablePassthroughEntry, len(src))
+	for i := range src {
+		dst[i] = src[i]
+		if src[i].Paths != nil {
+			dst[i].Paths = append([]string(nil), src[i].Paths...)
+		}
+		if src[i].PathPrefixes != nil {
+			dst[i].PathPrefixes = append([]string(nil), src[i].PathPrefixes...)
+		}
+		if src[i].ContentTypes != nil {
+			dst[i].ContentTypes = append([]string(nil), src[i].ContentTypes...)
+		}
+	}
+	return dst
+}
+
+func cloneRequestBodyEntropyWarnRoutes(src []RequestBodyEntropyWarnRoute) []RequestBodyEntropyWarnRoute {
+	dst := append([]RequestBodyEntropyWarnRoute(nil), src...)
+	for i := range src {
+		dst[i].ContentTypes = append([]string(nil), src[i].ContentTypes...)
+		dst[i].Methods = append([]string(nil), src[i].Methods...)
+	}
+	return dst
+}
+
+// cloneResponseScanPatterns returns a deep copy of src. ResponseScanPattern
+// has no nested slices today; the helper exists so future additions pick up
+// deep-copy behavior without caller churn.
+func cloneResponseScanPatterns(src []ResponseScanPattern) []ResponseScanPattern {
+	if src == nil {
+		return nil
+	}
+	dst := make([]ResponseScanPattern, len(src))
+	copy(dst, src)
+	return dst
+}
+
+// cloneToolPolicyRules returns a deep copy of src.
+func cloneToolPolicyRules(src []ToolPolicyRule) []ToolPolicyRule {
+	if src == nil {
+		return nil
+	}
+	dst := make([]ToolPolicyRule, len(src))
+	for i := range src {
+		dst[i] = src[i]
+		if src[i].ArgNumberGT != nil {
+			v := *src[i].ArgNumberGT
+			dst[i].ArgNumberGT = &v
+		}
+		if src[i].ArgNumberLT != nil {
+			v := *src[i].ArgNumberLT
+			dst[i].ArgNumberLT = &v
+		}
+		if src[i].ArgLenGT != nil {
+			v := *src[i].ArgLenGT
+			dst[i].ArgLenGT = &v
+		}
+		if src[i].ArgLenLT != nil {
+			v := *src[i].ArgLenLT
+			dst[i].ArgLenLT = &v
+		}
+		if src[i].ArgValueIn != nil {
+			dst[i].ArgValueIn = append([]string(nil), src[i].ArgValueIn...)
+		}
+		if src[i].ResolutionPolicy != nil {
+			v := *src[i].ResolutionPolicy
+			dst[i].ResolutionPolicy = &v
+		}
+	}
+	return dst
+}

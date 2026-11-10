@@ -1,0 +1,1075 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package proxydecision
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
+	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+const testSpanDigest = "sha256:" +
+	"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+const (
+	testRedactedSourceSpanValue = "[redacted-value]"
+	testSpanHMACKey             = "span-mac-key"
+)
+
+// captureRecorder records entries in memory so tests can extract the signed
+// receipt JSON and verify it offline.
+type captureRecorder struct {
+	entries []recorder.Entry
+	err     error
+}
+
+type partialErrorRecorder struct {
+	entries []recorder.Entry
+	calls   int
+}
+
+func (r *partialErrorRecorder) Record(entry recorder.Entry) error {
+	r.calls++
+	r.entries = append(r.entries, entry)
+	return errTestRecorder
+}
+
+func TestEmitPartialRecordErrorBlocksChainHandoff(t *testing.T) {
+	rec := &partialErrorRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	if err := em.Emit(validDecision()); !errors.Is(err, errTestRecorder) {
+		t.Fatalf("Emit error = %v, want partial record error", err)
+	}
+	if len(rec.entries) != 1 {
+		t.Fatalf("written entries = %d, want 1", len(rec.entries))
+	}
+	if _, _, err := em.Retire(); !errors.Is(err, errTestRecorder) {
+		t.Fatalf("Retire error = %v, want uncertain record error", err)
+	}
+	if err := em.Emit(validDecision()); !errors.Is(err, errTestRecorder) {
+		t.Fatalf("retry error = %v, want poisoned emitter", err)
+	}
+	if rec.calls != 1 {
+		t.Fatalf("recorder calls = %d, want 1", rec.calls)
+	}
+}
+
+func (c *captureRecorder) Record(e recorder.Entry) error {
+	if c.err != nil {
+		return c.err
+	}
+	c.entries = append(c.entries, e)
+	return nil
+}
+
+func newTestEmitter(t *testing.T, rec Recorder, sanitize SanitizeFunc) (*Emitter, ed25519.PublicKey, string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	signer := NewKeyedSigner(priv)
+	em := NewEmitter(EmitterConfig{
+		Recorder:  rec,
+		Signer:    signer,
+		Sanitize:  sanitize,
+		Principal: "local",
+		Actor:     "pipelock",
+	})
+	if em == nil {
+		t.Fatal("NewEmitter returned nil for a valid config")
+	}
+	return em, pub, signer.KeyID()
+}
+
+// decodeReceipt extracts the signed EvidenceReceipt from a recorded entry.
+func decodeReceipt(t *testing.T, e recorder.Entry) contractreceipt.EvidenceReceipt {
+	t.Helper()
+	raw, ok := e.Detail.(json.RawMessage)
+	if !ok {
+		t.Fatalf("entry Detail is %T, want json.RawMessage", e.Detail)
+	}
+	var rcpt contractreceipt.EvidenceReceipt
+	if err := json.Unmarshal(raw, &rcpt); err != nil {
+		t.Fatalf("unmarshal receipt: %v", err)
+	}
+	return rcpt
+}
+
+func decodePayload(t *testing.T, rcpt contractreceipt.EvidenceReceipt) contractreceipt.PayloadProxyDecisionStruct {
+	t.Helper()
+	var p contractreceipt.PayloadProxyDecisionStruct
+	if err := json.Unmarshal(rcpt.Payload, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return p
+}
+
+func decodeSpannedPayload(t *testing.T, rcpt contractreceipt.EvidenceReceipt) contractreceipt.PayloadProxyDecisionWithSpansStruct {
+	t.Helper()
+	var p contractreceipt.PayloadProxyDecisionWithSpansStruct
+	if err := json.Unmarshal(rcpt.Payload, &p); err != nil {
+		t.Fatalf("unmarshal spanned payload: %v", err)
+	}
+	return p
+}
+
+func spannedEvidenceFixture() []contractruntime.SourceSpanEvidence {
+	offset, length := 9, len(testRedactedSourceSpanValue)
+	return []contractruntime.SourceSpanEvidence{{
+		Span: contractreceipt.SourceSpan{
+			SourceID:             "req-1",
+			SourceKind:           contractreceipt.SourceKindMCPToolArgs,
+			NormalizedView:       contractreceipt.NormalizedViewDLPNormalized,
+			PipelockBinaryDigest: testSpanDigest,
+			RulesBundleDigest:    testSpanDigest,
+			TransformProfile:     "pipelock-transform-v1",
+			PolicyHash:           testSpanDigest,
+			RuleID:               "aws_access_key",
+			Bundle:               "builtin",
+			BundleVersion:        "2026.06.05",
+			CharOffset:           &offset,
+			CharLength:           &length,
+			MatchClass:           "secret:aws_access_key",
+			RedactedSample:       testRedactedSourceSpanValue,
+		},
+		MatchValue: testRedactedSourceSpanValue,
+	}}
+}
+
+func TestEmit_BuildsVerifiableReceipt(t *testing.T) {
+	rec := &captureRecorder{}
+	em, pub, keyID := newTestEmitter(t, rec, nil)
+
+	err := em.Emit(Decision{
+		ActionType:    "http_request",
+		Transport:     "forward",
+		Target:        "https://api.vendor.example/v1/things",
+		Verdict:       "block",
+		WinningSource: SourceScanner,
+		PolicySources: []string{SourceScanner},
+		RuleID:        "prompt_injection",
+		PolicyHash:    testSpanDigest,
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if len(rec.entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(rec.entries))
+	}
+	entry := rec.entries[0]
+	if entry.Type != evidenceReceiptEntryType {
+		t.Errorf("entry Type = %q, want %q", entry.Type, evidenceReceiptEntryType)
+	}
+	if entry.EventKind != string(contractreceipt.PayloadProxyDecision) {
+		t.Errorf("entry EventKind = %q, want %q", entry.EventKind, contractreceipt.PayloadProxyDecision)
+	}
+	if entry.Transport != "forward" {
+		t.Errorf("entry Transport = %q, want forward", entry.Transport)
+	}
+
+	rcpt := decodeReceipt(t, entry)
+	// The Bundle A done-state: v2 proxy_decision verifies offline in Go.
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+		t.Fatalf("VerifyWithKey: %v", err)
+	}
+	if rcpt.RecordType != contractreceipt.RecordTypeEvidenceV2 {
+		t.Errorf("RecordType = %q", rcpt.RecordType)
+	}
+	if rcpt.PayloadKind != contractreceipt.PayloadProxyDecision {
+		t.Errorf("PayloadKind = %q", rcpt.PayloadKind)
+	}
+	if rcpt.PolicyHash != testSpanDigest {
+		t.Errorf("PolicyHash = %q, want %q", rcpt.PolicyHash, testSpanDigest)
+	}
+	if rcpt.ChainSeq != 0 {
+		t.Errorf("ChainSeq = %d, want 0", rcpt.ChainSeq)
+	}
+	if rcpt.ChainPrevHash != recorder.GenesisHash {
+		t.Errorf("ChainPrevHash = %q, want %q", rcpt.ChainPrevHash, recorder.GenesisHash)
+	}
+
+	p := decodePayload(t, rcpt)
+	if p.ActionType != "http_request" || p.Verdict != "block" || p.Transport != "forward" {
+		t.Errorf("payload core fields wrong: %+v", p)
+	}
+	if p.WinningSource != SourceScanner || len(p.PolicySources) != 1 || p.PolicySources[0] != SourceScanner {
+		t.Errorf("payload provenance wrong: winning=%q sources=%v", p.WinningSource, p.PolicySources)
+	}
+	if p.RuleID != "prompt_injection" {
+		t.Errorf("payload RuleID = %q", p.RuleID)
+	}
+}
+
+func TestEmit_WithSpansBuildsVerifiableReceipt(t *testing.T) {
+	rec := &captureRecorder{}
+	em, pub, keyID := newTestEmitter(t, rec, nil)
+
+	evidence := spannedEvidenceFixture()
+
+	err := em.Emit(Decision{
+		ActionType:         "mcp_tool_call",
+		Transport:          "mcp_stdio",
+		Target:             "tool://example/list",
+		Verdict:            "block",
+		WinningSource:      SourceScanner,
+		PolicySources:      []string{SourceScanner},
+		RuleID:             "aws_access_key",
+		PolicyHash:         testSpanDigest,
+		SpanHMACKey:        []byte(testSpanHMACKey),
+		SourceSpanEvidence: evidence,
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if len(rec.entries) != 1 {
+		t.Fatalf("got %d entries, want 1", len(rec.entries))
+	}
+	entry := rec.entries[0]
+	if entry.EventKind != string(contractreceipt.PayloadProxyDecisionWithSpans) {
+		t.Fatalf("entry EventKind = %q, want %q", entry.EventKind, contractreceipt.PayloadProxyDecisionWithSpans)
+	}
+	if !strings.HasPrefix(entry.Summary, string(contractreceipt.PayloadProxyDecisionWithSpans)+":") {
+		t.Fatalf("entry Summary = %q, want spanned payload kind prefix", entry.Summary)
+	}
+
+	rcpt := decodeReceipt(t, entry)
+	if rcpt.PayloadKind != contractreceipt.PayloadProxyDecisionWithSpans {
+		t.Fatalf("PayloadKind = %q, want %q", rcpt.PayloadKind, contractreceipt.PayloadProxyDecisionWithSpans)
+	}
+	if rcpt.PolicyHash != testSpanDigest {
+		t.Errorf("PolicyHash = %q, want %q", rcpt.PolicyHash, testSpanDigest)
+	}
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+		t.Fatalf("VerifyWithKey: %v", err)
+	}
+	payload := decodeSpannedPayload(t, rcpt)
+	if len(payload.SourceSpans) != 1 {
+		t.Fatalf("source_spans length = %d, want 1", len(payload.SourceSpans))
+	}
+	span := payload.SourceSpans[0]
+	wantHash, err := contractreceipt.SourceSpanMatchHash([]byte(testSpanHMACKey), rcpt.EventID, 0, span, testRedactedSourceSpanValue)
+	if err != nil {
+		t.Fatalf("SourceSpanMatchHash: %v", err)
+	}
+	if span.MatchHash != wantHash {
+		t.Fatalf("MatchHash = %q, want event_id-bound hash %q", span.MatchHash, wantHash)
+	}
+	if span.RedactedSample != testRedactedSourceSpanValue {
+		t.Fatalf("RedactedSample = %q, want %q", span.RedactedSample, testRedactedSourceSpanValue)
+	}
+}
+
+func TestEmit_WithSpansRejectsMalformedEvidenceBeforeRecording(t *testing.T) {
+	rec := &captureRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	evidence := spannedEvidenceFixture()
+	evidence[0].Span.SourceKind = "bogus"
+
+	err := em.Emit(Decision{
+		ActionType:         "mcp_tool_call",
+		Transport:          "mcp_stdio",
+		Target:             "tool://example/list",
+		Verdict:            "block",
+		WinningSource:      SourceScanner,
+		PolicySources:      []string{SourceScanner},
+		RuleID:             "aws_access_key",
+		PolicyHash:         testSpanDigest,
+		SpanHMACKey:        []byte(testSpanHMACKey),
+		SourceSpanEvidence: evidence,
+	})
+	if !errors.Is(err, contractruntime.ErrInvalidProxyDecisionInput) {
+		t.Fatalf("Emit err = %v, want ErrInvalidProxyDecisionInput", err)
+	}
+	if len(rec.entries) != 0 {
+		t.Fatalf("recorded %d entries despite malformed source span", len(rec.entries))
+	}
+	if seq, _ := em.ChainState(); seq != 0 {
+		t.Fatalf("chain advanced to %d despite malformed source span", seq)
+	}
+}
+
+func TestEmit_WithSpansSanitizesSpanFieldsBeforeSigning(t *testing.T) {
+	const secret = "AKIA" + "IOSFODNN7EXAMPLE"
+	// Active DLP redaction: clean reports false for any text containing the
+	// secret. A caller mistake puts raw matched bytes into "redacted" span
+	// fields; the emitter must scrub them out of the SIGNED spanned payload,
+	// exactly as it does for target/rule_id (#676).
+	clean := func(text string) bool { return !strings.Contains(text, secret) }
+
+	rec := &captureRecorder{}
+	em, pub, keyID := newTestEmitter(t, rec, clean)
+
+	evidence := spannedEvidenceFixture()
+	evidence[0].Span.SourceID = "source:" + secret
+	evidence[0].Span.RedactedSample = "sample:" + secret
+	evidence[0].Span.RuleID = "dlp:" + secret
+	evidence[0].Span.MatchClass = "class:" + secret
+
+	err := em.Emit(Decision{
+		ActionType:         "mcp_tool_call",
+		Transport:          "mcp_stdio",
+		Target:             "tool://example/list",
+		Verdict:            "block",
+		WinningSource:      SourceScanner,
+		PolicySources:      []string{SourceScanner},
+		RuleID:             "aws_access_key",
+		PolicyHash:         testSpanDigest,
+		SpanHMACKey:        []byte(testSpanHMACKey),
+		SourceSpanEvidence: evidence,
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	rcpt := decodeReceipt(t, rec.entries[0])
+	if rcpt.PayloadKind != contractreceipt.PayloadProxyDecisionWithSpans {
+		t.Fatalf("PayloadKind = %q, want %q", rcpt.PayloadKind, contractreceipt.PayloadProxyDecisionWithSpans)
+	}
+	// The signed receipt must still verify after pre-sign sanitization.
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+		t.Fatalf("VerifyWithKey: %v", err)
+	}
+	// The whole serialized receipt must be free of the secret.
+	full, err := json.Marshal(rcpt)
+	if err != nil {
+		t.Fatalf("marshal receipt: %v", err)
+	}
+	if strings.Contains(string(full), secret) {
+		t.Fatalf("serialized spanned receipt leaks secret: %s", full)
+	}
+	span := decodeSpannedPayload(t, rcpt).SourceSpans[0]
+	if strings.Contains(span.RedactedSample, secret) {
+		t.Errorf("signed RedactedSample leaks secret: %q", span.RedactedSample)
+	}
+	if strings.Contains(span.RuleID, secret) {
+		t.Errorf("signed span RuleID leaks secret: %q", span.RuleID)
+	}
+	if strings.Contains(span.MatchClass, secret) {
+		t.Errorf("signed span MatchClass leaks secret: %q", span.MatchClass)
+	}
+	wantHash, err := contractreceipt.SourceSpanMatchHash([]byte(testSpanHMACKey), rcpt.EventID, 0, span, testRedactedSourceSpanValue)
+	if err != nil {
+		t.Fatalf("SourceSpanMatchHash: %v", err)
+	}
+	if span.MatchHash != wantHash {
+		t.Fatalf("MatchHash = %q, want sanitized RuleID-bound hash %q", span.MatchHash, wantHash)
+	}
+	// The caller's evidence slice must not be mutated by sanitization.
+	if evidence[0].Span.SourceID != "source:"+secret {
+		t.Errorf("emitter mutated caller evidence SourceID: %q", evidence[0].Span.SourceID)
+	}
+	if evidence[0].Span.RedactedSample != "sample:"+secret {
+		t.Errorf("emitter mutated caller evidence RedactedSample: %q", evidence[0].Span.RedactedSample)
+	}
+	if evidence[0].Span.RuleID != "dlp:"+secret {
+		t.Errorf("emitter mutated caller evidence RuleID: %q", evidence[0].Span.RuleID)
+	}
+	if evidence[0].Span.MatchClass != "class:"+secret {
+		t.Errorf("emitter mutated caller evidence MatchClass: %q", evidence[0].Span.MatchClass)
+	}
+}
+
+func TestEmit_WithSpansRejectsMissingHMACKey(t *testing.T) {
+	rec := &captureRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+
+	err := em.Emit(Decision{
+		ActionType:         "mcp_tool_call",
+		Transport:          "mcp_stdio",
+		Target:             "tool://example/list",
+		Verdict:            "block",
+		WinningSource:      SourceScanner,
+		PolicySources:      []string{SourceScanner},
+		RuleID:             "aws_access_key",
+		PolicyHash:         testSpanDigest,
+		SpanHMACKey:        nil, // evidence present but no key
+		SourceSpanEvidence: spannedEvidenceFixture(),
+	})
+	if !errors.Is(err, contractruntime.ErrInvalidProxyDecisionInput) {
+		t.Fatalf("Emit err = %v, want ErrInvalidProxyDecisionInput", err)
+	}
+	if len(rec.entries) != 0 {
+		t.Fatalf("recorded %d entries despite missing span HMAC key", len(rec.entries))
+	}
+	if seq, _ := em.ChainState(); seq != 0 {
+		t.Fatalf("chain advanced to %d despite missing span HMAC key", seq)
+	}
+}
+
+func TestEmit_SanitizesTargetBeforeSigning(t *testing.T) {
+	const secret = "AKIA" + "IOSFODNN7EXAMPLE"
+	// clean reports false for any text containing the secret, mirroring a DLP
+	// hit. The emitter must scrub the secret out of the SIGNED target.
+	clean := func(text string) bool { return !strings.Contains(text, secret) }
+
+	rec := &captureRecorder{}
+	em, pub, keyID := newTestEmitter(t, rec, clean)
+
+	rawTarget := "https://api.vendor.example/v1/items?key=" + secret
+	err := em.Emit(Decision{
+		ActionType:    "http_request",
+		Transport:     "forward",
+		Target:        rawTarget,
+		Verdict:       "block",
+		WinningSource: SourceScanner,
+		PolicySources: []string{SourceScanner},
+		RuleID:        "dlp:" + secret, // rule label echoing the matched bytes
+		PolicyHash:    testSpanDigest,
+	})
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+
+	rcpt := decodeReceipt(t, rec.entries[0])
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+		t.Fatalf("VerifyWithKey: %v", err)
+	}
+	p := decodePayload(t, rcpt)
+	if strings.Contains(p.Target, secret) {
+		t.Errorf("signed target leaks secret: %q", p.Target)
+	}
+	if strings.Contains(p.RuleID, secret) {
+		t.Errorf("signed rule_id leaks secret: %q", p.RuleID)
+	}
+	// The whole serialized receipt must be free of the secret.
+	if strings.Contains(string(rcpt.Payload), secret) {
+		t.Errorf("serialized payload leaks secret: %s", rcpt.Payload)
+	}
+}
+
+// URL content is dropped from the signed target whether or not a DLP
+// predicate is configured; the predicate only adds redaction on top.
+func TestEmit_ReducesTargetWithoutSanitizer(t *testing.T) {
+	for _, tc := range []struct{ name, target, want string }{
+		{"url", "https://user:pw@api.vendor.example:8443/v1/items?ref=value#frag", "https://api.vendor.example:8443"},
+		{"origin_form", "/fetch?url=https%3A%2F%2Fapi.vendor.example%2F%3Fref%3Dvalue", "[redacted-url]"},
+		{"tool_name", "read_file", "read_file"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &captureRecorder{}
+			em, pub, keyID := newTestEmitter(t, rec, nil)
+			d := validDecision()
+			d.Target = tc.target
+			if err := em.Emit(d); err != nil {
+				t.Fatalf("Emit: %v", err)
+			}
+			rcpt := decodeReceipt(t, rec.entries[0])
+			if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+				t.Fatalf("VerifyWithKey: %v", err)
+			}
+			if got := decodePayload(t, rcpt).Target; got != tc.want {
+				t.Fatalf("signed target = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestEmit_ProvenanceShapes(t *testing.T) {
+	tests := []struct {
+		name        string
+		decision    Decision
+		wantWinning string
+		wantSources []string
+		wantStamped bool
+	}{
+		{
+			name: "scanner block",
+			decision: Decision{
+				ActionType: "http_request", Transport: "fetch", Target: "https://x.example/a",
+				Verdict: "block", WinningSource: SourceScanner, PolicySources: []string{SourceScanner},
+				RuleID: "ssrf", PolicyHash: testSpanDigest,
+			},
+			wantWinning: SourceScanner, wantSources: []string{SourceScanner}, wantStamped: false,
+		},
+		{
+			name: "kill switch",
+			decision: Decision{
+				ActionType: "http_request", Transport: "intercept", Target: "https://x.example/b",
+				Verdict: "block", WinningSource: SourceKillSwitch, PolicySources: []string{SourceKillSwitch},
+				RuleID: "kill_switch_active", PolicyHash: testSpanDigest,
+			},
+			wantWinning: SourceKillSwitch, wantSources: []string{SourceKillSwitch}, wantStamped: false,
+		},
+		{
+			name: "contract decision stamps envelope",
+			decision: Decision{
+				ActionType: "http_request", Transport: "forward", Target: "https://x.example/c",
+				Verdict: "block", WinningSource: SourceContract,
+				PolicySources:      []string{"observation", SourceContract},
+				RuleID:             "rule-42",
+				PolicyHash:         testSpanDigest,
+				ActiveManifestHash: "sha256:manifest", ContractHash: "sha256:contract",
+				SelectorID: "sel-1", ContractGeneration: 7,
+			},
+			wantWinning: SourceContract, wantSources: []string{"observation", SourceContract}, wantStamped: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := &captureRecorder{}
+			em, pub, keyID := newTestEmitter(t, rec, nil)
+			if err := em.Emit(tc.decision); err != nil {
+				t.Fatalf("Emit: %v", err)
+			}
+			rcpt := decodeReceipt(t, rec.entries[0])
+			if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+				t.Fatalf("VerifyWithKey: %v", err)
+			}
+			p := decodePayload(t, rcpt)
+			if p.WinningSource != tc.wantWinning {
+				t.Errorf("winning_source = %q, want %q", p.WinningSource, tc.wantWinning)
+			}
+			if strings.Join(p.PolicySources, ",") != strings.Join(tc.wantSources, ",") {
+				t.Errorf("policy_sources = %v, want %v", p.PolicySources, tc.wantSources)
+			}
+			gotStamped := rcpt.ActiveManifestHash != "" || rcpt.ContractHash != "" ||
+				rcpt.SelectorID != "" || rcpt.ContractGeneration != 0
+			if gotStamped != tc.wantStamped {
+				t.Errorf("envelope stamped = %v, want %v (manifest=%q contract=%q selector=%q gen=%d)",
+					gotStamped, tc.wantStamped, rcpt.ActiveManifestHash, rcpt.ContractHash,
+					rcpt.SelectorID, rcpt.ContractGeneration)
+			}
+			if tc.wantStamped {
+				if rcpt.ActiveManifestHash != tc.decision.ActiveManifestHash ||
+					rcpt.ContractHash != tc.decision.ContractHash ||
+					rcpt.SelectorID != tc.decision.SelectorID ||
+					rcpt.ContractGeneration != tc.decision.ContractGeneration {
+					t.Errorf("stamped envelope mismatch: %+v", rcpt)
+				}
+			}
+		})
+	}
+}
+
+func TestEmit_ChainAdvancesAndLinks(t *testing.T) {
+	rec := &captureRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	base := Decision{
+		ActionType: "http_request", Transport: "forward", Target: "https://x.example/a",
+		Verdict: "allow", WinningSource: SourceScanner, PolicySources: []string{SourceScanner},
+		PolicyHash: testSpanDigest,
+	}
+	for i := 0; i < 3; i++ {
+		if err := em.Emit(base); err != nil {
+			t.Fatalf("Emit %d: %v", i, err)
+		}
+	}
+	if len(rec.entries) != 3 {
+		t.Fatalf("got %d entries, want 3", len(rec.entries))
+	}
+	var prevHash string
+	for i, e := range rec.entries {
+		rcpt := decodeReceipt(t, e)
+		if rcpt.ChainSeq != uint64(i) {
+			t.Errorf("entry %d ChainSeq = %d, want %d", i, rcpt.ChainSeq, i)
+		}
+		if i == 0 {
+			if rcpt.ChainPrevHash != recorder.GenesisHash {
+				t.Errorf("first ChainPrevHash = %q, want genesis", rcpt.ChainPrevHash)
+			}
+		} else if rcpt.ChainPrevHash != prevHash {
+			t.Errorf("entry %d ChainPrevHash = %q, want %q", i, rcpt.ChainPrevHash, prevHash)
+		}
+		h, err := contractreceipt.ReceiptHash(rcpt)
+		if err != nil {
+			t.Fatalf("ReceiptHash: %v", err)
+		}
+		prevHash = h
+	}
+	seq, head := em.ChainState()
+	if seq != 3 || head != prevHash {
+		t.Errorf("ChainState = (%d,%q), want (3,%q)", seq, head, prevHash)
+	}
+}
+
+func TestEmit_ResumeContinuity(t *testing.T) {
+	// First emitter produces one receipt, then we capture its head and build a
+	// replacement (as a hot reload would) seeded with ResumeSeq/ResumePrevHash.
+	rec := &captureRecorder{}
+	em1, _, _ := newTestEmitter(t, rec, nil)
+	base := Decision{
+		ActionType: "http_request", Transport: "forward", Target: "https://x.example/a",
+		Verdict: "allow", WinningSource: SourceScanner, PolicySources: []string{SourceScanner},
+		PolicyHash: testSpanDigest,
+	}
+	if err := em1.Emit(base); err != nil {
+		t.Fatalf("Emit em1: %v", err)
+	}
+	seq, head := em1.ChainState()
+
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signer := NewKeyedSigner(priv)
+	em2 := NewEmitter(EmitterConfig{
+		Recorder: rec, Signer: signer, Principal: "local", Actor: "pipelock",
+		ResumeSeq: seq, ResumePrevHash: head,
+	})
+	if err := em2.Emit(base); err != nil {
+		t.Fatalf("Emit em2: %v", err)
+	}
+	rcpt := decodeReceipt(t, rec.entries[1])
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, signer.KeyID()); err != nil {
+		t.Fatalf("VerifyWithKey: %v", err)
+	}
+	if rcpt.ChainSeq != seq {
+		t.Errorf("resumed ChainSeq = %d, want %d", rcpt.ChainSeq, seq)
+	}
+	if rcpt.ChainPrevHash != head {
+		t.Errorf("resumed ChainPrevHash = %q, want %q", rcpt.ChainPrevHash, head)
+	}
+}
+
+func TestEmit_TamperBreaksSignature(t *testing.T) {
+	rec := &captureRecorder{}
+	em, pub, keyID := newTestEmitter(t, rec, nil)
+	if err := em.Emit(Decision{
+		ActionType: "http_request", Transport: "forward", Target: "https://x.example/a",
+		Verdict: "allow", WinningSource: SourceScanner, PolicySources: []string{SourceScanner},
+		PolicyHash: testSpanDigest,
+	}); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rcpt := decodeReceipt(t, rec.entries[0])
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, keyID); err != nil {
+		t.Fatalf("baseline VerifyWithKey: %v", err)
+	}
+	// Flip a payload field; the JCS preimage changes, so verification must fail.
+	tampered := rcpt
+	tampered.Payload = json.RawMessage(strings.Replace(string(rcpt.Payload), `"allow"`, `"forward"`, 1))
+	if err := contractreceipt.VerifyWithKey(tampered, pub, keyID); err == nil {
+		t.Fatal("tampered receipt verified; signature did not bind payload")
+	}
+}
+
+func TestNewEmitter_DisabledWhenMissingDeps(t *testing.T) {
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	if NewEmitter(EmitterConfig{Signer: NewKeyedSigner(priv)}) != nil {
+		t.Error("NewEmitter with nil recorder should return nil")
+	}
+	if NewEmitter(EmitterConfig{Recorder: &captureRecorder{}}) != nil {
+		t.Error("NewEmitter with nil signer should return nil")
+	}
+}
+
+func TestNilEmitter_IsNoOp(t *testing.T) {
+	var em *Emitter
+	if err := em.HealthError(); err != nil {
+		t.Fatalf("nil HealthError = %v, want nil", err)
+	}
+	if err := em.Emit(Decision{Verdict: "block"}); err != nil {
+		t.Errorf("nil Emit returned %v, want nil", err)
+	}
+	if err := em.EmitDurable(validDecision()); err != nil {
+		t.Errorf("nil EmitDurable returned %v, want nil", err)
+	}
+	seq, head := em.ChainState()
+	if seq != 0 || head != recorder.GenesisHash {
+		t.Errorf("nil ChainState = (%d,%q), want (0,genesis)", seq, head)
+	}
+}
+
+func TestEmitDurableRequiresDurableRecorder(t *testing.T) {
+	rec := &captureRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	err := em.EmitDurable(validDecision())
+	if err == nil || !strings.Contains(err.Error(), "does not support durable writes") {
+		t.Fatalf("EmitDurable error = %v, want unsupported recorder", err)
+	}
+	if len(rec.entries) != 0 {
+		t.Fatalf("recorded %d entries despite unsupported durable write", len(rec.entries))
+	}
+	if seq, head := em.ChainState(); seq != 0 || head != recorder.GenesisHash {
+		t.Fatalf("chain advanced on failed durable write: (%d, %q)", seq, head)
+	}
+}
+
+func TestEmitDurableSyncFailureStopsRetryAtSameChainPosition(t *testing.T) {
+	dir := t.TempDir()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := recorder.New(recorder.Config{Enabled: true, Dir: dir, CheckpointInterval: 1000}, nil, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rec.Close() })
+	em, _, _ := newTestEmitter(t, rec, nil)
+	if err := em.HealthError(); err != nil {
+		t.Fatalf("healthy emitter error = %v, want nil", err)
+	}
+	var calls int
+	rec.SetSyncForTest(func(*os.File) error {
+		calls++
+		if calls == 1 {
+			return errors.New("injected sync failure")
+		}
+		return nil
+	})
+	if err := em.EmitDurable(validDecision()); !errors.Is(err, recorder.ErrDurability) {
+		t.Fatalf("first emit = %v, want durability error", err)
+	}
+	if !errors.Is(em.HealthError(), recorder.ErrDurability) {
+		t.Fatalf("health error = %v, want durability error", em.HealthError())
+	}
+	if err := em.EmitDurable(validDecision()); err == nil {
+		t.Fatal("retry emitted at an uncertain chain position")
+	}
+	if calls != 1 {
+		t.Fatalf("sync calls = %d, want 1", calls)
+	}
+	// The injected sync failure leaves the stream failed, so close
+	// refuses to sign a final checkpoint over it.
+	if err := rec.Close(); !errors.Is(err, recorder.ErrDurabilityInherited) {
+		t.Fatalf("recorder close after a failed sync = %v, want the final checkpoint refused", err)
+	}
+	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipts int
+	for _, file := range files {
+		data, readErr := os.ReadFile(filepath.Clean(file))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		receipts += strings.Count(string(data), `"type":"evidence_receipt"`)
+	}
+	if receipts != 1 {
+		t.Fatalf("recorded v2 receipts = %d, want 1", receipts)
+	}
+}
+
+type durableCaptureRecorder struct {
+	captureRecorder
+	durableCalls int
+}
+
+func (r *durableCaptureRecorder) RecordDurable(entry recorder.Entry) error {
+	r.durableCalls++
+	return r.Record(entry)
+}
+
+func TestEmitDurableRecordsAndAdvancesOnlyOnSuccess(t *testing.T) {
+	rec := &durableCaptureRecorder{captureRecorder: captureRecorder{err: errTestRecorder}}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	if err := em.EmitDurable(validDecision()); !errors.Is(err, errTestRecorder) {
+		t.Fatalf("failed durable write error = %v, want recorder error", err)
+	}
+	if seq, head := em.ChainState(); seq != 0 || head != recorder.GenesisHash {
+		t.Fatalf("chain advanced on failed durable write: (%d, %q)", seq, head)
+	}
+	rec.err = nil
+	if err := em.EmitDurable(validDecision()); !errors.Is(err, errTestRecorder) {
+		t.Fatalf("retry after uncertain write = %v, want original recorder error", err)
+	}
+	if rec.durableCalls != 1 || len(rec.entries) != 0 {
+		t.Fatalf("durable calls = %d, entries = %d, want 1 and 0", rec.durableCalls, len(rec.entries))
+	}
+}
+
+func TestEmit_InvalidProvenanceFailsFast(t *testing.T) {
+	// Missing policy_sources / winning_source must fail at build time (the v2
+	// payload validator rejects them) rather than emit a malformed receipt.
+	rec := &captureRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	err := em.Emit(Decision{
+		ActionType: "http_request", Transport: "forward", Target: "https://x.example/a",
+		Verdict:    "block", // no WinningSource / PolicySources
+		PolicyHash: testSpanDigest,
+	})
+	if err == nil {
+		t.Fatal("Emit with empty provenance succeeded; want build error")
+	}
+	if len(rec.entries) != 0 {
+		t.Errorf("recorded %d entries on failed build, want 0", len(rec.entries))
+	}
+	// Chain must not advance on a failed build.
+	if seq, head := em.ChainState(); seq != 0 || head != recorder.GenesisHash {
+		t.Errorf("chain advanced on failure: (%d,%q)", seq, head)
+	}
+}
+
+func TestKeyedSigner(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	s := NewKeyedSigner(priv)
+	if len(s.KeyID()) != ed25519.PublicKeySize*2 { // hex of 32-byte pubkey
+		t.Errorf("KeyID length = %d, want %d", len(s.KeyID()), ed25519.PublicKeySize*2)
+	}
+	msg := []byte("preimage bytes")
+	sig, err := s.Sign(msg)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if !ed25519.Verify(pub, msg, sig) {
+		t.Error("signature did not verify against the public key")
+	}
+	var zero KeyedSigner
+	if _, err := zero.Sign(msg); err == nil {
+		t.Error("zero-value signer should fail to sign")
+	}
+}
+
+func TestEmit_RecorderErrorPropagates(t *testing.T) {
+	rec := &captureRecorder{err: errTestRecorder}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	err := em.Emit(Decision{
+		ActionType: "http_request", Transport: "forward", Target: "https://x.example/a",
+		Verdict: "allow", WinningSource: SourceScanner, PolicySources: []string{SourceScanner},
+		PolicyHash: testSpanDigest,
+	})
+	if err == nil {
+		t.Fatal("Emit succeeded despite recorder error")
+	}
+	// Chain must not advance when the record fails.
+	if seq, _ := em.ChainState(); seq != 0 {
+		t.Errorf("chain advanced to %d on record failure", seq)
+	}
+}
+
+func TestEmitSerializedSizeRejectDoesNotPoisonChain(t *testing.T) {
+	rec := &captureRecorder{err: recorder.ErrSerializedEntryTooLarge}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	if err := em.Emit(validDecision()); !errors.Is(err, recorder.ErrSerializedEntryTooLarge) {
+		t.Fatalf("size rejection = %v", err)
+	}
+	if err := em.HealthError(); err != nil {
+		t.Fatalf("deterministic size rejection poisoned emitter: %v", err)
+	}
+	if seq, prev := em.ChainState(); seq != 0 || prev != recorder.GenesisHash {
+		t.Fatalf("size rejection advanced chain to %d, %s", seq, prev)
+	}
+	rec.err = nil
+	if err := em.Emit(validDecision()); err != nil {
+		t.Fatalf("valid receipt after size rejection: %v", err)
+	}
+	if seq, _ := em.ChainState(); seq != 1 {
+		t.Fatalf("chain after valid receipt = %d, want 1", seq)
+	}
+
+	readLimit := &captureRecorder{err: recorder.ErrEvidenceReadLimitExceeded}
+	em, _, _ = newTestEmitter(t, readLimit, nil)
+	if err := em.Emit(validDecision()); !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("read-limit error = %v", err)
+	}
+	if !errors.Is(em.HealthError(), recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("uncertain read-limit error was not sticky: %v", em.HealthError())
+	}
+}
+
+func TestEmitRecorderRejectsOversizedLineBeforeV2Advance(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := recorder.New(recorder.Config{Enabled: true, Dir: t.TempDir(), SignCheckpoints: true}, nil, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rec.Close() })
+	session, err := recorder.AcquireRunSession(rec, "proxy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	em := NewEmitter(EmitterConfig{
+		Recorder: rec, Signer: NewKeyedSigner(key), Session: session,
+		Principal: "local", Actor: "pipelock",
+	})
+	tooLarge := validDecision()
+	tooLarge.Target = "opaque-" + strings.Repeat("x", recorder.MaxEntryLineBytes)
+	if err := em.Emit(tooLarge); !errors.Is(err, recorder.ErrSerializedEntryTooLarge) {
+		t.Fatalf("oversized live recorder entry = %v", err)
+	}
+	if err := em.HealthError(); err != nil {
+		t.Fatalf("oversized entry poisoned v2 emitter: %v", err)
+	}
+	if seq, _ := em.ChainState(); seq != 0 {
+		t.Fatalf("oversized entry advanced v2 chain to %d", seq)
+	}
+	if err := em.Emit(validDecision()); err != nil {
+		t.Fatalf("valid v2 receipt after size rejection: %v", err)
+	}
+}
+
+var errTestRecorder = &recorderError{"boom"}
+
+type recorderError struct{ msg string }
+
+func (e *recorderError) Error() string { return e.msg }
+
+func newDeterministicClock() func() time.Time {
+	base := time.Date(2026, 6, 5, 22, 0, 0, 0, time.UTC)
+	return func() time.Time { return base }
+}
+
+func TestEmit_UsesInjectedClock(t *testing.T) {
+	rec := &captureRecorder{}
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	signer := NewKeyedSigner(priv)
+	em := NewEmitter(EmitterConfig{
+		Recorder: rec, Signer: signer, Principal: "local", Actor: "pipelock",
+		Clock: newDeterministicClock(),
+	})
+	if err := em.Emit(Decision{
+		ActionType: "http_request", Transport: "forward", Target: "https://x.example/a",
+		Verdict: "allow", WinningSource: SourceScanner, PolicySources: []string{SourceScanner},
+		PolicyHash: testSpanDigest,
+	}); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	rcpt := decodeReceipt(t, rec.entries[0])
+	if err := contractreceipt.VerifyWithKey(rcpt, pub, signer.KeyID()); err != nil {
+		t.Fatalf("VerifyWithKey: %v", err)
+	}
+	if !rcpt.Timestamp.Equal(time.Date(2026, 6, 5, 22, 0, 0, 0, time.UTC)) {
+		t.Errorf("Timestamp = %v, want injected clock value", rcpt.Timestamp)
+	}
+}
+
+func TestSanitizeFromRedactor(t *testing.T) {
+	if got := SanitizeFromRedactor(nil); got != nil {
+		t.Fatal("nil redactor should produce a nil sanitizer")
+	}
+	fn := SanitizeFromRedactor(func(_ context.Context, text string) scanner.TextDLPResult {
+		return scanner.TextDLPResult{Clean: text != "leak"}
+	})
+	if fn == nil {
+		t.Fatal("expected sanitizer wrapper")
+	}
+	if !fn("ok") {
+		t.Fatal("clean text reported dirty")
+	}
+	if fn("leak") {
+		t.Fatal("dirty text reported clean")
+	}
+}
+
+func TestEmit_EventIDError(t *testing.T) {
+	rec := &captureRecorder{}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	em := NewEmitter(EmitterConfig{
+		Recorder: rec,
+		Signer:   NewKeyedSigner(priv),
+		EventID:  func() (string, error) { return "", errors.New("id boom") },
+	})
+	err = em.Emit(validDecision())
+	if err == nil || !strings.Contains(err.Error(), "generate proxy_decision event id") {
+		t.Fatalf("Emit error = %v, want event-id failure", err)
+	}
+	if len(rec.entries) != 0 {
+		t.Fatalf("recorded %d entries on event-id failure", len(rec.entries))
+	}
+}
+
+func TestEmit_SignerError(t *testing.T) {
+	rec := &captureRecorder{}
+	em := NewEmitter(EmitterConfig{
+		Recorder: rec,
+		Signer:   stubSigner{err: errors.New("sign boom")},
+	})
+	err := em.Emit(validDecision())
+	if err == nil || !strings.Contains(err.Error(), "sign proxy_decision receipt") {
+		t.Fatalf("Emit error = %v, want signer failure", err)
+	}
+	if len(rec.entries) != 0 {
+		t.Fatalf("recorded %d entries on signer failure", len(rec.entries))
+	}
+}
+
+func TestEmit_SignatureSizeMismatch(t *testing.T) {
+	rec := &captureRecorder{}
+	em := NewEmitter(EmitterConfig{
+		Recorder: rec,
+		Signer:   stubSigner{sig: []byte("short")},
+	})
+	err := em.Emit(validDecision())
+	if err == nil || !errors.Is(err, ErrSignatureSize) {
+		t.Fatalf("Emit error = %v, want ErrSignatureSize", err)
+	}
+	if len(rec.entries) != 0 {
+		t.Fatalf("recorded %d entries on signature-size failure", len(rec.entries))
+	}
+}
+
+type stubSigner struct {
+	keyID string
+	sig   []byte
+	err   error
+}
+
+func (s stubSigner) KeyID() string { return s.keyID }
+
+func (s stubSigner) Sign([]byte) ([]byte, error) { return s.sig, s.err }
+
+func validDecision() Decision {
+	return Decision{
+		ActionType:    "http_request",
+		Transport:     "forward",
+		Target:        "https://x.example/a",
+		Verdict:       "allow",
+		WinningSource: SourceScanner,
+		PolicySources: []string{SourceScanner},
+		PolicyHash:    testSpanDigest,
+	}
+}
+
+func TestRetireHandsOffHeadAndStopsEmission(t *testing.T) {
+	rec := &captureRecorder{}
+	em, _, _ := newTestEmitter(t, rec, nil)
+	if err := em.Emit(validDecision()); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	wantSeq, wantHead := em.ChainState()
+	seq, head, err := em.Retire()
+	if err != nil || seq != wantSeq || head != wantHead {
+		t.Fatalf("Retire = (%d, %q, %v), want (%d, %q, nil)", seq, head, err, wantSeq, wantHead)
+	}
+	if err := em.Emit(validDecision()); !errors.Is(err, ErrEmitterRetired) {
+		t.Fatalf("Emit after Retire = %v, want ErrEmitterRetired", err)
+	}
+	if _, _, err := em.Retire(); !errors.Is(err, ErrEmitterRetired) {
+		t.Fatalf("second Retire = %v, want ErrEmitterRetired", err)
+	}
+	next, _, _ := newTestEmitter(t, rec, nil)
+	next.ResumeAt(seq, head)
+	if gotSeq, gotHead := next.ChainState(); gotSeq != seq || gotHead != head {
+		t.Fatalf("ResumeAt state = (%d, %q), want (%d, %q)", gotSeq, gotHead, seq, head)
+	}
+}
+
+func TestRetireAndResumeAtNilEmitter(t *testing.T) {
+	var em *Emitter
+	seq, head, err := em.Retire()
+	if err != nil || seq != 0 || head != recorder.GenesisHash {
+		t.Fatalf("nil Retire = (%d, %q, %v)", seq, head, err)
+	}
+	em.ResumeAt(3, "head")
+}
+
+// TestEmitterRecordsWithRetainedIdentity narrows the content stamper to the
+// configured principal and actor, which every receipt it writes stamps.
+func TestEmitterRecordsWithRetainedIdentity(t *testing.T) {
+	em, _, _ := newTestEmitter(t, &partialErrorRecorder{}, nil)
+	if em.contentStamper() == evidenceStamper {
+		t.Fatal("emitter records with the unnarrowed stamper")
+	}
+	if (&Emitter{}).contentStamper() != evidenceStamper {
+		t.Fatal("an emitter without a derived stamper must fall back to the package stamper")
+	}
+}

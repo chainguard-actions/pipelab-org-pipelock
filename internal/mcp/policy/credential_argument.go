@@ -1,0 +1,191 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package policy
+
+import (
+	"encoding/json"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+)
+
+// matchCredentialDestinations checks each scoped path and its expanded local
+// identities independently. Joining a public-key path to another identity must
+// not manufacture text after its .pub extension. Custom rules retain their
+// ordinary matching semantics.
+func (pc *Config) matchCredentialDestinations(rule *CompiledRule, candidates []string, memo candidateViews, pathReadings bool) (matched, incomplete, handled bool) {
+	if rule.Name != "Credential File Write" || rule.ArgPattern == nil || rule.ArgKey == nil || rule.ToolPattern == nil {
+		return false, false, false
+	}
+	shipped, ok := shippedCredentialWriteRuleShapes[rule.ToolPattern.String()]
+	if !ok || rule.ArgPattern.String() != shipped.ArgPattern || rule.ArgKey.String() != shipped.ArgKey || rule.ArgSource != shipped.ArgSource {
+		return false, false, false
+	}
+	for _, candidate := range candidates {
+		m, inc := pc.credentialCandidateMatches(rule, candidate, memo, pathReadings)
+		incomplete = incomplete || inc
+		if m {
+			return true, incomplete, true
+		}
+	}
+	return false, incomplete, true
+}
+
+var shippedCredentialWriteRuleShapes = func() map[string]config.ToolPolicyRule {
+	out := make(map[string]config.ToolPolicyRule, 3)
+	for _, rule := range DefaultToolPolicyRules() {
+		if rule.Name == "Credential File Write" {
+			out[rule.ToolPattern] = rule
+		}
+	}
+	return out
+}()
+
+// matchSingleCredentialArgument applies the shipped public-key boundary to one
+// submitted string and each of its local identities independently. Aliases of
+// that string must not manufacture a second argument. Each candidate still uses
+// the full normalization and pairwise checks, so shell text remains blocked.
+//
+// Recognize only the two shipped argument patterns (the hostile preset adds
+// Kubernetes and Docker locations). A custom pattern, scoped rule, or patch rule
+// retains the ordinary matcher, even if it uses the same rule name.
+func (pc *Config) matchSingleCredentialArgument(rule *CompiledRule, args []string, raw json.RawMessage, memo candidateViews, pathValues bool) (matched, incomplete, handled bool) {
+	if rule.Name != "Credential File Access" || rule.ArgPattern == nil || rule.ArgKey != nil || rule.ArgSource != "" {
+		return false, false, false
+	}
+	// A custom rule that reuses the shipped name and argument pattern with its
+	// own tool scope keeps the ordinary matcher: provenance is the shipped tool
+	// pattern as well, in its built-in or preset spelling.
+	if rule.ToolPattern == nil || !shippedCredentialToolPatterns[rule.ToolPattern.String()] {
+		return false, false, false
+	}
+	pattern := rule.ArgPattern.String()
+	if pattern != `(?i)(`+sensitiveFilePathPattern+`)` &&
+		pattern != `(?i)(`+sensitiveFilePathPattern+`|\.kube[\\/]?config|\.docker[\\/]?config)` {
+		return false, false, false
+	}
+	var keys []string
+	if len(raw) != 0 {
+		extracted := jsonrpc.ExtractStringsFromJSONResult(raw)
+		if extracted.Truncated {
+			return false, false, false
+		}
+		args = extracted.Strings
+		var ok bool
+		if keys, ok = jsonObjectKeys(raw); !ok {
+			return false, false, false
+		}
+	}
+	if len(args) != 1 {
+		return false, false, false
+	}
+	// A JSON key is not an alias of the value, but it is text the tool may act
+	// on. Any key that names a protected path on its own keeps the block, so the
+	// exception can only narrow what the value alone would match.
+	keyViews, _ := pc.localPaths.expandNoted(keys, pathValues)
+	for _, key := range keyViews {
+		m, inc := pc.credentialCandidateMatches(rule, key, memo, !pathValues)
+		incomplete = incomplete || inc
+		if m {
+			return true, incomplete, true
+		}
+	}
+	argViews, _ := pc.localPaths.expandNoted(args, pathValues)
+	for _, candidate := range argViews {
+		m, inc := pc.credentialCandidateMatches(rule, candidate, memo, !pathValues)
+		incomplete = incomplete || inc
+		if m {
+			return true, incomplete, true
+		}
+	}
+	return false, incomplete, true
+}
+
+// candidateViews holds the views of single candidate strings for one request.
+// Views depend only on the string, and each credential rule reads the same ones.
+type candidateViews map[string][]argView
+
+// credentialCandidateMatches runs every normalization view of one string.
+// pathReadings is the flag buildArgViews takes: false for a file tool's values,
+// which are pathnames and carry their own spellings.
+func (pc *Config) credentialCandidateMatches(rule *CompiledRule, candidate string, memo candidateViews, pathReadings bool) (matched, incomplete bool) {
+	views, ok := memo[candidate]
+	if !ok {
+		views = buildArgViews([]string{candidate}, false, nil, pathReadings)
+		if memo != nil {
+			memo[candidate] = views
+		}
+	}
+	// Every view carries the same unreadable flag (see buildArgViews). As in
+	// matchArgViews, a match in the word reading alone cannot clear an
+	// incomplete check; only a match in another view can.
+	// A bounded pair scan that stopped early, in any view, is also an
+	// incomplete check, and is kept the same way.
+	incomplete = len(views) > 0 && views[0].unreadable
+	for _, v := range views {
+		if v.wordReading {
+			continue
+		}
+		m, inc := matchArgViews(rule.ArgPattern, argView{tokens: v.tokens, joined: v.joined})
+		if m {
+			return true, false
+		}
+		incomplete = incomplete || inc
+	}
+	for _, v := range views {
+		if !v.wordReading {
+			continue
+		}
+		m, inc := matchArgViews(rule.ArgPattern, argView{tokens: v.tokens, joined: v.joined})
+		if m {
+			return true, incomplete
+		}
+		incomplete = incomplete || inc
+	}
+	return false, incomplete
+}
+
+// jsonObjectKeys returns every object key at any depth. ok is false when the
+// arguments cannot be parsed, which sends the call back to the ordinary matcher.
+func jsonObjectKeys(raw json.RawMessage) (keys []string, ok bool) {
+	var v any
+	if err := extract.DecodeJSON(raw, &v); err != nil {
+		return nil, false
+	}
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case map[string]any:
+			for k, child := range t {
+				keys = append(keys, k)
+				walk(child)
+			}
+		case []any:
+			for _, child := range t {
+				walk(child)
+			}
+		}
+	}
+	walk(v)
+	return keys, true
+}
+
+// shippedCredentialToolPatterns holds the two spellings Pipelock ships for the
+// Credential File Access tool pattern: the built-in rule after alias wrapping,
+// and the preset YAML form that writes the alias prefix once. Both are derived
+// from the built-in rule, so a change there changes this set with it.
+var shippedCredentialToolPatterns = func() map[string]bool {
+	out := make(map[string]bool, 2)
+	for _, r := range DefaultToolPolicyRules() {
+		if r.Name != "Credential File Access" {
+			continue
+		}
+		out[r.ToolPattern] = true
+		body := strings.TrimSuffix(strings.TrimPrefix(r.ToolPattern, `(?i)^(?:`+builtinToolNameAliasPrefix+`)?`), `$`)
+		out[`(?i)^`+builtinToolNameAliasPrefix+`?`+body+`$`] = true
+	}
+	return out
+}()

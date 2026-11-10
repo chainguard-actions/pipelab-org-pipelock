@@ -1,0 +1,2466 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package signing
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/evidence/endproof"
+	"github.com/luckyPipewrench/pipelock/internal/fleetreceipt"
+	posturepkg "github.com/luckyPipewrench/pipelock/internal/posture"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	sigutil "github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+func TestVerifyReceiptCmd_ValidReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://example.com/api",
+		Verdict:         "block",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected unpinned receipt verification to exit non-zero")
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "UNPINNED:") {
+		t.Errorf("expected UNPINNED in output, got: %s", output)
+	}
+	if !strings.Contains(output, unpinnedReceiptBanner) {
+		t.Errorf("expected unpinned banner in output, got: %s", output)
+	}
+	if !strings.Contains(output, ar.ActionID) {
+		t.Errorf("expected action_id in output, got: %s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_DisplaySanitizesTargetAndHexdump(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://api.vendor.example/\u202Etxt",
+		Verdict:         "block",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", hex.EncodeToString(pub), "--hexdump"}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\n%s", err, buf.String())
+	}
+	output := buf.String()
+	for _, want := range []string{"OK:", "‹U+202E RIGHT-TO-LEFT OVERRIDE›", "⚠ display anomaly:", "hexdump:", "00000000"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestVerifyReceiptCmd_PostureKernelObserved(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey receipt: %v", err)
+	}
+	posturePub, posturePriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey posture: %v", err)
+	}
+	capsule, err := posturepkg.Emit(config.Defaults(), posturepkg.Options{
+		SigningKey: posturePriv,
+		EvidenceBundle: &posturepkg.EvidenceBundle{
+			Containment: &posturepkg.ContainmentEvidence{
+				Mode:                     posturepkg.ContainmentModeKernelNFTOwnerMatch,
+				BoundaryVerified:         true,
+				ProbeRefusedDirectEgress: true,
+				KernelRuleHash:           strings.Repeat("a", 64),
+				TargetUID:                "966",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("posture.Emit: %v", err)
+	}
+	capsuleHash, err := postureCapsuleSHA256(capsule)
+	if err != nil {
+		t.Fatalf("postureCapsuleSHA256: %v", err)
+	}
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       capsule.GeneratedAt.Add(time.Second),
+		Target:          "https://api.vendor.example/data",
+		Verdict:         "allow",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+		SessionControl: &receipt.SessionControl{
+			Kind: receipt.SessionControlOpen,
+			Open: &receipt.SessionOpen{
+				PostureCapsuleSHA256: capsuleHash,
+				PostureSignerKeyID:   capsule.SignerKeyID,
+				ContainedUID:         "966",
+			},
+		},
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	dir := t.TempDir()
+	receiptPath := filepath.Join(dir, "receipt.json")
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal receipt: %v", err)
+	}
+	if err := os.WriteFile(receiptPath, data, 0o600); err != nil {
+		t.Fatalf("Write receipt: %v", err)
+	}
+	posturePath := filepath.Join(dir, "posture.json")
+	postureData, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal posture: %v", err)
+	}
+	if err := os.WriteFile(posturePath, postureData, 0o600); err != nil {
+		t.Fatalf("Write posture: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{
+		receiptPath,
+		"--key", hex.EncodeToString(pub),
+		"--posture", posturePath,
+		"--posture-key", hex.EncodeToString(posturePub),
+	}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\n%s", err, buf.String())
+	}
+	output := buf.String()
+	if !strings.Contains(output, "Containment: KERNEL-OBSERVED") ||
+		!strings.Contains(output, "direct egress by the contained UID was kernel-refused") ||
+		!strings.Contains(output, "not continuous enforcement") {
+		t.Fatalf("missing kernel-observed containment line:\n%s", output)
+	}
+	if strings.Contains(output, "Containment: KERNEL-ENFORCED") {
+		t.Fatalf("point-in-time posture overclaimed kernel-enforced containment:\n%s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_PostureRequiresSignedSessionBinding(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey receipt: %v", err)
+	}
+	posturePub, posturePriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey posture: %v", err)
+	}
+	capsule, err := posturepkg.Emit(config.Defaults(), posturepkg.Options{
+		SigningKey: posturePriv,
+		EvidenceBundle: &posturepkg.EvidenceBundle{
+			Containment: &posturepkg.ContainmentEvidence{
+				Mode:                     posturepkg.ContainmentModeKernelNFTOwnerMatch,
+				BoundaryVerified:         true,
+				ProbeRefusedDirectEgress: true,
+				KernelRuleHash:           strings.Repeat("a", 64),
+				TargetUID:                "966",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("posture.Emit: %v", err)
+	}
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       capsule.GeneratedAt.Add(time.Second),
+		Target:          "https://api.vendor.example/data",
+		Verdict:         "allow",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	dir := t.TempDir()
+	receiptPath := filepath.Join(dir, "receipt.json")
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal receipt: %v", err)
+	}
+	if err := os.WriteFile(receiptPath, data, 0o600); err != nil {
+		t.Fatalf("Write receipt: %v", err)
+	}
+	posturePath := filepath.Join(dir, "posture.json")
+	postureData, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal posture: %v", err)
+	}
+	if err := os.WriteFile(posturePath, postureData, 0o600); err != nil {
+		t.Fatalf("Write posture: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{
+		receiptPath,
+		"--key", hex.EncodeToString(pub),
+		"--posture", posturePath,
+		"--posture-key", hex.EncodeToString(posturePub),
+	}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\n%s", err, buf.String())
+	}
+	output := buf.String()
+	if strings.Contains(output, "KERNEL-OBSERVED") || strings.Contains(output, "KERNEL-ENFORCED") || strings.Contains(output, "kernel-refused") {
+		t.Fatalf("unbound receipt over-claimed containment:\n%s", output)
+	}
+	if !strings.Contains(output, "Containment: UNKNOWN") ||
+		!strings.Contains(output, "receipt actor/principal binding has no contained uid") {
+		t.Fatalf("missing fail-closed containment reason:\n%s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_AllowUnpinnedValidReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://example.com/api",
+		Verdict:         "block",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--allow-unpinned"}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "UNPINNED:") {
+		t.Errorf("expected UNPINNED in output, got: %s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_WithExpectedKey(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	pubKey := priv.Public().(ed25519.PublicKey)
+	keyHex := hex.EncodeToString(pubKey)
+
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionWrite,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://api.example.com/data",
+		Verdict:         "allow",
+		Transport:       "forward",
+		SideEffectClass: receipt.SideEffectExternalWrite,
+		Reversibility:   receipt.ReversibilityCompensatable,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", keyHex}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "OK:") {
+		t.Errorf("expected OK in output, got: %s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_FleetReportWithExpectedKey(t *testing.T) {
+	t.Parallel()
+
+	pub, path := writeFleetReportFixture(t)
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--fleet-report", "--key", hex.EncodeToString(pub)}))
+	assertFleetPartial(t, cmd.Execute())
+
+	output := buf.String()
+	for _, want := range []string{
+		"FLEET RECEIPT VALID PREFIX, END UNPROVEN:",
+		"Org/Fleet:        pipelab/dogfood",
+		"Source batches:   1",
+		"Total actions:    2",
+		"Mediated fraction of included observed actions: 1",
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+// TestVerifyReceiptCmd_FleetReportHumanKeyID proves --key <hex> verifies a
+// report whose signer key id is a human label (not the hex of the public key).
+// The trusted-key map is resolved by the envelope's signer key id, so a bare
+// hex key must be bound to that id; otherwise the offline-verify flow only ever
+// worked when the key id happened to equal the public-key hex.
+func TestVerifyReceiptCmd_FleetReportHumanKeyID(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	_, path := writeFleetReportFixtureSigned(t, "fleet-report-2026", pub, priv)
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--fleet-report", "--key", hex.EncodeToString(pub)}))
+	assertFleetPartial(t, cmd.Execute())
+	if !strings.Contains(buf.String(), "FLEET RECEIPT VALID PREFIX, END UNPROVEN:") || !strings.Contains(buf.String(), "Signer:           fleet-report-2026") {
+		t.Fatalf("output:\n%s", buf.String())
+	}
+
+	// The same human key id with the WRONG public key must still fail closed:
+	// binding to the signer id does not bypass the Ed25519 signature check.
+	wrongPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(wrong): %v", err)
+	}
+	wrongCmd := VerifyReceiptCmd()
+	var wrongBuf bytes.Buffer
+	wrongCmd.SetOut(&wrongBuf)
+	wrongCmd.SetArgs(legacyReceiptPrefixArgs(wrongCmd, []string{path, "--fleet-report", "--key", hex.EncodeToString(wrongPub)}))
+	if err := wrongCmd.Execute(); err == nil {
+		t.Fatalf("expected wrong-key verification to fail closed:\n%s", wrongBuf.String())
+	}
+	if !strings.Contains(wrongBuf.String(), "FAILED:") {
+		t.Fatalf("wrong-key output missing FAILED:\n%s", wrongBuf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_FleetReportRequiresPinByDefault(t *testing.T) {
+	t.Parallel()
+
+	_, path := writeFleetReportFixture(t)
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--fleet-report"}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected unpinned fleet report verification to exit non-zero")
+	}
+	if !strings.Contains(buf.String(), "FLEET RECEIPT UNPINNED:") {
+		t.Fatalf("output missing unpinned warning:\n%s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_FleetReportRejectsSessionSelector(t *testing.T) {
+	t.Parallel()
+
+	_, path := writeFleetReportFixture(t)
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--fleet-report", "--session", "operator"}))
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected --fleet-report with --session to fail")
+	}
+	if !strings.Contains(err.Error(), "--fleet-report cannot be combined with --session") {
+		t.Fatalf("Execute error = %v, want --session conflict", err)
+	}
+}
+
+func TestVerifyReceiptCmd_FleetReportFailsClosedOnTamper(t *testing.T) {
+	t.Parallel()
+
+	pub, path := writeFleetReportFixture(t)
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var env fleetreceipt.Envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	// Flip one byte of the signed payload; the Ed25519 signature must no
+	// longer verify and the command must exit non-zero with FAILED.
+	payload, err := base64.StdEncoding.DecodeString(env.Payload)
+	if err != nil {
+		t.Fatalf("DecodeString: %v", err)
+	}
+	payload[0] ^= 0x01
+	env.Payload = base64.StdEncoding.EncodeToString(payload)
+	tamperedBytes, err := fleetreceipt.MarshalEnvelope(env)
+	if err != nil {
+		t.Fatalf("MarshalEnvelope: %v", err)
+	}
+	tamperedPath := filepath.Join(t.TempDir(), "tampered.dsse.json")
+	if err := os.WriteFile(tamperedPath, tamperedBytes, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{tamperedPath, "--fleet-report", "--key", hex.EncodeToString(pub)}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected tampered fleet report verification to exit non-zero")
+	}
+	if !strings.Contains(buf.String(), "FAILED:") {
+		t.Fatalf("output missing FAILED marker:\n%s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_FleetReportRejectsChainSelector(t *testing.T) {
+	t.Parallel()
+
+	_, path := writeFleetReportFixture(t)
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--fleet-report", "--chain", filepath.Dir(path)}))
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected --fleet-report with --chain to fail")
+	}
+	if !strings.Contains(err.Error(), "--fleet-report cannot be combined with --chain") {
+		t.Fatalf("Execute error = %v, want --chain conflict", err)
+	}
+}
+
+func TestVerifyReceiptCmd_WithExpectedKeyFile(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	pubKey := priv.Public().(ed25519.PublicKey)
+
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://example.com/receipt",
+		Verdict:         "allow",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	keyPath := filepath.Join(dir, "pub.key")
+	if err := os.WriteFile(keyPath, []byte(sigutil.EncodePublicKey(pubKey)), 0o600); err != nil {
+		t.Fatalf("WriteFile(key): %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", keyPath}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "OK:") {
+		t.Errorf("expected OK in output, got: %s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_WrongKey(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://example.com",
+		Verdict:         "block",
+		Transport:       "fetch",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Generate a different key
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", hex.EncodeToString(otherPub)}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error for wrong key")
+	}
+
+	if !strings.Contains(buf.String(), "FAILED") {
+		t.Errorf("expected FAILED in output, got: %s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_InvalidFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--allow-unpinned"}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestVerifyReceiptCmd_MissingFile(t *testing.T) {
+	t.Parallel()
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"/nonexistent/receipt.json"}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestVerifyReceiptCmd_NoArgs(t *testing.T) {
+	t.Parallel()
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error for no args")
+	}
+}
+
+func TestVerifyReceiptCmd_ReceiptWithMethodShowsFullRecord(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://example.com/api",
+		Verdict:         "block",
+		Transport:       "fetch",
+		Method:          "GET",
+		Layer:           "blocklist",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--allow-unpinned"}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	output := buf.String()
+	// When method/layer are present, full record JSON is printed
+	if !strings.Contains(output, "Full record:") {
+		t.Errorf("expected full record in output, got: %s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_FullRecordSanitizesAllStringFields(t *testing.T) {
+	t.Parallel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	ar := receipt.ActionRecord{
+		Version:         receipt.ActionRecordVersion,
+		ActionID:        receipt.NewActionID(),
+		ActionType:      receipt.ActionRead,
+		Timestamp:       time.Now().UTC(),
+		Target:          "https://api.vendor.example/path",
+		Principal:       "operator\u202Etxt",
+		Verdict:         "block",
+		Transport:       "fetch",
+		Method:          "GET",
+		Layer:           "blocklist",
+		SideEffectClass: receipt.SideEffectExternalRead,
+		Reversibility:   receipt.ReversibilityFull,
+	}
+	r, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(r)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", hex.EncodeToString(pub)}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\n%s", err, buf.String())
+	}
+	output := buf.String()
+	if strings.Contains(output, "\u202E") {
+		t.Fatalf("output contains raw bidi control:\n%s", output)
+	}
+	if !strings.Contains(output, "operator‹U+202E RIGHT-TO-LEFT OVERRIDE›txt") {
+		t.Fatalf("output missing sanitized principal:\n%s", output)
+	}
+}
+
+// buildChainJSONL creates a JSONL file with a valid receipt chain using the
+// emitter, which handles chain state (prev_hash, seq) automatically.
+func buildChainJSONL(t *testing.T, count int) (string, ed25519.PublicKey) {
+	t.Helper()
+
+	dir := t.TempDir()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}, nil, priv)
+	if err != nil {
+		t.Fatalf("recorder.New: %v", err)
+	}
+
+	emitter := receipt.NewEmitter(receipt.EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: "test-chain-hash",
+		Principal:  "test",
+		Actor:      "test",
+	})
+	if err := emitter.EmitSessionOpen(); err != nil {
+		t.Fatalf("EmitSessionOpen: %v", err)
+	}
+
+	for i := range count {
+		err := emitter.Emit(receipt.EmitOpts{
+			ActionID:  receipt.NewActionID(),
+			Verdict:   "allow",
+			Transport: "fetch",
+			Method:    "GET",
+			Target:    "https://example.com/" + string(rune('a'+i)),
+		})
+		if err != nil {
+			t.Fatalf("Emit %d: %v", i, err)
+		}
+	}
+
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+
+	// Find the JSONL file
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, de := range entries {
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			return filepath.Join(dir, de.Name()), priv.Public().(ed25519.PublicKey)
+		}
+	}
+	t.Fatal("no JSONL file found")
+	return "", nil
+}
+
+func buildSealedRecorderJSONL(t *testing.T) (string, ed25519.PublicKey) {
+	t.Helper()
+	return buildSealedRecorderJSONLSigned(t, true)
+}
+
+// buildSealedRecorderJSONLSigned builds a sealed single-session recorder file.
+// With signCheckpoints the recorder signs its checkpoints with the same key
+// that signs receipts, which is the production default.
+func buildSealedRecorderJSONLSigned(t *testing.T, signCheckpoints bool) (string, ed25519.PublicKey) {
+	t.Helper()
+	return buildSealedRecorderJSONLWith(t, signCheckpoints, 1000)
+}
+
+// buildSealedRecorderJSONLWith also sets the checkpoint interval; an interval
+// of 1 writes a checkpoint after every entry, which gives a session more than
+// one checkpoint to reason about.
+func buildSealedRecorderJSONLWith(t *testing.T, signCheckpoints bool, checkpointInterval int) (string, ed25519.PublicKey) {
+	t.Helper()
+
+	dir := t.TempDir()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	rec, err := recorder.New(recorder.Config{Enabled: true, Dir: dir, CheckpointInterval: checkpointInterval, SignCheckpoints: signCheckpoints}, nil, priv)
+	if err != nil {
+		t.Fatalf("recorder.New: %v", err)
+	}
+	emitter := receipt.NewEmitter(receipt.EmitterConfig{Recorder: rec, PrivKey: priv, ConfigHash: "test-chain-hash", Principal: "test", Actor: "test"})
+	if err := emitter.EmitSessionOpen(); err != nil {
+		t.Fatalf("EmitSessionOpen: %v", err)
+	}
+	if err := rec.Record(recorder.Entry{SessionID: "proxy", Type: "decision", Transport: "fetch", Summary: "operational decision"}); err != nil {
+		t.Fatalf("Record operational entry: %v", err)
+	}
+	if err := emitter.Emit(receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: "allow", Transport: "fetch", Method: "GET", Target: "https://api.vendor.example/data"}); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if err := emitter.EmitTranscriptRoot("proxy"); err != nil {
+		t.Fatalf("EmitTranscriptRoot: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, file := range files {
+		if strings.HasSuffix(file.Name(), ".jsonl") {
+			return filepath.Join(dir, file.Name()), priv.Public().(ed25519.PublicKey)
+		}
+	}
+	t.Fatal("no JSONL file found")
+	return "", nil
+}
+
+func TestVerifyReceiptCmd_FileModesRejectOperationalTampering(t *testing.T) {
+	t.Parallel()
+
+	path, pub := buildSealedRecorderJSONL(t)
+	original, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{
+			name: "delete operational entry",
+			mutate: func(data []byte) []byte {
+				var kept []string
+				for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+					if strings.Contains(line, `"type":"decision"`) {
+						continue
+					}
+					kept = append(kept, line)
+				}
+				return []byte(strings.Join(kept, "\n") + "\n")
+			},
+		},
+		{
+			name: "edit operational summary",
+			mutate: func(data []byte) []byte {
+				return bytes.Replace(data, []byte("operational decision"), []byte("altered operational data"), 1)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutatedPath := filepath.Join(t.TempDir(), "evidence.jsonl")
+			if err := os.WriteFile(mutatedPath, tc.mutate(original), 0o600); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			key := hex.EncodeToString(pub)
+			defaultCmd := VerifyReceiptCmd()
+			var defaultOut bytes.Buffer
+			defaultCmd.SetOut(&defaultOut)
+			defaultCmd.SetArgs(legacyReceiptPrefixArgs(defaultCmd, []string{mutatedPath, "--key", key}))
+			// File mode checks the recorder entry hash chain too, so an edit
+			// that leaves every receipt intact still fails there.
+			if err := defaultCmd.Execute(); err == nil || !strings.Contains(err.Error(), "recorder entry hash chain") {
+				t.Fatalf("default file verification accepted operational tampering: err=%v\n%s", err, defaultOut.String())
+			}
+			wholeCmd := VerifyReceiptCmd()
+			var wholeOut bytes.Buffer
+			wholeCmd.SetOut(&wholeOut)
+			wholeCmd.SetArgs(legacyReceiptPrefixArgs(wholeCmd, []string{mutatedPath, "--whole-recorder", "--key", key}))
+			if err := wholeCmd.Execute(); err == nil {
+				t.Fatalf("whole-recorder accepted operational tampering:\n%s", wholeOut.String())
+			}
+		})
+	}
+}
+
+func TestVerifyReceiptCmd_WholeRecorderSealAndIncompleteStates(t *testing.T) {
+	t.Parallel()
+
+	path, pub := buildSealedRecorderJSONL(t)
+	key := hex.EncodeToString(pub)
+	cmd := VerifyReceiptCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--whole-recorder", "--key", key}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("whole-recorder sealed verification: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{"Mode:      whole-recorder", "hash-chain-verified and in-taxonomy", "Seal:      sealed at seq", "trailing checkpoint may follow it"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("whole-recorder output missing %q:\n%s", want, out.String())
+		}
+	}
+
+	dirCmd := VerifyReceiptCmd()
+	var dirOut bytes.Buffer
+	dirCmd.SetOut(&dirOut)
+	dirCmd.SetArgs(legacyReceiptPrefixArgs(dirCmd, []string{"--whole-recorder", "--chain", filepath.Dir(path), "--key", key}))
+	if err := dirCmd.Execute(); err != nil {
+		t.Fatalf("whole-recorder directory verification: %v\n%s", err, dirOut.String())
+	}
+	if !strings.Contains(dirOut.String(), "WHOLE-RECORDER") {
+		t.Fatalf("whole-recorder directory output:\n%s", dirOut.String())
+	}
+
+	unsealedPath, unsealedPub := buildChainJSONL(t, 1)
+	cmd = VerifyReceiptCmd()
+	out.Reset()
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{unsealedPath, "--whole-recorder", "--key", hex.EncodeToString(unsealedPub)}))
+	if err := cmd.Execute(); err != nil || !strings.Contains(out.String(), "INCOMPLETE: no transcript_root seal") {
+		t.Fatalf("unsealed whole-recorder result err=%v output:\n%s", err, out.String())
+	}
+}
+
+func TestVerifyReceiptCmd_WholeRecorderChainAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	// Each run closes at a shard boundary. The recorder must still persist a
+	// signed checkpoint covering that run's seal, including after restart.
+	dir, pub := buildSealedRestartRecorderDir(t, 1, 1)
+	cmd := VerifyReceiptCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--whole-recorder", "--chain", dir, "--key", hex.EncodeToString(pub)}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("whole-recorder restart-chain verification: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{"WHOLE-RECORDER", "Entries:", "Receipts:  4 receipts verified", "Seal:      sealed at seq 3", "2 signed checkpoints verified"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("whole-recorder restart-chain output missing %q:\n%s", want, out.String())
+		}
+	}
+
+	// Explicitly remove only the final checkpoint from this temporary corpus.
+	// The earlier run remains authenticated, but it cannot cover the later seal.
+	shards, err := filepath.Glob(filepath.Join(dir, "evidence-*.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastPath string
+	var lastEntry recorder.Entry
+	for _, shard := range shards {
+		entries, readErr := recorder.ReadEntries(shard)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("shard %s has %d entries, want one", filepath.Base(shard), len(entries))
+		}
+		if lastPath == "" || entries[0].Sequence > lastEntry.Sequence {
+			lastPath, lastEntry = shard, entries[0]
+		}
+	}
+	if lastPath == "" || lastEntry.Type != "checkpoint" {
+		t.Fatal("restart fixture must end with a checkpoint shard")
+	}
+	if err := os.Remove(lastPath); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	cmd = VerifyReceiptCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--whole-recorder", "--chain", dir, "--key", hex.EncodeToString(pub)}))
+	if err := cmd.Execute(); err == nil || !strings.Contains(out.String(), "UNANCHORED: no signed checkpoint") || strings.Contains(out.String(), "Seal:      sealed at seq") {
+		t.Fatalf("seal without its checkpoint must be refused err=%v\n%s", err, out.String())
+	}
+	out.Reset()
+	cmd = VerifyReceiptCmd()
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--whole-recorder", "--chain", dir, "--key", hex.EncodeToString(pub), "--allow-unanchored-seal"}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("explicitly accepted unanchored restart-chain: %v\n%s", err, out.String())
+	}
+	for _, want := range []string{"Receipts:  4 receipts verified", "Seal:      sealed at seq 3", "none after the seal (accepted by --allow-unanchored-seal)"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("whole-recorder restart-chain output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestVerifyReceiptCmd_WholeRecorderDirectoryIncompleteSummary(t *testing.T) {
+	t.Parallel()
+	path, pub := buildChainJSONL(t, 1)
+	key := hex.EncodeToString(pub)
+	for _, tc := range []struct {
+		name    string
+		require bool
+	}{{"report", false}, {"require", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := VerifyReceiptCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			args := []string{"--whole-recorder", "--chain", filepath.Dir(path), "--key", key}
+			if tc.require {
+				args = append(args, "--require-seal")
+			}
+			cmd.SetArgs(legacyReceiptPrefixArgs(cmd, args))
+			err := cmd.Execute()
+			if (err != nil) != tc.require || !strings.Contains(out.String(), "INCOMPLETE RUNS (1): proxy") || strings.Contains(out.String(), "CHAIN VALID") {
+				t.Fatalf("require=%v err=%v output=%s", tc.require, err, out.String())
+			}
+		})
+	}
+}
+
+func TestVerifyReceiptCmd_WholeRecorderReportsReceiptTailAfterSealIncomplete(t *testing.T) {
+	t.Parallel()
+
+	dir, pub := buildRestartedRecorderWithUnsealedReceiptTail(t)
+	cmd := VerifyReceiptCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--whole-recorder", "--chain", dir, "--key", hex.EncodeToString(pub)}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatalf("whole-recorder accepted receipts after a prior seal:\n%s", out.String())
+	}
+	if got := out.String(); !strings.Contains(got, "INCOMPLETE: transcript_root seal precedes later unsealed entries (first: action_receipt") || strings.Contains(got, "CHAIN VALID") {
+		t.Fatalf("receipt tail result must be incomplete without a valid conclusion:\n%s", got)
+	}
+}
+
+// A session past the display entry budget is verified to its end: the break
+// in its final entry is found rather than hidden behind a truncated read.
+func TestVerifyReceiptCmd_WholeRecorderSessionReadsPastDisplayBudget(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	count := recorder.MaxEvidenceReadEntries + 2
+	writeLinkedCheckpointsWithFinalBreak(t, filepath.Join(dir, "evidence-proxy-0.jsonl"), count)
+
+	cmd := VerifyReceiptCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--whole-recorder", "--chain", dir}))
+	err := cmd.Execute()
+	want := fmt.Sprintf("entry seq %d: chain break", count-1)
+	if err == nil || !strings.Contains(err.Error()+out.String(), want) || strings.Contains(out.String(), "bounded read limits") || strings.Contains(out.String(), "CHAIN VALID") {
+		t.Fatalf("whole-recorder past the display budget: want %q, err=%v output:\n%s", want, err, out.String())
+	}
+}
+
+func TestVerifyReceiptCmd_WholeRecorderRejectsSealMismatchAndRawReceiptJSONL(t *testing.T) {
+	t.Parallel()
+
+	path, pub := buildSealedRecorderJSONL(t)
+	writeMismatch := func(t *testing.T, name string, mutate func(map[string]any)) string {
+		t.Helper()
+		entries, err := recorder.ReadEntries(path)
+		if err != nil {
+			t.Fatalf("ReadEntries: %v", err)
+		}
+		for i := range entries {
+			if entries[i].Type == "transcript_root" {
+				detail, ok := entries[i].Detail.(map[string]any)
+				if !ok {
+					t.Fatalf("transcript root detail type = %T", entries[i].Detail)
+				}
+				mutate(detail)
+			}
+			if i > 0 {
+				entries[i].PrevHash = entries[i-1].Hash
+			}
+			entries[i].RawDetail = nil
+			entries[i].Hash = recorder.ComputeHash(entries[i])
+		}
+		var rewritten strings.Builder
+		for _, entry := range entries {
+			data, err := json.Marshal(entry)
+			if err != nil {
+				t.Fatalf("Marshal entry: %v", err)
+			}
+			rewritten.Write(data)
+			rewritten.WriteByte('\n')
+		}
+		mismatchPath := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(mismatchPath, []byte(rewritten.String()), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return mismatchPath
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "root hash", mutate: func(detail map[string]any) { detail["root_hash"] = strings.Repeat("0", 64) }},
+		{name: "root session", mutate: func(detail map[string]any) { detail["session_id"] = "another-recorder-session" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := VerifyReceiptCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{writeMismatch(t, "seal-mismatch.jsonl", tc.mutate), "--whole-recorder", "--key", hex.EncodeToString(pub)}))
+			if err := cmd.Execute(); err == nil || !strings.Contains(out.String(), "SEAL MISMATCH") {
+				t.Fatalf("seal mismatch result err=%v output:\n%s", err, out.String())
+			}
+		})
+	}
+
+	rawSource, rawPub := buildChainJSONL(t, 1)
+	receipts, err := receipt.ExtractReceipts(rawSource)
+	if err != nil {
+		t.Fatalf("ExtractReceipts: %v", err)
+	}
+	var raw strings.Builder
+	for _, r := range receipts {
+		data, err := receipt.Marshal(r)
+		if err != nil {
+			t.Fatalf("Marshal receipt: %v", err)
+		}
+		raw.Write(data)
+		raw.WriteByte('\n')
+	}
+	rawPath := filepath.Join(t.TempDir(), "receipts.jsonl")
+	if err := os.WriteFile(rawPath, []byte(raw.String()), 0o600); err != nil {
+		t.Fatalf("WriteFile raw receipts: %v", err)
+	}
+	cmd := VerifyReceiptCmd()
+	var out bytes.Buffer
+	out.Reset()
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{rawPath, "--key", hex.EncodeToString(rawPub)}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("default raw receipt JSONL verification: %v\n%s", err, out.String())
+	}
+	cmd = VerifyReceiptCmd()
+	out.Reset()
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{rawPath, "--whole-recorder", "--key", hex.EncodeToString(rawPub)}))
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "not a recorder file") {
+		t.Fatalf("whole-recorder raw JSONL error=%v, want not a recorder file", err)
+	}
+}
+
+func buildDeferredCleanChainJSONL(t *testing.T) (string, ed25519.PublicKey) {
+	t.Helper()
+
+	dir := t.TempDir()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}, nil, priv)
+	if err != nil {
+		t.Fatalf("recorder.New: %v", err)
+	}
+
+	emitter := receipt.NewEmitter(receipt.EmitterConfig{
+		Recorder:   rec,
+		PrivKey:    priv,
+		ConfigHash: "test-chain-hash",
+		Principal:  "operator",
+		Actor:      "agent",
+	})
+	if err := emitter.EmitSessionOpen(); err != nil {
+		t.Fatalf("EmitSessionOpen: %v", err)
+	}
+
+	deferID := receipt.NewActionID()
+	if err := emitter.Emit(receipt.EmitOpts{
+		ActionID:         deferID,
+		Verdict:          config.ActionDefer,
+		Transport:        "mcp_stdio",
+		Method:           "tools/call",
+		Target:           "dangerous_tool",
+		DecisionPhase:    receipt.DecisionPhaseDefer,
+		DeferID:          deferID,
+		ResolutionPolicy: `{"allow_on":{"approval":true}}`,
+		SessionID:        "sess-1",
+	}); err != nil {
+		t.Fatalf("Emit defer: %v", err)
+	}
+	if err := emitter.Emit(receipt.EmitOpts{
+		ActionID:         receipt.NewActionID(),
+		ParentActionID:   deferID,
+		Verdict:          config.ActionBlock,
+		Transport:        "mcp_stdio",
+		Method:           "tools/call",
+		Target:           "dangerous_tool",
+		DecisionPhase:    receipt.DecisionPhaseResolution,
+		DeferID:          deferID,
+		ResolutionSource: "approval",
+		SessionID:        "sess-1",
+	}); err != nil {
+		t.Fatalf("Emit resolution: %v", err)
+	}
+	if err := emitter.Emit(receipt.EmitOpts{
+		ActionID:  receipt.NewActionID(),
+		Verdict:   config.ActionAllow,
+		Transport: "fetch",
+		Method:    "GET",
+		Target:    "https://example.com/ok",
+	}); err != nil {
+		t.Fatalf("Emit allow: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	for _, de := range entries {
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			return filepath.Join(dir, de.Name()), priv.Public().(ed25519.PublicKey)
+		}
+	}
+	t.Fatal("no JSONL file found")
+	return "", nil
+}
+
+func buildRestartChainDir(t *testing.T, counts ...int) (string, ed25519.PublicKey) {
+	t.Helper()
+
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	for i, count := range counts {
+		rec, err := recorder.New(recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 1000,
+			MaxEntriesPerFile:  1,
+			SignCheckpoints:    true,
+		}, nil, priv)
+		if err != nil {
+			t.Fatalf("recorder.New[%d]: %v", i, err)
+		}
+
+		emitter := receipt.NewEmitter(receipt.EmitterConfig{
+			Recorder:   rec,
+			PrivKey:    priv,
+			ConfigHash: "test-chain-hash",
+			Principal:  "test",
+			Actor:      "test",
+		})
+		if err := emitter.EmitSessionOpen(); err != nil {
+			t.Fatalf("EmitSessionOpen[%d]: %v", i, err)
+		}
+
+		for j := range count {
+			err := emitter.Emit(receipt.EmitOpts{
+				ActionID:  receipt.NewActionID(),
+				Verdict:   "allow",
+				Transport: "fetch",
+				Method:    "GET",
+				Target:    "https://example.com/restart/" + string(rune('a'+j)),
+			})
+			if err != nil {
+				t.Fatalf("Emit[%d][%d]: %v", i, j, err)
+			}
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("recorder.Close[%d]: %v", i, err)
+		}
+	}
+
+	return dir, pub
+}
+
+func buildSealedRestartRecorderDir(t *testing.T, counts ...int) (string, ed25519.PublicKey) {
+	t.Helper()
+
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	for i, count := range counts {
+		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: dir, CheckpointInterval: 1000, MaxEntriesPerFile: 1, SignCheckpoints: true}, nil, priv)
+		if err != nil {
+			t.Fatalf("recorder.New[%d]: %v", i, err)
+		}
+		emitter := receipt.NewEmitter(receipt.EmitterConfig{Recorder: rec, PrivKey: priv, ConfigHash: "test-chain-hash", Principal: "test", Actor: "test"})
+		if err := emitter.EmitSessionOpen(); err != nil {
+			t.Fatalf("EmitSessionOpen[%d]: %v", i, err)
+		}
+		for j := range count {
+			if err := emitter.Emit(receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: "allow", Transport: "fetch", Method: "GET", Target: "https://api.vendor.example/restart/" + string(rune('a'+j))}); err != nil {
+				t.Fatalf("Emit[%d][%d]: %v", i, j, err)
+			}
+		}
+		if err := emitter.EmitTranscriptRoot("proxy"); err != nil {
+			t.Fatalf("EmitTranscriptRoot[%d]: %v", i, err)
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("recorder.Close[%d]: %v", i, err)
+		}
+	}
+	return dir, pub
+}
+
+func buildRestartedRecorderWithUnsealedReceiptTail(t *testing.T) (string, ed25519.PublicKey) {
+	t.Helper()
+
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	for run := range 2 {
+		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: dir, CheckpointInterval: 1000}, nil, priv)
+		if err != nil {
+			t.Fatalf("recorder.New[%d]: %v", run, err)
+		}
+		emitter := receipt.NewEmitter(receipt.EmitterConfig{Recorder: rec, PrivKey: priv, ConfigHash: "test-chain-hash", Principal: "test", Actor: "test"})
+		if err := emitter.EmitSessionOpen(); err != nil {
+			t.Fatalf("EmitSessionOpen[%d]: %v", run, err)
+		}
+		if err := emitter.Emit(receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: "allow", Transport: "fetch", Method: "GET", Target: "https://api.vendor.example/restart"}); err != nil {
+			t.Fatalf("Emit[%d]: %v", run, err)
+		}
+		if run == 0 {
+			if err := emitter.EmitTranscriptRoot("proxy"); err != nil {
+				t.Fatalf("EmitTranscriptRoot: %v", err)
+			}
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("recorder.Close[%d]: %v", run, err)
+		}
+	}
+	return dir, pub
+}
+
+func copyEvidenceFiles(t *testing.T, source, target string) {
+	t.Helper()
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", target, err)
+	}
+	entries, err := os.ReadDir(source)
+	if err != nil {
+		t.Fatalf("ReadDir(%q): %v", source, err)
+	}
+	sourceRoot, err := os.OpenRoot(source)
+	if err != nil {
+		t.Fatalf("OpenRoot(%q): %v", source, err)
+	}
+	defer func() { _ = sourceRoot.Close() }()
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		raw, readErr := sourceRoot.ReadFile(entry.Name())
+		if readErr != nil {
+			t.Fatalf("ReadFile(%q): %v", entry.Name(), readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(target, entry.Name()), raw, 0o600); writeErr != nil {
+			t.Fatalf("WriteFile(%q): %v", entry.Name(), writeErr)
+		}
+	}
+}
+
+func TestVerifyReceiptCmd_ChainValid(t *testing.T) {
+	t.Parallel()
+
+	path, _ := buildChainJSONL(t, 5)
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path}))
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected unpinned chain verification to exit non-zero")
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "VALID PREFIX, END UNPROVEN") {
+		t.Errorf("expected VALID PREFIX, END UNPROVEN, got: %s", output)
+	}
+	if !strings.Contains(output, unpinnedReceiptBanner) {
+		t.Errorf("expected unpinned banner, got: %s", output)
+	}
+	if !strings.Contains(output, "Receipts:  6") {
+		t.Errorf("expected 6 receipts, got: %s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_ChainAllowUnpinned(t *testing.T) {
+	t.Parallel()
+
+	path, _ := buildChainJSONL(t, 5)
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--allow-unpinned"}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "VALID PREFIX, END UNPROVEN") {
+		t.Errorf("expected VALID PREFIX, END UNPROVEN, got: %s", output)
+	}
+	if !strings.Contains(output, "Receipts:  6") {
+		t.Errorf("expected 6 receipts, got: %s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_ChainWithKey(t *testing.T) {
+	t.Parallel()
+
+	path, pubKey := buildChainJSONL(t, 3)
+	keyHex := hex.EncodeToString(pubKey)
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", keyHex}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "VALID PREFIX, END UNPROVEN") {
+		t.Errorf("expected VALID PREFIX, END UNPROVEN, got: %s", buf.String())
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportJSONLWithDeferPair(t *testing.T) {
+	t.Parallel()
+
+	path, pubKey := buildDeferredCleanChainJSONL(t)
+	reportPath := filepath.Join(t.TempDir(), "clean-report.json")
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", hex.EncodeToString(pubKey), "--clean-report", reportPath}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v\n%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "VALID PREFIX, END UNPROVEN") {
+		t.Fatalf("output missing clean report success:\n%s", buf.String())
+	}
+	raw, err := os.ReadFile(filepath.Clean(reportPath))
+	if err != nil {
+		t.Fatalf("ReadFile(report): %v", err)
+	}
+	var report cleanActionReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("Unmarshal(report): %v", err)
+	}
+	if report.Chain.ReceiptCount != 4 || report.Chain.FinalSeq != 3 {
+		t.Fatalf("chain summary = %+v, want 4 receipts seq 3", report.Chain)
+	}
+	if len(report.Actions) != 4 {
+		t.Fatalf("actions = %d, want 4", len(report.Actions))
+	}
+	if report.Actions[1].DecisionPhase != receipt.DecisionPhaseDefer || report.Actions[2].DecisionPhase != receipt.DecisionPhaseResolution {
+		t.Fatalf("defer pair phases = (%q,%q)", report.Actions[1].DecisionPhase, report.Actions[2].DecisionPhase)
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportVerificationMode(t *testing.T) {
+	t.Parallel()
+	path, pubKey := buildDeferredCleanChainJSONL(t)
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantMode string
+		wantText string
+	}{
+		{"pinned", []string{"--key", hex.EncodeToString(pubKey)}, "pinned_provenance", "VALID PREFIX, END UNPROVEN"},
+		{"unpinned", []string{"--allow-unpinned"}, "unpinned_structural", "VALID PREFIX, END UNPROVEN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reportPath := filepath.Join(t.TempDir(), "report.json")
+			cmd := VerifyReceiptCmd()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetArgs(legacyReceiptPrefixArgs(cmd, append([]string{path, "--clean-report", reportPath}, tc.args...)))
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute: %v", err)
+			}
+			raw, err := os.ReadFile(filepath.Clean(reportPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report map[string]any
+			if err := json.Unmarshal(raw, &report); err != nil {
+				t.Fatal(err)
+			}
+			if report["schema_version"] != "pipelock.clean_report.v2" || report["verification_mode"] != tc.wantMode {
+				t.Fatalf("report trust contract: %s", raw)
+			}
+			if err := validateCleanReportSchema(t, raw); err != nil {
+				t.Fatalf("generated report violates published schema: %v\n%s", err, raw)
+			}
+			if !strings.Contains(out.String(), tc.wantText) {
+				t.Fatalf("output: %s", out.String())
+			}
+		})
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportRejectsUnpinned(t *testing.T) {
+	t.Parallel()
+	path, _ := buildDeferredCleanChainJSONL(t)
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+	cmd := VerifyReceiptCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--clean-report", reportPath}))
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "verification unpinned") {
+		t.Fatalf("Execute error = %v, want verification unpinned", err)
+	}
+	if _, err := os.Stat(reportPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("report path exists or stat failed: %v", err)
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportRefusesKeyFileAlias(t *testing.T) {
+	t.Parallel()
+	path, pubKey := buildDeferredCleanChainJSONL(t)
+	keyFile := filepath.Join(t.TempDir(), "trusted.key")
+	if err := os.WriteFile(keyFile, []byte(hex.EncodeToString(pubKey)+"\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile key: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Clean(keyFile))
+	if err != nil {
+		t.Fatalf("read key: %v", err)
+	}
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", keyFile, "--clean-report", keyFile}))
+	err = cmd.Execute()
+	after, readErr := os.ReadFile(filepath.Clean(keyFile))
+	if readErr != nil {
+		t.Fatalf("re-read key: %v", readErr)
+	}
+	if err == nil {
+		t.Fatalf("verify-receipt succeeded writing --clean-report over --key; stdout=%q", buf.String())
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("trusted signer key file was overwritten")
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportRefusesReceiptInputAlias(t *testing.T) {
+	t.Parallel()
+	path, pubKey := buildDeferredCleanChainJSONL(t)
+	before, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("read receipts: %v", err)
+	}
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--key", hex.EncodeToString(pubKey), "--clean-report", path}))
+	err = cmd.Execute()
+	after, readErr := os.ReadFile(filepath.Clean(path))
+	if readErr != nil {
+		t.Fatalf("re-read receipts: %v", readErr)
+	}
+	if err == nil {
+		t.Fatalf("verify-receipt succeeded writing --clean-report over the receipt input; stdout=%q", buf.String())
+	}
+	if !strings.Contains(err.Error(), "--clean-report must not name the receipt input") {
+		t.Fatalf("verify-receipt error = %v, want receipt-input alias refusal", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("receipt input was overwritten")
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportRejectsSingleReceipt(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	ar := receipt.ActionRecord{
+		Version:    receipt.ActionRecordVersion,
+		ActionID:   receipt.NewActionID(),
+		ActionType: receipt.ActionRead,
+		Timestamp:  time.Now().UTC(),
+		Target:     "https://example.com/api",
+		Verdict:    config.ActionAllow,
+		Transport:  "fetch",
+	}
+	rcpt, err := receipt.Sign(ar, priv)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := receipt.Marshal(rcpt)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "receipt.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{path, "--allow-unpinned", "--clean-report", filepath.Join(t.TempDir(), "report.json")}))
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--clean-report requires --chain or a JSONL receipt file") {
+		t.Fatalf("Execute error = %v, want clean-report input rejection", err)
+	}
+}
+
+func TestBuildCleanActionReportRejectsBadDeferPairs(t *testing.T) {
+	t.Parallel()
+
+	baseTime := time.Date(2026, 6, 17, 2, 30, 0, 0, time.UTC)
+	deferRecord := receipt.ActionRecord{
+		Version:       receipt.ActionRecordVersion,
+		ActionID:      "defer-action",
+		ActionType:    receipt.ActionWrite,
+		Timestamp:     baseTime,
+		Target:        "dangerous_tool",
+		Verdict:       config.ActionDefer,
+		Transport:     "mcp_stdio",
+		Method:        "tools/call",
+		DecisionPhase: receipt.DecisionPhaseDefer,
+		DeferID:       "defer-1",
+		Principal:     "operator",
+		Actor:         "agent",
+		SessionID:     "sess-1",
+		PolicyHash:    "policy",
+		ChainSeq:      1,
+	}
+	resolutionRecord := deferRecord
+	resolutionRecord.ActionID = "resolution-action"
+	resolutionRecord.ParentActionID = deferRecord.ActionID
+	resolutionRecord.Verdict = config.ActionBlock
+	resolutionRecord.DecisionPhase = receipt.DecisionPhaseResolution
+	resolutionRecord.ResolutionSource = "approval"
+	resolutionRecord.ChainSeq = 2
+	result := receipt.ChainResult{
+		Valid:        true,
+		ReceiptCount: 2,
+		FinalSeq:     2,
+		RootHash:     "root",
+		SignerKeys:   []string{"key"},
+	}
+
+	report, err := buildCleanActionReport("valid", []receipt.Receipt{
+		{ActionRecord: deferRecord},
+		{ActionRecord: resolutionRecord},
+	}, result)
+	if err != nil {
+		t.Fatalf("buildCleanActionReport valid pair: %v", err)
+	}
+	if len(report.Actions) != 2 || report.Actions[1].ResolutionSource != "approval" {
+		t.Fatalf("report actions = %+v", report.Actions)
+	}
+
+	tests := []struct {
+		name     string
+		records  []receipt.ActionRecord
+		wantText string
+	}{
+		{
+			name: "missing_defer_id",
+			records: []receipt.ActionRecord{
+				func() receipt.ActionRecord {
+					r := deferRecord
+					r.DeferID = ""
+					return r
+				}(),
+			},
+			wantText: "missing defer_id",
+		},
+		{
+			name: "duplicate_defer_id",
+			records: []receipt.ActionRecord{
+				deferRecord,
+				func() receipt.ActionRecord {
+					r := deferRecord
+					r.ActionID = "second-defer"
+					r.ChainSeq = 2
+					return r
+				}(),
+			},
+			wantText: "duplicate defer_id",
+		},
+		{
+			name: "resolution_missing_linkage",
+			records: []receipt.ActionRecord{
+				func() receipt.ActionRecord {
+					r := resolutionRecord
+					r.ParentActionID = ""
+					return r
+				}(),
+			},
+			wantText: "missing defer linkage",
+		},
+		{
+			name:     "missing_resolution",
+			records:  []receipt.ActionRecord{deferRecord},
+			wantText: "has 0 resolution receipts",
+		},
+		{
+			name: "parent_mismatch",
+			records: []receipt.ActionRecord{
+				deferRecord,
+				func() receipt.ActionRecord {
+					r := resolutionRecord
+					r.ParentActionID = "other"
+					return r
+				}(),
+			},
+			wantText: "resolution parent mismatch",
+		},
+		{
+			name: "resolution_before_defer",
+			records: []receipt.ActionRecord{
+				deferRecord,
+				func() receipt.ActionRecord {
+					r := resolutionRecord
+					r.ChainSeq = 1
+					return r
+				}(),
+			},
+			wantText: "appears before defer receipt",
+		},
+		{
+			name: "identity_changed",
+			records: []receipt.ActionRecord{
+				deferRecord,
+				func() receipt.ActionRecord {
+					r := resolutionRecord
+					r.Actor = "other-agent"
+					return r
+				}(),
+			},
+			wantText: "resolution identity changed",
+		},
+		{
+			name: "non_terminal_verdict",
+			records: []receipt.ActionRecord{
+				deferRecord,
+				func() receipt.ActionRecord {
+					r := resolutionRecord
+					r.Verdict = config.ActionDefer
+					return r
+				}(),
+			},
+			wantText: "resolved to non-terminal verdict",
+		},
+		{
+			name: "unknown_defer_resolution",
+			records: []receipt.ActionRecord{
+				func() receipt.ActionRecord {
+					r := resolutionRecord
+					r.DeferID = "unknown"
+					return r
+				}(),
+			},
+			wantText: "resolution for unknown defer",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			receipts := make([]receipt.Receipt, 0, len(tc.records))
+			for _, record := range tc.records {
+				receipts = append(receipts, receipt.Receipt{ActionRecord: record})
+			}
+			_, err := buildCleanActionReport(tc.name, receipts, result)
+			if err == nil || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("buildCleanActionReport() error = %v, want %q", err, tc.wantText)
+			}
+		})
+	}
+}
+
+func TestVerifyReceiptCmd_ChainDirAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	dir, pubKey := buildRestartChainDir(t, 2, 2)
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--chain", dir, "--key", hex.EncodeToString(pubKey)}))
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "VALID PREFIX, END UNPROVEN") {
+		t.Errorf("expected VALID PREFIX, END UNPROVEN, got: %s", output)
+	}
+	if !strings.Contains(output, "Receipts:  6") {
+		t.Errorf("expected 6 receipts, got: %s", output)
+	}
+}
+
+func TestVerifyReceiptCmd_ChainEmpty(t *testing.T) {
+	t.Parallel()
+
+	// Write an empty JSONL file (no receipts).
+	dir := t.TempDir()
+	emptyPath := filepath.Join(dir, "empty.jsonl")
+	if err := os.WriteFile(emptyPath, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := VerifyReceiptCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{emptyPath}))
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for empty JSONL")
+	}
+}
+
+func TestTranscriptRootCmd_NoKey(t *testing.T) {
+	t.Parallel()
+
+	path, _ := buildChainJSONL(t, 3)
+
+	cmd := TranscriptRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{path})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when --key not provided")
+	}
+	if !strings.Contains(err.Error(), "--key is required") {
+		t.Errorf("expected --key required error, got: %v", err)
+	}
+}
+
+func TestTranscriptRootCmd_Valid(t *testing.T) {
+	t.Parallel()
+
+	path, pub := buildChainJSONL(t, 4)
+	keyHex := hex.EncodeToString(pub)
+
+	cmd := TranscriptRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"--key", keyHex, path})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Transcript Root") {
+		t.Errorf("expected Transcript Root header, got: %s", output)
+	}
+	if !strings.Contains(output, "Receipt count: 5") {
+		t.Errorf("expected 5 receipts, got: %s", output)
+	}
+	if !strings.Contains(output, "Root hash:") {
+		t.Errorf("expected root hash, got: %s", output)
+	}
+}
+
+func TestTranscriptRootCmd_ChainDirAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	dir, pub := buildRestartChainDir(t, 2, 1)
+
+	cmd := TranscriptRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"--chain", dir, "--key", hex.EncodeToString(pub)})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Transcript Root") {
+		t.Errorf("expected Transcript Root header, got: %s", output)
+	}
+	if !strings.Contains(output, "Receipt count: 5") {
+		t.Errorf("expected 5 receipts, got: %s", output)
+	}
+}
+
+func TestTranscriptRootCmd_KeyFile(t *testing.T) {
+	t.Parallel()
+
+	path, pub := buildChainJSONL(t, 4)
+	keyPath := filepath.Join(t.TempDir(), "pub.key")
+	if err := os.WriteFile(keyPath, []byte(sigutil.EncodePublicKey(pub)), 0o600); err != nil {
+		t.Fatalf("WriteFile(key): %v", err)
+	}
+
+	cmd := TranscriptRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"--key", keyPath, path})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "Transcript Root") {
+		t.Errorf("expected Transcript Root header, got: %s", buf.String())
+	}
+}
+
+func TestTranscriptRootCmd_NoArgs(t *testing.T) {
+	t.Parallel()
+
+	cmd := TranscriptRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error for no args")
+	}
+}
+
+func TestTranscriptRootCmd_MissingFile(t *testing.T) {
+	t.Parallel()
+
+	cmd := TranscriptRootCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetArgs([]string{"/nonexistent/file.jsonl"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestVerifyChainFromFile_ValidChain(t *testing.T) {
+	t.Parallel()
+
+	path, pubKey := buildChainJSONL(t, 3)
+	keyHex := hex.EncodeToString(pubKey)
+
+	var buf bytes.Buffer
+	err := verifyChainFromFile(&buf, path, []string{keyHex})
+	if err != nil {
+		t.Fatalf("verifyChainFromFile: %v", err)
+	}
+	if !strings.Contains(buf.String(), "CHAIN VALID") {
+		t.Errorf("expected CHAIN VALID, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "Receipts:  4") {
+		t.Errorf("expected 4 receipts, got: %s", buf.String())
+	}
+}
+
+func TestVerifyChainFromFile_BadSignature(t *testing.T) {
+	t.Parallel()
+
+	path, _ := buildChainJSONL(t, 2)
+
+	// Use a different key to force signature mismatch.
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	wrongKeyHex := hex.EncodeToString(otherPub)
+
+	var buf bytes.Buffer
+	err = verifyChainFromFile(&buf, path, []string{wrongKeyHex})
+	if err == nil {
+		t.Fatal("expected error for wrong key")
+	}
+	if !strings.Contains(buf.String(), "CHAIN BROKEN") {
+		t.Errorf("expected CHAIN BROKEN, got: %s", buf.String())
+	}
+}
+
+func TestVerifyChainFromFile_EmptyFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	emptyPath := filepath.Join(dir, "empty.jsonl")
+	if err := os.WriteFile(emptyPath, []byte{}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	err := verifyChainFromFile(&buf, emptyPath, nil)
+	if err == nil {
+		t.Fatal("expected error for empty file")
+	}
+	if !strings.Contains(buf.String(), "No receipts found") {
+		t.Errorf("expected 'No receipts found' in output, got: %s", buf.String())
+	}
+}
+
+func TestVerifyChain_ValidReceiptsNoKey(t *testing.T) {
+	t.Parallel()
+
+	path, _ := buildChainJSONL(t, 4)
+	receipts, err := receipt.ExtractReceipts(path)
+	if err != nil {
+		t.Fatalf("ExtractReceipts: %v", err)
+	}
+
+	var buf bytes.Buffer
+	err = verifyChain(&buf, "test-chain", receipts, nil)
+	if err == nil {
+		t.Fatal("expected unpinned chain verification to fail closed")
+	}
+	if !strings.Contains(buf.String(), "CHAIN UNPINNED") {
+		t.Errorf("expected CHAIN UNPINNED, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "Receipts:  5") {
+		t.Errorf("expected 5 receipts, got: %s", buf.String())
+	}
+
+	buf.Reset()
+	err = verifyChainWithOptions(&buf, "test-chain", receipts, nil, true)
+	if err != nil {
+		t.Fatalf("verifyChainWithOptions allow unpinned: %v", err)
+	}
+	if !strings.Contains(buf.String(), "CHAIN UNPINNED") {
+		t.Errorf("expected CHAIN UNPINNED, got: %s", buf.String())
+	}
+}
+
+func TestVerifyChain_EmptySlice(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	err := verifyChain(&buf, "empty-chain", nil, nil)
+	if err == nil {
+		t.Fatal("expected error for empty receipt slice")
+	}
+	if !strings.Contains(buf.String(), "No receipts found") {
+		t.Errorf("expected 'No receipts found' in output, got: %s", buf.String())
+	}
+}
+
+func TestVerifyChainFromFile_NonexistentFile(t *testing.T) {
+	t.Parallel()
+
+	var buf bytes.Buffer
+	err := verifyChainFromFile(&buf, "/nonexistent/path/receipt.jsonl", nil)
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+	if !strings.Contains(err.Error(), "extracting receipts") {
+		t.Errorf("expected 'extracting receipts' in error, got: %v", err)
+	}
+}
+
+func TestVerifyChain_WrongKeyBreaksChain(t *testing.T) {
+	t.Parallel()
+
+	path, _ := buildChainJSONL(t, 3)
+	receipts, err := receipt.ExtractReceipts(path)
+	if err != nil {
+		t.Fatalf("ExtractReceipts: %v", err)
+	}
+
+	otherPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	wrongKeyHex := hex.EncodeToString(otherPub)
+
+	var buf bytes.Buffer
+	err = verifyChain(&buf, "wrong-key-chain", receipts, []string{wrongKeyHex})
+	if err == nil {
+		t.Fatal("expected error for wrong key")
+	}
+	if !strings.Contains(buf.String(), "CHAIN BROKEN") {
+		t.Errorf("expected CHAIN BROKEN, got: %s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "Broke at:") {
+		t.Errorf("expected 'Broke at' detail, got: %s", buf.String())
+	}
+}
+
+func TestResolveExpectedKeyHexesWrapsFailedKey(t *testing.T) {
+	t.Parallel()
+
+	_, err := resolveExpectedKeyHexes([]string{"not-a-key"})
+	if err == nil {
+		t.Fatal("expected invalid key to fail")
+	}
+	if !strings.Contains(err.Error(), `resolving --key "not-a-key"`) {
+		t.Fatalf("expected failing key in error, got %v", err)
+	}
+}
+
+func writeFleetReportFixture(t *testing.T) (ed25519.PublicKey, string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	return writeFleetReportFixtureSigned(t, hex.EncodeToString(pub), pub, priv)
+}
+
+func writeFleetReportFixtureSigned(t *testing.T, keyID string, pub ed25519.PublicKey, priv ed25519.PrivateKey) (ed25519.PublicKey, string) {
+	t.Helper()
+	statement := fleetreceipt.Statement{
+		Type: fleetreceipt.StatementType,
+		Subject: []fleetreceipt.Subject{{
+			Name:   "conductor-audit-batch:pipelab/dogfood/pl-1/audit-1",
+			Digest: fleetreceipt.Digest{SHA256: testHexSHA256("envelope")},
+		}},
+		PredicateType: fleetreceipt.PredicateType,
+		Predicate: fleetreceipt.Predicate{
+			SchemaVersion:     1,
+			ReportID:          "01934e1c-cd60-7abc-823a-d6f5e6f7a8b9",
+			GeneratedAt:       "2026-06-13T12:00:00Z",
+			OrgID:             "pipelab",
+			FleetID:           "dogfood",
+			ReportWindow:      fleetreceipt.TimeWindow{Start: "2026-06-13T11:00:00Z", End: "2026-06-13T12:00:00Z"},
+			VerificationLevel: fleetreceipt.VerificationLevelL1,
+			Conductor:         fleetreceipt.Conductor{ID: "conductor"},
+			SourceBatches: []fleetreceipt.SourceBatch{{
+				OrgID:           "pipelab",
+				FleetID:         "dogfood",
+				InstanceID:      "pl-1",
+				BatchID:         "audit-1",
+				SeqStart:        1,
+				SeqEnd:          2,
+				EventCount:      2,
+				PayloadSHA256:   testHexSHA256("payload"),
+				PayloadBytes:    512,
+				EnvelopeHash:    testHexSHA256("envelope"),
+				SegmentTailHash: testHexSHA256("tail"),
+				EmittedAt:       "2026-06-13T12:00:00Z",
+				ReceivedAt:      "2026-06-13T12:00:00Z",
+				SignatureKeyIDs: []string{"audit-key"},
+			}},
+			Summary: fleetreceipt.Summary{
+				TotalActions: 2,
+				ByFollower:   map[string]uint64{"pl-1": 2},
+				ByVerdict:    map[string]uint64{"allow": 1, "block": 1},
+			},
+			Completeness: fleetreceipt.Completeness{
+				ObservedActions:        2,
+				DroppedObservedActions: 0,
+				MediatedActions:        2,
+				MediatedFraction:       "1",
+				Basis:                  "included_signed_audit_batches",
+				Claim:                  "fraction of observed fleet action records in included signed audit batches that were mediated by Pipelock",
+				NonClaim:               "does not prove no bypass occurred outside Pipelock, outside enrolled followers, or outside the report window",
+			},
+		},
+	}
+	env, err := fleetreceipt.SignStatement(statement, keyID, priv)
+	if err != nil {
+		t.Fatalf("SignStatement: %v", err)
+	}
+	data, err := fleetreceipt.MarshalEnvelope(env)
+	if err != nil {
+		t.Fatalf("MarshalEnvelope: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "fleet-receipt.dsse.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	return pub, path
+}
+
+func TestReceiptCommandsRejectAmbiguousEvidenceLocations(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	for _, rel := range []string{"recorder-a/run-a", "recorder-b/run-b"} {
+		dir := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "evidence-proxy-0.jsonl"), []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+	}
+
+	verify := VerifyReceiptCmd()
+	verify.SetArgs(legacyReceiptPrefixArgs(verify, []string{"--chain", root, "--allow-unpinned"}))
+	if err := verify.Execute(); err == nil || !strings.Contains(err.Error(), "multiple evidence locations") {
+		t.Fatalf("verify-receipt error = %v, want ambiguous-location failure", err)
+	}
+
+	transcript := TranscriptRootCmd()
+	transcript.SetArgs(legacyReceiptPrefixArgs(transcript, []string{"--chain", root, "--key", strings.Repeat("a", 64)}))
+	if err := transcript.Execute(); err == nil || !strings.Contains(err.Error(), "multiple evidence locations") {
+		t.Fatalf("transcript-root error = %v, want ambiguous-location failure", err)
+	}
+}
+
+func TestVerifyReceiptCmd_CleanReportRefusesLocationReceiptAlias(t *testing.T) {
+	t.Parallel()
+	source, pub := buildRestartChainDir(t, 1)
+	otherSource, _ := buildRestartChainDir(t, 1)
+	root := t.TempDir()
+	selectedID := "recorder-a/run-a"
+	otherID := "recorder-b/run-b"
+	selectedDir := filepath.Join(root, filepath.FromSlash(selectedID))
+	copyEvidenceFiles(t, source, selectedDir)
+	copyEvidenceFiles(t, otherSource, filepath.Join(root, filepath.FromSlash(otherID)))
+	entries, err := os.ReadDir(selectedDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	var receiptFile string
+	for _, entry := range entries {
+		if entry.Type().IsRegular() {
+			receiptFile = filepath.Join(selectedDir, entry.Name())
+			break
+		}
+	}
+	if receiptFile == "" {
+		t.Fatal("selected location has no receipt file")
+	}
+	before, err := os.ReadFile(filepath.Clean(receiptFile))
+	if err != nil {
+		t.Fatalf("read receipt: %v", err)
+	}
+	cmd := VerifyReceiptCmd()
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{
+		"--chain", root,
+		"--location", selectedID,
+		"--key", hex.EncodeToString(pub),
+		"--clean-report", receiptFile,
+	}))
+	err = cmd.Execute()
+	after, readErr := os.ReadFile(filepath.Clean(receiptFile))
+	if readErr != nil {
+		t.Fatalf("re-read receipt: %v", readErr)
+	}
+	if err == nil {
+		t.Fatal("verify-receipt succeeded writing --clean-report over a nested location receipt")
+	}
+	if !strings.Contains(err.Error(), "--clean-report must not name the receipt input") {
+		t.Fatalf("verify-receipt error = %v, want nested receipt-input alias refusal", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("nested receipt input was overwritten")
+	}
+}
+
+func TestReceiptCommandsSelectEvidenceLocation(t *testing.T) {
+	t.Parallel()
+	source, pub := buildRestartChainDir(t, 1)
+	otherSource, _ := buildRestartChainDir(t, 1)
+	root := t.TempDir()
+	selectedID := "recorder-a/run-a"
+	otherID := "recorder-b/run-b"
+	copyEvidenceFiles(t, source, filepath.Join(root, filepath.FromSlash(selectedID)))
+	copyEvidenceFiles(t, otherSource, filepath.Join(root, filepath.FromSlash(otherID)))
+	keyHex := hex.EncodeToString(pub)
+
+	verify := VerifyReceiptCmd()
+	var verifyOut bytes.Buffer
+	verify.SetOut(&verifyOut)
+	verify.SetArgs(legacyReceiptPrefixArgs(verify, []string{"--chain", root, "--location", selectedID, "--key", keyHex}))
+	if err := verify.Execute(); err != nil {
+		t.Fatalf("verify-receipt selected location: %v", err)
+	}
+	if !strings.Contains(verifyOut.String(), "VALID PREFIX, END UNPROVEN") {
+		t.Fatalf("verify-receipt output = %q, want VALID PREFIX, END UNPROVEN", verifyOut.String())
+	}
+	// Without --allow-prefix the same selected location must refuse with the
+	// dedicated prefix exit code, not succeed and not report a broken chain.
+	strict := VerifyReceiptCmd()
+	var strictOut bytes.Buffer
+	strict.SetOut(&strictOut)
+	strict.SetArgs([]string{"--chain", root, "--location", selectedID, "--key", keyHex})
+	var strictErr *cliutil.ExitError
+	if err := strict.Execute(); !errors.As(err, &strictErr) || strictErr.Code != endproof.ExitPrefix {
+		t.Fatalf("strict selected location err = %v, want exit %d", err, endproof.ExitPrefix)
+	}
+	if !strings.Contains(strictOut.String(), "VALID PREFIX, END UNPROVEN") {
+		t.Fatalf("strict selected location output = %q, want VALID PREFIX, END UNPROVEN", strictOut.String())
+	}
+	cleanReport := filepath.Join(t.TempDir(), "clean-report.json")
+	verifyClean := VerifyReceiptCmd()
+	verifyClean.SetArgs(legacyReceiptPrefixArgs(verifyClean, []string{"--chain", root, "--location", selectedID, "--key", keyHex, "--clean-report", cleanReport}))
+	if err := verifyClean.Execute(); err != nil {
+		t.Fatalf("verify-receipt selected location clean report: %v", err)
+	}
+	if _, err := os.Stat(cleanReport); err != nil {
+		t.Fatalf("clean report was not written: %v", err)
+	}
+
+	transcript := TranscriptRootCmd()
+	var transcriptOut bytes.Buffer
+	transcript.SetOut(&transcriptOut)
+	transcript.SetArgs(legacyReceiptPrefixArgs(transcript, []string{"--chain", root, "--location", selectedID, "--key", keyHex}))
+	if err := transcript.Execute(); err != nil {
+		t.Fatalf("transcript-root selected location: %v", err)
+	}
+	if !strings.Contains(transcriptOut.String(), "Transcript Root") {
+		t.Fatalf("transcript-root output = %q, want transcript root", transcriptOut.String())
+	}
+
+	wrongVerify := VerifyReceiptCmd()
+	wrongVerify.SetArgs(legacyReceiptPrefixArgs(wrongVerify, []string{"--chain", root, "--location", otherID, "--key", keyHex}))
+	if err := wrongVerify.Execute(); err == nil {
+		t.Fatal("verify-receipt accepted the other location with the selected location's key")
+	}
+	wrongTranscript := TranscriptRootCmd()
+	wrongTranscript.SetArgs(legacyReceiptPrefixArgs(wrongTranscript, []string{"--chain", root, "--location", otherID, "--key", keyHex}))
+	if err := wrongTranscript.Execute(); err == nil {
+		t.Fatal("transcript-root accepted the other location with the selected location's key")
+	}
+
+	unknownVerify := VerifyReceiptCmd()
+	unknownVerify.SetArgs(legacyReceiptPrefixArgs(unknownVerify, []string{"--chain", root, "--location", "missing/run", "--key", keyHex}))
+	if err := unknownVerify.Execute(); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("verify-receipt unknown location error = %v, want not found", err)
+	}
+	unknownTranscript := TranscriptRootCmd()
+	unknownTranscript.SetArgs(legacyReceiptPrefixArgs(unknownTranscript, []string{"--chain", root, "--location", "missing/run", "--key", keyHex}))
+	if err := unknownTranscript.Execute(); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("transcript-root unknown location error = %v, want not found", err)
+	}
+}
+
+func TestVerifyReceiptCmdFleetReportRejectsLocation(t *testing.T) {
+	t.Parallel()
+	_, path := writeFleetReportFixture(t)
+	cmd := VerifyReceiptCmd()
+	cmd.SetArgs(legacyReceiptPrefixArgs(cmd, []string{"--fleet-report", "--location", "run-a", path}))
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--location requires --chain") {
+		t.Fatalf("fleet report location error = %v, want --location conflict", err)
+	}
+}
+
+func TestReceiptCommandsRejectLocationWithoutChain(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "evidence.jsonl")
+	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	verify := VerifyReceiptCmd()
+	verify.SetArgs(legacyReceiptPrefixArgs(verify, []string{"--location", "run-a", "--allow-unpinned", path}))
+	if err := verify.Execute(); err == nil || !strings.Contains(err.Error(), "--location requires --chain") {
+		t.Fatalf("verify-receipt error = %v", err)
+	}
+
+	transcript := TranscriptRootCmd()
+	transcript.SetArgs(legacyReceiptPrefixArgs(transcript, []string{"--location", "run-a", "--key", strings.Repeat("a", 64), path}))
+	if err := transcript.Execute(); err == nil || !strings.Contains(err.Error(), "--location requires --chain") {
+		t.Fatalf("transcript-root error = %v", err)
+	}
+}
+
+func testHexSHA256(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:])
+}

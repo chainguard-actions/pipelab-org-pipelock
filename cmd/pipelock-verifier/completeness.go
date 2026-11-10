@@ -1,0 +1,262 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/evidence/completeness"
+	actionreceipt "github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+)
+
+type completenessOptions struct {
+	signerKey     string
+	sessionID     string
+	locationID    string
+	jsonOutput    bool
+	allowUnpinned bool
+	// sessionExplicit records that --session was passed. Without it, a
+	// directory of per-run chains resolves its lone chain of the default base.
+	sessionExplicit bool
+}
+
+func newCompletenessCmd() *cobra.Command {
+	var opts completenessOptions
+	cmd := &cobra.Command{
+		Use:   "completeness RUNDIR|FILE",
+		Short: "Analyze bounded run-completeness evidence",
+		Long: `Analyzes signed session lifecycle evidence in an action-receipt chain.
+The best possible completeness result is LIMITED, never COMPLETE/PASS/OK:
+Pipelock can bound mediated egress it observed, but cannot prove the agent had
+no egress path outside that boundary.
+
+Exit-code contract:
+  0  LIMITED bounded-completeness result
+  1  BROKEN or UNVERIFIED completeness evidence, unpinned non-empty chain
+     without --allow-unpinned, or another verifier failure
+  2  tool, IO, extraction, or key-resolution error
+ 64  command-line usage error`,
+		Args:          exactOneArg,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.sessionExplicit = cmd.Flags().Changed("session")
+			return runCompleteness(cmd.OutOrStdout(), cmd.ErrOrStderr(), args[0], opts)
+		},
+	}
+	cmd.SetFlagErrorFunc(usageFlagError)
+	cmd.Flags().StringVar(&opts.signerKey, "key", "", "expected signer public key (hex, public-key text, or file path)")
+	cmd.Flags().StringVar(&opts.sessionID, "session", "proxy", "session ID inside an evidence directory (default: the directory's only proxy chain)")
+	cmd.Flags().StringVar(&opts.locationID, "location", "", "location path relative to the evidence directory")
+	cmd.Flags().BoolVar(&opts.jsonOutput, "json", false, "emit a structured JSON report on stdout")
+	cmd.Flags().BoolVar(&opts.allowUnpinned, "allow-unpinned", false, "allow structural-only verification without a trusted signer key")
+	return cmd
+}
+
+func runCompleteness(stdout, stderr io.Writer, target string, opts completenessOptions) error {
+	keyHex, err := resolveSignerKey(strings.TrimSpace(opts.signerKey))
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve signer key: %w", err))
+	}
+	clean := filepath.Clean(target)
+	var resolvedLocation *recorder.EvidenceLocation
+	info, statErr := os.Stat(target)
+	if statErr != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("stat %q: %w", clean, statErr))
+	}
+	if info.IsDir() {
+		location, locationErr := recorder.ResolveEvidenceLocation(target, opts.locationID)
+		if locationErr != nil {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve evidence location: %w", locationErr))
+		}
+		clean = location.Dir
+		resolvedLocation = &location
+		if !opts.sessionExplicit {
+			session, others, resolveErr := resolveCompletenessSession(location.Dir, opts.sessionID)
+			if resolveErr != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, resolveErr)
+			}
+			if len(others) > 0 {
+				_, _ = fmt.Fprintf(stderr, "NOTE: analyzing the legacy %s chain; this directory also holds %s; pass --session to analyze one of them\n",
+					session, strings.Join(others, ", "))
+			}
+			opts.sessionID = session
+		}
+	} else if opts.locationID != "" {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("--location requires an evidence directory"))
+	} else {
+		clean, err = filepath.EvalSymlinks(target)
+		if err != nil {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve %q: %w", target, err))
+		}
+	}
+	receipts, label, err := extractCompletenessReceipts(clean, opts.sessionID, resolvedLocation)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+	}
+	chainResult := actionreceipt.VerifyChain(receipts, keyHex)
+	report := completeness.Analyze(receipts, chainResult)
+	report.Path = label
+	// An empty chain has no signatures to verify. VerifyChain reports its
+	// integrity result separately so that lifecycle-only failures can retain
+	// their provenance detail, but that must not turn no evidence into a
+	// signatures-verified claim.
+	report.SignaturesVerified = len(receipts) > 0 && chainResult.IntegrityVerified && keyHex != ""
+	report.Unpinned = len(receipts) > 0 && chainResult.IntegrityVerified && keyHex == ""
+	if report.Unpinned && !opts.allowUnpinned {
+		// Append rather than overwrite: a report can be both Unpinned and
+		// StatusBroken (integrity-valid chain with a completeness structural
+		// violation), and the broken reason must survive so the exit-1 detail
+		// below reports the real cause, not just the unpinned banner.
+		if report.Error == "" {
+			report.Error = unpinnedReceiptBanner
+		} else {
+			report.Error = report.Error + "; " + unpinnedReceiptBanner
+		}
+	}
+
+	emitCompletenessReport(stdout, stderr, report, opts.jsonOutput)
+	if report.Status == completeness.StatusBroken {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("completeness broken: %s", report.Error))
+	}
+	if report.Status == completeness.StatusUnverified {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("completeness unverified: %s", report.Reason))
+	}
+	if report.Unpinned && !opts.allowUnpinned {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("completeness verification unpinned"))
+	}
+	return nil
+}
+
+// resolveCompletenessSession picks the chain the default --session names. A
+// recorder writes one chain per run ("proxy.run.<id>"), so the plain base
+// usually matches no file. The report covers exactly one chain:
+//   - a legacy chain named exactly base keeps its earlier default, and the
+//     other chains of the base are returned so the caller can name them;
+//   - otherwise a lone chain is used and several are refused by name rather
+//     than one being chosen silently;
+//   - no chain keeps the base, which reports no_receipts.
+//
+// Receipt-group shards are named separately: completeness cannot read them,
+// so --session would not help and the group verifier is the remedy.
+func resolveCompletenessSession(dir, base string) (string, []string, error) {
+	sessions, err := actionreceipt.ResolveBaseSessions(dir, base)
+	if err != nil {
+		return "", nil, fmt.Errorf("list receipt chains: %w", err)
+	}
+	legacy, err := actionreceipt.ResolveBaseSessionsExcludingReceiptGroups(dir, base)
+	if err != nil {
+		return "", nil, fmt.Errorf("list receipt chains: %w", err)
+	}
+	if grouped := len(sessions) - len(legacy); grouped > 0 {
+		msg := fmt.Sprintf("%s holds %d receipt-group shard(s) for base %q, which completeness analysis does not read; verify them with pipelock-verifier chain %s --dir --key <trusted signer key>",
+			dir, grouped, base, dir)
+		if len(legacy) > 0 {
+			msg += fmt.Sprintf("; pass --session to analyze one of the ungrouped chains (%s)", strings.Join(legacy, ", "))
+		}
+		return "", nil, errors.New(msg)
+	}
+	for i, session := range sessions {
+		if session == base {
+			others := append(append([]string{}, sessions[:i]...), sessions[i+1:]...)
+			return base, others, nil
+		}
+	}
+	switch len(sessions) {
+	case 0:
+		return base, nil, nil
+	case 1:
+		return sessions[0], nil, nil
+	default:
+		return "", nil, fmt.Errorf("%s holds %d receipt chains for base %q (%s); pass --session to analyze one",
+			dir, len(sessions), base, strings.Join(sessions, ", "))
+	}
+}
+
+func extractCompletenessReceipts(clean, sessionID string, resolvedLocation *recorder.EvidenceLocation) ([]actionreceipt.Receipt, string, error) {
+	if resolvedLocation != nil {
+		receipts, err := actionreceipt.ExtractReceiptsFromResolvedSessionDir(*resolvedLocation, sessionID)
+		if err != nil {
+			return nil, "", fmt.Errorf("extract receipts: %w", err)
+		}
+		return receipts, fmt.Sprintf("%s (session %s)", resolvedLocation.Dir, sessionID), nil
+	}
+
+	info, err := os.Stat(clean)
+	if err != nil {
+		return nil, "", fmt.Errorf("stat %q: %w", clean, err)
+	}
+	if info.IsDir() {
+		receipts, extractErr := actionreceipt.ExtractReceiptsFromSessionDir(clean, sessionID)
+		if extractErr != nil {
+			return nil, "", fmt.Errorf("extract receipts: %w", extractErr)
+		}
+		return receipts, fmt.Sprintf("%s (session %s)", clean, sessionID), nil
+	}
+	receipts, err := actionreceipt.ExtractReceipts(clean)
+	if err != nil {
+		return nil, "", fmt.Errorf("extract receipts: %w", err)
+	}
+	return receipts, clean, nil
+}
+
+func emitCompletenessReport(stdout, stderr io.Writer, report completeness.Report, jsonMode bool) {
+	if jsonMode {
+		writeJSON(stdout, report)
+		return
+	}
+	if report.Unpinned {
+		_, _ = fmt.Fprintf(stderr, "WARN: %s\n", unpinnedReceiptBanner)
+	}
+	_, _ = fmt.Fprintf(stdout, "completeness: %s (%s)\n", report.Status, report.Reason)
+	_, _ = fmt.Fprintf(stdout, "path: %s\n", report.Path)
+	_, _ = fmt.Fprintf(stdout, "receipts: %d\n", report.ReceiptCount)
+	if report.FinalSeq != 0 || report.RootHash != "" {
+		_, _ = fmt.Fprintf(stdout, "final_seq: %d\n", report.FinalSeq)
+	}
+	if report.RootHash != "" {
+		_, _ = fmt.Fprintf(stdout, "root_hash: %s\n", report.RootHash)
+	}
+	if report.Error != "" {
+		_, _ = fmt.Fprintf(stdout, "detail: %s\n", report.Error)
+	}
+	for _, run := range report.Runs {
+		emitCompletenessRun(stdout, run)
+	}
+}
+
+func emitCompletenessRun(stdout io.Writer, run completeness.RunReport) {
+	_, _ = fmt.Fprintf(stdout, "\nrun_nonce: %s\n", run.RunNonce)
+	_, _ = fmt.Fprintf(stdout, "  status: %s\n", run.Status)
+	_, _ = fmt.Fprintf(stdout, "  reason: %s\n", run.Reason)
+	_, _ = fmt.Fprintf(stdout, "  intents: %d\n", run.Intents)
+	_, _ = fmt.Fprintf(stdout, "  outcomes: %d\n", run.Outcomes)
+	_, _ = fmt.Fprintf(stdout, "  matched_pairs: %d\n", run.MatchedPairs)
+	_, _ = fmt.Fprintf(stdout, "  unmatched_intents: %d\n", run.UnmatchedIntents)
+	_, _ = fmt.Fprintf(stdout, "  heartbeats: %d\n", run.Heartbeats)
+	_, _ = fmt.Fprintf(stdout, "  closed: %t\n", run.Closed)
+	_, _ = fmt.Fprintf(stdout, "  durability_monotonic: %t\n", run.DurabilityMonotonic)
+	_, _ = fmt.Fprintf(stdout, "  fsync_errors_gated: %d\n", run.FsyncErrorsGated)
+	_, _ = fmt.Fprintf(stdout, "  durability_blocks: %d\n", run.DurabilityBlocks)
+	if run.LastHeartbeat != nil {
+		_, _ = fmt.Fprintf(stdout, "  last_heartbeat_fsync_errors_gated: %d\n", run.LastHeartbeat.FsyncErrorsGated)
+		_, _ = fmt.Fprintf(stdout, "  last_heartbeat_durability_blocks: %d\n", run.LastHeartbeat.DurabilityBlocks)
+	}
+	if run.Close != nil {
+		_, _ = fmt.Fprintf(stdout, "  close_fsync_errors_gated: %d\n", run.Close.FsyncErrorsGated)
+		_, _ = fmt.Fprintf(stdout, "  close_durability_blocks: %d\n", run.Close.DurabilityBlocks)
+	}
+	if run.StructuralViolation != "" {
+		_, _ = fmt.Fprintf(stdout, "  structural_violation: %s\n", run.StructuralViolation)
+	}
+}

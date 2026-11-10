@@ -1,0 +1,110 @@
+# Filesystem Sentinel
+
+The filesystem sentinel monitors directories where agent subprocesses write files. When pipelock wraps an MCP server in subprocess mode (`pipelock mcp proxy -- COMMAND`), it can watch the agent's working directories for secrets written to disk.
+
+This catches a class of exfiltration that the network proxy cannot see: an agent writing credentials to a file, then a later process reading and exfiltrating them through a channel pipelock doesn't monitor.
+
+## When to Use It
+
+- Your MCP server subprocess writes files to a working directory
+- You want to detect leaked credentials in agent output files
+
+## Scope
+
+`action: block` applies to **subprocess MCP mode only**. HTTP upstream, WebSocket, and listener modes have no local child process to cancel. `pipelock run` can use file sentry with `action: warn`, but it rejects `file_sentry.action: block` at startup and rejects a reload that introduces it.
+
+File sentry detects writes; it doesn't intercept them. With `action: warn` (default), findings are alerted and the agent keeps running. With `action: block`, file sentry fails closed only after it emits a detected, agent-attributed DLP finding. The consumer logs the finding, records the metric, and then cancels the proxy context, terminating the MCP child so the agent cannot continue acting on that detected leak. A skipped, unreadable, ignored, or deleted file doesn't create a finding. If the path is replaced before the scan opens it, the replacement content is scanned and can become a finding. Without a finding, block leaves the child running. Writes before Arm work the same way. A watcher backend failure from `Start()` still cancels the runtime; that is a dead watcher, not a skipped file. For write-time interception, use Landlock or the process sandbox (`--sandbox`).
+
+## Configuration
+
+```yaml
+file_sentry:
+  enabled: true
+  best_effort: false        # false: fail startup on any skipped subtree
+  action: warn               # warn (default) or block
+  watch_paths:
+    - "/workspace"           # strict by default
+    - path: "/tmp/agent-output"
+      required: true         # remains strict when best_effort is true
+  scan_content: true
+  max_file_bytes: 0           # 0 = built-in 10 MiB default
+  ignore_patterns:
+    - "node_modules/**"
+    - ".git/**"
+    - "*.o"
+    - "*.so"
+    - "*.pyc"
+```
+
+### Action
+
+- `warn` (default): every finding is logged to stderr and recorded as a Prometheus metric. The MCP child keeps running.
+- `block`: same logging + metrics, AND on the first detected finding attributed to a process in the agent tree (`IsAgent=true`), the proxy context is cancelled, which terminates the MCP child. Non-agent writes (editor saves, build output, other system processes touching the watched directory) never trigger the block path. Skipped, unreadable, ignored, deleted, and pre-arm writes don't create a finding, so they don't cancel the child. Replacement content present when the scan opens the path can still become a finding. The cancel fires exactly once per session.
+
+### Watch Paths
+
+Directories are watched recursively. New subdirectories created after startup are automatically added to the watch. Paths are resolved to absolute paths at startup.
+
+When file sentry observes a runtime directory creation, it recursively adds watches and scans regular, non-ignored files already in that new subtree. `Arm()` only installs watches. It does not scan content that predates the child.
+
+Each entry can be either a bare string or a mapping:
+
+```yaml
+watch_paths:
+  - "/workspace"             # strict by default
+  - path: "/var/agent-secrets"
+    required: true
+```
+
+Setup is strict by default. If Pipelock cannot watch any configured root or descendant subtree, it reports every skipped subtree and fails startup. Set `best_effort: true` to keep accessible siblings armed while reporting the gaps. Startup still fails if no directory can be armed. Use `required: true` for a root that must stay strict while best-effort is enabled. Root symlinks are rejected and child symlinks are not followed. Unknown mapping fields are rejected so typos do not silently change the requested behavior.
+
+### Ignore Patterns
+
+Glob patterns match against the file or directory base name. Common patterns to ignore:
+
+- Build artifacts: `*.o`, `*.so`, `*.pyc`, `*.class`
+- Package managers: `node_modules/**`, `.venv/**`
+- Version control: `.git/**`
+
+### Content Scanning
+
+When `scan_content` is true (the default), file sentry reads each modified file and runs pipelock's DLP scanner on the content. The same 65 credential patterns used for network traffic apply to file content.
+
+`max_file_bytes` caps how much file content the scanner will read. `0` uses the built-in 10 MiB default; set a positive byte value to override it. Negative values are rejected during config validation.
+
+Files larger than the cap are skipped to avoid unbounded memory use, and the skip is surfaced through the watcher's error path instead of being silently dropped. Stat and read failures are surfaced the same way, so operators can distinguish "clean file" from "file was not inspected."
+
+## How It Works
+
+1. On startup, pipelock walks each `watch_paths` directory and adds recursive inotify (Linux) or fsnotify watches. Arm does not scan files that already exist.
+2. When a new directory is created at runtime, pipelock adds nested watches and scans regular, non-ignored files already in that subtree.
+3. When a file write event fires, pipelock debounces for 50ms (waits for the write to complete)
+4. After the quiet window, pipelock reads the file and runs DLP pattern matching
+5. If a match is found, a finding is reported as:
+   - A stderr log line: `pipelock: [file_sentry] DLP match in /path: Pattern Name (severity=critical)`
+   - A Prometheus counter increment: `pipelock_file_sentry_findings_total{pattern, severity, agent}`
+
+## Process Attribution (Linux)
+
+On Linux, pipelock uses `PR_SET_CHILD_SUBREAPER` to track the agent's process tree. When a file write is detected, pipelock checks `/proc/[pid]/fd` for all tracked processes to determine if the write came from the agent.
+
+If attribution succeeds, the finding includes `is_agent: true` and the `agent` Prometheus label is set to `"true"`.
+
+Attribution is probabilistic: if the writing process has already closed the file descriptor by the time pipelock checks, attribution will not succeed. This is a detection heuristic, not forensic proof.
+
+## Diagnosing coverage
+
+`pipelock doctor` runs the same traversal file sentry uses to arm watches, without installing any watcher. It reports `FAIL` when a watch subtree is unreachable. With `file_sentry.best_effort: true` that becomes `WARN`, except under a watch path marked `required: true`, which stays `FAIL` because `best_effort` never covers a required path. A watch path list that reduces to nothing after `ignore_patterns` fails closed regardless of `best_effort`, because arming would have nothing to watch. A truncated walk (the traversal hit its entry budget) reports a warning rather than a pass, since the unvisited remainder is unchecked, not proven reachable. A coverage `OK` proves the configured tree was traversable as the doctor's user; it does not prove the watcher is armed and running, which still depends on the agent launching through the Pipelock MCP wrapper.
+
+On a real arming failure at startup, Pipelock prints a summary line naming how many watch subtrees were skipped or unarmed, followed by remedies scoped to what would actually fix it. `best_effort` is offered as a remedy only when it can resolve the failure; a required watch path or a zero-watchable-path config are never rescued by it, and the message says so.
+
+## Relationship to `pipelock integrity`
+
+`pipelock integrity` is a point-in-time snapshot scan. It checks files once and reports. File sentry is real-time continuous monitoring. They are complementary:
+
+| Feature | `pipelock integrity` | File Sentry |
+|---------|---------------------|-------------|
+| Timing | On-demand snapshot | Continuous real-time |
+| Scope | Any directory | Any listener with `action: warn`; `action: block` in subprocess MCP mode only |
+| Detection | File hashes + DLP | DLP on write events |
+| Attribution | None | Process tree (Linux) |

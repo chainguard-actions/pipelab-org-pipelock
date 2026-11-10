@@ -1,0 +1,608 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package main
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+)
+
+// These tests hold pipelock-verifier to the verdicts verify-receipt reaches
+// on the same real Go-written evidence: the run-chain conformance fixtures.
+
+const (
+	parityRun1   = "proxy.run.03b13ee13e01e7f770480f62ea42f1fe"
+	parityRun2   = "proxy.run.f7b327337534352a514bd0a256b1d1c0"
+	parityReplay = "proxy.run.00000000000000000000000000000000"
+	rotatedRun   = "proxy.run.da660e29de374fd065cf1a12b3abde7b"
+)
+
+func runFileIn(dir, session string) string {
+	return filepath.Join(dir, "evidence-"+session+"-0.jsonl")
+}
+
+// editLines rewrites path line by line; returning nil drops the line.
+func editLines(t *testing.T, path string, edit func(line []byte) []byte) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out [][]byte
+	for _, l := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		if e := edit(l); e != nil {
+			out = append(out, e)
+		}
+	}
+	if err := os.WriteFile(filepath.Clean(path), append(bytes.Join(out, []byte("\n")), '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// forgeFirstV2 edits a signed field of the first EvidenceReceipt v2 and
+// recomputes the recorder hash chain, so only the receipt's own signature can
+// catch it.
+func forgeFirstV2(t *testing.T, path string) {
+	t.Helper()
+	done := false
+	editLines(t, path, func(l []byte) []byte {
+		if !done && bytes.Contains(l, []byte(`"type":"evidence_receipt"`)) {
+			done = true
+			return bytes.Replace(l, []byte(`"actor":"pipelock"`), []byte(`"actor":"pipelocx"`), 1)
+		}
+		return l
+	})
+	if !done {
+		t.Fatal("no evidence receipt to forge")
+	}
+	rehashRecorderFile(t, path)
+}
+
+func TestChain_RotatedEvidenceTrust(t *testing.T) {
+	t.Parallel()
+	dir := filepath.Join(runChainFixtures, "key-rotated")
+	keyA := readRunChainFixture(t, "signer-key.hex")
+	keyB := readRunChainFixture(t, "rotated-signer-key.hex")
+	endorsement := filepath.Join(dir, "rotation-endorsement.json")
+	for name, tc := range map[string]struct {
+		args []string
+		code int
+	}{
+		"first key only":                 {[]string{"--key", keyA}, 1},
+		"both keys":                      {[]string{"--key", keyA, "--key", keyB}, 0},
+		"first key and endorsement":      {[]string{"--key", keyA, "--rotation-endorsement", endorsement}, 0},
+		"endorsement without a root key": {[]string{"--rotation-endorsement", endorsement}, 2},
+		"named rotated run, both keys":   {[]string{"--key", keyA, "--key", keyB, "--session", rotatedRun}, 0},
+		"named rotated run, endorsed":    {[]string{"--key", keyA, "--rotation-endorsement", endorsement, "--session", rotatedRun}, 0},
+		"named rotated run, first only":  {[]string{"--key", keyA, "--session", rotatedRun}, 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			stdout, stderr, code := runRoot(t, append([]string{"chain", "--allow-prefix", dir, "--dir"}, tc.args...)...)
+			if code != tc.code {
+				t.Fatalf("exit %d, want %d\n%s%s", code, tc.code, stdout, stderr)
+			}
+		})
+	}
+	// The rotated run's own file verifies under its own key.
+	if stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", runFileIn(dir, rotatedRun), "--key", keyB); code != 0 {
+		t.Fatalf("rotated run file: exit %d\n%s%s", code, stdout, stderr)
+	}
+}
+
+func TestChain_NamedRunFailsOnAnotherRunsFinding(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	clean := copyFixtureDir(t, "valid")
+	if stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", clean, "--dir", "--key", key, "--session", parityRun1); code != 0 {
+		t.Fatalf("positive control: exit %d\n%s%s", code, stdout, stderr)
+	}
+	dir := copyFixtureDir(t, "valid")
+	forgeFirstV2(t, runFileIn(dir, parityRun2))
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", dir, "--dir", "--key", key, "--session", parityRun1, "--json")
+	var got chainReport
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("decode: %v\n%s", err, stdout)
+	}
+	if code != 1 || got.Valid || !strings.Contains(got.Error, "corrupt_chain on "+parityRun2) {
+		t.Fatalf("exit %d valid=%v error=%q: want a failure naming %s", code, got.Valid, got.Error, parityRun2)
+	}
+	if !strings.Contains(stderr, parityRun2) {
+		t.Fatalf("stderr must name the offending run:\n%s", stderr)
+	}
+}
+
+func TestChain_DirectoryForgedV2AndDuplicateRun(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	t.Run("forged v2 with rehashed recorder chain", func(t *testing.T) {
+		t.Parallel()
+		dir := copyFixtureDir(t, "valid")
+		forgeFirstV2(t, runFileIn(dir, parityRun2))
+		stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", dir, "--dir", "--key", key)
+		if code != 1 || !strings.Contains(stdout+stderr, "evidence receipt chain") {
+			t.Fatalf("exit %d\n%s%s", code, stdout, stderr)
+		}
+	})
+	t.Run("replayed run under a new session name", func(t *testing.T) {
+		t.Parallel()
+		dir := copyFixtureDir(t, "valid")
+		data, err := os.ReadFile(filepath.Clean(runFileIn(dir, parityRun1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		replay := runFileIn(dir, parityReplay)
+		if err := os.WriteFile(replay, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		editLines(t, replay, func(l []byte) []byte {
+			return bytes.ReplaceAll(l, []byte(`"session_id":"`+parityRun1+`"`), []byte(`"session_id":"`+parityReplay+`"`))
+		})
+		rehashRecorderFile(t, replay)
+		stdout, _, code := runRoot(t, "chain", "--allow-prefix", dir, "--dir", "--key", key, "--json")
+		var got chainSetReport
+		if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+			t.Fatalf("decode: %v\n%s", err, stdout)
+		}
+		found := false
+		for _, f := range got.Continuity.Findings {
+			if f.Kind == receipt.FindingDuplicateRunNonce {
+				found = true
+			}
+		}
+		if code != 1 || got.Valid || !found {
+			t.Fatalf("exit %d valid=%v findings=%+v: want duplicate_run_nonce", code, got.Valid, got.Continuity.Findings)
+		}
+	})
+}
+
+func TestChain_FileModeRules(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	for name, tc := range map[string]struct {
+		setup   func(t *testing.T, dir string) string
+		code    int
+		wantOut string
+	}{
+		"clean": {
+			setup: func(_ *testing.T, dir string) string { return runFileIn(dir, parityRun2) },
+		},
+		"recorder hash chain broken, receipts intact": {
+			setup: func(t *testing.T, dir string) string {
+				editLines(t, runFileIn(dir, parityRun2), func(l []byte) []byte {
+					if bytes.Contains(l, []byte(`"type":"decision"`)) {
+						return bytes.Replace(l, []byte(`"summary":"`), []byte(`"summary":"edited `), 1)
+					}
+					return l
+				})
+				return runFileIn(dir, parityRun2)
+			},
+			code: 1, wantOut: "recorder entry hash chain",
+		},
+		"another session's entries under this name": {
+			setup: func(t *testing.T, dir string) string {
+				data, err := os.ReadFile(filepath.Clean(runFileIn(dir, parityRun1)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(runFileIn(dir, parityReplay), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return runFileIn(dir, parityReplay)
+			},
+			code: 1, wantOut: "does not match requested session",
+		},
+		"only evidence receipts": {
+			setup: func(t *testing.T, dir string) string {
+				editLines(t, runFileIn(dir, parityRun2), func(l []byte) []byte {
+					if bytes.Contains(l, []byte(`"type":"action_receipt"`)) {
+						return nil
+					}
+					return l
+				})
+				rehashRecorderFile(t, runFileIn(dir, parityRun2))
+				return runFileIn(dir, parityRun2)
+			},
+			wantOut: recordTypeEvidenceV2,
+		},
+		"only evidence receipts, one forged": {
+			setup: func(t *testing.T, dir string) string {
+				editLines(t, runFileIn(dir, parityRun2), func(l []byte) []byte {
+					if bytes.Contains(l, []byte(`"type":"action_receipt"`)) {
+						return nil
+					}
+					return l
+				})
+				forgeFirstV2(t, runFileIn(dir, parityRun2))
+				return runFileIn(dir, parityRun2)
+			},
+			code: 1, wantOut: "signature",
+		},
+		"explicit symlinked file is read as given": {
+			setup: func(t *testing.T, dir string) string {
+				link := filepath.Join(t.TempDir(), filepath.Base(runFileIn(dir, parityRun2)))
+				if err := os.Symlink(runFileIn(dir, parityRun2), link); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+				return link
+			},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			path := tc.setup(t, copyFixtureDir(t, "valid"))
+			stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", path, "--key", key, "--json")
+			if code != tc.code || !strings.Contains(stdout+stderr, tc.wantOut) {
+				t.Fatalf("exit %d, want %d with %q\n%s%s", code, tc.code, tc.wantOut, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestChain_DirectorySymlinkRefusedAsVerificationFailure(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	dir := copyFixtureDir(t, "valid")
+	outside := filepath.Join(t.TempDir(), "run2.jsonl")
+	data, err := os.ReadFile(filepath.Clean(runFileIn(dir, parityRun2)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(runFileIn(dir, parityRun2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, runFileIn(dir, parityRun2)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	for _, extra := range [][]string{nil, {"--session", parityRun1}} {
+		_, stderr, code := runRoot(t, append([]string{"chain", "--allow-prefix", dir, "--dir", "--key", key}, extra...)...)
+		if code != 1 || !strings.Contains(stderr, "refuse symlink") || !strings.Contains(stderr, filepath.Base(runFileIn(dir, parityRun2))) {
+			t.Fatalf("%v: exit %d, want 1 naming the file\n%s", extra, code, stderr)
+		}
+	}
+}
+
+func TestChain_ExplicitPathResolvesSymlinkBeforeDotDot(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	dir := physicalTempDir(t)
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	for _, path := range []string{a, filepath.Join(b, "sub")} {
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	name := filepath.Base(runFileIn("", parityRun1))
+	valid, err := os.ReadFile(filepath.Join(runChainFixtures, "valid", name)) // #nosec G304 -- name comes from a test fixture constant.
+	if err != nil {
+		t.Fatal(err)
+	}
+	pathA := filepath.Join(a, name)
+	pathB := filepath.Join(b, name)
+	link := filepath.Join(a, "link")
+	if err := os.Symlink(filepath.Join(b, "sub"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	input := link + string(filepath.Separator) + ".." + string(filepath.Separator) + name
+	for _, tc := range []struct {
+		name   string
+		aData  []byte
+		bData  []byte
+		wantOK bool
+	}{
+		{name: "invalid reached target", aData: valid, bData: []byte("not-json\n")},
+		{name: "valid reached target", aData: []byte("not-json\n"), bData: valid, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(pathA, tc.aData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(pathB, tc.bData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			resolved, err := filepath.EvalSymlinks(input)
+			if err != nil || resolved != pathB {
+				t.Fatalf("path resolves to %q, want %q: %v", resolved, pathB, err)
+			}
+			stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", input, "--key", key, "--json")
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("exit %d, want valid=%t\n%s%s", code, tc.wantOK, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestReceipt_ExplicitPathResolvesSymlinkBeforeDotDot(t *testing.T) {
+	t.Parallel()
+	fix := newFixture(t, 1)
+	valid, err := receipt.Marshal(fix.receipts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	for _, path := range []string{a, filepath.Join(b, "sub")} {
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pathA := filepath.Join(a, "receipt.json")
+	pathB := filepath.Join(b, "receipt.json")
+	link := filepath.Join(a, "link")
+	if err := os.Symlink(filepath.Join(b, "sub"), link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	input := link + string(filepath.Separator) + ".." + string(filepath.Separator) + "receipt.json"
+	for _, tc := range []struct {
+		name   string
+		aData  []byte
+		bData  []byte
+		wantOK bool
+	}{
+		{name: "invalid reached target", aData: valid, bData: []byte("not-json\n")},
+		{name: "valid reached target", aData: []byte("not-json\n"), bData: valid, wantOK: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(pathA, tc.aData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(pathB, tc.bData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runRoot(t, "receipt", input, "--key", fix.keyHex, "--json")
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("exit %d, want valid=%t\n%s%s", code, tc.wantOK, stdout, stderr)
+			}
+		})
+	}
+}
+
+// writeRunPacket wraps one run's evidence file in a v0 Audit Packet whose
+// claims match its action chain.
+func writeRunPacket(t *testing.T, evidence []byte, keyHex string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "evidence.jsonl"), evidence, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	receipts, err := receipt.ExtractReceiptsBytes(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := receipt.VerifyChain(receipts, keyHex)
+	if !res.Valid {
+		t.Fatalf("action chain of the packet evidence: %s", res.Error)
+	}
+	raw, err := os.ReadFile(filepath.Clean("../../sdk/audit-packet/example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	totals := map[string]any{"allow": 0, "block": 0, "warn": 0, "ask": 0, "strip": 0, "forward": 0, "redirect": 0, "other": 0}
+	for k, v := range computeTotals(receipts) {
+		totals[k] = v
+	}
+	summary := p["summary"].(map[string]any)
+	summary["receipt_count"] = len(receipts)
+	summary["totals"] = totals
+	v := p["verifier"].(map[string]any)
+	v["receipt_count"] = len(receipts)
+	v["final_seq"] = res.FinalSeq
+	v["root_hash"] = res.RootHash
+	v["signer_key"] = keyHex
+	p["artifacts"].(map[string]any)["evidence"] = "evidence.jsonl"
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "packet.json"), out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestAuditPacket_VerifiesBothChainsOfItsEvidence(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	dir := copyFixtureDir(t, "valid")
+	clean, err := os.ReadFile(filepath.Clean(runFileIn(dir, parityRun2)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runRoot(t, "audit-packet", writeRunPacket(t, clean, key), "--key", key, "--json")
+	if code != 0 || !strings.Contains(stdout, `"trusted": true`) {
+		t.Fatalf("positive control: exit %d\n%s%s", code, stdout, stderr)
+	}
+	forgeFirstV2(t, runFileIn(dir, parityRun2))
+	forged, err := os.ReadFile(filepath.Clean(runFileIn(dir, parityRun2)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code = runRoot(t, "audit-packet", writeRunPacket(t, forged, key), "--key", key, "--json")
+	var got auditPacketReport
+	if err := json.Unmarshal([]byte(stdout), &got); err != nil {
+		t.Fatalf("decode: %v\n%s", err, stdout)
+	}
+	if code != 1 || got.Trusted || got.Valid || got.Verdict == "valid" || got.ChainCheck != statusFail {
+		t.Fatalf("forged v2 packet: exit %d trusted=%v valid=%v verdict=%q chain=%q", code, got.Trusted, got.Valid, got.Verdict, got.ChainCheck)
+	}
+	if !strings.Contains(stderr, "evidence receipt chain") {
+		t.Fatalf("stderr must give the reason:\n%s", stderr)
+	}
+}
+
+// Every failure prints a one-line reason on stderr. Before, each subcommand
+// silenced cobra's error printing, so a failure with no report of its own
+// exited non-zero with nothing on either stream.
+func TestExecute_EveryFailurePrintsReason(t *testing.T) {
+	t.Parallel()
+	missing := filepath.Join(t.TempDir(), "absent")
+	for _, args := range [][]string{
+		{"chain", missing},
+		{"chain", missing, "--dir"},
+		{"chain", runFileIn(filepath.Join(runChainFixtures, "valid"), parityRun1), "--key", "zz"},
+		{"receipt", missing},
+		{"audit-packet", missing},
+		{"evidence", missing},
+		{"completeness", missing},
+		{"provenance", missing},
+		{"aarp", missing},
+		{"no-such-subcommand"},
+	} {
+		stdout, stderr, code := runRoot(t, args...)
+		if code == 0 {
+			t.Fatalf("%v: exit 0", args)
+		}
+		if n := strings.Count(stderr, "pipelock-verifier: "); n != 1 {
+			t.Fatalf("%v: want exactly one reason line on stderr, got %d\nstdout: %s\nstderr: %s", args, n, stdout, stderr)
+		}
+	}
+}
+
+func TestChain_DirectoryRootSymlinkRefusedAlongWalkedPath(t *testing.T) {
+	t.Parallel()
+	key := readRunChainFixture(t, "signer-key.hex")
+	base := physicalTempDir(t)
+	valid := copyFixtureDir(t, "valid")
+	tampered := copyFixtureDir(t, "tampered-predecessor")
+	realEv := filepath.Join(base, "a", "ev")
+	otherEv := filepath.Join(base, "b", "ev")
+	for _, pair := range [][2]string{{valid, realEv}, {tampered, otherEv}} {
+		if err := os.MkdirAll(filepath.Dir(pair[1]), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(pair[0], pair[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(base, "b", "sub"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(base, "b", "sub"), filepath.Join(base, "a", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(realEv, filepath.Join(base, "evlink")); err != nil {
+		t.Fatal(err)
+	}
+	sep := string(filepath.Separator)
+	hidden := filepath.Join(base, "a", "link") + sep + ".." + sep + "ev"
+	for _, tc := range []struct {
+		name    string
+		target  string
+		code    int
+		wantOut string
+	}{
+		{name: "real directory", target: realEv, code: 0, wantOut: "VALID PREFIX, END UNPROVEN"},
+		{name: "directory the hidden path opens", target: otherEv, code: 1, wantOut: "CHAIN BROKEN"},
+		{name: "symlinked root", target: filepath.Join(base, "evlink"), code: 1, wantOut: "refuse symlink in evidence root path"},
+		{name: "symlink hidden by dot-dot", target: hidden, code: 1, wantOut: "refuse symlink in evidence root path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", tc.target, "--dir", "--key", key)
+			if code != tc.code || !strings.Contains(stdout+stderr, tc.wantOut) {
+				t.Fatalf("exit %d, want %d with %q\n%s%s", code, tc.code, tc.wantOut, stdout, stderr)
+			}
+		})
+	}
+}
+
+// A --key file path is read as the operating system opens it, as every
+// receipt verifier reads it: "link/../keys/k.hex" names the key under the
+// link's target, not the lexical keys/k.hex.
+// physicalTempDir returns t.TempDir() with symlinks resolved. An evidence root
+// may not pass through a symlink, and the system temp directory does on some
+// platforms (macOS /var is a symlink to /private/var).
+func physicalTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestChain_KeyFileResolvesSymlinkBeforeDotDot(t *testing.T) {
+	t.Parallel()
+	signer := readRunChainFixture(t, "signer-key.hex")
+	other, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherHex := hex.EncodeToString(other)
+	dir := t.TempDir()
+	for _, sub := range []string{filepath.Join("a", "keys"), filepath.Join("b", "keys"), filepath.Join("b", "sub")} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "b", "sub"), filepath.Join(dir, "a", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	sep := string(filepath.Separator)
+	input := filepath.Join(dir, "a", "link") + sep + ".." + sep + "keys" + sep + "k.hex"
+	lexical := filepath.Join(dir, "a", "keys", "k.hex")
+	opened := filepath.Join(dir, "b", "keys", "k.hex")
+	evidence := filepath.Join(runChainFixtures, "valid")
+	for _, tc := range []struct {
+		name            string
+		lexKey, openKey string
+		wantOK          bool
+	}{
+		{name: "signer at the opened path", lexKey: otherHex, openKey: signer, wantOK: true},
+		{name: "signer only at the lexical path", lexKey: signer, openKey: otherHex},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(lexical, []byte(tc.lexKey+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(opened, []byte(tc.openKey+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", evidence, "--dir", "--key", input, "--json")
+			if (code == 0) != tc.wantOK {
+				t.Fatalf("exit %d, want valid=%t\n%s%s", code, tc.wantOK, stdout, stderr)
+			}
+		})
+	}
+}
+
+// A file named as a directory ("receipt.json/", "receipt.json/.") is refused,
+// as the operating system refuses to open it and as every verifier refuses it.
+func TestReceipt_FileNamedAsDirectoryRefused(t *testing.T) {
+	t.Parallel()
+	file := filepath.Join(physicalTempDir(t), "receipt.json")
+	data, err := os.ReadFile(filepath.Join("..", "..", "sdk", "conformance", "testdata", "valid-single.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if stdout, stderr, code := runRoot(t, "receipt", file, "--allow-unpinned"); code != 0 {
+		t.Fatalf("positive control: exit %d\n%s%s", code, stdout, stderr)
+	}
+	sep := string(filepath.Separator)
+	for _, input := range []string{file + sep, file + sep + "."} {
+		stdout, stderr, code := runRoot(t, "receipt", input, "--allow-unpinned")
+		if code != 2 || !strings.Contains(stdout+stderr, "not a directory") {
+			t.Fatalf("%q: exit %d, want 2 not-a-directory\n%s%s", input, code, stdout, stderr)
+		}
+	}
+}

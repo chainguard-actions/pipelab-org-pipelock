@@ -1,0 +1,6273 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package audit
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/emit"
+	scannerpkg "github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+const (
+	testClientIP   = "10.0.0.1"
+	testReqID      = "req-7"
+	testComponent  = "pipelock"
+	testActionWarn = "warn"
+	testConfigHash = "testhash"
+	testVersion    = "0.0.0-dev.unknown"
+	testAgentName  = "claude-code"
+	testDoWTarget  = "expensive_tool"
+	testMethodGet  = "GET"
+	mitreT1048     = "T1048"
+	mitreT1053     = "T1053"
+	mitreT1059     = "T1059"
+)
+
+// collectingSink records all emitted events for test assertions.
+type collectingSink struct {
+	mu     sync.Mutex
+	events []emit.Event
+}
+
+func (c *collectingSink) Emit(_ context.Context, event emit.Event) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, event)
+	return nil
+}
+
+func (c *collectingSink) Close() error { return nil }
+
+func (c *collectingSink) lastEvent() (emit.Event, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) == 0 {
+		return emit.Event{}, false
+	}
+	return c.events[len(c.events)-1], true
+}
+
+func (c *collectingSink) onlyEvent(t *testing.T) emit.Event {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.events) != 1 {
+		t.Fatalf("got %d emitted events, want exactly 1", len(c.events))
+	}
+	return c.events[0]
+}
+
+func TestNew_StdoutJSON(t *testing.T) {
+	logger, err := New("json", "stdout", "", true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer logger.Close()
+	if logger.filePath != "" || logger.fileHandle != nil {
+		t.Fatalf("stdout logger file state = path %q handle %v, want no file state", logger.filePath, logger.fileHandle)
+	}
+}
+
+func TestNew_FileOutput(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer logger.Close()
+
+	// Verify file was created with correct permissions
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("log file not created: %v", err)
+	}
+	// Windows reports a synthesized 0o666 mode for any user-readable+writable
+	// file regardless of the mode passed to OpenFile. Skip the perm assertion
+	// there; file creation itself is still verified above.
+	if runtime.GOOS != "windows" {
+		perm := info.Mode().Perm()
+		if perm != 0o600 {
+			t.Errorf("expected file permissions 0600, got %o", perm)
+		}
+	}
+}
+
+func TestNewDurableFileRejectsNonRegularFile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/dev/full is a Linux special device")
+	}
+	if _, err := NewDurableFile("json", "/dev/full", true, true); err == nil || !strings.Contains(err.Error(), "set logging.file to a writable regular file") {
+		t.Fatalf("NewDurableFile(/dev/full) error = %v, want regular-file refusal", err)
+	}
+}
+
+func TestNewDurableFileRejectsSymlinkToNonRegularFile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("/dev/full is a Linux special device")
+	}
+	path := filepath.Join(durableAuditTempDir(t), "audit-link")
+	if err := os.Symlink("/dev/full", path); err != nil {
+		t.Fatalf("create audit link: %v", err)
+	}
+	if _, err := NewDurableFile("json", path, true, true); err == nil || !strings.Contains(err.Error(), "too many levels of symbolic links") {
+		t.Fatalf("NewDurableFile(%q) error = %v, want final-symlink refusal", path, err)
+	}
+}
+
+func TestNewDurableFileRejectsUnopenablePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path func(t *testing.T) string
+	}{
+		{
+			name: "missing parent",
+			path: func(t *testing.T) string {
+				return filepath.Join(durableAuditTempDir(t), "missing", "audit.jsonl")
+			},
+		},
+		{
+			name: "directory instead of file",
+			path: func(t *testing.T) string {
+				return durableAuditTempDir(t)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := NewDurableFile("json", tc.path(t), false, false); err == nil {
+				t.Fatal("NewDurableFile succeeded with an unusable audit path")
+			}
+		})
+	}
+}
+
+func TestNewDurableFileUnsupportedOnNonUnix(t *testing.T) {
+	if DurableAuditFileSupported() {
+		t.Skip("Unix durable audit support boundary")
+	}
+	if _, err := NewDurableFile("json", filepath.Join(durableAuditTempDir(t), "audit.jsonl"), false, false); err == nil || !strings.Contains(err.Error(), "unsupported on this platform") {
+		t.Fatalf("NewDurableFile error = %v, want unsupported-platform refusal", err)
+	}
+}
+
+func requireDurableAuditFile(t *testing.T) {
+	t.Helper()
+	if !DurableAuditFileSupported() {
+		t.Skip("durable lifecycle audit files are unsupported on this platform")
+	}
+}
+
+// durableAuditTempDir gives durable-file fixtures private permissions regardless
+// of the process umask. Tests of unsafe modes set those modes explicitly.
+func durableAuditTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302 -- owner execute permission is required for directory traversal
+		t.Fatalf("secure durable audit fixture directory: %v", err)
+	}
+	return dir
+}
+
+func TestNewReusesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	if err := os.WriteFile(path, []byte("existing\n"), 0o600); err != nil {
+		t.Fatalf("write existing audit file: %v", err)
+	}
+
+	logger, err := New("json", "file", path, false, false)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer logger.Close()
+	if logger.fileCreated {
+		t.Fatal("New reported a pre-existing file as created")
+	}
+}
+
+func TestNewDurableFileRejectsFilesystemSyncFailure(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the procfs sync failure case is Linux-specific")
+	}
+	if _, err := os.Stat("/proc/self/clear_refs"); err != nil {
+		t.Skipf("procfs clear_refs unavailable: %v", err)
+	}
+
+	logger, err := NewDurableFile("json", "/proc/self/clear_refs", false, false)
+	if logger != nil {
+		logger.Close()
+		t.Fatal("NewDurableFile accepted a procfs file whose sync failed")
+	}
+	if err == nil || !strings.Contains(err.Error(), "sync audit log file") {
+		t.Fatalf("NewDurableFile error = %v, want sync failure", err)
+	}
+}
+
+func TestNewDurableFileResyncsParentAfterFailedCreation(t *testing.T) {
+	requireDurableAuditFile(t)
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+	originalSync := syncDurableAuditParent
+	var syncCalls int
+	syncDurableAuditParent = func(string) error {
+		syncCalls++
+		return errors.New("injected parent sync failure")
+	}
+	t.Cleanup(func() { syncDurableAuditParent = originalSync })
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		logger, err := NewDurableFile("json", path, false, false)
+		if logger != nil {
+			logger.Close()
+			t.Fatalf("attempt %d returned a logger after parent sync failure", attempt)
+		}
+		if err == nil || !strings.Contains(err.Error(), "sync audit log directory") {
+			t.Fatalf("attempt %d error = %v, want parent sync refusal", attempt, err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("attempt %d did not leave the created audit path behind: %v", attempt, err)
+		}
+	}
+	if syncCalls != 2 {
+		t.Fatalf("parent sync calls = %d, want a check on both the create and retry opens", syncCalls)
+	}
+}
+
+func TestNewDurableFileRejectsUnsafeUnixOwnershipAndModes(t *testing.T) {
+	requireDurableAuditFile(t)
+
+	for _, tc := range []struct {
+		name        string
+		prepare     func(t *testing.T, path string)
+		want        string
+		inParentDir bool
+	}{
+		{
+			name: "group writable file",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("write audit file: %v", err)
+				}
+				if err := os.Chmod(path, 0o620); err != nil { // #nosec G302 -- test requires an intentionally group-writable fixture.
+					t.Fatalf("make audit file group writable: %v", err)
+				}
+			},
+			want: "audit log file must not be group or world writable",
+		},
+		{
+			name: "world writable file",
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("write audit file: %v", err)
+				}
+				if err := os.Chmod(path, 0o602); err != nil { // #nosec G302 -- test requires an intentionally world-writable fixture.
+					t.Fatalf("make audit file world writable: %v", err)
+				}
+			},
+			want: "audit log file must not be group or world writable",
+		},
+		{
+			name:        "group writable parent",
+			inParentDir: true,
+			prepare: func(t *testing.T, path string) {
+				t.Helper()
+				parent := filepath.Dir(path)
+				if err := os.Mkdir(parent, 0o700); err != nil {
+					t.Fatalf("create audit parent: %v", err)
+				}
+				if err := os.Chmod(parent, 0o770); err != nil { // #nosec G302 -- test requires an intentionally group-writable fixture.
+					t.Fatalf("make audit parent group writable: %v", err)
+				}
+			},
+			want: "audit log directory must not be group or world writable",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+			if tc.inParentDir {
+				path = filepath.Join(durableAuditTempDir(t), "audit-parent", "audit.jsonl")
+			}
+			tc.prepare(t, path)
+			logger, err := NewDurableFile("json", path, false, false)
+			if logger != nil {
+				logger.Close()
+				t.Fatal("NewDurableFile accepted an unsafe audit path")
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("NewDurableFile error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	if os.Geteuid() == 0 {
+		t.Run("untrusted file owner", func(t *testing.T) {
+			path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+			if err := os.WriteFile(path, nil, 0o600); err != nil {
+				t.Fatalf("write audit file: %v", err)
+			}
+			if err := os.Chown(path, 1, -1); err != nil {
+				t.Fatalf("change audit file owner: %v", err)
+			}
+			logger, err := NewDurableFile("json", path, false, false)
+			if logger != nil {
+				logger.Close()
+				t.Fatal("NewDurableFile accepted an audit file owned by another user")
+			}
+			if err == nil || !strings.Contains(err.Error(), "audit log file must be owned by the service user or root") {
+				t.Fatalf("NewDurableFile error = %v, want untrusted-owner refusal", err)
+			}
+		})
+	}
+}
+
+func TestLogCommitmentKeyLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		outcome string
+		level   string
+	}{
+		{name: "denied is warn", outcome: "denied", level: "warn"},
+		{name: "non-denied is info", outcome: "succeeded", level: "info"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.jsonl")
+			logger, err := New("json", "file", path, false, false)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			logger.LogCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{
+				Operation:     "retire",
+				Phase:         "outcome",
+				Outcome:       tc.outcome,
+				OperationID:   "cka_test",
+				KeyID:         "ck_0123456789abcdef0123456789abcdef",
+				Epoch:         2,
+				Timestamp:     "2026-08-12T21:00:00Z",
+				Reason:        "missing_required_flag",
+				Authorization: "operator_accept_loss",
+			})
+			logger.Close()
+
+			var event map[string]any
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+			if err := json.Unmarshal(bytes.TrimSpace(data), &event); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if event["event"] != string(EventCommitmentKeyLifecycle) || event["event_type"] != string(EventCommitmentKeyLifecycle) || event["level"] != tc.level || event["phase"] != "outcome" || event["operation_id"] != "cka_test" || event["outcome"] != tc.outcome || event["epoch"] != float64(2) || event["timestamp"] != "2026-08-12T21:00:00Z" || event["reason"] != "missing_required_flag" {
+				t.Fatalf("event = %#v", event)
+			}
+		})
+	}
+}
+
+func TestWriteDurableCommitmentKeyLifecycleSyncsJSONRecord(t *testing.T) {
+	requireDurableAuditFile(t)
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+	logger, err := NewDurableFile("json", path, false, false)
+	if err != nil {
+		t.Fatalf("NewDurableFile: %v", err)
+	}
+	defer logger.Close()
+
+	err = logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{
+		Operation:   "rotate",
+		Phase:       "intent",
+		Outcome:     "pending",
+		OperationID: "cka_test",
+	})
+	if err != nil {
+		t.Fatalf("WriteDurableCommitmentKeyLifecycle: %v", err)
+	}
+
+	var event map[string]any
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(data), &event); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if event["phase"] != "intent" || event["outcome"] != "pending" || event["operation_id"] != "cka_test" {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestWriteDurableCommitmentKeyLifecycleInterleavesWithOrdinaryJSONLines(t *testing.T) {
+	requireDurableAuditFile(t)
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+	logger, err := NewDurableFile("json", path, false, false)
+	if err != nil {
+		t.Fatalf("NewDurableFile: %v", err)
+	}
+	defer logger.Close()
+
+	appendOrdinaryJSONLine := func(name string) {
+		t.Helper()
+		file, err := os.OpenFile(filepath.Clean(path), os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open ordinary JSON Lines sink: %v", err)
+		}
+		defer func() { _ = file.Close() }()
+		data, err := json.Marshal(map[string]string{"event": "ordinary", "name": name})
+		if err != nil {
+			t.Fatalf("marshal ordinary JSON Lines record: %v", err)
+		}
+		data = append(data, '\n')
+		if n, err := file.Write(data); err != nil || n != len(data) {
+			t.Fatalf("write ordinary JSON Lines record: n=%d err=%v", n, err)
+		}
+	}
+
+	appendOrdinaryJSONLine("before")
+	if err := logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{Operation: "rotate", Phase: "intent", Outcome: "pending", OperationID: "cka_interleave"}); err != nil {
+		t.Fatalf("write intent: %v", err)
+	}
+	appendOrdinaryJSONLine("between")
+	if err := logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{Operation: "rotate", Phase: "outcome", Outcome: "succeeded", OperationID: "cka_interleave"}); err != nil {
+		t.Fatalf("write outcome: %v", err)
+	}
+	appendOrdinaryJSONLine("after")
+
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if !strings.HasSuffix(string(data), "\n") {
+		t.Fatalf("audit log does not end with a record delimiter: %q", data)
+	}
+	var records []map[string]any
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("non-empty JSON Lines record %q did not parse independently: %v", line, err)
+		}
+		records = append(records, record)
+	}
+	if len(records) != 5 {
+		t.Fatalf("parsed %d records, want 5: %#v", len(records), records)
+	}
+	if records[0]["name"] != "before" || records[1]["phase"] != "intent" || records[2]["name"] != "between" || records[3]["phase"] != "outcome" || records[4]["name"] != "after" {
+		t.Fatalf("record order = %#v", records)
+	}
+}
+
+func TestWriteDurableCommitmentKeyLifecycleFailurePaths(t *testing.T) {
+	requireDurableAuditFile(t)
+	t.Run("no durable file is open", func(t *testing.T) {
+		if err := (&Logger{}).WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{}); err == nil || !strings.Contains(err.Error(), "not open") {
+			t.Fatalf("WriteDurableCommitmentKeyLifecycle error = %v, want unopened-file refusal", err)
+		}
+	})
+
+	t.Run("closed file handle is refused", func(t *testing.T) {
+		path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+		logger, err := NewDurableFile("json", path, false, false)
+		if err != nil {
+			t.Fatalf("NewDurableFile: %v", err)
+		}
+		defer logger.Close()
+		if err := logger.fileHandle.Close(); err != nil {
+			t.Fatalf("close audit file: %v", err)
+		}
+		if err := logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{Operation: "rotate", Outcome: "pending"}); err == nil || !strings.Contains(err.Error(), "stat open audit log file") {
+			t.Fatalf("WriteDurableCommitmentKeyLifecycle error = %v, want closed-handle refusal", err)
+		}
+	})
+
+	t.Run("denied record is warn level", func(t *testing.T) {
+		path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+		logger, err := NewDurableFile("json", path, false, false)
+		if err != nil {
+			t.Fatalf("NewDurableFile: %v", err)
+		}
+		defer logger.Close()
+		if err := logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{Operation: "rotate", Outcome: "denied"}); err != nil {
+			t.Fatalf("WriteDurableCommitmentKeyLifecycle: %v", err)
+		}
+		data, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		var record durableCommitmentKeyLifecycleRecord
+		if err := json.Unmarshal(bytes.TrimSpace(data), &record); err != nil {
+			t.Fatalf("Unmarshal: %v", err)
+		}
+		if record.Level != "warn" {
+			t.Fatalf("record level = %q, want warn", record.Level)
+		}
+	})
+
+	t.Run("full device returns write failure", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("/dev/full is a Linux special device")
+		}
+		file, err := os.OpenFile("/dev/full", os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("open /dev/full: %v", err)
+		}
+		defer func() { _ = file.Close() }()
+
+		logger := &Logger{fileHandle: file, filePath: "/dev/full"}
+		err = logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{Operation: "rotate", Outcome: "pending"})
+		if err == nil || !strings.Contains(err.Error(), "write lifecycle audit record") {
+			t.Fatalf("WriteDurableCommitmentKeyLifecycle error = %v, want write failure", err)
+		}
+	})
+}
+
+func TestRejectDurableFileAliases(t *testing.T) {
+	requireDurableAuditFile(t)
+	newLogger := func(t *testing.T) (*Logger, string) {
+		t.Helper()
+		path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+		logger, err := NewDurableFile("json", path, false, false)
+		if err != nil {
+			t.Fatalf("NewDurableFile: %v", err)
+		}
+		t.Cleanup(logger.Close)
+		return logger, path
+	}
+
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T)
+	}{
+		{
+			name: "unopened logger is refused",
+			run: func(t *testing.T) {
+				err := (&Logger{}).RejectDurableFileAliases("keyring.json")
+				if err == nil || !strings.Contains(err.Error(), "not open") {
+					t.Fatalf("RejectDurableFileAliases error = %v, want unopened-file refusal", err)
+				}
+			},
+		},
+		{
+			name: "closed handle is refused",
+			run: func(t *testing.T) {
+				logger, _ := newLogger(t)
+				if err := logger.fileHandle.Close(); err != nil {
+					t.Fatalf("close audit file: %v", err)
+				}
+				err := logger.RejectDurableFileAliases("keyring.json")
+				if err == nil || !strings.Contains(err.Error(), "stat open audit log file") {
+					t.Fatalf("RejectDurableFileAliases error = %v, want closed-handle refusal", err)
+				}
+			},
+		},
+		{
+			name: "blank missing and distinct paths are allowed",
+			run: func(t *testing.T) {
+				logger, path := newLogger(t)
+				distinct := filepath.Join(filepath.Dir(path), "keyring.json")
+				if err := os.WriteFile(distinct, []byte("keyring"), 0o600); err != nil {
+					t.Fatalf("write distinct protected file: %v", err)
+				}
+				if err := logger.RejectDurableFileAliases("", "-", filepath.Join(filepath.Dir(path), "missing.json"), distinct); err != nil {
+					t.Fatalf("RejectDurableFileAliases: %v", err)
+				}
+			},
+		},
+		{
+			name: "hard link to sink is refused",
+			run: func(t *testing.T) {
+				logger, path := newLogger(t)
+				alias := filepath.Join(filepath.Dir(path), "keyring.json")
+				if err := os.Link(path, alias); err != nil {
+					t.Fatalf("hard link audit sink: %v", err)
+				}
+				err := logger.RejectDurableFileAliases(alias)
+				if err == nil || !strings.Contains(err.Error(), "must not refer") {
+					t.Fatalf("RejectDurableFileAliases error = %v, want alias refusal", err)
+				}
+			},
+		},
+		{
+			name: "protected path below a regular file is refused",
+			run: func(t *testing.T) {
+				logger, path := newLogger(t)
+				protected := filepath.Join(filepath.Dir(path), "keyring.json")
+				if err := os.WriteFile(protected, []byte("keyring"), 0o600); err != nil {
+					t.Fatalf("write protected file: %v", err)
+				}
+				err := logger.RejectDurableFileAliases(filepath.Join(protected, "child"))
+				if err == nil || !strings.Contains(err.Error(), "stat protected lifecycle file") {
+					t.Fatalf("RejectDurableFileAliases error = %v, want protected-path stat failure", err)
+				}
+			},
+		},
+		{
+			name: "replaced sink is refused by final binding check",
+			run: func(t *testing.T) {
+				logger, path := newLogger(t)
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("remove audit sink: %v", err)
+				}
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("replace audit sink: %v", err)
+				}
+				err := logger.RejectDurableFileAliases(filepath.Join(filepath.Dir(path), "missing.json"))
+				if err == nil || !strings.Contains(err.Error(), "was replaced or rotated") {
+					t.Fatalf("RejectDurableFileAliases error = %v, want replaced-sink refusal", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+func TestWriteAndSyncLifecycleRecordFailurePaths(t *testing.T) {
+	record := durableCommitmentKeyLifecycleRecord{Event: string(EventCommitmentKeyLifecycle), Operation: "rotate", Outcome: "pending"}
+
+	for _, tc := range []struct {
+		name      string
+		file      *lifecycleRecordTestFile
+		want      string
+		wantShort bool
+		wantSync  int
+	}{
+		{name: "write error", file: &lifecycleRecordTestFile{writeErr: errors.New("disk gone")}, want: "write lifecycle audit record", wantSync: 0},
+		{name: "partial write", file: &lifecycleRecordTestFile{writeLimit: 5}, wantShort: true, wantSync: 0},
+		{name: "sync failure", file: &lifecycleRecordTestFile{syncErr: errors.New("no space left")}, want: "sync lifecycle audit record", wantSync: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := writeAndSyncLifecycleRecord(tc.file, record)
+			if err == nil {
+				t.Fatal("writeAndSyncLifecycleRecord error = nil, want failure")
+			}
+			if tc.wantShort && !errors.Is(err, io.ErrShortWrite) {
+				t.Fatalf("writeAndSyncLifecycleRecord error = %v, want short write", err)
+			}
+			if tc.want != "" && !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("writeAndSyncLifecycleRecord error = %v, want %q", err, tc.want)
+			}
+			if tc.file.syncCalls != tc.wantSync {
+				t.Fatalf("Sync calls = %d, want %d", tc.file.syncCalls, tc.wantSync)
+			}
+		})
+	}
+
+	t.Run("success syncs the record", func(t *testing.T) {
+		file := &lifecycleRecordTestFile{}
+		if err := writeAndSyncLifecycleRecord(file, record); err != nil {
+			t.Fatalf("writeAndSyncLifecycleRecord: %v", err)
+		}
+		if file.syncCalls != 1 {
+			t.Fatalf("Sync calls = %d, want 1", file.syncCalls)
+		}
+	})
+
+	t.Run("closed file write", func(t *testing.T) {
+		file, err := os.CreateTemp(t.TempDir(), "audit.jsonl")
+		if err != nil {
+			t.Fatalf("CreateTemp: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := writeAndSyncLifecycleRecord(file, record); err == nil || !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("writeAndSyncLifecycleRecord error = %v, want closed-file write failure", err)
+		}
+	})
+
+	t.Run("next record recovers after partial write", func(t *testing.T) {
+		file := &lifecycleRecordTestFile{writeLimit: 5}
+		_ = writeAndSyncLifecycleRecord(file, record)
+		file.writeLimit = 0
+		record.Outcome = "succeeded"
+		if err := writeAndSyncLifecycleRecord(file, record); err != nil {
+			t.Fatalf("second write: %v", err)
+		}
+		lines := strings.Split(strings.TrimSpace(file.String()), "\n")
+		var recovered durableCommitmentKeyLifecycleRecord
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &recovered); err != nil {
+			t.Fatalf("last record after partial write: %v", err)
+		}
+		if recovered.Outcome != "succeeded" {
+			t.Fatalf("recovered record = %#v", recovered)
+		}
+	})
+}
+
+func TestWriteDurableCommitmentKeyLifecycleRejectsDeletedOrRotatedSink(t *testing.T) {
+	requireDurableAuditFile(t)
+	for _, tc := range []struct {
+		name   string
+		mutate func(t *testing.T, path string)
+	}{
+		{
+			name: "deleted",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Remove(path); err != nil {
+					t.Fatalf("Remove: %v", err)
+				}
+			},
+		},
+		{
+			name: "rotated",
+			mutate: func(t *testing.T, path string) {
+				t.Helper()
+				rotated := path + ".1"
+				if err := os.Rename(path, rotated); err != nil {
+					t.Fatalf("Rename: %v", err)
+				}
+				if err := os.WriteFile(path, nil, 0o600); err != nil {
+					t.Fatalf("replace log path: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+			logger, err := NewDurableFile("json", path, false, false)
+			if err != nil {
+				t.Fatalf("NewDurableFile: %v", err)
+			}
+			defer logger.Close()
+			tc.mutate(t, path)
+			if err := logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{Operation: "rotate", Outcome: "pending"}); err == nil {
+				t.Fatal("WriteDurableCommitmentKeyLifecycle succeeded after sink changed")
+			}
+		})
+	}
+}
+
+func TestWriteDurableCommitmentKeyLifecycleConcurrentAppends(t *testing.T) {
+	requireDurableAuditFile(t)
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
+	const writers = 32
+
+	errs := make(chan error, writers)
+	var wg sync.WaitGroup
+	for i := range writers {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			logger, err := NewDurableFile("json", path, false, false)
+			if err == nil {
+				err = logger.WriteDurableCommitmentKeyLifecycle(CommitmentKeyLifecycleEvent{
+					Operation:   "rotate",
+					Phase:       "intent",
+					Outcome:     "pending",
+					OperationID: fmt.Sprintf("cka_%d", n),
+				})
+				logger.Close()
+			}
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent durable write: %v", err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	seen := make(map[string]struct{}, writers)
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var event durableCommitmentKeyLifecycleRecord
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("interleaved lifecycle record %q: %v", line, err)
+		}
+		seen[event.OperationID] = struct{}{}
+	}
+	if len(seen) != writers {
+		t.Fatalf("parsed %d durable lifecycle records, want %d", len(seen), writers)
+	}
+}
+
+type lifecycleRecordTestFile struct {
+	bytes.Buffer
+	writeLimit int
+	writeErr   error
+	syncErr    error
+	syncCalls  int
+}
+
+func (f *lifecycleRecordTestFile) Write(data []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	if f.writeLimit > 0 && len(data) > f.writeLimit {
+		_, _ = f.Buffer.Write(data[:f.writeLimit])
+		return f.writeLimit, nil
+	}
+	return f.Buffer.Write(data)
+}
+
+func (f *lifecycleRecordTestFile) Sync() error {
+	f.syncCalls++
+	return f.syncErr
+}
+
+func TestNew_FileOutputMissingPath(t *testing.T) {
+	_, err := New("json", "file", "/nonexistent/dir/test.log", true, true)
+	if err == nil {
+		t.Error("expected error for nonexistent directory")
+	}
+}
+
+func TestNewNop(_ *testing.T) {
+	logger := NewNop()
+	// Should not panic
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com", clientIP: "127.0.0.1", requestID: "req-1"}, 200, 1024, time.Second)
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com", clientIP: "127.0.0.1", requestID: "req-2"}, "blocklist", "domain blocked")
+	logger.LogError(LogContext{method: testMethodGet, url: "https://fail.com", clientIP: "127.0.0.1", requestID: "req-3"}, os.ErrNotExist)
+	logger.LogAnomaly(LogContext{method: testMethodGet, url: "https://sus.com", clientIP: "127.0.0.1", requestID: "req-4"}, "entropy", "high entropy", 0.9)
+	logger.LogStartup(":8888", "balanced", testVersion, testConfigHash)
+	logger.LogShutdown("test")
+	logger.LogRedirect("https://a.com", "https://b.com", "127.0.0.1", "req-6", "", 1)
+	logger.LogResponseScan(LogContext{url: "https://example.com", clientIP: "127.0.0.1", requestID: "req-8"}, testActionWarn, 2, []string{"Prompt Injection", "Jailbreak Attempt"}, nil)
+	logger.Close()
+}
+
+func TestLogAllowed_Filtering(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// includeAllowed=false should suppress allowed events
+	logger, err := New("json", "file", path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com", clientIP: "127.0.0.1", requestID: "req-1"}, 200, 1024, time.Second)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if strings.Contains(string(data), "allowed") {
+		t.Error("expected allowed event to be filtered out")
+	}
+}
+
+func TestLogBlocked_Filtering(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// includeBlocked=false should suppress blocked events
+	logger, err := New("json", "file", path, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com", clientIP: "127.0.0.1", requestID: "req-1"}, "blocklist", "domain blocked")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if strings.Contains(string(data), "blocked") {
+		t.Error("expected blocked event to be filtered out")
+	}
+}
+
+func TestLogAllowed_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com", clientIP: "10.0.0.5", requestID: "req-42"}, 200, 1024, time.Second)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one log line")
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("expected valid JSON, got error: %v\nline: %s", err, lines[0])
+	}
+
+	if entry["event"] != "allowed" {
+		t.Errorf("expected event=allowed, got %v", entry["event"])
+	}
+	if entry["url"] != "https://example.com" {
+		t.Errorf("expected url=https://example.com, got %v", entry["url"])
+	}
+	if entry["method"] != testMethodGet {
+		t.Errorf("expected method=GET, got %v", entry["method"])
+	}
+	if entry["client_ip"] != "10.0.0.5" {
+		t.Errorf("expected client_ip=10.0.0.5, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-42" {
+		t.Errorf("expected request_id=req-42, got %v", entry["request_id"])
+	}
+}
+
+func TestLogBlocked_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com", clientIP: "192.168.1.1", requestID: testReqID}, "blocklist", "domain in blocklist")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "blocked" {
+		t.Errorf("expected event=blocked, got %v", entry["event"])
+	}
+	if entry["scanner"] != "blocklist" {
+		t.Errorf("expected scanner=blocklist, got %v", entry["scanner"])
+	}
+	if entry["reason"] != "domain in blocklist" {
+		t.Errorf("expected reason='domain in blocklist', got %v", entry["reason"])
+	}
+	if entry["client_ip"] != "192.168.1.1" {
+		t.Errorf("expected client_ip=192.168.1.1, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != testReqID {
+		t.Errorf("expected request_id=req-7, got %v", entry["request_id"])
+	}
+}
+
+func TestLogError_IncludesError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogError(LogContext{method: testMethodGet, url: "https://fail.com", clientIP: testClientIP, requestID: "req-9"}, os.ErrNotExist)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventError) {
+		t.Errorf("expected event=error, got %v", entry["event"])
+	}
+	if entry[string(EventError)] == nil || entry[string(EventError)] == "" {
+		t.Error("expected error field to be populated")
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip=10.0.0.1, got %v", entry["client_ip"])
+	}
+}
+
+func TestLogger_DoubleClose(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close twice - should not panic
+	logger.Close()
+	logger.Close()
+}
+
+func TestLogStartup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogStartup(":8888", "balanced", testVersion, testConfigHash)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "startup" {
+		t.Errorf("expected event=startup, got %v", entry["event"])
+	}
+	if entry["mode"] != "balanced" {
+		t.Errorf("expected mode=balanced, got %v", entry["mode"])
+	}
+	if entry["version"] != testVersion {
+		t.Errorf("expected version=%s, got %v", testVersion, entry["version"])
+	}
+	if entry["config_hash"] != testConfigHash {
+		t.Errorf("expected config_hash=%s, got %v", testConfigHash, entry["config_hash"])
+	}
+}
+
+func TestLogShutdown_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogShutdown("test complete")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "shutdown" {
+		t.Errorf("expected event=shutdown, got %v", entry["event"])
+	}
+	if entry["reason"] != "test complete" {
+		t.Errorf("expected reason='test complete', got %v", entry["reason"])
+	}
+}
+
+func TestLogAnomaly_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAnomaly(LogContext{method: testMethodGet, url: "https://sus.com/data", clientIP: testClientIP, requestID: "req-5"}, "entropy", "high entropy segment", 0.85)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "anomaly" {
+		t.Errorf("expected event=anomaly, got %v", entry["event"])
+	}
+	if entry["url"] != "https://sus.com/[redacted]" {
+		t.Errorf("expected url, got %v", entry["url"])
+	}
+	if entry["reason"] != "high entropy segment" {
+		t.Errorf("expected reason, got %v", entry["reason"])
+	}
+	score, ok := entry["score"].(float64)
+	if !ok || score < 0.84 || score > 0.86 {
+		t.Errorf("expected score ~0.85, got %v", entry["score"])
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip=10.0.0.1, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-5" {
+		t.Errorf("expected request_id=req-5, got %v", entry["request_id"])
+	}
+	if entry["scanner"] != "entropy" {
+		t.Errorf("expected scanner=entropy, got %v", entry["scanner"])
+	}
+	if entry["mitre_technique"] != mitreT1048 {
+		t.Errorf("expected mitre_technique=T1048, got %v", entry["mitre_technique"])
+	}
+}
+
+// A content-matching scanner (e.g. dlp) firing in audit mode surfaces as an
+// anomaly warn, not a block. The URL/target/resource must be redacted the same
+// way LogBlockedDetail redacts them, or the secret that triggered the match is
+// echoed verbatim into every operator sink.
+func TestLogAnomaly_ContentScannerRedactsURL(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Split literal so the dogfood self-scan does not flag the fixture; the
+	// constant is folded to the same value at compile time.
+	const secret = "sk-live-" + "0123456789abcdef0123456789abcdef"
+	logger.LogAnomaly(LogContext{
+		method:    testMethodGet,
+		url:       "https://api.vendor.example/v1/chat?api_key=" + secret,
+		target:    "https://api.vendor.example/v1/chat?api_key=" + secret,
+		resource:  secret,
+		clientIP:  testClientIP,
+		requestID: "req-redact",
+	}, "dlp", "credential in query", 0.9)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if bytes.Contains(data, []byte(secret)) {
+		t.Fatalf("anomaly log leaked the content-scanner secret: %s", data)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry["url"] != "https://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted url, got %v", entry["url"])
+	}
+	if entry["target"] != "https://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted target, got %v", entry["target"])
+	}
+	if entry["resource"] != "[redacted]" {
+		t.Errorf("expected redacted resource, got %v", entry["resource"])
+	}
+}
+
+// TestCoreFloorScannersRedactContentBearingFields pins the immutable floors.
+// They are the strictest detectors in the product and cannot be exempted by
+// config, so a floor block that echoed the matched credential would publish it
+// to the audit stream and to every configured sink. Both the block path and the
+// anomaly path are covered, because they are separate call sites.
+func TestCoreFloorScannersRedactContentBearingFields(t *testing.T) {
+	// Split literal so the dogfood self-scan does not flag the fixture; the
+	// constant is folded to the same value at compile time.
+	const secret = "AKIA" + "IOSFODNN7EXAMPLE"
+	rawURL := "https://api.vendor.example/v1/upload?key=" + secret
+
+	for _, scanner := range []string{"core_dlp", "core_response"} {
+		for _, path := range []string{"blocked", "anomaly"} {
+			t.Run(scanner+"/"+path, func(t *testing.T) {
+				dir := t.TempDir()
+				logPath := filepath.Join(dir, "test.log")
+				logger, err := New("json", "file", logPath, true, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx := LogContext{
+					method:    testMethodGet,
+					url:       rawURL,
+					target:    rawURL,
+					resource:  secret,
+					clientIP:  testClientIP,
+					requestID: "req-core-redact",
+				}
+				if path == "blocked" {
+					logger.LogBlockedDetail(ctx, scanner, "core floor match", BlockDetail{})
+				} else {
+					logger.LogAnomaly(ctx, scanner, "core floor match", 1.0)
+				}
+				logger.Close()
+
+				data, _ := os.ReadFile(filepath.Clean(logPath))
+				if bytes.Contains(data, []byte(secret)) {
+					t.Fatalf("%s %s log leaked the matched credential: %s", scanner, path, data)
+				}
+				var entry map[string]any
+				if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+					t.Fatalf("expected valid JSON: %v", err)
+				}
+				if entry["url"] != "https://api.vendor.example/[redacted]" {
+					t.Errorf("expected redacted url, got %v", entry["url"])
+				}
+				if entry["target"] != "https://api.vendor.example/[redacted]" {
+					t.Errorf("expected redacted target, got %v", entry["target"])
+				}
+				if entry["resource"] != "[redacted]" {
+					t.Errorf("expected redacted resource, got %v", entry["resource"])
+				}
+			})
+		}
+	}
+}
+
+func TestUnknownScannerDefaultsToRedactedContentBearingFields(t *testing.T) {
+	const secret = "AKIA" + "IOSFODNN7EXAMPLE"
+	rawURL := "https://api.vendor.example/v1/upload?key=" + secret
+	scanner := "future_" + "content_scanner"
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "test.log")
+	logger, err := New("json", "file", logPath, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger.LogBlockedDetail(LogContext{
+		method:    testMethodGet,
+		url:       rawURL,
+		target:    rawURL,
+		resource:  secret,
+		clientIP:  testClientIP,
+		requestID: "req-unknown-redact",
+		agent:     testAgentName,
+	}, scanner, "future scanner matched content", BlockDetail{})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(logPath))
+	if bytes.Contains(data, []byte(secret)) {
+		t.Fatalf("unknown scanner leaked the matched credential: %s", data)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry["url"] != "https://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted url, got %v", entry["url"])
+	}
+	if entry["target"] != "https://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted target, got %v", entry["target"])
+	}
+	if entry["resource"] != "[redacted]" {
+		t.Errorf("expected redacted resource, got %v", entry["resource"])
+	}
+	if entry["request_id"] != "req-unknown-redact" {
+		t.Errorf("expected request_id to survive redaction, got %v", entry["request_id"])
+	}
+	if entry["scanner"] != scanner {
+		t.Errorf("expected scanner to survive redaction, got %v", entry["scanner"])
+	}
+	if entry["reason"] != "future scanner matched content" {
+		t.Errorf("expected reason to survive redaction, got %v", entry["reason"])
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("expected agent to survive redaction, got %v", entry["agent"])
+	}
+	if !IsContentScanner(scanner) {
+		t.Fatal("unknown scanner must be treated as content-bearing")
+	}
+}
+
+// TestCoreSSRFKeepsDestinationDropsRequestLine pins both directions of the
+// destination mode at once. The refused address survives, because an SSRF block
+// the operator cannot attribute to a destination is not actionable. Everything
+// after the authority is dropped, because a destination-class scanner routinely
+// reports a request before DLP inspects it and therefore cannot vouch for the
+// request line it is about to write to logs and external sinks.
+func TestCoreSSRFKeepsDestinationDropsRequestLine(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "test.log")
+	logger, err := New("json", "file", logPath, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A credential in the query is the case this pins: the core SSRF floor runs
+	// well ahead of the core DLP floor, so this request is attributed to SSRF and
+	// the detector that would have recognised the credential never sees it.
+	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	rawURL := "http://169.254.169.254/latest/meta-data/iam/security-credentials/?api_key=" + secret
+	logger.LogBlockedDetail(LogContext{
+		method:    testMethodGet,
+		url:       rawURL,
+		target:    rawURL,
+		clientIP:  testClientIP,
+		requestID: "req-ssrf",
+	}, "core_ssrf", "cloud metadata endpoint", BlockDetail{})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(logPath))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	const wantURL = "http://169.254.169.254"
+	if entry["url"] != wantURL {
+		t.Errorf("core_ssrf url = %v, want the destination only (%s)", entry["url"], wantURL)
+	}
+	if entry["target"] != wantURL {
+		t.Errorf("core_ssrf target = %v, want the destination only (%s)", entry["target"], wantURL)
+	}
+	if strings.Contains(string(data), secret) {
+		t.Fatal("a credential in the query reached the audit record on a destination-class block")
+	}
+	if IsContentScanner(scannerpkg.ScannerCoreSSRF) {
+		t.Fatal("core_ssrf must remain a destination-class scanner, not a fully redacted one")
+	}
+}
+
+// TestPathDiagnosticScannersKeepPathDropQuery pins the narrower mode. A path
+// traversal or CRLF block reports "sequence in URL" without naming the
+// sequence, so dropping the path would leave the operator with a block they
+// cannot investigate. The query is dropped regardless, because nothing about
+// either finding depends on it.
+func TestPathDiagnosticScannersKeepPathDropQuery(t *testing.T) {
+	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	for _, scanner := range []string{scannerpkg.ScannerPathTraversal, scannerpkg.ScannerCRLF} {
+		t.Run(scanner, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "test.log")
+			logger, err := New("json", "file", logPath, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.LogBlockedDetail(LogContext{
+				method:    testMethodGet,
+				url:       "https://api.vendor.example/a/../../etc/passwd?api_key=" + secret,
+				clientIP:  testClientIP,
+				requestID: "req-path",
+			}, scanner, "sequence in URL", BlockDetail{})
+			logger.Close()
+
+			data, _ := os.ReadFile(filepath.Clean(logPath))
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatalf("expected valid JSON: %v", err)
+			}
+			const wantURL = "https://api.vendor.example/a/../../etc/passwd"
+			if entry["url"] != wantURL {
+				t.Errorf("url = %v, want the path retained without the query (%s)", entry["url"], wantURL)
+			}
+			if strings.Contains(string(data), secret) {
+				t.Fatal("a credential in the query reached the audit record")
+			}
+		})
+	}
+}
+
+// TestDropURLContentSegmentsPreservesConnectAuthority pins the non-URL input
+// path. A forward-proxy CONNECT target is an authority, not an absolute URL, so
+// it must survive intact rather than collapse into a placeholder that would
+// make every tunnel block indistinguishable from every other.
+func TestDropURLContentSegmentsPreservesConnectAuthority(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		keepPath bool
+		want     string
+	}{
+		{name: "connect authority survives", raw: "evil.com:443", want: "evil.com:443"},
+		{name: "connect authority drops query", raw: "evil.com:443?blob=leakcanary", want: "evil.com:443"},
+		// A schemeless value parses with an empty Host and reaches the fallback
+		// with its path intact. Destination mode has to drop that path like any
+		// other, or the least parseable inputs get the weakest redaction.
+		{name: "schemeless value drops path and query", raw: "evil.com/admin?blob=leakcanary", want: "evil.com"},
+		{name: "authority with path drops both", raw: "evil.com:443/admin?blob=leakcanary", want: "evil.com:443"},
+		{name: "schemeless value keeps path when asked", raw: "evil.com/admin?blob=leakcanary", keepPath: true, want: "evil.com/admin"},
+		{name: "absolute url drops path and query", raw: "https://host.example/p/q?a=b#frag", want: "https://host.example"},
+		{name: "absolute url keeps path when asked", raw: "https://host.example/p/q?a=b#frag", keepPath: true, want: "https://host.example/p/q"},
+		{name: "empty stays empty", raw: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dropURLContentSegments(tt.raw, tt.keepPath)
+			if got != tt.want {
+				t.Errorf("dropURLContentSegments(%q, %v) = %q, want %q", tt.raw, tt.keepPath, got, tt.want)
+			}
+			if !tt.keepPath && strings.Contains(got, "leakcanary") {
+				t.Errorf("destination mode echoed content: %q", got)
+			}
+		})
+	}
+}
+
+func TestLogResponseScanExempt_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScanExempt(LogContext{method: testMethodGet, url: "https://api.openai.com/v1/chat", clientIP: testClientIP, requestID: "req-exempt-3", agent: testAgentName}, "api.openai.com")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventResponseScanExempt) {
+		t.Errorf("expected event=%s, got %v", EventResponseScanExempt, entry["event"])
+	}
+	if entry["hostname"] != "api.openai.com" {
+		t.Errorf("expected hostname=api.openai.com, got %v", entry["hostname"])
+	}
+	if entry["enforcement_type"] != "response_scanning" {
+		t.Errorf("expected enforcement_type=response_scanning, got %v", entry["enforcement_type"])
+	}
+	if entry["reason"] != "exempt_domains match; findings pinned to warn (not scored)" {
+		t.Errorf("expected pinned-to-warn reason, got %v", entry["reason"])
+	}
+	if entry["message"] != "response scan pinned to warn: exempt domain" {
+		t.Errorf("generic exempt log must say pinned to warn, not skipped: %v", entry["message"])
+	}
+	if _, ok := entry["effect"]; ok {
+		t.Errorf("generic response scan exempt log must not claim full-trust effect: %v", entry["effect"])
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("expected agent=%s, got %v", testAgentName, entry["agent"])
+	}
+	if entry["level"] != "info" {
+		t.Errorf("expected level=info, got %v", entry["level"])
+	}
+}
+
+// TestEmit_ResponseScanExempt_FullTrustAndOverCap exercises the full-trust and
+// over-cap exempt log helpers with every optional LogContext field populated
+// (including target and resource) so the conditional field branches and the
+// emitter path in both helpers are covered, and asserts the full-trust effect
+// discriminator is present on both.
+func TestEmit_ResponseScanExempt_FullTrustAndOverCap(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	ctx := LogContext{
+		method:    testMethodGet,
+		url:       "https://api.vendor.example/v1/data",
+		target:    "api.vendor.example:443",
+		resource:  "resource-1",
+		clientIP:  testClientIP,
+		requestID: "req-exempt-full",
+		agent:     testAgentName,
+	}
+	wantFields := []string{"url", "target", "resource", "client_ip", "request_id", "agent"}
+
+	logger.LogResponseScanExemptFullTrust(ctx, "api.vendor.example")
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted full-trust exempt event")
+	}
+	if ev.Fields["effect"] != responseScanExemptFullTrustEffect {
+		t.Errorf("full-trust effect = %v, want the full-trust valve string", ev.Fields["effect"])
+	}
+	for _, k := range wantFields {
+		if _, present := ev.Fields[k]; !present {
+			t.Errorf("full-trust exempt emitted fields missing %q", k)
+		}
+	}
+
+	logger.LogResponseScanExemptOverCapUnscanned(ctx, "api.vendor.example", "forward", 2048, 1024)
+	ev2, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted over-cap exempt event")
+	}
+	if ev2.Fields["effect"] != responseScanExemptFullTrustEffect {
+		t.Errorf("over-cap effect = %v, want the full-trust valve string", ev2.Fields["effect"])
+	}
+	if ev2.Fields["transport"] != "forward" {
+		t.Errorf("over-cap transport = %v, want forward", ev2.Fields["transport"])
+	}
+	if ev2.Fields["bytes_written"] != int64(2048) || ev2.Fields["scan_cap_bytes"] != int64(1024) {
+		t.Errorf("over-cap byte fields = %v/%v, want 2048/1024", ev2.Fields["bytes_written"], ev2.Fields["scan_cap_bytes"])
+	}
+	for _, k := range wantFields {
+		if _, present := ev2.Fields[k]; !present {
+			t.Errorf("over-cap exempt emitted fields missing %q", k)
+		}
+	}
+}
+
+func TestNew_BothOutput(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "both", path, true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	logger.LogStartup(":8888", "balanced", testVersion, testConfigHash)
+	logger.Close()
+
+	// Verify file was written
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(data) == 0 {
+		t.Error("expected log file to have content with 'both' output")
+	}
+}
+
+func TestNew_TextFormat(t *testing.T) {
+	// Text format with console writer - should not error
+	logger, err := New("text", "stdout", "", true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer logger.Close()
+
+	// Should not panic
+	logger.LogStartup(":8888", "balanced", testVersion, testConfigHash)
+}
+
+func TestNew_DefaultsToStdout(t *testing.T) {
+	// Empty writers list should default to stdout
+	logger, err := New("json", "invalid_output", "", true, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer logger.Close()
+}
+
+func TestLogAllowed_IncludesAllFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com/page", clientIP: "10.0.0.5", requestID: "req-100"}, 200, 5000, 150*time.Millisecond)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	checks := map[string]any{
+		"event":      "allowed",
+		"method":     testMethodGet,
+		"url":        "https://example.com",
+		"component":  "pipelock",
+		"client_ip":  "10.0.0.5",
+		"request_id": "req-100",
+	}
+	for key, want := range checks {
+		if entry[key] != want {
+			t.Errorf("expected %s=%v, got %v", key, want, entry[key])
+		}
+	}
+
+	// Numeric fields - JSON unmarshals numbers as float64
+	if statusCode, ok := entry["status_code"].(float64); !ok || statusCode != 200 {
+		t.Errorf("expected status_code=200, got %v", entry["status_code"])
+	}
+	if sizeBytes, ok := entry["size_bytes"].(float64); !ok || sizeBytes != 5000 {
+		t.Errorf("expected size_bytes=5000, got %v", entry["size_bytes"])
+	}
+
+	// Duration and timestamp should exist
+	if entry["duration_ms"] == nil {
+		t.Error("expected duration_ms field")
+	}
+	if entry["time"] == nil {
+		t.Error("expected time field")
+	}
+}
+
+func TestLogBlocked_IncludesAllFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com/exfil", clientIP: "192.168.1.1", requestID: "req-50"}, "blocklist", "domain in blocklist: evil.com")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	checks := map[string]any{
+		"event":           "blocked",
+		"method":          testMethodGet,
+		"url":             "https://evil.com",
+		"scanner":         "blocklist",
+		"reason":          "domain in blocklist: evil.com",
+		"component":       "pipelock",
+		"client_ip":       "192.168.1.1",
+		"request_id":      "req-50",
+		"mitre_technique": "T1071.001",
+	}
+	for key, want := range checks {
+		if entry[key] != want {
+			t.Errorf("expected %s=%v, got %v", key, want, entry[key])
+		}
+	}
+}
+
+func TestLogError_IncludesAllFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogError(LogContext{method: testMethodGet, url: "https://fail.com", clientIP: testClientIP, requestID: "req-77"}, os.ErrPermission)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventError) {
+		t.Errorf("expected event=error, got %v", entry["event"])
+	}
+	if entry["component"] != testComponent {
+		t.Errorf("expected component=pipelock, got %v", entry["component"])
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip=10.0.0.1, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-77" {
+		t.Errorf("expected request_id=req-77, got %v", entry["request_id"])
+	}
+}
+
+func TestNewNop_CloseIsSafe(_ *testing.T) {
+	logger := NewNop()
+	// Multiple closes should be safe
+	logger.Close()
+	logger.Close()
+	logger.Close()
+}
+
+func TestLogger_FilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses NTFS ACLs not Unix mode bits; os.Stat reports a synthesized 0o666")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secure.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogStartup(":8888", "test", testVersion, testConfigHash)
+	logger.Close()
+
+	info, _ := os.Stat(path)
+	perm := info.Mode().Perm()
+	if perm != 0o600 {
+		t.Errorf("expected log file permissions 0600, got %o", perm)
+	}
+}
+
+func TestLogger_MultipleEvents(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logger.LogStartup(":8888", "balanced", testVersion, testConfigHash)
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "https://a.com", clientIP: testClientIP, requestID: "req-1"}, 200, 100, time.Millisecond)
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://b.com", clientIP: testClientIP, requestID: "req-2"}, ScannerDLP, "secret found")
+	logger.LogError(LogContext{method: testMethodGet, url: "https://c.com", clientIP: testClientIP, requestID: "req-3"}, os.ErrNotExist)
+	logger.LogAnomaly(LogContext{method: testMethodGet, url: "https://d.com", clientIP: testClientIP, requestID: "req-4"}, "", "weird", 0.5)
+	logger.LogShutdown("done")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 6 {
+		t.Errorf("expected 6 log lines, got %d", len(lines))
+	}
+
+	// Verify each line is valid JSON
+	for i, line := range lines {
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Errorf("line %d is not valid JSON: %v", i, err)
+		}
+	}
+}
+
+func TestLogResponseScan_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScan(LogContext{url: "https://example.com/page", clientIP: testClientIP, requestID: "req-10"}, testActionWarn, 2, []string{"Prompt Injection", "Jailbreak Attempt"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventResponseScan) {
+		t.Errorf("expected event=response_scan, got %v", entry["event"])
+	}
+	if entry["url"] != "https://example.com/[redacted]" {
+		t.Errorf("expected url, got %v", entry["url"])
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip=10.0.0.1, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-10" {
+		t.Errorf("expected request_id=req-10, got %v", entry["request_id"])
+	}
+	if entry["action"] != testActionWarn {
+		t.Errorf("expected action=warn, got %v", entry["action"])
+	}
+	matchCount, ok := entry["match_count"].(float64)
+	if !ok || matchCount != 2 {
+		t.Errorf("expected match_count=2, got %v", entry["match_count"])
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 2 {
+		t.Errorf("expected 2 patterns, got %v", entry["patterns"])
+	}
+	if entry["component"] != testComponent {
+		t.Errorf("expected component=pipelock, got %v", entry["component"])
+	}
+}
+
+func TestLogResponseScanRedactsContentBearingContext(t *testing.T) {
+	const secret = "AKIA" + "IOSFODNN7EXAMPLE"
+	rawURL := "https://api.vendor.example/v1/chat?token=" + secret
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScan(LogContext{
+		method:    testMethodGet,
+		url:       rawURL,
+		target:    rawURL,
+		resource:  secret,
+		clientIP:  testClientIP,
+		requestID: "req-response-redact",
+		agent:     testAgentName,
+	}, testActionWarn, 1, []string{"Prompt Injection"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if bytes.Contains(data, []byte(secret)) {
+		t.Fatalf("response_scan leaked the matched credential: %s", data)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry["url"] != "https://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted url, got %v", entry["url"])
+	}
+	if entry["target"] != "https://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted target, got %v", entry["target"])
+	}
+	if entry["resource"] != "[redacted]" {
+		t.Errorf("expected redacted resource, got %v", entry["resource"])
+	}
+	if entry["request_id"] != "req-response-redact" {
+		t.Errorf("expected request_id to survive redaction, got %v", entry["request_id"])
+	}
+	if entry["scanner"] != scannerpkg.AuditResponseScan {
+		t.Errorf("expected scanner=response_scan, got %v", entry["scanner"])
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 1 || patterns[0] != "Prompt Injection" {
+		t.Errorf("expected patterns to survive redaction, got %v", entry["patterns"])
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("expected agent to survive redaction, got %v", entry["agent"])
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if !strings.Contains(hint, "suppress:") {
+		t.Fatalf("remediation_hint = %q, want response-scan operator hint", hint)
+	}
+}
+
+func TestLogResponseScan_StripAction(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScan(LogContext{url: "https://example.com/page", clientIP: testClientIP, requestID: "req-11"}, "strip", 1, []string{"System Override"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventResponseScan) {
+		t.Errorf("expected event=response_scan, got %v", entry["event"])
+	}
+	if entry["action"] != "strip" {
+		t.Errorf("expected action=strip, got %v", entry["action"])
+	}
+}
+
+func TestLogResponseScan_BundleRulesIncluded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleRules := []BundleRuleHit{
+		{RuleID: "owasp-injection-001", Bundle: "owasp-top10", BundleVersion: "1.2.0"},
+		{RuleID: "custom-xss-002", Bundle: "owasp-top10", BundleVersion: "1.2.0"},
+	}
+	logger.LogResponseScan(LogContext{url: "https://example.com/page", clientIP: testClientIP, requestID: "req-12"}, testActionWarn, 2,
+		[]string{"owasp-injection-001", "custom-xss-002"}, bundleRules)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	rawRules, ok := entry["bundle_rules"].([]any)
+	if !ok {
+		t.Fatalf("expected bundle_rules array, got %T (%v)", entry["bundle_rules"], entry["bundle_rules"])
+	}
+	if len(rawRules) != 2 {
+		t.Fatalf("expected 2 bundle rules, got %d", len(rawRules))
+	}
+	first, ok := rawRules[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map for bundle rule, got %T", rawRules[0])
+	}
+	if first["rule_id"] != "owasp-injection-001" {
+		t.Errorf("rule_id = %v, want owasp-injection-001", first["rule_id"])
+	}
+	if first["bundle"] != "owasp-top10" {
+		t.Errorf("bundle = %v, want owasp-top10", first["bundle"])
+	}
+	if first["bundle_version"] != "1.2.0" {
+		t.Errorf("bundle_version = %v, want 1.2.0", first["bundle_version"])
+	}
+}
+
+func TestLogResponseScan_NilBundleRulesOmitsField(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScan(LogContext{url: "https://example.com/page", clientIP: testClientIP, requestID: "req-13"}, testActionWarn, 1, []string{"injection"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if _, exists := entry["bundle_rules"]; exists {
+		t.Error("bundle_rules field should be omitted when nil")
+	}
+}
+
+func TestEmit_LogResponseScan_BundleRules(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	bundleRules := []BundleRuleHit{
+		{RuleID: "rule-1", Bundle: "test-bundle", BundleVersion: "0.1.0"},
+	}
+	logger.LogResponseScan(LogContext{url: "https://example.com", clientIP: testClientIP, requestID: "req-14"}, testActionWarn, 1, []string{"rule-1"}, bundleRules)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	emittedRules, ok := ev.Fields["bundle_rules"].([]BundleRuleHit)
+	if !ok {
+		t.Fatalf("bundle_rules field type = %T, want []BundleRuleHit", ev.Fields["bundle_rules"])
+	}
+	if len(emittedRules) != 1 {
+		t.Fatalf("expected 1 bundle rule, got %d", len(emittedRules))
+	}
+	if emittedRules[0].RuleID != "rule-1" {
+		t.Errorf("rule_id = %q, want rule-1", emittedRules[0].RuleID)
+	}
+	if emittedRules[0].Bundle != "test-bundle" {
+		t.Errorf("bundle = %q, want test-bundle", emittedRules[0].Bundle)
+	}
+}
+
+func TestEmit_LogResponseScan_NilBundleRulesOmitsField(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScan(LogContext{url: "https://example.com", clientIP: testClientIP, requestID: "req-15"}, testActionWarn, 1, []string{"injection"}, nil)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, exists := ev.Fields["bundle_rules"]; exists {
+		t.Error("bundle_rules should not be in emitted fields when nil")
+	}
+}
+
+func TestLogWSScan_BundleRulesIncluded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleRules := []BundleRuleHit{
+		{RuleID: "ws-rule-1", Bundle: "ws-bundle", BundleVersion: "2.0.0"},
+	}
+	logger.LogWSScan(WSScanEvent{
+		Target:       "ws://example.com/chat",
+		Direction:    DirectionServerToClient,
+		ClientIP:     testClientIP,
+		RequestID:    "req-402",
+		Action:       testActionWarn,
+		MatchCount:   1,
+		PatternNames: []string{"ws-rule-1"},
+		BundleRules:  bundleRules,
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	rawRules, ok := entry["bundle_rules"].([]any)
+	if !ok {
+		t.Fatalf("expected bundle_rules array, got %T", entry["bundle_rules"])
+	}
+	if len(rawRules) != 1 {
+		t.Fatalf("expected 1 bundle rule, got %d", len(rawRules))
+	}
+	first := rawRules[0].(map[string]any)
+	if first["rule_id"] != "ws-rule-1" {
+		t.Errorf("rule_id = %v, want ws-rule-1", first["rule_id"])
+	}
+}
+
+func TestLogBodyDLP_BundleRulesIncluded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleRules := []BundleRuleHit{
+		{RuleID: "dlp-rule-1", Bundle: "dlp-bundle", BundleVersion: "3.0.0"},
+	}
+	logger.LogBodyDLP(LogContext{method: "POST", url: "https://api.example.com", clientIP: testClientIP, requestID: "req-54"}, testActionWarn, 1, []string{"dlp-rule-1"}, bundleRules)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	rawRules, ok := entry["bundle_rules"].([]any)
+	if !ok {
+		t.Fatalf("expected bundle_rules array, got %T", entry["bundle_rules"])
+	}
+	if len(rawRules) != 1 {
+		t.Fatalf("expected 1 bundle rule, got %d", len(rawRules))
+	}
+	first := rawRules[0].(map[string]any)
+	if first["bundle"] != "dlp-bundle" {
+		t.Errorf("bundle = %v, want dlp-bundle", first["bundle"])
+	}
+}
+
+func TestLogHeaderDLP_BundleRulesIncluded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleRules := []BundleRuleHit{
+		{RuleID: "hdr-rule-1", Bundle: "hdr-bundle", BundleVersion: "1.0.0"},
+	}
+	logger.LogHeaderDLP(LogContext{method: testMethodGet, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-55"}, "Authorization", testActionWarn, []string{"hdr-rule-1"}, bundleRules)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	rawRules, ok := entry["bundle_rules"].([]any)
+	if !ok {
+		t.Fatalf("expected bundle_rules array, got %T", entry["bundle_rules"])
+	}
+	if len(rawRules) != 1 {
+		t.Fatalf("expected 1 bundle rule, got %d", len(rawRules))
+	}
+	first := rawRules[0].(map[string]any)
+	if first["bundle"] != "hdr-bundle" {
+		t.Errorf("bundle = %v, want hdr-bundle", first["bundle"])
+	}
+}
+
+func TestLogger_With(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub := logger.With("agent", "test-bot")
+	sub.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-1"}, 200, 100, time.Millisecond)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["agent"] != "test-bot" {
+		t.Errorf("expected agent=test-bot, got %v", entry["agent"])
+	}
+	if entry["event"] != "allowed" {
+		t.Errorf("expected event=allowed, got %v", entry["event"])
+	}
+	if entry["component"] != testComponent {
+		t.Errorf("expected component=pipelock inherited, got %v", entry["component"])
+	}
+}
+
+func TestLogger_With_DoesNotAffectParent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = logger.With("agent", "child-bot")
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-1"}, 200, 100, time.Millisecond)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if _, ok := entry["agent"]; ok {
+		t.Error("expected parent logger not to have agent field")
+	}
+}
+
+func TestLogger_With_InheritsConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	// includeAllowed=false - sub-logger should inherit this
+	logger, err := New("json", "file", path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sub := logger.With("agent", "test-bot")
+	sub.LogAllowed(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-1"}, 200, 100, time.Millisecond)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected sub-logger to inherit includeAllowed=false and suppress allowed events")
+	}
+}
+
+func TestLogRedirect_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogRedirect("https://example.com", "https://www.example.com", testClientIP, testReqID, "", 1)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "redirect" {
+		t.Errorf("expected event=redirect, got %v", entry["event"])
+	}
+	if entry["message"] != "redirect observed" {
+		t.Errorf("redirect observation must not claim the target was contacted: %v", entry["message"])
+	}
+	if entry["original_url"] != "https://example.com" {
+		t.Errorf("expected original_url, got %v", entry["original_url"])
+	}
+	if entry["redirect_url"] != "https://www.example.com" {
+		t.Errorf("expected redirect_url, got %v", entry["redirect_url"])
+	}
+	hop, ok := entry["hop"].(float64)
+	if !ok || hop != 1 {
+		t.Errorf("expected hop=1, got %v", entry["hop"])
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip=10.0.0.1, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != testReqID {
+		t.Errorf("expected request_id=req-7, got %v", entry["request_id"])
+	}
+}
+
+func TestLogTunnelOpen_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelOpen(LogContext{target: "example.com:443", clientIP: "10.0.0.5", requestID: "req-100"})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "tunnel_open" {
+		t.Errorf("expected event=tunnel_open, got %v", entry["event"])
+	}
+	if entry["target"] != "example.com:443" {
+		t.Errorf("expected target=example.com:443, got %v", entry["target"])
+	}
+	if entry["client_ip"] != "10.0.0.5" {
+		t.Errorf("expected client_ip=10.0.0.5, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-100" {
+		t.Errorf("expected request_id=req-100, got %v", entry["request_id"])
+	}
+}
+
+func TestLogTunnelOpen_Filtered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, false, true) // includeAllowed=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelOpen(LogContext{target: "example.com:443", clientIP: "10.0.0.5", requestID: "req-100"})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected tunnel_open to be filtered when includeAllowed=false")
+	}
+}
+
+func TestLogTunnelClose_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelClose(LogContext{target: "example.com:443", clientIP: "10.0.0.5", requestID: "req-100"}, 4096, 5*time.Second)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "tunnel_close" {
+		t.Errorf("expected event=tunnel_close, got %v", entry["event"])
+	}
+	if entry["target"] != "example.com:443" {
+		t.Errorf("expected target=example.com:443, got %v", entry["target"])
+	}
+	totalBytes, ok := entry["total_bytes"].(float64)
+	if !ok || totalBytes != 4096 {
+		t.Errorf("expected total_bytes=4096, got %v", entry["total_bytes"])
+	}
+	if _, ok := entry["duration_ms"]; !ok {
+		t.Error("expected duration_ms field in tunnel_close event")
+	}
+}
+
+func TestLogTunnelClose_Filtered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, false, true) // includeAllowed=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelClose(LogContext{target: "example.com:443", clientIP: "10.0.0.5", requestID: "req-100"}, 4096, 5*time.Second)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected tunnel_close to be filtered when includeAllowed=false")
+	}
+}
+
+func TestLogForwardHTTP_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogForwardHTTP(LogContext{method: testMethodGet, url: "http://example.com/path", clientIP: "10.0.0.5", requestID: "req-200"}, 200, 2048, 100*time.Millisecond)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "forward_http" {
+		t.Errorf("expected event=forward_http, got %v", entry["event"])
+	}
+	if entry["method"] != testMethodGet {
+		t.Errorf("expected method=GET, got %v", entry["method"])
+	}
+	if entry["url"] != "http://example.com" {
+		t.Errorf("expected url=http://example.com, got %v", entry["url"])
+	}
+	statusCode, ok := entry["status_code"].(float64)
+	if !ok || statusCode != 200 {
+		t.Errorf("expected status_code=200, got %v", entry["status_code"])
+	}
+	sizeBytes, ok := entry["size_bytes"].(float64)
+	if !ok || sizeBytes != 2048 {
+		t.Errorf("expected size_bytes=2048, got %v", entry["size_bytes"])
+	}
+	if _, ok := entry["duration_ms"]; !ok {
+		t.Error("expected duration_ms field in forward_http event")
+	}
+}
+
+func TestLogForwardHTTP_Filtered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, false, true) // includeAllowed=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogForwardHTTP(LogContext{method: testMethodGet, url: "http://example.com/path", clientIP: "10.0.0.5", requestID: "req-200"}, 200, 2048, 100*time.Millisecond)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected forward_http to be filtered when includeAllowed=false")
+	}
+}
+
+func TestLogSessionAnomaly_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogSessionAnomaly(testClientIP, "domain_burst", "6 new domains in 5m window", testClientIP, "req-20", 2.0)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "session_anomaly" {
+		t.Errorf("expected event=session_anomaly, got %v", entry["event"])
+	}
+	if entry["session"] != testClientIP {
+		t.Errorf("expected session=10.0.0.1, got %v", entry["session"])
+	}
+	if entry["anomaly_type"] != "domain_burst" {
+		t.Errorf("expected anomaly_type=domain_burst, got %v", entry["anomaly_type"])
+	}
+	if entry["detail"] != "6 new domains in 5m window" {
+		t.Errorf("expected detail, got %v", entry["detail"])
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip=10.0.0.1, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-20" {
+		t.Errorf("expected request_id=req-20, got %v", entry["request_id"])
+	}
+	score, ok := entry["score"].(float64)
+	if !ok || score != 2.0 {
+		t.Errorf("expected score=2.0, got %v", entry["score"])
+	}
+}
+
+func TestLogAdaptiveEscalation_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAdaptiveEscalation(testClientIP, testActionWarn, actionBlock, testClientIP, "req-30", 5.5)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "adaptive_escalation" {
+		t.Errorf("expected event=adaptive_escalation, got %v", entry["event"])
+	}
+	if entry["session"] != testClientIP {
+		t.Errorf("expected session=10.0.0.1, got %v", entry["session"])
+	}
+	if entry["from"] != testActionWarn {
+		t.Errorf("expected from=warn, got %v", entry["from"])
+	}
+	if entry["to"] != actionBlock {
+		t.Errorf("expected to=block, got %v", entry["to"])
+	}
+	score, ok := entry["score"].(float64)
+	if !ok || score != 5.5 {
+		t.Errorf("expected score=5.5, got %v", entry["score"])
+	}
+}
+
+func TestLogAdaptiveRecovery_JSONAndEmitter(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAdaptiveRecovery(LogAdaptiveRecoveryOptions{
+		SessionKey: "agent|10.0.0.1",
+		Scope:      "api.vendor.example",
+		From:       "high",
+		To:         "elevated",
+		Reason:     "clean_request_recovery",
+		ClientIP:   testClientIP,
+		RequestID:  "req-recover",
+	})
+
+	ev := sink.onlyEvent(t)
+	if ev.Type != string(EventAdaptiveRecovery) {
+		t.Fatalf("event type = %q, want adaptive recovery", ev.Type)
+	}
+	for key, want := range map[string]any{
+		"session":    "agent|10.0.0.1",
+		"scope":      "api.vendor.example",
+		"from":       "high",
+		"to":         "elevated",
+		"reason":     "clean_request_recovery",
+		"client_ip":  testClientIP,
+		"request_id": "req-recover",
+	} {
+		if got := ev.Fields[key]; got != want {
+			t.Fatalf("emitted field %s = %v, want %v", key, got, want)
+		}
+	}
+}
+
+func TestLogMCPUnknownTool_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogMCPUnknownTool("execute_code", testActionWarn)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "mcp_unknown_tool" {
+		t.Errorf("expected event=mcp_unknown_tool, got %v", entry["event"])
+	}
+	if entry["tool"] != "execute_code" {
+		t.Errorf("expected tool=execute_code, got %v", entry["tool"])
+	}
+	if entry["action"] != testActionWarn {
+		t.Errorf("expected action=warn, got %v", entry["action"])
+	}
+}
+
+func TestNewNop_SessionEvents(_ *testing.T) {
+	logger := NewNop()
+	// Should not panic
+	logger.LogSessionAnomaly(testClientIP, "domain_burst", "test", testClientIP, "req-1", 1.0)
+	logger.LogAdaptiveEscalation(testClientIP, testActionWarn, actionBlock, testClientIP, "req-2", 5.0)
+	logger.LogMCPUnknownTool("bad_tool", testActionWarn)
+	logger.Close()
+}
+
+func TestLogConfigReload_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogConfigReload("success", "hot-reload via SIGHUP", testConfigHash)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "config_reload" {
+		t.Errorf("expected event=config_reload, got %v", entry["event"])
+	}
+	if entry["status"] != "success" {
+		t.Errorf("expected status=success, got %v", entry["status"])
+	}
+	if entry["detail"] != "hot-reload via SIGHUP" {
+		t.Errorf("expected detail, got %v", entry["detail"])
+	}
+	if entry["config_hash"] != testConfigHash {
+		t.Errorf("expected config_hash=%s, got %v", testConfigHash, entry["config_hash"])
+	}
+}
+
+func TestLogWSOpen_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSOpen("ws://example.com/stream", "10.0.0.5", "req-200", "test-agent")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "ws_open" {
+		t.Errorf("expected event=ws_open, got %v", entry["event"])
+	}
+	if entry["target"] != "ws://example.com" {
+		t.Errorf("expected target, got %v", entry["target"])
+	}
+	if entry["agent"] != "test-agent" {
+		t.Errorf("expected agent=test-agent, got %v", entry["agent"])
+	}
+}
+
+func TestLogWSOpen_Filtered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, false, true) // includeAllowed=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSOpen("ws://example.com/stream", "10.0.0.5", "req-200", "test-agent")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected ws_open to be filtered when includeAllowed=false")
+	}
+}
+
+func TestLogWSClose_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSClose(WSCloseEvent{
+		Target:         "ws://example.com/stream",
+		ClientIP:       "10.0.0.5",
+		RequestID:      "req-200",
+		Agent:          "test-agent",
+		ClientToServer: 4096,
+		ServerToClient: 8192,
+		TextFrames:     10,
+		BinaryFrames:   2,
+		Duration:       5 * time.Second,
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "ws_close" {
+		t.Errorf("expected event=ws_close, got %v", entry["event"])
+	}
+	if entry["target"] != "ws://example.com" {
+		t.Errorf("expected target, got %v", entry["target"])
+	}
+	c2s, ok := entry["client_to_server_bytes"].(float64)
+	if !ok || c2s != 4096 {
+		t.Errorf("expected client_to_server_bytes=4096, got %v", entry["client_to_server_bytes"])
+	}
+	s2c, ok := entry["server_to_client_bytes"].(float64)
+	if !ok || s2c != 8192 {
+		t.Errorf("expected server_to_client_bytes=8192, got %v", entry["server_to_client_bytes"])
+	}
+	tf, ok := entry["text_frames"].(float64)
+	if !ok || tf != 10 {
+		t.Errorf("expected text_frames=10, got %v", entry["text_frames"])
+	}
+}
+
+func TestLogWSClose_Filtered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, false, true) // includeAllowed=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSClose(WSCloseEvent{
+		Target:         "ws://example.com/stream",
+		ClientIP:       "10.0.0.5",
+		RequestID:      "req-200",
+		Agent:          "test-agent",
+		ClientToServer: 4096,
+		ServerToClient: 8192,
+		TextFrames:     10,
+		BinaryFrames:   2,
+		Duration:       5 * time.Second,
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected ws_close to be filtered when includeAllowed=false")
+	}
+}
+
+func TestLogWSBlocked_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSBlocked(WSBlockedEvent{
+		Target: "ws://evil.com/exfil", Direction: DirectionClientToServer, Scanner: ScannerDLP,
+		Reason: "secret detected", ClientIP: testClientIP, RequestID: "req-300",
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "ws_blocked" {
+		t.Errorf("expected event=ws_blocked, got %v", entry["event"])
+	}
+	if entry["direction"] != DirectionClientToServer {
+		t.Errorf("expected direction=client_to_server, got %v", entry["direction"])
+	}
+	if entry["scanner"] != ScannerDLP {
+		t.Errorf("expected scanner=dlp, got %v", entry["scanner"])
+	}
+	if entry["reason"] != "secret detected" {
+		t.Errorf("expected reason='secret detected', got %v", entry["reason"])
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if !strings.Contains(hint, "dlp.patterns[].exempt_domains") {
+		t.Fatalf("remediation_hint = %q, want DLP operator knob", hint)
+	}
+}
+
+func TestLogWSBlocked_Filtered(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, false) // includeBlocked=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSBlocked(WSBlockedEvent{
+		Target: "ws://evil.com/exfil", Direction: DirectionClientToServer, Scanner: ScannerDLP,
+		Reason: "secret detected", ClientIP: testClientIP, RequestID: "req-300",
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if len(bytes.TrimSpace(data)) > 0 {
+		t.Error("expected ws_blocked to be filtered when includeBlocked=false")
+	}
+}
+
+func TestLogWSScan_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSScan(WSScanEvent{
+		Target:       "ws://example.com/chat",
+		Direction:    DirectionServerToClient,
+		ClientIP:     testClientIP,
+		RequestID:    "req-400",
+		Action:       testActionWarn,
+		MatchCount:   2,
+		PatternNames: []string{"Prompt Injection", "Jailbreak"},
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != "ws_scan" {
+		t.Errorf("expected event=ws_scan, got %v", entry["event"])
+	}
+	if entry["direction"] != DirectionServerToClient {
+		t.Errorf("expected direction=server_to_client, got %v", entry["direction"])
+	}
+	if entry["action"] != testActionWarn {
+		t.Errorf("expected action=warn, got %v", entry["action"])
+	}
+	matchCount, ok := entry["match_count"].(float64)
+	if !ok || matchCount != 2 {
+		t.Errorf("expected match_count=2, got %v", entry["match_count"])
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 2 {
+		t.Errorf("expected 2 patterns, got %v", entry["patterns"])
+	}
+	// server_to_client = response injection = T1059.
+	if entry["mitre_technique"] != mitreT1059 {
+		t.Errorf("expected mitre_technique=T1059 for server_to_client, got %v", entry["mitre_technique"])
+	}
+}
+
+func TestLogWSScanRedactsContentBearingTarget(t *testing.T) {
+	const secret = "AKIA" + "IOSFODNN7EXAMPLE"
+	rawTarget := "wss://api.vendor.example/socket?token=" + secret
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSScan(WSScanEvent{
+		Target:       rawTarget,
+		Direction:    DirectionClientToServer,
+		ClientIP:     testClientIP,
+		RequestID:    "req-ws-redact",
+		Agent:        testAgentName,
+		Action:       "audit",
+		MatchCount:   1,
+		PatternNames: []string{"AWS Access ID"},
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	if bytes.Contains(data, []byte(secret)) {
+		t.Fatalf("ws_scan leaked the matched credential: %s", data)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry["target"] != "wss://api.vendor.example/[redacted]" {
+		t.Errorf("expected redacted target, got %v", entry["target"])
+	}
+	if entry["request_id"] != "req-ws-redact" {
+		t.Errorf("expected request_id to survive redaction, got %v", entry["request_id"])
+	}
+	if entry["scanner"] != scannerpkg.ScannerDLP {
+		t.Errorf("expected scanner=dlp, got %v", entry["scanner"])
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 1 || patterns[0] != "AWS Access ID" {
+		t.Errorf("expected patterns to survive redaction, got %v", entry["patterns"])
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("expected agent to survive redaction, got %v", entry["agent"])
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if !strings.Contains(hint, "dlp.patterns[].exempt_domains") {
+		t.Fatalf("remediation_hint = %q, want DLP operator hint", hint)
+	}
+}
+
+func TestLogWSScan_ClientToServer_DLPTechnique(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogWSScan(WSScanEvent{
+		Target:       "ws://example.com/chat",
+		Direction:    DirectionClientToServer,
+		ClientIP:     testClientIP,
+		RequestID:    "req-401",
+		Action:       "audit",
+		MatchCount:   1,
+		PatternNames: []string{"AWS Key"},
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	// client_to_server = DLP/exfil = T1048.
+	if entry["mitre_technique"] != mitreT1048 {
+		t.Errorf("expected mitre_technique=T1048 for client_to_server, got %v", entry["mitre_technique"])
+	}
+	if entry["direction"] != DirectionClientToServer {
+		t.Errorf("expected direction=client_to_server, got %v", entry["direction"])
+	}
+}
+
+func TestLogKillSwitchDeny_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogKillSwitchDeny("http", "https://api.example.com/v1/chat", "global", "all traffic halted", "10.0.0.5", "req-42")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	checks := map[string]any{
+		"event":        "kill_switch_deny",
+		"request_id":   "req-42",
+		"transport":    "http",
+		"endpoint":     "https://api.example.com/v1/chat",
+		"source":       "global",
+		"deny_message": "all traffic halted",
+		"client_ip":    "10.0.0.5",
+		"component":    "pipelock",
+		"message":      "kill switch denied request",
+	}
+	for key, want := range checks {
+		if entry[key] != want {
+			t.Errorf("expected %s=%v, got %v", key, want, entry[key])
+		}
+	}
+
+	if entry["time"] == nil {
+		t.Error("expected time field")
+	}
+}
+
+func TestLogKillSwitchDeny_SanitizesFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogKillSwitchDeny(
+		"http",
+		"https://evil\x1b[2J.com/path",
+		"global",
+		"bad\x1b[0mmessage",
+		"10.0.0\x1b[2J.1",
+		"")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	for _, field := range []string{"transport", "endpoint", "source", "deny_message", "client_ip"} {
+		val, _ := entry[field].(string)
+		if strings.Contains(val, "\x1b") {
+			t.Errorf("expected ANSI escape to be stripped from %s, got %q", field, val)
+		}
+	}
+}
+
+func TestLogTunnelOpen_SanitizesTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelOpen(LogContext{target: "evil\x1b[2J.com:443", clientIP: "10.0.0.5", requestID: "req-101"})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	target, _ := entry["target"].(string)
+	if strings.Contains(target, "\x1b") {
+		t.Error("expected ANSI escape to be stripped from target")
+	}
+}
+
+// --- Emitter path tests ---
+// These verify that audit log methods actually emit events through the emitter.
+
+func newLoggerWithEmitter(t *testing.T) (*Logger, *collectingSink) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &collectingSink{}
+	emitter := emit.NewEmitter("test-instance", sink)
+	logger.SetEmitter(emitter)
+	t.Cleanup(logger.Close)
+	t.Cleanup(func() { _ = emitter.Close() })
+	return logger, sink
+}
+
+func TestLogContainmentMetricsDenyEmitsStructuredFields(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogContainmentMetricsDeny("/metrics", "192.0.2.42", "192.0.2.20:9091", "source_cidr_mismatch")
+	event, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted containment metrics denial")
+	}
+	if event.Type != string(EventContainmentMetricsDeny) || event.Severity != emit.SeverityWarn {
+		t.Fatalf("event type/severity = %q/%v", event.Type, event.Severity)
+	}
+	want := map[string]any{
+		"endpoint":            "/metrics",
+		"client_ip":           "192.0.2.42",
+		"configured_listener": "192.0.2.20:9091",
+		"reason":              "source_cidr_mismatch",
+		"outcome":             "denied",
+	}
+	for field, value := range want {
+		if got := event.Fields[field]; got != value {
+			t.Errorf("%s = %v, want %v", field, got, value)
+		}
+	}
+}
+
+func mustHTTPLogContext(t *testing.T, method, targetURL, requestID string) LogContext {
+	t.Helper()
+	ctx, err := NewHTTPLogContext(method, targetURL, testClientIP, requestID, testAgentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx
+}
+
+func mustConnectLogContext(t *testing.T, target, clientIP, requestID, agent string) LogContext {
+	t.Helper()
+	ctx, err := NewConnectLogContext(target, clientIP, requestID, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx
+}
+
+func mustMCPLogContext(t *testing.T, method, resource, agent string) LogContext {
+	t.Helper()
+	ctx, err := NewMCPLogContext(method, resource, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ctx
+}
+
+func assertEmitterContextFields(t *testing.T, ev emit.Event, wantKey string, wantValue any, absent ...string) {
+	t.Helper()
+	if got := ev.Fields[wantKey]; got != wantValue {
+		t.Fatalf("fields[%s] = %v, want %v", wantKey, got, wantValue)
+	}
+	for _, key := range absent {
+		if _, exists := ev.Fields[key]; exists {
+			t.Fatalf("expected %q to be absent, got %v", key, ev.Fields[key])
+		}
+	}
+}
+
+func assertEmitterFields(t *testing.T, ev emit.Event, wantType EventType, wantSeverity emit.Severity, want map[string]any) {
+	t.Helper()
+	if ev.Type != string(wantType) {
+		t.Fatalf("type = %q, want %q", ev.Type, wantType)
+	}
+	if ev.Severity != wantSeverity {
+		t.Fatalf("severity = %s, want %s", ev.Severity, wantSeverity)
+	}
+	for key, wantValue := range want {
+		if got := ev.Fields[key]; got != wantValue {
+			t.Fatalf("fields[%s] = %v, want %v", key, got, wantValue)
+		}
+	}
+}
+
+func TestEmit_RuleBundleDegradedEventUsesConfiguredFields(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	logger.LogRuleBundleDegraded(RuleBundleDegradedEvent{
+		Bundle:          "community-rules",
+		FailureClass:    "coverage_drop",
+		Reason:          "clean bundle removal dropped live patterns: dlp=2",
+		Phase:           "reload",
+		Outcome:         "rejected",
+		Severity:        severityCritical,
+		AllowDegraded:   true,
+		DroppedPatterns: 2,
+	})
+
+	ev := sink.onlyEvent(t)
+	assertEmitterFields(t, ev, EventRuleBundleDegraded, emit.SeverityCritical, map[string]any{
+		"bundle":           "community-rules",
+		"failure_class":    "coverage_drop",
+		"reason":           "clean bundle removal dropped live patterns: dlp=2",
+		"phase":            "reload",
+		"outcome":          "rejected",
+		"allow_degraded":   true,
+		"dropped_patterns": 2,
+	})
+}
+
+func TestEmit_OperationalLifecycleEvents(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantType EventType
+		log      func(*Logger)
+		want     map[string]any
+	}{
+		{
+			name:     "startup",
+			wantType: EventStartup,
+			log: func(l *Logger) {
+				l.LogStartup(":8888", "balanced", testVersion, testConfigHash)
+			},
+			want: map[string]any{
+				"listen":      ":8888",
+				"mode":        "balanced",
+				"version":     testVersion,
+				"config_hash": testConfigHash,
+			},
+		},
+		{
+			name:     "shutdown",
+			wantType: EventShutdown,
+			log: func(l *Logger) {
+				l.LogShutdown("signal")
+			},
+			want: map[string]any{
+				"reason": "signal",
+			},
+		},
+		{
+			name:     "agent listener",
+			wantType: EventAgentListener,
+			log: func(l *Logger) {
+				l.LogAgentListener("127.0.0.1:9100", "strict-bot")
+			},
+			want: map[string]any{
+				"listen": "127.0.0.1:9100",
+				"agent":  "strict-bot",
+			},
+		},
+		{
+			name:     "redirect",
+			wantType: EventRedirect,
+			log: func(l *Logger) {
+				l.LogRedirect("https://example.com", "https://www.example.com", testClientIP, testReqID, testAgentName, 2)
+			},
+			want: map[string]any{
+				"original_url": "https://example.com",
+				"redirect_url": "https://www.example.com",
+				"client_ip":    testClientIP,
+				"request_id":   testReqID,
+				"agent":        testAgentName,
+				"hop":          2,
+			},
+		},
+		{
+			name:     "websocket open",
+			wantType: EventWSOpen,
+			log: func(l *Logger) {
+				l.LogWSOpen("ws://example.com/stream", testClientIP, testReqID, testAgentName)
+			},
+			want: map[string]any{
+				"target":     "ws://example.com",
+				"client_ip":  testClientIP,
+				"request_id": testReqID,
+				"agent":      testAgentName,
+			},
+		},
+		{
+			name:     "websocket close",
+			wantType: EventWSClose,
+			log: func(l *Logger) {
+				l.LogWSClose(WSCloseEvent{
+					Target:         "ws://example.com/stream",
+					ClientIP:       testClientIP,
+					RequestID:      testReqID,
+					Agent:          testAgentName,
+					ClientToServer: 11,
+					ServerToClient: 22,
+					TextFrames:     3,
+					BinaryFrames:   4,
+					Duration:       250 * time.Millisecond,
+				})
+			},
+			want: map[string]any{
+				"target":                 "ws://example.com",
+				"client_ip":              testClientIP,
+				"request_id":             testReqID,
+				"agent":                  testAgentName,
+				"client_to_server_bytes": int64(11),
+				"server_to_client_bytes": int64(22),
+				"text_frames":            int64(3),
+				"binary_frames":          int64(4),
+				"duration_ms":            int64(250),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			tt.log(logger)
+
+			ev := sink.onlyEvent(t)
+			assertEmitterFields(t, ev, tt.wantType, emit.SeverityInfo, tt.want)
+			if ev.InstanceID != "test-instance" {
+				t.Fatalf("instance_id = %q, want test-instance", ev.InstanceID)
+			}
+		})
+	}
+}
+
+func TestEmit_WebSocketLifecycleHonorsIncludeAllowedFalse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	logger, err := New("json", "file", path, false, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+
+	sink := &collectingSink{}
+	emitter := emit.NewEmitter("test", sink)
+	logger.SetEmitter(emitter)
+	t.Cleanup(logger.Close)
+	t.Cleanup(func() { _ = emitter.Close() })
+
+	logger.LogWSOpen("ws://example.com/stream", testClientIP, testReqID, testAgentName)
+	logger.LogWSClose(WSCloseEvent{
+		Target:         "ws://example.com/stream",
+		ClientIP:       testClientIP,
+		RequestID:      testReqID,
+		Agent:          testAgentName,
+		ClientToServer: 11,
+		ServerToClient: 22,
+		TextFrames:     3,
+		BinaryFrames:   4,
+		Duration:       250 * time.Millisecond,
+	})
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.events) != 0 {
+		t.Fatalf("got %d emitted events, want none", len(sink.events))
+	}
+}
+
+func TestEmit_SecurityEventsUseWarnSeverity(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantType EventType
+		log      func(*Logger)
+	}{
+		{
+			name:     "dlp warn",
+			wantType: EventDLPWarn,
+			log: func(l *Logger) {
+				l.LogDLPWarn(
+					LogContext{method: http.MethodGet, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-dlp-warn", agent: testAgentName},
+					"staged-key",
+					"high",
+					"fetch",
+				)
+			},
+		},
+		{
+			name:     "address protection",
+			wantType: EventAddressProtection,
+			log: func(l *Logger) {
+				l.LogBodyScan(
+					LogContext{method: http.MethodPost, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-address", agent: testAgentName},
+					EventAddressProtection,
+					actionBlock,
+					1,
+					[]string{"ETH lookalike detected"},
+				)
+			},
+		},
+		{
+			name:     "body dlp",
+			wantType: EventBodyDLP,
+			log: func(l *Logger) {
+				l.LogBodyDLP(
+					LogContext{method: http.MethodPost, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-body", agent: testAgentName},
+					actionBlock,
+					1,
+					[]string{"api-key"},
+					nil,
+				)
+			},
+		},
+		{
+			name:     "body prompt injection",
+			wantType: EventBodyPromptInjection,
+			log: func(l *Logger) {
+				l.LogBodyScan(
+					LogContext{method: http.MethodPost, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-body-inj", agent: testAgentName},
+					EventBodyPromptInjection,
+					actionBlock,
+					1,
+					[]string{"Prompt Injection"},
+				)
+			},
+		},
+		{
+			name:     "header dlp",
+			wantType: EventHeaderDLP,
+			log: func(l *Logger) {
+				l.LogHeaderDLP(
+					LogContext{method: http.MethodGet, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-header", agent: testAgentName},
+					"Authorization",
+					actionBlock,
+					[]string{"bearer-token"},
+					nil,
+				)
+			},
+		},
+		{
+			name:     "sni mismatch",
+			wantType: EventSNIMismatch,
+			log: func(l *Logger) {
+				l.LogSNIMismatch("allowed.com", "evil.com", testClientIP, testReqID, testAgentName, "mismatch")
+			},
+		},
+		{
+			name:     "taint decision",
+			wantType: EventTaintDecision,
+			log: func(l *Logger) {
+				l.LogTaintDecision(
+					LogContext{method: http.MethodPost, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-taint", agent: testAgentName},
+					TaintDecision{
+						TaintLevel:  "high",
+						ActionClass: "write",
+						Sensitivity: "secret",
+						Authority:   "remote_content",
+						Decision:    actionBlock,
+						Reason:      "tainted source",
+					},
+				)
+			},
+		},
+		{
+			name:     "airlock enter",
+			wantType: EventAirlockEnter,
+			log: func(l *Logger) {
+				l.LogAirlockEnter("sess-1", "quarantine", "response_scan", testClientIP, testReqID)
+			},
+		},
+		{
+			name:     "airlock deny",
+			wantType: EventAirlockDeny,
+			log: func(l *Logger) {
+				l.LogAirlockDeny("sess-1", "quarantine", "fetch", http.MethodGet, testClientIP, testReqID)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			tt.log(logger)
+
+			ev := sink.onlyEvent(t)
+			if ev.Type != string(tt.wantType) {
+				t.Fatalf("type = %q, want %q", ev.Type, tt.wantType)
+			}
+			if ev.Severity != emit.SeverityWarn {
+				t.Fatalf("severity = %s, want warn", ev.Severity)
+			}
+		})
+	}
+}
+
+func TestAuditEmitLookupEventsHaveExplicitSeverity(t *testing.T) {
+	lookupEvents := map[EventType]string{
+		EventStartup:                emit.EventStartup,
+		EventShutdown:               emit.EventShutdown,
+		EventAllowed:                emit.EventAllowed,
+		EventBlocked:                emit.EventBlocked,
+		EventDLPWarn:                emit.EventDLPWarn,
+		EventAuthorityVerification:  emit.EventAuthorityVerification,
+		EventError:                  emit.EventError,
+		EventAnomaly:                emit.EventAnomaly,
+		EventResponseScanExempt:     emit.EventResponseScanExempt,
+		EventMediaExposure:          emit.EventMediaExposure,
+		EventResponseScan:           emit.EventResponseScan,
+		EventResponseScanSuppressed: emit.EventResponseScanSuppressed,
+		EventTaintDecision:          emit.EventTaintDecision,
+		EventTunnelOpen:             emit.EventTunnelOpen,
+		EventTunnelClose:            emit.EventTunnelClose,
+		EventForwardHTTP:            emit.EventForwardHTTP,
+		EventInterceptHTTP:          emit.EventInterceptHTTP,
+		EventRedirect:               emit.EventRedirect,
+		EventToolRedirect:           emit.EventToolRedirect,
+		EventConfigReload:           emit.EventConfigReload,
+		EventAgentListener:          emit.EventAgentListener,
+		EventWSOpen:                 emit.EventWSOpen,
+		EventWSClose:                emit.EventWSClose,
+		EventWSBlocked:              emit.EventWSBlocked,
+		EventWSScan:                 emit.EventWSScan,
+		EventSessionAnomaly:         emit.EventSessionAnomaly,
+		EventAdaptiveRecovery:       emit.EventAdaptiveRecovery,
+		EventMCPUnknownTool:         emit.EventMCPUnknownTool,
+		EventSNIMismatch:            emit.EventSNIMismatch,
+		EventKillSwitchDeny:         emit.EventKillSwitchDeny,
+		EventBodyDLP:                emit.EventBodyDLP,
+		EventBodyPromptInjection:    emit.EventBodyPromptInjection,
+		EventAddressProtection:      emit.EventAddressProtection,
+		EventHeaderDLP:              emit.EventHeaderDLP,
+		EventSessionAdmin:           emit.EventSessionAdmin,
+		EventAirlockEnter:           emit.EventAirlockEnter,
+		EventAirlockDeny:            emit.EventAirlockDeny,
+		EventAirlockDeescalate:      emit.EventAirlockDeescalate,
+		EventShieldRewrite:          emit.EventShieldRewrite,
+	}
+
+	for auditEvent, emitEvent := range lookupEvents {
+		t.Run(string(auditEvent), func(t *testing.T) {
+			if string(auditEvent) != emitEvent {
+				t.Fatalf("audit event %q does not match emit event %q", auditEvent, emitEvent)
+			}
+			if _, ok := emit.EventSeverity[emitEvent]; !ok {
+				t.Fatalf("emit.EventSeverity missing %q", emitEvent)
+			}
+		})
+	}
+}
+
+func TestEmit_OperationalLifecycleEventsSanitizeFields(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogRedirect(
+		"https://example.com/\x1b[2Jtoken",
+		"https://www.example.com/\x1b[31mnext",
+		"10.0.0\x1b[2J.1",
+		"req-\x1b[0m1",
+		"agent-\x1b[1mbot",
+		1,
+	)
+
+	ev := sink.onlyEvent(t)
+	for _, field := range []string{"original_url", "redirect_url", "client_ip", "request_id", "agent"} {
+		value, ok := ev.Fields[field].(string)
+		if !ok {
+			t.Fatalf("fields[%s] = %T, want string", field, ev.Fields[field])
+		}
+		if strings.Contains(value, "\x1b") {
+			t.Fatalf("fields[%s] contains ANSI escape: %q", field, value)
+		}
+	}
+}
+
+func TestNewHTTPLogContext_RequiresCorrelationFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		url       string
+		clientIP  string
+		requestID string
+		wantErr   error
+	}{
+		{name: "missing_url", url: "", clientIP: testClientIP, requestID: testReqID, wantErr: errLogContextMissingURL},
+		{name: "missing_client_ip", url: "https://example.com", clientIP: "", requestID: testReqID, wantErr: errLogContextMissingClientIP},
+		{name: "missing_request_id", url: "https://example.com", clientIP: testClientIP, requestID: "", wantErr: errLogContextMissingRequestID},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewHTTPLogContext(testMethodGet, tt.url, tt.clientIP, tt.requestID, "")
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewConnectLogContext_RequiresCorrelationFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		target    string
+		clientIP  string
+		requestID string
+		wantErr   error
+	}{
+		{name: "missing_target", target: "", clientIP: testClientIP, requestID: testReqID, wantErr: errLogContextMissingTarget},
+		{name: "missing_client_ip", target: "evil.com:443", clientIP: "", requestID: testReqID, wantErr: errLogContextMissingClientIP},
+		{name: "missing_request_id", target: "evil.com:443", clientIP: testClientIP, requestID: "", wantErr: errLogContextMissingRequestID},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := NewConnectLogContext(tt.target, tt.clientIP, tt.requestID, "")
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewMCPLogContext_RequiresResource(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewMCPLogContext("MCP", "", "")
+	if !errors.Is(err, errLogContextMissingResource) {
+		t.Fatalf("err = %v, want %v", err, errLogContextMissingResource)
+	}
+}
+
+func TestNewLogContext_RejectsInvalidIdentifierCombinations(t *testing.T) {
+	t.Parallel()
+
+	_, err := newLogContext(LogContextOpts{
+		Method:    testMethodGet,
+		URL:       "https://example.com",
+		Target:    "example.com:443",
+		ClientIP:  testClientIP,
+		RequestID: testReqID,
+	})
+	if !errors.Is(err, errLogContextIdentifierClash) {
+		t.Fatalf("err = %v, want %v", err, errLogContextIdentifierClash)
+	}
+
+	_, err = newLogContext(LogContextOpts{
+		Method:    testMethodGet,
+		Target:    "example.com:443",
+		ClientIP:  testClientIP,
+		RequestID: testReqID,
+	})
+	if err == nil || !strings.Contains(err.Error(), "target contexts require") {
+		t.Fatalf("err = %v, want target method validation error", err)
+	}
+}
+
+func TestEmit_LogContextFieldRouting(t *testing.T) {
+	tests := []struct {
+		name      string
+		emitFn    func(*testing.T, *Logger)
+		wantType  string
+		wantKey   string
+		wantValue string
+		absent    []string
+	}{
+		{
+			name: "fetch_allowed_uses_url_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogAllowed(mustHTTPLogContext(t, testMethodGet, "https://fetch.example/path", "req-fetch"), 200, 64, time.Millisecond)
+			},
+			wantType:  string(EventAllowed),
+			wantKey:   "url",
+			wantValue: "https://fetch.example",
+			absent:    []string{"target", "resource"},
+		},
+		{
+			name: "forward_blocked_uses_url_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogBlocked(mustHTTPLogContext(t, "POST", "http://forward.example/path", "req-forward"), "blocklist", "blocked")
+			},
+			wantType:  string(EventBlocked),
+			wantKey:   "url",
+			wantValue: "http://forward.example",
+			absent:    []string{"target", "resource"},
+		},
+		{
+			name: "websocket_response_scan_uses_url_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogResponseScan(mustHTTPLogContext(t, "WS", "wss://socket.example/stream", "req-ws-scan"), testActionWarn, 1, []string{"injection"}, nil)
+			},
+			wantType:  string(EventResponseScan),
+			wantKey:   "url",
+			wantValue: "wss://socket.example/[redacted]",
+			absent:    []string{"target", "resource"},
+		},
+		{
+			name: "websocket_exempt_uses_url_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogResponseScanExempt(mustHTTPLogContext(t, "WS", "ws://socket.example/stream", "req-ws-exempt"), "socket.example")
+			},
+			wantType:  string(EventResponseScanExempt),
+			wantKey:   "url",
+			wantValue: "ws://socket.example",
+			absent:    []string{"target", "resource"},
+		},
+		{
+			name: "mcp_stdio_blocked_uses_resource_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogBlocked(mustMCPLogContext(t, "MCP", "tools/list", testAgentName), "mcp_tool_scanning", "poisoned description")
+			},
+			wantType:  string(EventBlocked),
+			wantKey:   "resource",
+			wantValue: "tools/list",
+			absent:    []string{"url", "target"},
+		},
+		{
+			name: "mcp_http_anomaly_uses_resource_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogAnomaly(mustMCPLogContext(t, "MCP", "resources/read", testAgentName), "prompt_injection", "tool output suspicious", 0.5)
+			},
+			wantType:  string(EventAnomaly),
+			wantKey:   "resource",
+			wantValue: "[redacted]",
+			absent:    []string{"url", "target"},
+		},
+		{
+			name: "mcp_sse_exempt_uses_resource_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogResponseScanExempt(mustMCPLogContext(t, "MCP", "prompts/get", testAgentName), "mcp.example")
+			},
+			wantType:  string(EventResponseScanExempt),
+			wantKey:   "resource",
+			wantValue: "prompts/get",
+			absent:    []string{"url", "target"},
+		},
+		{
+			name: "connect_open_uses_target_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogTunnelOpen(mustConnectLogContext(t, "evil.com:443", testClientIP, "req-connect-open", testAgentName))
+			},
+			wantType:  string(EventTunnelOpen),
+			wantKey:   "target",
+			wantValue: "evil.com:443",
+			absent:    []string{"url", "resource"},
+		},
+		{
+			name: "connect_close_uses_target_only",
+			emitFn: func(t *testing.T, logger *Logger) {
+				logger.LogTunnelClose(mustConnectLogContext(t, "evil.com:443", testClientIP, "req-connect-close", testAgentName), 128, time.Second)
+			},
+			wantType:  string(EventTunnelClose),
+			wantKey:   "target",
+			wantValue: "evil.com:443",
+			absent:    []string{"url", "resource"},
+		},
+		{
+			name: "config_reload_error_uses_resource_only",
+			emitFn: func(_ *testing.T, logger *Logger) {
+				logger.LogError(NewResourceLogContext("CONFIG_RELOAD", "/etc/pipelock/config.yaml"), fmt.Errorf("validation failed"))
+			},
+			wantType:  string(EventError),
+			wantKey:   "resource",
+			wantValue: "/etc/pipelock/config.yaml",
+			absent:    []string{"url", "target"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			tt.emitFn(t, logger)
+
+			ev, ok := sink.lastEvent()
+			if !ok {
+				t.Fatal("expected emitted event")
+			}
+			if ev.Type != tt.wantType {
+				t.Fatalf("type = %q, want %q", ev.Type, tt.wantType)
+			}
+			assertEmitterContextFields(t, ev, tt.wantKey, tt.wantValue, tt.absent...)
+		})
+	}
+}
+
+func TestEmit_LogBlocked(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com", clientIP: testClientIP, requestID: "req-1"}, ScannerDLP, "secret found")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "blocked" {
+		t.Errorf("type = %q, want blocked", ev.Type)
+	}
+	if ev.Fields["scanner"] != ScannerDLP {
+		t.Errorf("fields[scanner] = %v, want dlp", ev.Fields["scanner"])
+	}
+	if ev.Fields["mitre_technique"] != mitreT1048 {
+		t.Errorf("fields[mitre_technique] = %v, want T1048", ev.Fields["mitre_technique"])
+	}
+	if ev.InstanceID != "test-instance" {
+		t.Errorf("instance_id = %q, want test-instance", ev.InstanceID)
+	}
+}
+
+func TestEmit_LogBlocked_IncludeBlockedFalse(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	logger, err := New("json", "file", path, true, false) // includeBlocked=false
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logger.Close()
+	sink := &collectingSink{}
+	emitter := emit.NewEmitter("test", sink)
+	logger.SetEmitter(emitter)
+	t.Cleanup(logger.Close)
+	t.Cleanup(func() { _ = emitter.Close() })
+
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com", clientIP: testClientIP, requestID: "req-1"}, ScannerDLP, "secret found")
+
+	// Even with includeBlocked=false, emission should still fire
+	if _, ok := sink.lastEvent(); !ok {
+		t.Error("expected emitted event even when includeBlocked=false")
+	}
+}
+
+func TestEmit_LogError(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogError(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-2"}, fmt.Errorf("connection refused"))
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventError) {
+		t.Errorf("type = %q, want error", ev.Type)
+	}
+	if ev.Fields[string(EventError)] != "connection refused" {
+		t.Errorf("fields[error] = %v", ev.Fields[string(EventError)])
+	}
+}
+
+func TestEmit_LogAnomaly(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAnomaly(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-3"}, "entropy", "high entropy", 3.5)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "anomaly" {
+		t.Errorf("type = %q, want anomaly", ev.Type)
+	}
+	if ev.Fields["score"] != 3.5 {
+		t.Errorf("fields[score] = %v, want 3.5", ev.Fields["score"])
+	}
+	if ev.Fields["scanner"] != "entropy" {
+		t.Errorf("fields[scanner] = %v, want entropy", ev.Fields["scanner"])
+	}
+	if ev.Fields["mitre_technique"] != mitreT1048 {
+		t.Errorf("fields[mitre_technique] = %v, want T1048", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogDenialOfWalletRemediationHint(t *testing.T) {
+	tests := []struct {
+		name      string
+		log       func(*Logger)
+		wantEvent EventType
+	}{
+		{
+			name: "blocked",
+			log: func(logger *Logger) {
+				logger.LogBlocked(LogContext{method: "MCP", target: testDoWTarget}, scannerpkg.ScannerDenialOfWallet, "tool call limit exceeded: 11/10")
+			},
+			wantEvent: EventBlocked,
+		},
+		{
+			name: "anomaly",
+			log: func(logger *Logger) {
+				logger.LogAnomaly(LogContext{method: "MCP", target: testDoWTarget}, scannerpkg.ScannerDenialOfWallet, "tool call limit exceeded: 11/10", 0)
+			},
+			wantEvent: EventAnomaly,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			tt.log(logger)
+
+			ev, ok := sink.lastEvent()
+			if !ok {
+				t.Fatal("expected emitted event")
+			}
+			if ev.Type != string(tt.wantEvent) {
+				t.Fatalf("type = %q, want %s", ev.Type, tt.wantEvent)
+			}
+			if ev.Fields["scanner"] != scannerpkg.ScannerDenialOfWallet {
+				t.Fatalf("fields[scanner] = %v, want %s", ev.Fields["scanner"], scannerpkg.ScannerDenialOfWallet)
+			}
+			hint, _ := ev.Fields["remediation_hint"].(string)
+			if !strings.Contains(hint, "agents._default.budget.max_tool_calls_per_session") {
+				t.Fatalf("fields[remediation_hint] = %q, want exact tool-call budget knob", hint)
+			}
+		})
+	}
+}
+
+func TestEmit_RemediationHintSweep(t *testing.T) {
+	ctx := LogContext{method: testMethodGet, url: "https://api.vendor.example/data", clientIP: testClientIP, requestID: "req-hint-sweep"}
+	tests := []struct {
+		name        string
+		log         func(*Logger)
+		wantEvent   EventType
+		wantHint    string
+		wantAction  string
+		wantScanner string
+	}{
+		{
+			name: "response scan",
+			log: func(logger *Logger) {
+				logger.LogResponseScan(ctx, actionBlock, 1, []string{"Prompt Injection"}, nil)
+			},
+			wantEvent: EventResponseScan,
+			wantHint:  "suppress:",
+		},
+		{
+			name: "websocket response scan",
+			log: func(logger *Logger) {
+				logger.LogWSScan(WSScanEvent{Target: "wss://api.vendor.example/ws", Direction: DirectionServerToClient, Action: "warn", MatchCount: 1, PatternNames: []string{"Prompt Injection"}})
+			},
+			wantEvent:   EventWSScan,
+			wantHint:    "suppress:",
+			wantAction:  "warn",
+			wantScanner: scannerpkg.AuditResponseScan,
+		},
+		{
+			name: "websocket address protection",
+			log: func(logger *Logger) {
+				logger.LogWSScan(WSScanEvent{Target: "wss://api.vendor.example/ws", Direction: DirectionClientToServer, Action: "warn", Scanner: scannerpkg.AuditAddressProtection, MatchCount: 1, PatternNames: []string{"unapproved destination"}})
+			},
+			wantEvent:   EventWSScan,
+			wantHint:    "address_protection.allowed_addresses",
+			wantAction:  "warn",
+			wantScanner: scannerpkg.AuditAddressProtection,
+		},
+		{
+			name: "header DLP",
+			log: func(logger *Logger) {
+				logger.LogHeaderDLP(ctx, "Authorization", actionBlock, []string{"Generic API Key"}, nil)
+			},
+			wantEvent: EventHeaderDLP,
+			wantHint:  "suppress:",
+		},
+		{
+			name: "body prompt injection",
+			log: func(logger *Logger) {
+				logger.LogBodyScan(ctx, EventBodyPromptInjection, actionBlock, 1, []string{"Prompt Injection"})
+			},
+			wantEvent: EventBodyPromptInjection,
+			wantHint:  "request_body_scanning.trusted_hosts",
+		},
+		{
+			name: "chain detection",
+			log: func(logger *Logger) {
+				logger.LogChainDetection("lethal-trifecta", "critical", actionBlock, "send", "session-1")
+			},
+			wantEvent: EventChainDetection,
+			wantHint:  "tool_chain_detection.pattern_overrides",
+		},
+		{
+			name: "blocked media reason selects exact knob",
+			log: func(logger *Logger) {
+				logger.LogBlocked(ctx, scannerpkg.AuditMediaPolicy, "media_policy: image size 2048 exceeds limit 1024")
+			},
+			wantEvent: EventBlocked,
+			wantHint:  "media_policy.max_image_bytes",
+		},
+		{
+			name: "blocked media exposure",
+			log: func(logger *Logger) {
+				logger.LogMediaExposure(ctx, MediaExposureInfo{Transport: "fetch", ContentType: "audio/mpeg", SizeBytes: 2048, Blocked: true, BlockReason: "media_policy: audio stripped"})
+			},
+			wantEvent: EventMediaExposure,
+			wantHint:  "media_policy.strip_audio",
+		},
+		{
+			name: "provenance anomaly",
+			log: func(logger *Logger) {
+				logger.LogAnomaly(ctx, scannerpkg.AuditProvenance, "unsigned tool", 0)
+			},
+			wantEvent: EventAnomaly,
+			wantHint:  "mcp_tool_provenance.trusted_keys",
+		},
+		{
+			name: "request policy block",
+			log: func(logger *Logger) {
+				logger.LogBlocked(ctx, scannerpkg.AuditRequestPolicy, "deny-production-delete")
+			},
+			wantEvent: EventBlocked,
+			wantHint:  "request_policy.rules",
+		},
+		{
+			name: "kill switch deny",
+			log: func(logger *Logger) {
+				logger.LogKillSwitchDeny("fetch", "/fetch", "sentinel", "maintenance", testClientIP, "")
+			},
+			wantEvent: EventKillSwitchDeny,
+			wantHint:  "active kill-switch source",
+		},
+		{
+			name: "session baseline anomaly",
+			log: func(logger *Logger) {
+				logger.LogSessionAnomaly("session-1", "baseline_deviation", "tool count drift", testClientIP, "req-1", 3)
+			},
+			wantEvent: EventSessionAnomaly,
+			wantHint:  "pipelock baseline show",
+		},
+		{
+			name: "adaptive upgrade",
+			log: func(logger *Logger) {
+				logger.LogAdaptiveUpgrade("session-1", "critical", "warn", actionBlock, "response_scan", testClientIP, "req-1")
+			},
+			wantEvent: EventAdaptiveUpgrade,
+			wantHint:  "affected identity session",
+		},
+		{
+			name: "airlock deny",
+			log: func(logger *Logger) {
+				logger.LogAirlockDeny("session-1", "hard", "fetch", testMethodGet, testClientIP, "req-1")
+			},
+			wantEvent: EventAirlockDeny,
+			wantHint:  "airlock.timers",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			tt.log(logger)
+
+			ev, ok := sink.lastEvent()
+			if !ok {
+				t.Fatal("expected emitted event")
+			}
+			if ev.Type != string(tt.wantEvent) {
+				t.Fatalf("type = %q, want %s", ev.Type, tt.wantEvent)
+			}
+			if tt.wantAction != "" && ev.Fields["action"] != tt.wantAction {
+				t.Fatalf("action = %v, want %s", ev.Fields["action"], tt.wantAction)
+			}
+			if tt.wantScanner != "" && ev.Fields["scanner"] != tt.wantScanner {
+				t.Fatalf("scanner = %v, want %s", ev.Fields["scanner"], tt.wantScanner)
+			}
+			if tt.wantScanner == scannerpkg.AuditAddressProtection && ev.Fields["action"] == scannerpkg.AuditAddressProtection {
+				t.Fatal("address-protection scanner label must not be emitted as the enforcement action")
+			}
+			hint, _ := ev.Fields["remediation_hint"].(string)
+			if !strings.Contains(hint, tt.wantHint) {
+				t.Fatalf("remediation_hint = %q, want substring %q", hint, tt.wantHint)
+			}
+		})
+	}
+}
+
+func TestEmit_LogResponseScanExempt(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanExempt(LogContext{method: testMethodGet, url: "https://api.openai.com/v1/chat", clientIP: testClientIP, requestID: "req-exempt-1", agent: testAgentName}, "api.openai.com")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanExempt) {
+		t.Errorf("type = %q, want %s", ev.Type, EventResponseScanExempt)
+	}
+	if ev.Fields["hostname"] != "api.openai.com" {
+		t.Errorf("fields[hostname] = %v, want api.openai.com", ev.Fields["hostname"])
+	}
+	if ev.Fields["enforcement_type"] != "response_scanning" {
+		t.Errorf("fields[enforcement_type] = %v, want response_scanning", ev.Fields["enforcement_type"])
+	}
+	if ev.Fields["reason"] != "exempt_domains match; findings pinned to warn (not scored)" {
+		t.Errorf("fields[reason] = %v, want pinned-to-warn reason", ev.Fields["reason"])
+	}
+	if _, ok := ev.Fields["effect"]; ok {
+		t.Errorf("generic response scan exempt event must not claim full-trust effect: %v", ev.Fields["effect"])
+	}
+	if ev.Fields["agent"] != testAgentName {
+		t.Errorf("fields[agent] = %v, want %s", ev.Fields["agent"], testAgentName)
+	}
+}
+
+func TestEmit_LogResponseScanExemptFullTrust(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanExemptFullTrust(LogContext{method: testMethodGet, url: "https://api.openai.com/v1/chat", clientIP: testClientIP, requestID: "req-exempt-full-trust", agent: testAgentName}, "api.openai.com")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanExempt) {
+		t.Errorf("type = %q, want %s", ev.Type, EventResponseScanExempt)
+	}
+	effect, _ := ev.Fields["effect"].(string)
+	if !strings.Contains(effect, "injection scanning is disabled for ALL responses") ||
+		!strings.Contains(effect, "oversized over-cap responses that stream unscanned") {
+		t.Errorf("fields[effect] = %q, want full-trust over-cap warning", effect)
+	}
+}
+
+func TestEmit_LogResponseScanExemptOverCapUnscanned(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanExemptOverCapUnscanned(
+		LogContext{method: testMethodGet, url: "https://api.vendor.example/download", clientIP: testClientIP, requestID: "req-exempt-overcap", agent: testAgentName},
+		"api.vendor.example", "forward", 2048, 1024,
+	)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanExempt) {
+		t.Errorf("type = %q, want %s", ev.Type, EventResponseScanExempt)
+	}
+	if ev.Fields["reason"] != "exempt_domains over-cap response streamed unscanned" {
+		t.Errorf("fields[reason] = %v, want over-cap unscanned reason", ev.Fields["reason"])
+	}
+	if ev.Fields["transport"] != "forward" {
+		t.Errorf("fields[transport] = %v, want forward", ev.Fields["transport"])
+	}
+	effect, _ := ev.Fields["effect"].(string)
+	if !strings.Contains(effect, "injection scanning is disabled for ALL responses") ||
+		!strings.Contains(effect, "oversized over-cap responses that stream unscanned") {
+		t.Errorf("fields[effect] = %q, want full-trust over-cap warning", effect)
+	}
+}
+
+func TestEmit_LogResponseScanExempt_NoAgent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanExempt(LogContext{method: testMethodGet, url: "https://api.openai.com/v1/chat", clientIP: testClientIP, requestID: "req-exempt-2"}, "api.openai.com")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, hasAgent := ev.Fields["agent"]; hasAgent {
+		t.Error("agent field should be absent when empty")
+	}
+}
+
+func TestEmit_LogResponseScan(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScan(LogContext{url: "https://example.com", clientIP: testClientIP, requestID: "req-4"}, actionBlock, 2, []string{"injection", "jailbreak"}, nil)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScan) {
+		t.Errorf("type = %q, want response_scan", ev.Type)
+	}
+	if ev.Fields["match_count"] != 2 {
+		t.Errorf("fields[match_count] = %v, want 2", ev.Fields["match_count"])
+	}
+	if ev.Fields["mitre_technique"] != mitreT1059 {
+		t.Errorf("fields[mitre_technique] = %v, want T1059", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogResponseScanSuppressed(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanSuppressed(
+		LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-suppressed", agent: testAgentName},
+		"new-instructions",
+		"forward",
+		"destination policy",
+	)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanSuppressed) {
+		t.Errorf("type = %q, want %q", ev.Type, EventResponseScanSuppressed)
+	}
+	for field, want := range map[string]any{
+		"scanner":         scannerpkg.AuditResponseScan,
+		"mode":            "informational",
+		"pattern":         "new-instructions",
+		"surface":         "forward",
+		"reason":          "destination policy",
+		"mitre_technique": mitreT1059,
+	} {
+		if got := ev.Fields[field]; got != want {
+			t.Errorf("fields[%s] = %v, want %v", field, got, want)
+		}
+	}
+}
+
+func TestEmit_LogForwardHTTP(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogForwardHTTP(LogContext{method: testMethodGet, url: "http://example.com/path", clientIP: testClientIP, requestID: "req-forward-http", agent: testAgentName}, 200, 2048, 100*time.Millisecond)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventForwardHTTP) {
+		t.Fatalf("type = %q, want %s", ev.Type, EventForwardHTTP)
+	}
+	if ev.Fields["url"] != "http://example.com" {
+		t.Errorf("fields[url] = %v, want http://example.com", ev.Fields["url"])
+	}
+	if ev.Fields["status_code"] != 200 {
+		t.Errorf("fields[status_code] = %v, want 200", ev.Fields["status_code"])
+	}
+}
+
+func TestEmit_LogConfigReload(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogConfigReload("success", "SIGHUP", testConfigHash)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "config_reload" {
+		t.Errorf("type = %q, want config_reload", ev.Type)
+	}
+	if ev.Fields["status"] != "success" {
+		t.Errorf("fields[status] = %v", ev.Fields["status"])
+	}
+	if ev.Fields["config_hash"] != testConfigHash {
+		t.Errorf("fields[config_hash] = %v, want %s", ev.Fields["config_hash"], testConfigHash)
+	}
+}
+
+func TestEmit_LogWSBlocked(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogWSBlocked(WSBlockedEvent{
+		Target: "ws://evil.com", Direction: DirectionClientToServer, Scanner: ScannerDLP,
+		Reason: "secret", ClientIP: testClientIP, RequestID: "req-5",
+	})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "ws_blocked" {
+		t.Errorf("type = %q, want ws_blocked", ev.Type)
+	}
+	if ev.Fields["mitre_technique"] != mitreT1048 {
+		t.Errorf("fields[mitre_technique] = %v, want T1048", ev.Fields["mitre_technique"])
+	}
+	hint, _ := ev.Fields["remediation_hint"].(string)
+	if !strings.Contains(hint, "dlp.patterns[].exempt_domains") {
+		t.Fatalf("fields[remediation_hint] = %q, want DLP operator knob", hint)
+	}
+}
+
+func TestEmit_LogWSScan(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogWSScan(WSScanEvent{
+		Target:       "ws://example.com",
+		Direction:    DirectionServerToClient,
+		ClientIP:     testClientIP,
+		RequestID:    "req-6",
+		Action:       testActionWarn,
+		MatchCount:   1,
+		PatternNames: []string{"injection"},
+	})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "ws_scan" {
+		t.Errorf("type = %q, want ws_scan", ev.Type)
+	}
+	if ev.Fields["mitre_technique"] != mitreT1059 {
+		t.Errorf("fields[mitre_technique] = %v, want T1059", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogWSScan_ClientToServer(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogWSScan(WSScanEvent{
+		Target:       "ws://example.com",
+		Direction:    DirectionClientToServer,
+		ClientIP:     testClientIP,
+		RequestID:    "req-6b",
+		Action:       "audit",
+		MatchCount:   1,
+		PatternNames: []string{"AWS Key"},
+	})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Fields["mitre_technique"] != mitreT1048 {
+		t.Errorf("fields[mitre_technique] = %v, want T1048", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogSessionAnomaly(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogSessionAnomaly(testClientIP, "domain_burst", "6 domains in 5m", testClientIP, testReqID, 2.0)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "session_anomaly" {
+		t.Errorf("type = %q, want session_anomaly", ev.Type)
+	}
+	if ev.Fields["client_ip"] != testClientIP {
+		t.Errorf("fields[client_ip] = %v, want 10.0.0.1", ev.Fields["client_ip"])
+	}
+	if ev.Fields["request_id"] != testReqID {
+		t.Errorf("fields[request_id] = %v, want req-7", ev.Fields["request_id"])
+	}
+	if ev.Fields["mitre_technique"] != "T1078" {
+		t.Errorf("fields[mitre_technique] = %v, want T1078", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogSessionAnomaly_OmitsEmptyFields(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	// Empty clientIP and requestID should be omitted from emitted event
+	logger.LogSessionAnomaly("session-1", "domain_burst", "test", "", "", 1.0)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, exists := ev.Fields["client_ip"]; exists {
+		t.Error("expected client_ip to be omitted when empty")
+	}
+	if _, exists := ev.Fields["request_id"]; exists {
+		t.Error("expected request_id to be omitted when empty")
+	}
+}
+
+func TestEmit_LogAdaptiveEscalation(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAdaptiveEscalation(testClientIP, testActionWarn, actionBlock, testClientIP, "req-8", 5.5)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "adaptive_escalation" {
+		t.Errorf("type = %q, want adaptive_escalation", ev.Type)
+	}
+	// Escalation to "block" should be critical severity
+	if ev.Severity != emit.SeverityCritical {
+		t.Errorf("severity = %v, want critical", ev.Severity)
+	}
+}
+
+func TestEmit_LogAdaptiveEscalation_OmitsEmptyFields(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAdaptiveEscalation("session-1", testActionWarn, actionBlock, "", "", 5.0)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, exists := ev.Fields["client_ip"]; exists {
+		t.Error("expected client_ip to be omitted when empty")
+	}
+}
+
+func TestEmit_LogMCPUnknownTool(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogMCPUnknownTool("execute_code", testActionWarn)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "mcp_unknown_tool" {
+		t.Errorf("type = %q, want mcp_unknown_tool", ev.Type)
+	}
+	if ev.Fields["tool"] != "execute_code" {
+		t.Errorf("fields[tool] = %v", ev.Fields["tool"])
+	}
+	if ev.Fields["mitre_technique"] != "T1195.002" {
+		t.Errorf("fields[mitre_technique] = %v, want T1195.002", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogKillSwitchDeny(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogKillSwitchDeny("http", "https://example.com", "global", "halted", testClientIP, "")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "kill_switch_deny" {
+		t.Errorf("type = %q, want kill_switch_deny", ev.Type)
+	}
+	if ev.Severity != emit.SeverityCritical {
+		t.Errorf("severity = %v, want critical", ev.Severity)
+	}
+}
+
+func TestEmit_DefensiveEvents_NoMITRETechnique(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	// Kill switch deny is a defensive action, not an attack detection.
+	logger.LogKillSwitchDeny("http", "https://example.com", "api", "testing", testClientIP, "")
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event for kill_switch_deny")
+	}
+	if _, exists := ev.Fields["mitre_technique"]; exists {
+		t.Error("kill_switch_deny should not have mitre_technique field")
+	}
+
+	// Config reload is normal operation.
+	logger.LogConfigReload("success", "SIGHUP", testConfigHash)
+	ev, ok = sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event for config_reload")
+	}
+	if _, exists := ev.Fields["mitre_technique"]; exists {
+		t.Error("config_reload should not have mitre_technique field")
+	}
+
+	// Adaptive escalation is a defensive response.
+	logger.LogAdaptiveEscalation("session-1", testActionWarn, actionBlock, testClientIP, "req-1", 5.0)
+	ev, ok = sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event for adaptive_escalation")
+	}
+	if _, exists := ev.Fields["mitre_technique"]; exists {
+		t.Error("adaptive_escalation should not have mitre_technique field")
+	}
+}
+
+func TestLogBodyDLP_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBodyDLP(LogContext{method: "POST", url: "https://api.example.com/v1/chat", clientIP: testClientIP, requestID: "req-50"}, testActionWarn, 2, []string{"AWS Access Key", "GitHub PAT"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventBodyDLP) {
+		t.Errorf("expected event=body_dlp, got %v", entry["event"])
+	}
+	if entry["method"] != "POST" {
+		t.Errorf("expected method=POST, got %v", entry["method"])
+	}
+	if entry["url"] != "https://api.example.com/[redacted]" {
+		t.Errorf("expected url, got %v", entry["url"])
+	}
+	if entry["action"] != testActionWarn {
+		t.Errorf("expected action=warn, got %v", entry["action"])
+	}
+	if entry["client_ip"] != testClientIP {
+		t.Errorf("expected client_ip, got %v", entry["client_ip"])
+	}
+	if entry["request_id"] != "req-50" {
+		t.Errorf("expected request_id=req-50, got %v", entry["request_id"])
+	}
+	matchCount, ok := entry["match_count"].(float64)
+	if !ok || matchCount != 2 {
+		t.Errorf("expected match_count=2, got %v", entry["match_count"])
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 2 {
+		t.Errorf("expected 2 patterns, got %v", entry["patterns"])
+	}
+	if entry["mitre_technique"] != mitreT1048 {
+		t.Errorf("expected mitre_technique=T1048, got %v", entry["mitre_technique"])
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if !strings.Contains(hint, "suppress:") {
+		t.Fatalf("remediation_hint = %q, want body-DLP suppress guidance", hint)
+	}
+}
+
+func TestLogBlockedBodyDLPIncludesRemediationHint(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(LogContext{method: "POST", url: "https://api.example.com/submit", clientIP: testClientIP, requestID: "req-51"}, "body_dlp", "request body contains secret: test_rule")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry["url"] != "https://api.example.com/[redacted]" {
+		t.Fatalf("body_dlp blocked url = %v, want redacted scheme+host", entry["url"])
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if !strings.Contains(hint, "suppress:") {
+		t.Fatalf("remediation_hint = %q, want suppress: remediation", hint)
+	}
+	if strings.Contains(hint, "exempt_domains") {
+		t.Fatalf("remediation_hint = %q, must not point to URL-DLP exempt_domains", hint)
+	}
+}
+
+func TestLogBlockedIncludesRemediationHintForNonBodyDLPLabels(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "ssrf" is not the single pre-existing body_dlp entry; before the central
+	// remediation table this block logged an empty remediation_hint. It now
+	// carries the SSRF operator allow-path.
+	logger.LogBlocked(LogContext{method: "GET", url: "https://svc.internal.example/", clientIP: testClientIP, requestID: "req-52"}, "ssrf", "destination resolves to a private IP")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if hint == "" {
+		t.Fatal("expected a remediation_hint for an ssrf block; audit remediation now covers every labelled block, not only body_dlp")
+	}
+	if !strings.Contains(hint, "trusted_domains") {
+		t.Fatalf("ssrf remediation_hint = %q, want the SSRF allow-path (trusted_domains / ssrf.ip_allowlist)", hint)
+	}
+}
+
+func TestLogBlockedEntropyRemediationHintUsesReason(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A query-entropy block shares the "entropy" label with path entropy; the
+	// remediation_hint must use the Reason to name the query knob, not the path
+	// default (which explicitly does not lift a query block).
+	logger.LogBlocked(LogContext{method: "GET", url: "https://api.example.com/x", clientIP: testClientIP, requestID: "req-53"}, "entropy", `high entropy query param "sig"`)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	hint, _ := entry["remediation_hint"].(string)
+	if !strings.Contains(hint, "query_entropy_exclusions") {
+		t.Fatalf("query-entropy remediation_hint = %q, want query_entropy_exclusions (not the path knob)", hint)
+	}
+}
+
+func TestLogAnomalyRemediationHintJSONFormat(t *testing.T) {
+	tests := []struct {
+		name       string
+		scanner    string
+		reason     string
+		wantHint   []string
+		wantAbsent bool
+	}{
+		{
+			name:     "audit mode ssrf anomaly includes narrow knob",
+			scanner:  "ssrf",
+			reason:   "destination resolves to a private IP",
+			wantHint: []string{"trusted_domains", "ssrf.ip_allowlist"},
+		},
+		{
+			name:     "audit mode query entropy uses reason-specific knob",
+			scanner:  "entropy",
+			reason:   `high entropy query param "sig"`,
+			wantHint: []string{"query_entropy_param_exclusions"},
+		},
+		{
+			name:       "scanner without registered hint omits field",
+			scanner:    "unregistered_scanner",
+			reason:     "suspicious but not remediable by scanner table",
+			wantAbsent: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "test.log")
+
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.LogAnomaly(LogContext{method: testMethodGet, url: "https://api.vendor.example/data", clientIP: testClientIP, requestID: "req-anomaly-hint"}, tt.scanner, tt.reason, 0.85)
+			logger.Close()
+
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatalf("expected valid JSON: %v", err)
+			}
+			if entry["event"] != string(EventAnomaly) {
+				t.Fatalf("event = %v, want anomaly", entry["event"])
+			}
+			if entry["scanner"] != tt.scanner {
+				t.Fatalf("scanner = %v, want %s", entry["scanner"], tt.scanner)
+			}
+			if entry["reason"] != tt.reason {
+				t.Fatalf("reason = %v, want %s", entry["reason"], tt.reason)
+			}
+
+			hint, ok := entry["remediation_hint"].(string)
+			if tt.wantAbsent {
+				if ok {
+					t.Fatalf("remediation_hint present = %q, want omitted", hint)
+				}
+				return
+			}
+			if !ok || hint == "" {
+				t.Fatal("remediation_hint missing or empty")
+			}
+			for _, want := range tt.wantHint {
+				if !strings.Contains(hint, want) {
+					t.Fatalf("remediation_hint = %q, want substring %q", hint, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLogBlockedDialTimeSSRFReasonIncludesRemediationHint(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+	}{
+		{
+			name:   "connect private ip",
+			reason: "ssrf_private_ip: SSRF blocked: api.vendor.example resolves to internal IP 10.0.0.42",
+		},
+		{
+			name:   "absolute uri private ip",
+			reason: "ssrf_private_ip: SSRF blocked: api.vendor.example resolves to internal IP 10.0.0.42",
+		},
+		{
+			name:   "websocket metadata ip",
+			reason: "ssrf_metadata: SSRF blocked: api.vendor.example resolves to cloud metadata endpoint 169.254.169.254",
+		},
+		{
+			name:   "reverse proxy dns rebind",
+			reason: "ssrf_dns_rebind: SSRF blocked: api.vendor.example resolves to internal IP 10.0.0.43",
+		},
+		{
+			name:   "fetch private ip",
+			reason: "ssrf_private_ip: SSRF blocked: api.vendor.example resolves to internal IP 10.0.0.42",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "test.log")
+
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.LogBlocked(LogContext{method: testMethodGet, url: "https://api.vendor.example/data", clientIP: testClientIP, requestID: "req-dial-hint"}, "ssrf", tt.reason)
+			logger.Close()
+
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatalf("expected valid JSON: %v", err)
+			}
+			if entry["event"] != string(EventBlocked) {
+				t.Fatalf("event = %v, want blocked", entry["event"])
+			}
+			if entry["reason"] != tt.reason {
+				t.Fatalf("reason = %v, want %s", entry["reason"], tt.reason)
+			}
+			hint, ok := entry["remediation_hint"].(string)
+			if !ok || hint == "" {
+				t.Fatal("remediation_hint missing or empty")
+			}
+			if !strings.Contains(hint, "ssrf.ip_allowlist") {
+				t.Fatalf("remediation_hint = %q, want ssrf.ip_allowlist", hint)
+			}
+		})
+	}
+}
+
+func TestLogHeaderDLP_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogHeaderDLP(LogContext{method: "POST", url: "https://api.example.com/v1/chat", clientIP: testClientIP, requestID: "req-51"}, "Authorization", actionBlock, []string{"AWS Access Key"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	if entry["event"] != string(EventHeaderDLP) {
+		t.Errorf("expected event=header_dlp, got %v", entry["event"])
+	}
+	if entry["method"] != "POST" {
+		t.Errorf("expected method=POST, got %v", entry["method"])
+	}
+	if entry["header"] != "Authorization" {
+		t.Errorf("expected header=Authorization, got %v", entry["header"])
+	}
+	if entry["action"] != actionBlock {
+		t.Errorf("expected action=block, got %v", entry["action"])
+	}
+	if entry["mitre_technique"] != mitreT1048 {
+		t.Errorf("expected mitre_technique=T1048, got %v", entry["mitre_technique"])
+	}
+}
+
+func TestLogBlockedDetailHeaderDLPMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlockedDetail(LogContext{method: "GET", url: "https://app.vendor.example/", requestID: "req-1"},
+		"header_dlp", "request header contains secret", BlockDetail{
+			Header: "Cookie", Patterns: []string{"Session Token"}, Cookies: []string{"sid"},
+		})
+	logger.Close()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["header"] != "Cookie" || entry["scanner"] != "header_dlp" {
+		t.Fatalf("missing header DLP block metadata: %v", entry)
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 1 || patterns[0] != "Session Token" {
+		t.Fatalf("patterns = %v", entry["patterns"])
+	}
+	cookies, ok := entry["cookies"].([]any)
+	if !ok || len(cookies) != 1 || cookies[0] != "sid" {
+		t.Fatalf("cookies = %v", entry["cookies"])
+	}
+}
+
+func TestEmit_LogBodyDLP(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogBodyDLP(LogContext{method: "POST", url: "https://api.example.com", clientIP: testClientIP, requestID: "req-52"}, actionBlock, 1, []string{"AWS Key"}, nil)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventBodyDLP) {
+		t.Errorf("type = %q, want body_dlp", ev.Type)
+	}
+	if ev.Fields["mitre_technique"] != mitreT1048 {
+		t.Errorf("fields[mitre_technique] = %v, want T1048", ev.Fields["mitre_technique"])
+	}
+	if ev.Fields["match_count"] != 1 {
+		t.Errorf("fields[match_count] = %v, want 1", ev.Fields["match_count"])
+	}
+	if ev.Fields["action"] != actionBlock {
+		t.Errorf("fields[action] = %v, want block", ev.Fields["action"])
+	}
+	hint, _ := ev.Fields["remediation_hint"].(string)
+	if !strings.Contains(hint, "suppress:") {
+		t.Fatalf("fields[remediation_hint] = %q, want body-DLP suppress guidance", hint)
+	}
+}
+
+func TestEmit_LogBodyScanAddressProtection(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogBodyScan(LogContext{method: "POST", url: "https://api.example.com", clientIP: testClientIP, requestID: "req-addr-1", agent: "trader-bot"}, EventAddressProtection, actionBlock, 1, []string{"ETH lookalike detected"})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "address_protection" {
+		t.Errorf("type = %q, want address_protection", ev.Type)
+	}
+	if ev.Fields["match_count"] != 1 {
+		t.Errorf("fields[match_count] = %v, want 1", ev.Fields["match_count"])
+	}
+	if ev.Fields["agent"] != "trader-bot" {
+		t.Errorf("fields[agent] = %v, want trader-bot", ev.Fields["agent"])
+	}
+}
+
+func TestEmit_LogBodyPromptInjection(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogBodyScan(LogContext{method: "POST", url: "https://api.example.com", clientIP: testClientIP, requestID: "req-body-inj", agent: "agent-a"}, EventBodyPromptInjection, actionBlock, 1, []string{"Prompt Injection"})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventBodyPromptInjection) {
+		t.Errorf("type = %q, want %s", ev.Type, EventBodyPromptInjection)
+	}
+	if ev.Fields["mitre_technique"] != mitreT1059 {
+		t.Errorf("fields[mitre_technique] = %v, want T1059", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogHeaderDLP(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogHeaderDLP(LogContext{method: testMethodGet, url: "https://api.example.com", clientIP: testClientIP, requestID: "req-53"}, "Authorization", actionBlock, []string{"GitHub PAT"}, nil)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventHeaderDLP) {
+		t.Errorf("type = %q, want header_dlp", ev.Type)
+	}
+	if ev.Fields["header"] != "Authorization" {
+		t.Errorf("fields[header] = %v, want Authorization", ev.Fields["header"])
+	}
+	if ev.Fields["mitre_technique"] != mitreT1048 {
+		t.Errorf("fields[mitre_technique] = %v, want T1048", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestEmit_LogAnomaly_NoScanner_NoTechnique(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	// Operational anomaly with empty scanner should not have mitre_technique.
+	logger.LogAnomaly(LogContext{method: "STARTUP", url: "0.0.0.0:8888"}, "", "listen address not loopback", 0.5)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, exists := ev.Fields["scanner"]; exists {
+		t.Error("expected scanner to be omitted when empty")
+	}
+	if _, exists := ev.Fields["mitre_technique"]; exists {
+		t.Error("expected mitre_technique to be omitted when scanner is empty")
+	}
+}
+
+func TestLogSNIMismatch(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogSNIMismatch("allowed.com", "evil.com", testClientIP, testReqID, "test-agent", "mismatch")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("unmarshal: %v\ndata: %s", err, data)
+	}
+
+	if entry["event"] != string(EventSNIMismatch) {
+		t.Errorf("event = %v, want %s", entry["event"], EventSNIMismatch)
+	}
+	if entry["connect_host"] != "allowed.com" {
+		t.Errorf("connect_host = %v, want allowed.com", entry["connect_host"])
+	}
+	if entry["sni_host"] != "evil.com" {
+		t.Errorf("sni_host = %v, want evil.com", entry["sni_host"])
+	}
+	if entry["category"] != "mismatch" {
+		t.Errorf("category = %v, want mismatch", entry["category"])
+	}
+	if entry["mitre_technique"] != "T1090.004" {
+		t.Errorf("mitre_technique = %v, want T1090.004", entry["mitre_technique"])
+	}
+}
+
+func TestLogSNIMismatch_Emitter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sink := &collectingSink{}
+	emitter := emit.NewEmitter("test", sink)
+	logger.SetEmitter(emitter)
+
+	logger.LogSNIMismatch("allowed.com", "evil.com", testClientIP, testReqID, "test-agent", "mismatch")
+	logger.Close()
+	_ = emitter.Close()
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventSNIMismatch) {
+		t.Errorf("emitted type = %q, want %q", ev.Type, EventSNIMismatch)
+	}
+	if ev.Fields["connect_host"] != "allowed.com" {
+		t.Errorf("connect_host = %v, want allowed.com", ev.Fields["connect_host"])
+	}
+	if ev.Fields["sni_host"] != "evil.com" {
+		t.Errorf("sni_host = %v, want evil.com", ev.Fields["sni_host"])
+	}
+	if ev.Fields["mitre_technique"] != "T1090.004" {
+		t.Errorf("mitre_technique = %v, want T1090.004", ev.Fields["mitre_technique"])
+	}
+}
+
+func TestLogLicenseExpiry(t *testing.T) {
+	tests := []struct {
+		name         string
+		severity     string
+		wantSeverity emit.Severity
+	}{
+		{name: "info", severity: "info", wantSeverity: emit.SeverityInfo},
+		{name: "warn", severity: "warn", wantSeverity: emit.SeverityWarn},
+		{name: "error", severity: "error", wantSeverity: emit.SeverityCritical},
+		{name: "critical", severity: "critical", wantSeverity: emit.SeverityCritical},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			logger.LogLicenseExpiry(LicenseExpiryWarning{
+				LicenseID:     "lic_expiry",
+				Tier:          "trial",
+				ThresholdDays: 14,
+				DaysRemaining: 13,
+				Severity:      tt.severity,
+				ExpiresAt:     "2026-06-01T00:00:00Z",
+				Message:       "trial ends in 13 day(s)",
+			})
+
+			ev, ok := sink.lastEvent()
+			if !ok {
+				t.Fatal("expected emitted event")
+			}
+			if ev.Type != string(EventLicenseExpiry) {
+				t.Fatalf("type = %q, want %q", ev.Type, EventLicenseExpiry)
+			}
+			if ev.Severity != tt.wantSeverity {
+				t.Fatalf("severity = %v, want %v", ev.Severity, tt.wantSeverity)
+			}
+			if ev.Fields["license_id"] != "lic_expiry" {
+				t.Errorf("license_id = %v, want lic_expiry", ev.Fields["license_id"])
+			}
+			if ev.Fields["tier"] != "trial" {
+				t.Errorf("tier = %v, want trial", ev.Fields["tier"])
+			}
+			if ev.Fields["threshold_days"] != 14 {
+				t.Errorf("threshold_days = %v, want 14", ev.Fields["threshold_days"])
+			}
+			if ev.Fields["days_remaining"] != 13 {
+				t.Errorf("days_remaining = %v, want 13", ev.Fields["days_remaining"])
+			}
+			if ev.Fields["severity"] != tt.severity {
+				t.Errorf("severity field = %v, want %s", ev.Fields["severity"], tt.severity)
+			}
+			if ev.Fields["expires_at"] != "2026-06-01T00:00:00Z" {
+				t.Errorf("expires_at = %v, want timestamp", ev.Fields["expires_at"])
+			}
+			if ev.Fields["message"] != "trial ends in 13 day(s)" {
+				t.Errorf("message = %v, want operator warning", ev.Fields["message"])
+			}
+		})
+	}
+}
+
+func TestLogChainDetection_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogChainDetection("exfil_then_delete", severityCritical, actionBlock, "filesystem_delete", "session-abc")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("unmarshal: %v\ndata: %s", err, data)
+	}
+
+	if entry["event"] != string(EventChainDetection) {
+		t.Errorf("event = %v, want %s", entry["event"], EventChainDetection)
+	}
+	if entry["pattern"] != "exfil_then_delete" {
+		t.Errorf("pattern = %v, want exfil_then_delete", entry["pattern"])
+	}
+	// pattern_severity is the caller-provided metadata; severity is derived from action.
+	if entry["pattern_severity"] != severityCritical {
+		t.Errorf("pattern_severity = %v, want %s", entry["pattern_severity"], severityCritical)
+	}
+	if entry["severity"] != severityCritical {
+		t.Errorf("severity = %v, want %s (derived from block action)", entry["severity"], severityCritical)
+	}
+	if entry["action"] != actionBlock {
+		t.Errorf("action = %v, want block", entry["action"])
+	}
+	if entry["tool"] != "filesystem_delete" {
+		t.Errorf("tool = %v, want filesystem_delete", entry["tool"])
+	}
+	if entry["session"] != "session-abc" {
+		t.Errorf("session = %v, want session-abc", entry["session"])
+	}
+	if entry["mitre_technique"] != mitreT1059 {
+		t.Errorf("mitre_technique = %v, want %s", entry["mitre_technique"], mitreT1059)
+	}
+}
+
+func TestLogChainDetection_Emitter_Block(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogChainDetection("exfil_then_delete", severityCritical, actionBlock, "filesystem_delete", "session-abc")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventChainDetection) {
+		t.Errorf("emitted type = %q, want %q", ev.Type, EventChainDetection)
+	}
+	if ev.Severity != emit.SeverityCritical {
+		t.Errorf("severity = %v, want %v", ev.Severity, emit.SeverityCritical)
+	}
+	if ev.Fields["pattern"] != "exfil_then_delete" {
+		t.Errorf("pattern = %v, want exfil_then_delete", ev.Fields["pattern"])
+	}
+	if ev.Fields["pattern_severity"] != severityCritical {
+		t.Errorf("pattern_severity = %v, want %s", ev.Fields["pattern_severity"], severityCritical)
+	}
+	if ev.Fields["severity"] != severityCritical {
+		t.Errorf("severity = %v, want %s (derived from block action)", ev.Fields["severity"], severityCritical)
+	}
+	if ev.Fields["tool"] != "filesystem_delete" {
+		t.Errorf("tool = %v, want filesystem_delete", ev.Fields["tool"])
+	}
+	if ev.Fields["session"] != "session-abc" {
+		t.Errorf("session = %v, want session-abc", ev.Fields["session"])
+	}
+	if ev.Fields["mitre_technique"] != mitreT1059 {
+		t.Errorf("mitre_technique = %v, want %s", ev.Fields["mitre_technique"], mitreT1059)
+	}
+}
+
+func TestLogChainDetection_Emitter_Warn(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogChainDetection("read_then_exfil", "warn", "warn", "http_fetch", "session-xyz")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Severity != emit.SeverityWarn {
+		t.Errorf("severity = %v, want %v", ev.Severity, emit.SeverityWarn)
+	}
+	if ev.Fields["action"] != "warn" {
+		t.Errorf("action = %v, want warn", ev.Fields["action"])
+	}
+}
+
+func TestLogBlockedIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "http://evil.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "dlp", "secret found")
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogBlockedOmitsEmptyAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "http://evil.com", clientIP: testClientIP, requestID: "req-1"}, "dlp", "secret found")
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := entry["agent"]; exists {
+		t.Errorf("agent key should not be present for empty agent, got %v", entry["agent"])
+	}
+}
+
+func TestLogAllowedIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAllowed(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, 200, 1024, time.Second)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogErrorIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogError(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, fmt.Errorf("connection refused"))
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogAnomalyIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAnomaly(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "dlp", "suspicious", 0.5)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogTunnelOpenIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelOpen(LogContext{target: "example.com:443", clientIP: testClientIP, requestID: "req-1", agent: testAgentName})
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogBlockedEmitterIncludesAgent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "http://evil.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "dlp", "secret found")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Fields["agent"] != testAgentName {
+		t.Errorf("emitter agent = %v, want %s", ev.Fields["agent"], testAgentName)
+	}
+}
+
+func TestLogBlockedEmitterOmitsEmptyAgent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogBlocked(LogContext{method: testMethodGet, url: "http://evil.com", clientIP: testClientIP, requestID: "req-1"}, "dlp", "secret found")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, exists := ev.Fields["agent"]; exists {
+		t.Errorf("emitter agent key should not be present for empty agent, got %v", ev.Fields["agent"])
+	}
+}
+
+func TestLogResponseScanEmitterIncludesAgent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScan(LogContext{url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "block", 1, []string{"injection"}, nil)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Fields["agent"] != testAgentName {
+		t.Errorf("emitter agent = %v, want %s", ev.Fields["agent"], testAgentName)
+	}
+}
+
+// TestBundleRulesField_ScalarFieldsOnEmitEvent verifies that when an
+// audit event carries a non-empty []BundleRuleHit, the emitter receives
+// primary_rule_id and bundle_version as scalar fields from the first
+// hit, so the emit-side OTel agent.threat.detection.* mapper can read
+// them without importing this package. See
+// internal/emit/otlp_agent_threat.go.
+func TestBundleRulesField_ScalarFieldsOnEmitEvent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	// Primary is selected by lexicographic sort on RuleID for determinism
+	// (see selectPrimaryBundleHit); "custom-xss-002" sorts before
+	// "owasp-injection-001" regardless of slice order.
+	const wantPrimaryRuleID = "custom-xss-002"
+	const wantBundleVersion = "1.2.0"
+	hits := []BundleRuleHit{
+		{RuleID: "owasp-injection-001", Bundle: "owasp-top10", BundleVersion: wantBundleVersion},
+		{RuleID: wantPrimaryRuleID, Bundle: "owasp-top10", BundleVersion: wantBundleVersion},
+	}
+	logger.LogResponseScan(LogContext{
+		url: "https://example.com/page", clientIP: testClientIP, requestID: "req-bundle-1",
+	}, "block", 2, []string{"owasp-injection-001", wantPrimaryRuleID}, hits)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if got := ev.Fields["primary_rule_id"]; got != wantPrimaryRuleID {
+		t.Errorf("emit primary_rule_id = %v, want %s", got, wantPrimaryRuleID)
+	}
+	if got := ev.Fields["bundle_version"]; got != wantBundleVersion {
+		t.Errorf("emit bundle_version = %v, want %s", got, wantBundleVersion)
+	}
+	// The typed slice must still be present for downstream consumers
+	// that want to enumerate every hit.
+	if _, ok := ev.Fields["bundle_rules"].([]BundleRuleHit); !ok {
+		t.Errorf("emit bundle_rules = %T, want []BundleRuleHit", ev.Fields["bundle_rules"])
+	}
+}
+
+// TestBundleRulesField_NoScalarsWithoutHits verifies that the scalar
+// fields are NOT populated when bundleRulesField is called with nil
+// or an empty slice. (A non-typed value never reaches the scalar path
+// because the type assertion to []BundleRuleHit short-circuits, which
+// is covered implicitly by every non-bundle-rule call site.)
+func TestBundleRulesField_NoScalarsWithoutHits(t *testing.T) {
+	cases := []struct {
+		name string
+		hits []BundleRuleHit
+	}{
+		{name: "nil-hits", hits: nil},
+		{name: "empty-hits", hits: []BundleRuleHit{}},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+
+			logger.LogResponseScan(LogContext{
+				url: "https://example.com/page", clientIP: testClientIP, requestID: "req-no-bundle",
+			}, "block", 1, []string{"injection"}, tc.hits)
+
+			ev, ok := sink.lastEvent()
+			if !ok {
+				t.Fatal("expected emitted event")
+			}
+			if got, present := ev.Fields["primary_rule_id"]; present {
+				t.Errorf("emit primary_rule_id present without bundle hits: %v", got)
+			}
+			if got, present := ev.Fields["bundle_version"]; present {
+				t.Errorf("emit bundle_version present without bundle hits: %v", got)
+			}
+		})
+	}
+}
+
+// TestSelectPrimaryBundleHit_Deterministic verifies the canonical
+// primary-hit selection: lexicographic sort on RuleID, regardless of
+// input slice order. This is the auditability property the OTel
+// `agent.threat.detection.rule_id` attribute depends on.
+func TestSelectPrimaryBundleHit_Deterministic(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		hits       []BundleRuleHit
+		wantRuleID string
+		wantBundle string
+	}{
+		{
+			name: "single-hit-passthrough",
+			hits: []BundleRuleHit{
+				{RuleID: "rule-z", BundleVersion: "1.0"},
+			},
+			wantRuleID: "rule-z",
+			wantBundle: "1.0",
+		},
+		{
+			name: "lex-smallest-wins-regardless-of-order",
+			hits: []BundleRuleHit{
+				{RuleID: "rule-z", BundleVersion: "1.0"},
+				{RuleID: "rule-a", BundleVersion: "1.0"},
+				{RuleID: "rule-m", BundleVersion: "1.0"},
+			},
+			wantRuleID: "rule-a",
+			wantBundle: "1.0",
+		},
+		{
+			name: "reversed-order-same-winner",
+			hits: []BundleRuleHit{
+				{RuleID: "rule-m", BundleVersion: "1.0"},
+				{RuleID: "rule-a", BundleVersion: "1.0"},
+				{RuleID: "rule-z", BundleVersion: "1.0"},
+			},
+			wantRuleID: "rule-a",
+			wantBundle: "1.0",
+		},
+		{
+			name: "empty-rule-ids-deprioritised",
+			hits: []BundleRuleHit{
+				{RuleID: "", BundleVersion: "1.0"},
+				{RuleID: "rule-real", BundleVersion: "1.0"},
+			},
+			wantRuleID: "rule-real",
+			wantBundle: "1.0",
+		},
+		{
+			name: "all-empty-rule-ids-fallthrough",
+			hits: []BundleRuleHit{
+				{RuleID: "", BundleVersion: "1.0"},
+				{RuleID: "", BundleVersion: "2.0"},
+			},
+			wantRuleID: "",
+			wantBundle: "1.0",
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := selectPrimaryBundleHit(tc.hits)
+			if got.RuleID != tc.wantRuleID {
+				t.Errorf("RuleID got=%q want=%q", got.RuleID, tc.wantRuleID)
+			}
+			if got.BundleVersion != tc.wantBundle {
+				t.Errorf("BundleVersion got=%q want=%q", got.BundleVersion, tc.wantBundle)
+			}
+		})
+	}
+}
+
+// TestBundleRulesField_DeterministicPrimaryRuleID verifies the
+// end-to-end determinism property: the same set of bundle rule hits
+// produces the same primary_rule_id scalar on the emit event regardless
+// of the order the scanner returned the hits in. The primary is
+// lex-smallest by RuleID, so "custom-xss-002" wins over
+// "owasp-injection-001".
+func TestBundleRulesField_DeterministicPrimaryRuleID(t *testing.T) {
+	t.Parallel()
+	const wantPrimary = "custom-xss-002"
+	const otherRule = "owasp-injection-001"
+	orderings := [][]BundleRuleHit{
+		{
+			{RuleID: otherRule, Bundle: "owasp-top10", BundleVersion: "1.2.0"},
+			{RuleID: wantPrimary, Bundle: "owasp-top10", BundleVersion: "1.2.0"},
+		},
+		{
+			// Same hits, different slice order; primary stays
+			// custom-xss-002 because it sorts first.
+			{RuleID: wantPrimary, Bundle: "owasp-top10", BundleVersion: "1.2.0"},
+			{RuleID: otherRule, Bundle: "owasp-top10", BundleVersion: "1.2.0"},
+		},
+	}
+	for i, hits := range orderings {
+		i, hits := i, hits
+		t.Run(fmt.Sprintf("ordering-%d", i), func(t *testing.T) {
+			logger, sink := newLoggerWithEmitter(t)
+			defer logger.Close()
+			logger.LogResponseScan(LogContext{
+				url: "https://example.com/p", clientIP: testClientIP, requestID: "req-det",
+			}, "block", 2, []string{otherRule, wantPrimary}, hits)
+
+			ev, ok := sink.lastEvent()
+			if !ok {
+				t.Fatal("expected emitted event")
+			}
+			if got := ev.Fields["primary_rule_id"]; got != wantPrimary {
+				t.Errorf("ordering-%d primary_rule_id=%v want=%s", i, got, wantPrimary)
+			}
+		})
+	}
+}
+
+func TestLogAnomalyEmitterIncludesAgent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAnomaly(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "dlp", "suspicious", 0.5)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Fields["agent"] != testAgentName {
+		t.Errorf("emitter agent = %v, want %s", ev.Fields["agent"], testAgentName)
+	}
+}
+
+func TestLogErrorEmitterIncludesAgent(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogError(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, fmt.Errorf("test"))
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Fields["agent"] != testAgentName {
+		t.Errorf("emitter agent = %v, want %s", ev.Fields["agent"], testAgentName)
+	}
+}
+
+func TestLogChainDetection_PersistPatternEmitsT1053(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogChainDetection("write-persist", severityCritical, actionBlock, "systemctl_enable", "session-1")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("unmarshal: %v\ndata: %s", err, data)
+	}
+
+	if entry["mitre_technique"] != mitreT1053 {
+		t.Errorf("mitre_technique = %v, want %s for persistence pattern", entry["mitre_technique"], mitreT1053)
+	}
+}
+
+func TestLogChainDetection_NonPersistPatternEmitsT1059(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogChainDetection("read-then-exec", severityWarn, testActionWarn, "bash_exec", "session-2")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("unmarshal: %v\ndata: %s", err, data)
+	}
+
+	if entry["mitre_technique"] != mitreT1059 {
+		t.Errorf("mitre_technique = %v, want %s for non-persistence pattern", entry["mitre_technique"], mitreT1059)
+	}
+}
+
+func TestLogResponseScanIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScan(LogContext{url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "block", 1, []string{"injection"}, nil)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogTunnelCloseIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelClose(LogContext{target: "example.com:443", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, 1024, time.Second)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogForwardHTTPIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogForwardHTTP(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, 200, 512, time.Second)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogRedirectIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogRedirect("http://a.com", "http://b.com", testClientIP, "req-1", testAgentName, 1)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogBodyDLPIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBodyDLP(LogContext{method: "POST", url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "block", 1, []string{"aws_key"}, nil)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogHeaderDLPIncludesAgent(t *testing.T) {
+	tmp := t.TempDir()
+	logFile := filepath.Join(tmp, "audit.jsonl")
+	logger, err := New("json", "file", logFile, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogHeaderDLP(LogContext{method: testMethodGet, url: "http://example.com", clientIP: testClientIP, requestID: "req-1", agent: testAgentName}, "Authorization", "warn", []string{"bearer"}, nil)
+	logger.Close()
+
+	data, err := os.ReadFile(filepath.Clean(logFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(data, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["agent"] != testAgentName {
+		t.Errorf("agent = %v, want %s", entry["agent"], testAgentName)
+	}
+}
+
+func TestLogAgentListener(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAgentListener("127.0.0.1:9100", "strict-bot")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("unmarshal: %v\ndata: %s", err, data)
+	}
+
+	if entry["event"] != string(EventAgentListener) {
+		t.Errorf("event = %v, want %s", entry["event"], EventAgentListener)
+	}
+	if entry["listen"] != "127.0.0.1:9100" {
+		t.Errorf("listen = %v, want 127.0.0.1:9100", entry["listen"])
+	}
+	if entry["agent"] != "strict-bot" {
+		t.Errorf("agent = %v, want strict-bot", entry["agent"])
+	}
+}
+
+func TestLogAdaptiveUpgrade_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAdaptiveUpgrade("agent|10.0.0.1", "elevated", testActionWarn, actionBlock, ScannerDLP, testClientIP, "req-123")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+
+	tests := []struct {
+		field string
+		want  any
+	}{
+		{"event", "adaptive_upgrade"},
+		{"session", "agent|10.0.0.1"},
+		{"escalation_level", "elevated"},
+		{"from_action", testActionWarn},
+		{"to_action", actionBlock},
+		{"scanner", ScannerDLP},
+		{"client_ip", testClientIP},
+		{"request_id", "req-123"},
+	}
+	for _, tt := range tests {
+		if entry[tt.field] != tt.want {
+			t.Errorf("field %q = %v, want %v", tt.field, entry[tt.field], tt.want)
+		}
+	}
+}
+
+func TestLogAdaptiveUpgrade_Nop(_ *testing.T) {
+	// Nop logger should not panic.
+	logger := NewNop()
+	logger.LogAdaptiveUpgrade("agent|10.0.0.1", "elevated", testActionWarn, actionBlock, ScannerDLP, testClientIP, "req-1")
+	logger.Close()
+}
+
+func TestEmit_LogAdaptiveUpgrade(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAdaptiveUpgrade("agent|10.0.0.1", "elevated", testActionWarn, actionBlock, ScannerDLP, testClientIP, "req-99")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "adaptive_upgrade" {
+		t.Errorf("type = %q, want adaptive_upgrade", ev.Type)
+	}
+	// Upgrade to "block" must emit at critical severity.
+	if ev.Severity != emit.SeverityCritical {
+		t.Errorf("severity = %v, want critical", ev.Severity)
+	}
+	if ev.Fields["escalation_level"] != "elevated" {
+		t.Errorf("escalation_level = %v, want elevated", ev.Fields["escalation_level"])
+	}
+	if ev.Fields["from_action"] != testActionWarn {
+		t.Errorf("from_action = %v, want %s", ev.Fields["from_action"], testActionWarn)
+	}
+	if ev.Fields["to_action"] != actionBlock {
+		t.Errorf("to_action = %v, want %s", ev.Fields["to_action"], actionBlock)
+	}
+}
+
+func TestEmit_LogAdaptiveUpgrade_WarnSeverity(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	// Upgrade to "warn" (not block) must emit at warn severity.
+	logger.LogAdaptiveUpgrade("agent|10.0.0.1", "high", "forward", testActionWarn, ScannerDLP, testClientIP, "req-100")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Severity != emit.SeverityWarn {
+		t.Errorf("severity = %v, want warn", ev.Severity)
+	}
+}
+
+func TestEmit_LogAdaptiveUpgrade_OmitsEmptyOptional(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogAdaptiveUpgrade("session-key", "elevated", testActionWarn, actionBlock, ScannerDLP, "", "")
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if _, exists := ev.Fields["client_ip"]; exists {
+		t.Error("expected client_ip to be omitted when empty")
+	}
+	if _, exists := ev.Fields["request_id"]; exists {
+		t.Error("expected request_id to be omitted when empty")
+	}
+}
+
+func TestLogToolRedirect_JSONFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogToolRedirect(ToolRedirectEvent{
+		SessionID:       "sess-1",
+		ToolName:        "bash",
+		ArgsDigest:      "sha256:abc123 len=42",
+		RedirectProfile: "safe-fetch",
+		RedirectReason:  "audited handler",
+		PolicyRule:      "redirect-curl",
+		Result:          "redirected",
+		LatencyMs:       15,
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one log line")
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["event"] != "tool_redirect" {
+		t.Errorf("event = %v, want tool_redirect", entry["event"])
+	}
+	if entry["tool_name"] != "bash" {
+		t.Errorf("tool_name = %v, want bash", entry["tool_name"])
+	}
+	if entry["args_digest"] != "sha256:abc123 len=42" {
+		t.Errorf("args_digest = %v, want sha256:abc123 len=42", entry["args_digest"])
+	}
+	if entry["redirect_profile"] != "safe-fetch" {
+		t.Errorf("redirect_profile = %v, want safe-fetch", entry["redirect_profile"])
+	}
+	if entry["result"] != "redirected" {
+		t.Errorf("result = %v, want redirected", entry["result"])
+	}
+	if entry["session_id"] != "sess-1" {
+		t.Errorf("session_id = %v, want sess-1", entry["session_id"])
+	}
+}
+
+func TestLogToolRedirect_Emitter(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogToolRedirect(ToolRedirectEvent{
+		SessionID:       "sess-2",
+		ToolName:        "curl-tool",
+		ArgsDigest:      "sha256:def456 len=100",
+		RedirectProfile: "safe-fetch",
+		RedirectReason:  "audited",
+		PolicyRule:      "rule-1",
+		Result:          "redirected",
+		LatencyMs:       25,
+	})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "tool_redirect" {
+		t.Errorf("type = %q, want tool_redirect", ev.Type)
+	}
+	if ev.Fields["tool_name"] != "curl-tool" {
+		t.Errorf("tool_name = %v, want curl-tool", ev.Fields["tool_name"])
+	}
+	if ev.Fields["redirect_profile"] != "safe-fetch" {
+		t.Errorf("redirect_profile = %v, want safe-fetch", ev.Fields["redirect_profile"])
+	}
+	if ev.Fields["result"] != "redirected" {
+		t.Errorf("result = %v, want redirected", ev.Fields["result"])
+	}
+	// session_id must NOT be in emitted fields - it's local-log only.
+	if _, exists := ev.Fields["session_id"]; exists {
+		t.Error("session_id must not be emitted to external sinks")
+	}
+}
+
+func TestLogToolRedirect_NoSessionID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogToolRedirect(ToolRedirectEvent{
+		ToolName:        "bash",
+		ArgsDigest:      "sha256:abc len=10",
+		RedirectProfile: "p",
+		RedirectReason:  "r",
+		PolicyRule:      "rule",
+		Result:          "blocked",
+		LatencyMs:       5,
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, exists := entry["session_id"]; exists {
+		t.Error("expected session_id to be omitted when empty")
+	}
+}
+
+// TestLogContext_EmptyFieldsOmitted verifies that LogContext methods using optStr
+// omit client_ip, request_id, and agent when empty (MCP/CEE paths).
+func TestLogContext_EmptyFieldsOmitted(t *testing.T) {
+	tests := []struct {
+		name   string
+		logFn  func(*Logger)
+		absent []string
+	}{
+		{
+			name: "LogBlocked_empty_http_fields",
+			logFn: func(l *Logger) {
+				l.LogBlocked(LogContext{method: "CEE", url: "mcp-input"}, "cross_request_entropy", "budget exceeded")
+			},
+			absent: []string{"client_ip", "request_id", "agent"},
+		},
+		{
+			name: "LogAnomaly_empty_http_fields",
+			logFn: func(l *Logger) {
+				l.LogAnomaly(LogContext{method: "CEE", url: "mcp-input"}, "cross_request_entropy", "near miss", 0)
+			},
+			absent: []string{"client_ip", "request_id", "agent"},
+		},
+		{
+			name: "LogError_empty_http_fields",
+			logFn: func(l *Logger) {
+				l.LogError(LogContext{method: "RELOAD"}, fmt.Errorf("test error"))
+			},
+			absent: []string{"client_ip", "request_id", "agent"},
+		},
+		{
+			name: "LogResponseScanExempt_empty_http_fields",
+			logFn: func(l *Logger) {
+				l.LogResponseScanExempt(LogContext{method: "WS", url: "ws://example.com"}, "example.com")
+			},
+			absent: []string{"client_ip", "request_id", "agent"},
+		},
+		{
+			name: "LogResponseScan_includes_method",
+			logFn: func(l *Logger) {
+				l.LogResponseScan(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-1"}, testActionWarn, 1, []string{"injection"}, nil)
+			},
+			absent: []string{"agent"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "test.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.logFn(logger)
+			logger.Close()
+
+			data, _ := os.ReadFile(filepath.Clean(path))
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatalf("invalid JSON: %v", err)
+			}
+			for _, key := range tt.absent {
+				if _, exists := entry[key]; exists {
+					t.Errorf("expected %q to be omitted when empty, but it was present with value %v", key, entry[key])
+				}
+			}
+		})
+	}
+}
+
+// TestLogResponseScan_IncludesMethod verifies the method field is present in response_scan events.
+func TestLogResponseScan_IncludesMethod(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogResponseScan(LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-method-1"}, testActionWarn, 1, []string{"Prompt Injection"}, nil)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["method"] != testMethodGet {
+		t.Errorf("expected method=GET, got %v", entry["method"])
+	}
+}
+
+// TestLogContext_ResourceField_MCP verifies that MCP contexts emit "resource"
+// instead of "url" in the audit log output.
+func TestLogContext_ResourceField_MCP(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "resource-mcp.json")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := NewMCPLogContext("MCP", "tools/list", testAgentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlocked(ctx, "mcp_tool_scanning", "poisoned description")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["resource"] != "tools/list" {
+		t.Errorf("expected resource=tools/list, got %v", entry["resource"])
+	}
+	if _, hasURL := entry["url"]; hasURL {
+		t.Error("url field should be absent for MCP contexts")
+	}
+	if _, hasTarget := entry["target"]; hasTarget {
+		t.Error("target field should be absent for MCP contexts")
+	}
+}
+
+// TestLogContext_ResourceField_ConfigReload verifies that config reload contexts
+// emit "resource" for the config file path.
+func TestLogContext_ResourceField_ConfigReload(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "resource-config.json")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := LogContext{method: "CONFIG_RELOAD", resource: "/etc/pipelock/config.yaml"}
+	logger.LogError(ctx, fmt.Errorf("validation failed"))
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["resource"] != "/etc/pipelock/config.yaml" {
+		t.Errorf("expected resource path, got %v", entry["resource"])
+	}
+	if _, hasURL := entry["url"]; hasURL {
+		t.Error("url field should be absent for config contexts")
+	}
+}
+
+// TestLogContext_TargetField_Connect verifies that CONNECT contexts emit
+// "target" instead of "url".
+func TestLogContext_TargetField_Connect(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "target-connect.json")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := NewConnectLogContext("evil.com:443", testClientIP, testReqID, testAgentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogTunnelOpen(ctx)
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if entry["target"] != "evil.com:443" {
+		t.Errorf("expected target=evil.com:443, got %v", entry["target"])
+	}
+	if _, hasURL := entry["url"]; hasURL {
+		t.Error("url field should be absent for CONNECT contexts")
+	}
+	if _, hasResource := entry["resource"]; hasResource {
+		t.Error("resource field should be absent for CONNECT contexts")
+	}
+}
+
+func TestNewLogContext_OptionsPositive(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		opts     LogContextOpts
+		wantCtx  LogContext
+		wantErr  bool
+		errCheck func(error) bool
+	}{
+		{
+			name: "http",
+			opts: LogContextOpts{Method: testMethodGet, URL: "https://example.com", ClientIP: testClientIP, RequestID: testReqID, Agent: testAgentName},
+			wantCtx: LogContext{
+				method: testMethodGet, url: "https://example.com",
+				clientIP: testClientIP, requestID: testReqID, agent: testAgentName,
+			},
+		},
+		{
+			name: "mcp_resource",
+			opts: LogContextOpts{Method: "MCP", Resource: "tool/bash", Agent: "claude"},
+			wantCtx: LogContext{
+				method: "MCP", resource: "tool/bash", agent: "claude",
+			},
+		},
+		{
+			name: "connect",
+			opts: LogContextOpts{Method: http.MethodConnect, Target: "host:443", ClientIP: testClientIP, RequestID: testReqID, Agent: testAgentName},
+			wantCtx: LogContext{
+				method: http.MethodConnect, target: "host:443",
+				clientIP: testClientIP, requestID: testReqID, agent: testAgentName,
+			},
+		},
+		{
+			name:     "target_without_connect_method",
+			opts:     LogContextOpts{Method: testMethodGet, Target: "host:443", ClientIP: testClientIP, RequestID: testReqID},
+			wantErr:  true,
+			errCheck: func(err error) bool { return strings.Contains(err.Error(), "target contexts require") },
+		},
+		{
+			name:     "two_identifiers",
+			opts:     LogContextOpts{Method: testMethodGet, URL: "https://example.com", Resource: "tool/x"},
+			wantErr:  true,
+			errCheck: func(err error) bool { return errors.Is(err, errLogContextIdentifierClash) },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := newLogContext(tt.opts)
+			if tt.wantErr {
+				if err == nil || !tt.errCheck(err) {
+					t.Fatalf("err = %v, want match", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+			}
+			if got != tt.wantCtx {
+				t.Fatalf("ctx = %+v, want %+v", got, tt.wantCtx)
+			}
+		})
+	}
+}
+
+func TestLogTaintDecision_LocalLogAndEmit(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	ctx := mustHTTPLogContext(t, testMethodGet, "https://api.example.com/v1/send", "req-taint-1")
+	logger.LogTaintDecision(ctx, TaintDecision{
+		TaintLevel:  "elevated",
+		ActionClass: "egress",
+		Sensitivity: "high",
+		Authority:   "agent",
+		Decision:    "block",
+		Reason:      "external content reached sensitive action",
+		SourceURL:   "https://untrusted.example.org/page",
+		SourceKind:  "fetch",
+	})
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != "taint_decision" {
+		t.Errorf("type = %q, want taint_decision", ev.Type)
+	}
+	cases := map[string]any{
+		"session_taint_level": "elevated",
+		"action_class":        "egress",
+		"action_sensitivity":  "high",
+		"authority_kind":      "agent",
+		"decision":            "block",
+		"reason":              "external content reached sensitive action",
+		"source_url":          "https://untrusted.example.org",
+		"source_kind":         "fetch",
+	}
+	for k, want := range cases {
+		if got := ev.Fields[k]; got != want {
+			t.Errorf("fields[%s] = %v, want %v", k, got, want)
+		}
+	}
+}
+
+func TestLogTaintDecision_OmitsOptionalSourceFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := mustHTTPLogContext(t, testMethodGet, "https://api.example.com/x", "req-taint-2")
+	logger.LogTaintDecision(ctx, TaintDecision{
+		TaintLevel:  "none",
+		ActionClass: "read",
+		Sensitivity: "low",
+		Authority:   "agent",
+		Decision:    "allow",
+		Reason:      "no taint",
+		// SourceURL and SourceKind intentionally empty.
+	})
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if _, has := entry["source_url"]; has {
+		t.Error("source_url should be omitted when empty (optStr)")
+	}
+	if _, has := entry["source_kind"]; has {
+		t.Error("source_kind should be omitted when empty (optStr)")
+	}
+}
+
+func TestLogAgentIdentityCollision_JSONFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.log")
+
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogAgentIdentityCollision(LogContext{method: testMethodGet, url: "https://vendor.example/api", clientIP: testClientIP, requestID: "req-collide", agent: "anonymous"}, "pipelock")
+	logger.Close()
+
+	data, _ := os.ReadFile(filepath.Clean(path))
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatalf("expected valid JSON: %v", err)
+	}
+	if entry["event"] != "anomaly" {
+		t.Errorf("expected event=anomaly, got %v", entry["event"])
+	}
+	if entry["scanner"] != "agent_identity" {
+		t.Errorf("expected scanner=agent_identity, got %v", entry["scanner"])
+	}
+	if entry["reserved_agent"] != "pipelock" {
+		t.Errorf("expected reserved_agent=pipelock, got %v", entry["reserved_agent"])
+	}
+	if entry["agent"] != "anonymous" {
+		t.Errorf("expected agent=anonymous, got %v", entry["agent"])
+	}
+	score, ok := entry["score"].(float64)
+	if !ok || score < 0.69 || score > 0.71 {
+		t.Errorf("expected score ~0.7, got %v", entry["score"])
+	}
+}
+
+func TestJSONInspectionRemediationHints(t *testing.T) {
+	pattern := scannerpkg.UninspectableJSONNumberPattern
+	ctx := LogContext{method: "POST", target: "https://api.vendor.example/submit"}
+	for name, log := range map[string]func(*Logger){
+		"body": func(l *Logger) { l.LogBodyDLP(ctx, "block", 1, []string{pattern}, nil) },
+		"blocked": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.ScannerBodyDLP, "request body contains secret: "+pattern)
+		},
+		"response": func(l *Logger) { l.LogResponseScan(ctx, "block", 1, []string{pattern}, nil) },
+		"header":   func(l *Logger) { l.LogHeaderDLP(ctx, "X-Value", "block", []string{pattern}, nil) },
+		"a2a":      func(l *Logger) { l.LogBodyScan(ctx, EventType(scannerpkg.AuditA2AScan), "block", 1, []string{pattern}) },
+		"websocket-blocked": func(l *Logger) {
+			l.LogWSBlocked(WSBlockedEvent{Scanner: scannerpkg.ScannerDLP, Reason: "DLP match: " + pattern})
+		},
+		"http-fragment": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.AuditCrossRequestFragment, "fragment reassembly DLP match: "+pattern)
+		},
+		"mcp-fragment": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.AuditCrossRequestFragment, "cross-request fragment refused: "+pattern+"; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)")
+		},
+		"websocket": func(l *Logger) {
+			l.LogWSScan(WSScanEvent{Direction: DirectionClientToServer, Action: "block", PatternNames: []string{pattern}, MatchCount: 1})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log(logger)
+			logger.Close()
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatal(err)
+			}
+			hint, _ := entry["remediation_hint"].(string)
+			if !strings.Contains(hint, "Reduce nesting or number size") || strings.Contains(strings.ToLower(hint), "suppress") {
+				t.Fatalf("inspection hint = %q", hint)
+			}
+		})
+	}
+}
+
+func TestRemediationNestedJSONInspectionKey(t *testing.T) {
+	for _, label := range []string{scannerpkg.ScannerSSRF, scannerpkg.ScannerDLP} {
+		t.Run(label, func(t *testing.T) {
+			reason := "SSRF blocked: 10.0.0.12 is an internal IP"
+			if label == scannerpkg.ScannerDLP {
+				reason = "DLP match: Test credential (high)"
+			}
+			path := filepath.Join(t.TempDir(), "audit.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.LogBlocked(LogContext{method: "GET", target: "https://api.vendor.example/"}, label, fmt.Sprintf("nested URL in query parameter %q: %s", scannerpkg.UninspectableJSONNumberPattern, reason))
+			logger.Close()
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatal(err)
+			}
+			hint, _ := entry["remediation_hint"].(string)
+			baseline := scannerpkg.OperatorHintForResult(label, reason)
+			if baseline == "" || !strings.HasPrefix(hint, baseline) || strings.Contains(hint, "limits are fixed") {
+				t.Fatalf("hint = %q, want %q", hint, baseline)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationPatternIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pattern := "ordinary, " + scannerpkg.UninspectableJSONNumberPattern
+	logger.LogBodyDLP(LogContext{method: "POST", target: "https://api.vendor.example/"}, "block", 1, []string{pattern}, nil)
+	logger.Close()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["remediation_hint"] != scannerpkg.OperatorHintFor(scannerpkg.ScannerBodyDLP) {
+		t.Fatalf("display text changed hint: %v", entry["remediation_hint"])
+	}
+}
+
+func TestLogAdaptiveRecoveryResidualScore(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+	logger.LogAdaptiveRecovery(LogAdaptiveRecoveryOptions{SessionKey: "session", From: "normal", To: "normal", Reason: "residual_score_expired", PreviousScore: 3})
+	ev := sink.onlyEvent(t)
+	if ev.Type != string(EventAdaptiveRecovery) || ev.Fields["previous_score"] != float64(3) {
+		t.Fatalf("expiry audit event = %+v", ev)
+	}
+}

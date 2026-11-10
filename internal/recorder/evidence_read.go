@@ -1,0 +1,161 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package recorder
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+)
+
+const (
+	// MaxEvidenceReadFileBytes matches the bounded dashboard evidence
+	// display ceiling: one evidence source may contribute at most 8 MiB
+	// to bounded query and online UI reads. Authoritative history readers do
+	// not apply this ceiling. Recorder resume uses a
+	// separately bounded single-entry tail read so legacy shards larger than
+	// this whole-file ceiling remain upgradeable.
+	MaxEvidenceReadFileBytes int64 = 8 << 20
+
+	// MaxEvidenceReadDirectoryEntries matches the bounded dashboard evidence
+	// directory ceiling. It applies to bounded query and dashboard reads,
+	// which report truncation or refusal instead of presenting partial evidence
+	// as complete. Authoritative history readers do not apply this ceiling.
+	//
+	// It deliberately does NOT apply to recorder resume. Resume enumerates the
+	// session's shards uncapped and reads them newest first until one yields a
+	// tail entry, so it may inspect several empty shards left by a crash before
+	// adopting a head. Every one of those reads is bounded by the per-file
+	// limits above. Resume never verifies the chain, so the directory ceiling
+	// bought no integrity there while permanently ending receipt emission once
+	// a directory grew past it. See sessionResumeCandidates.
+	MaxEvidenceReadDirectoryEntries = 256
+
+	// EvidenceFileWarningThreshold warns while a recorder session is still well
+	// under the read ceiling. 200 is ~78% of the 256-file cap, leaving
+	// operational headroom while avoiding noise for small installs.
+	//
+	// Resume no longer fails at the cap, so this is not a countdown to a write
+	// outage. It remains load-bearing for two reasons: the read paths above do
+	// still refuse past the ceiling, and unbounded shard growth is itself the
+	// symptom worth surfacing, because retention cannot prune chain shards.
+	EvidenceFileWarningThreshold = 200
+
+	// MaxEvidenceReadEntries matches the recorder's default shard size and
+	// bounds display reads. Authoritative history streams every complete entry.
+	MaxEvidenceReadEntries = defaultMaxEntriesPerFile
+)
+
+// ErrEvidenceReadLimitExceeded marks a fail-closed evidence read cap hit.
+var ErrEvidenceReadLimitExceeded = errors.New("evidence read limit exceeded")
+
+// ErrEvidenceRefused marks evidence a reader refused to read as the chain it
+// was asked for: a symlink inside an evidence root, or an entry whose
+// session_id is not the session its file name claims. A verifier reports it
+// as a verification failure, not as a configuration error, because the
+// evidence itself is what is wrong.
+var ErrEvidenceRefused = errors.New("evidence refused")
+
+// openRegularEvidenceFile opens an unchanged regular evidence file after the
+// platform access policy has accepted the operation.
+func openRegularEvidenceFile(path string, accessErr error) (*os.File, os.FileInfo, error) {
+	if accessErr != nil {
+		return nil, nil, accessErr
+	}
+	cleanPath := filepath.Clean(path)
+	before, err := os.Lstat(cleanPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("%w: evidence file is symlinked or non-regular", ErrEvidenceRefused)
+	}
+	file, err := os.OpenFile(cleanPath, os.O_RDONLY|evidenceReadNoFollowFlag|evidenceReadNonblockFlag, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if err := checkOpenedEvidenceFile(before, info); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	return file, info, nil
+}
+
+// checkOpenedEvidenceFile compares the file a reader opened with the entry it
+// examined before opening. A non-regular file is refused evidence, as it is
+// before the open. A different regular file means the shard was replaced
+// between the two, a race with the writer that callers retry or report as no
+// verdict rather than as a finding.
+func checkOpenedEvidenceFile(before, opened os.FileInfo) error {
+	if !opened.Mode().IsRegular() {
+		return fmt.Errorf("%w: opened evidence file is non-regular", ErrEvidenceRefused)
+	}
+	if !os.SameFile(before, opened) {
+		return fmt.Errorf("%w: evidence file replaced before it was opened", ErrEvidenceChanged)
+	}
+	return nil
+}
+
+// readBoundedEvidence opens path as a regular no-follow file and copies at
+// most maxBytes into sink. It is the single fail-closed read path shared by
+// ReadEvidenceFileBounded and computeEvidenceFileHashBounded: it rejects the
+// read if the file exceeds maxBytes (both by pre-read size and by actual bytes
+// copied) or if the file changes during the read. A non-positive maxBytes
+// falls back to MaxEvidenceReadFileBytes.
+func readBoundedEvidence(path string, maxBytes int64, sink io.Writer) error {
+	if maxBytes <= 0 {
+		maxBytes = MaxEvidenceReadFileBytes
+	}
+	file, info, err := openRegularEvidenceFile(path, validateEvidenceFileAccess())
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	if info.Size() > maxBytes {
+		return fmt.Errorf("%w: evidence file %s exceeds %d bytes", ErrEvidenceReadLimitExceeded, filepath.Base(path), maxBytes)
+	}
+	written, err := io.Copy(sink, io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return err
+	}
+	if written > maxBytes {
+		return fmt.Errorf("%w: evidence file %s exceeds %d bytes", ErrEvidenceReadLimitExceeded, filepath.Base(path), maxBytes)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if after.Size() != info.Size() || after.ModTime() != info.ModTime() {
+		return ErrEvidenceFileChanged
+	}
+	return nil
+}
+
+// ReadEvidenceFileBounded reads a regular evidence file through a no-follow
+// open and returns an error if the file exceeds maxBytes.
+func ReadEvidenceFileBounded(path string, maxBytes int64) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := readBoundedEvidence(path, maxBytes, &buf); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func computeEvidenceFileHashBounded(path string, maxBytes int64) (string, error) {
+	h := sha256.New()
+	if err := readBoundedEvidence(path, maxBytes, h); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

@@ -1,0 +1,4966 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package licenseservice
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/rs/zerolog"
+)
+
+const testLicenseExisting = "lic_existing"
+
+// testSetup creates a fully wired test environment with in-memory DB,
+// temp ledger, mock Polar server, and mock email server.
+type testSetup struct {
+	handler    *WebhookHandler
+	db         *EntitlementDB
+	ledger     *AuditLedger
+	cfg        *Config
+	polarSrv   *httptest.Server
+	emailSrv   *httptest.Server
+	privateKey ed25519.PrivateKey
+	publicKey  ed25519.PublicKey
+}
+
+func testServiceIntermediateCert(t *testing.T, intermediatePub ed25519.PublicKey) ([]byte, ed25519.PublicKey) {
+	t.Helper()
+	rootPub, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(root): %v", err)
+	}
+	now := time.Now().UTC()
+	data := testServiceIntermediateCertWithRoot(t, rootPriv, intermediatePub, "im_service_test", now.Add(-time.Minute), now.Add(90*24*time.Hour))
+	return data, rootPub
+}
+
+func testServiceIntermediateCertWithRoot(t *testing.T, rootPriv ed25519.PrivateKey, intermediatePub ed25519.PublicKey, serial string, notBefore, notAfter time.Time) []byte {
+	t.Helper()
+	im, err := license.SignIntermediate(license.IntermediatePayload{
+		Serial:    serial,
+		Purpose:   license.PurposeLicenseSigning,
+		Algorithm: license.AlgorithmEd25519,
+		PublicKey: hex.EncodeToString(intermediatePub),
+		NotBefore: notBefore.Unix(),
+		NotAfter:  notAfter.Unix(),
+		IssuedAt:  notBefore.Unix(),
+	}, rootPriv)
+	if err != nil {
+		t.Fatalf("SignIntermediate: %v", err)
+	}
+	data, err := json.Marshal(im)
+	if err != nil {
+		t.Fatalf("Marshal intermediate: %v", err)
+	}
+	return data
+}
+
+// newTestSetup creates a complete test environment. The Polar mock returns
+// the subscription set via setPolarResponse. The email mock always succeeds.
+func newTestSetup(t *testing.T) *testSetup {
+	t.Helper()
+
+	db := openTestDB(t)
+	ledger, _ := openTestLedger(t)
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	_, crlPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate CRL key: %v", err)
+	}
+
+	// Default Polar mock: returns an active pro subscription.
+	polarSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every production Polar read must carry the version pin; these
+		// end-to-end fixtures are the ones that would otherwise let an
+		// unpinned client through.
+		if got := r.Header.Get("Polar-Version"); got != defaultPolarAPIVersion {
+			t.Errorf("Polar-Version = %q, want %q", got, defaultPolarAPIVersion)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/orders/") {
+			orderID := strings.TrimPrefix(r.URL.Path, "/v1/orders/")
+			// order_trial_refund_<full|partial>_<label>: a paid Pro trial
+			// order already refunded (full or partial) so tests can drive
+			// HandleOrderRefundEvent's revocation path directly, the way
+			// the slot-immutability tests do.
+			if rest, ok := strings.CutPrefix(orderID, "order_trial_refund_"); ok {
+				status := orderStatusRefunded
+				refundedAmount := 100
+				if strings.HasPrefix(rest, "partial_") {
+					status = orderStatusPartiallyRefunded
+					refundedAmount = 40
+				}
+				_, _ = fmt.Fprintf(w, `{
+					"id": %q,
+					"billing_reason": "purchase",
+					"status": %q,
+					"paid": true,
+					"total_amount": 100,
+					"net_amount": 100,
+					"refunded_amount": %d,
+					"currency": "usd",
+					"customer": {"email": "trial-slot-immutable@example.com", "metadata": {}},
+					"product": {"id": "prod_trial", "name": "Pipelock Pro Trial", "metadata": {"pipelock_tier": "trial"}}
+				}`, orderID, status, refundedAmount)
+				return
+			}
+			if strings.HasPrefix(orderID, "order_enterprise_trial_") {
+				tier := tierEnterpriseTrial
+				if orderID == "order_enterprise_trial_unknown_tier" {
+					tier = "unknown"
+				}
+				status := orderStatusPaid
+				refundedAmount := 0
+				if orderID == "order_enterprise_trial_refunded" {
+					status = orderStatusRefunded
+					refundedAmount = 1
+				}
+				_, _ = fmt.Fprintf(w, `{
+					"id": %q,
+					"billing_reason": "purchase",
+					"status": %q,
+					"paid": true,
+					"net_amount": 0,
+					"refunded_amount": %d,
+					"currency": "usd",
+					"customer": {"email": "enterprise-trial@example.com", "metadata": {}},
+					"product": {"id": "prod_enterprise_trial_free", "name": "Pipelock Enterprise Trial", "metadata": {"pipelock_tier": %q}}
+				}`, orderID, status, refundedAmount, tier)
+				return
+			}
+			// Zero-amount trial orders: order_free_<n>_<email-local-part>
+			// maps to the prod_trial_free product so tests can vary the
+			// customer email per order and exercise the per-email dedupe.
+			if rest, ok := strings.CutPrefix(orderID, "order_free_"); ok {
+				email := testCustomerEmail
+				if _, local, found := strings.Cut(rest, "_"); found {
+					email = local + "@example.com"
+					if local == "bademail" {
+						email = "not-an-email"
+					}
+					if local == "alphaupper" {
+						email = "ALPHA@Example.com"
+					}
+					if local == "gammaupper" {
+						email = "GAMMA@Example.com"
+					}
+					if local == "umlaut" {
+						email = "üser@example.com"
+					}
+				}
+				_, _ = fmt.Fprintf(w, `{
+					"id": %q,
+					"billing_reason": "purchase",
+					"status": "paid",
+					"paid": true,
+					"net_amount": 0,
+					"currency": "usd",
+					"customer": {"email": %q, "metadata": {}},
+					"product": {"id": "prod_trial_free", "name": "Pipelock Pro Trial", "metadata": {"pipelock_tier": "trial"}}
+				}`, orderID, email)
+				return
+			}
+			productID, tier := "prod_trial", tierTrial
+			org := "testcorp"
+			if orderID == "order_trial_123" {
+				org = "trialcorp"
+			}
+			if orderID == "order_no_tier" || orderID == "order_bad_tier" {
+				productID = "prod_bad"
+			}
+			if orderID == "order_bad_tier" {
+				tier = "premium"
+			}
+			_, _ = fmt.Fprintf(w, `{
+				"id": %q,
+				"billing_reason": "purchase",
+				"status": "paid",
+				"paid": true,
+				"net_amount": 100,
+				"currency": "usd",
+				"customer": {"email": %q, "metadata": {"org": %q}},
+				"product": {"id": %q, "name": "Pipelock Pro Trial", "metadata": {"pipelock_tier": %q}}
+			}`, orderID, testCustomerEmail, org, productID, tier)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{
+			"id": "%s",
+			"status": "active",
+			"customer": {"email": "%s", "metadata": {"org": "testcorp"}},
+			"product": {"id": "%s", "name": "%s", "metadata": {"pipelock_tier": "pro"}},
+			"recurring_interval": "month",
+			"current_period_end": "2026-04-12T00:00:00Z"
+		}`, testSubscriptionID, testCustomerEmail, testProductID, testProductName)
+	}))
+	t.Cleanup(polarSrv.Close)
+
+	// Email mock: always returns success.
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test789"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+
+	cert, rootPub := testServiceIntermediateCert(t, pub)
+	cfg := &Config{
+		PolarWebhookSecret: "whsec_" + "dGVzdA==",
+		PolarAPIToken:      testPolarAPIToken,
+		PrivateKeyPath:     filepath.Join(t.TempDir(), "test.key"),
+		IntermediateCert:   cert,
+		RootPublicKey:      rootPub,
+		CRLPrivateKey:      crlPriv,
+		ResendAPIKey:       "re_" + "test_key",
+		DBPath:             ":memory:",
+		LedgerPath:         filepath.Join(t.TempDir(), "test.jsonl"),
+		FoundingProCap:     50,
+		ListenAddr:         ":0",
+		FromEmail:          "test@pipelock.dev",
+		PolarAPIBase:       polarSrv.URL,
+		PolarAPIVersion:    defaultPolarAPIVersion,
+		OrderProducts: []OrderProductConfig{
+			{ProductID: "prod_trial", Tier: tierTrial, AmountCents: 100, Currency: "usd"},
+			{ProductID: "prod_trial_test", Tier: tierTrial, AmountCents: 100, Currency: "usd"},
+			{ProductID: "prod_trial_free", Tier: tierTrial, AmountCents: 0, Currency: "usd"},
+			{ProductID: "prod_enterprise_trial_free", Tier: tierEnterpriseTrial, AmountCents: 0, Currency: "usd"},
+		},
+	}
+
+	polar := NewPolarClient(cfg.PolarAPIToken, cfg.PolarAPIBase, cfg.PolarAPIVersion)
+	email := &EmailSender{
+		apiKey:    cfg.ResendAPIKey,
+		fromEmail: cfg.FromEmail,
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	log := zerolog.Nop()
+
+	handler, err := NewWebhookHandler(cfg, db, polar, email, ledger, priv, log)
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+
+	return &testSetup{
+		handler:    handler,
+		db:         db,
+		ledger:     ledger,
+		cfg:        cfg,
+		polarSrv:   polarSrv,
+		emailSrv:   emailSrv,
+		privateKey: priv,
+		publicKey:  pub,
+	}
+}
+
+func testActiveSubscription(productID, tier string) *PolarSubscription {
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusActive,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+		AmountCents:       2900,
+		Currency:          "usd",
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "testcorp"}
+	sub.Product.ID = productID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": tier}
+	return sub
+}
+
+func countLicenseIssuances(t *testing.T, db *EntitlementDB, subID string) int {
+	t.Helper()
+	var count int
+	if err := db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM license_issuances WHERE subscription_id = ?`, subID).Scan(&count); err != nil {
+		t.Fatalf("count license issuances: %v", err)
+	}
+	return count
+}
+
+func TestMapProductToTier(t *testing.T) {
+	ts := newTestSetup(t)
+
+	tests := []struct {
+		name      string
+		metadata  map[string]string
+		wantTier  string
+		wantFound bool
+		wantErr   bool
+	}{
+		{
+			name:      "pro tier",
+			metadata:  map[string]string{"pipelock_tier": "pro"},
+			wantTier:  tierPro,
+			wantFound: false,
+			wantErr:   false,
+		},
+		{
+			name:      "founding pro tier",
+			metadata:  map[string]string{"pipelock_tier": "founding_pro"},
+			wantTier:  tierFoundingPro,
+			wantFound: true,
+			wantErr:   false,
+		},
+		{
+			name:      "enterprise tier",
+			metadata:  map[string]string{"pipelock_tier": "enterprise"},
+			wantTier:  tierEnterprise,
+			wantFound: false,
+			wantErr:   false,
+		},
+		{
+			name:      "trial tier",
+			metadata:  map[string]string{"pipelock_tier": "trial"},
+			wantTier:  tierTrial,
+			wantFound: false,
+			wantErr:   false,
+		},
+		{
+			name:     "missing tier metadata",
+			metadata: map[string]string{},
+			wantErr:  true,
+		},
+		{
+			name:     "unrecognized tier value",
+			metadata: map[string]string{"pipelock_tier": "premium"},
+			wantErr:  true,
+		},
+		{
+			name:     "typo in tier",
+			metadata: map[string]string{"pipelock_tier": "pr0"},
+			wantErr:  true,
+		},
+		{
+			name:     "empty tier value",
+			metadata: map[string]string{"pipelock_tier": ""},
+			wantErr:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sub := &PolarSubscription{
+				Product: struct {
+					ID       string            `json:"id"`
+					Name     string            `json:"name"`
+					Metadata map[string]string `json:"metadata"`
+				}{
+					ID:       testProductID,
+					Name:     testProductName,
+					Metadata: tt.metadata,
+				},
+			}
+
+			tier, founding, err := ts.handler.mapProductToTier(sub)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("mapProductToTier() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil {
+				return
+			}
+			if tier != tt.wantTier {
+				t.Errorf("tier = %q, want %q", tier, tt.wantTier)
+			}
+			if founding != tt.wantFound {
+				t.Errorf("founding = %v, want %v", founding, tt.wantFound)
+			}
+		})
+	}
+}
+
+func TestMapProductToTier_SubscriptionAllowlistRejectsUnknownProduct(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.SubscriptionProducts = []SubscriptionProductConfig{
+		{ProductID: "prod_allowed", Tier: tierEnterprise, Interval: testIntervalMonth, AmountCents: 9900, Currency: "usd"},
+	}
+	sub := testActiveSubscription("prod_mispriced", tierEnterprise)
+	sub.AmountCents = 9900
+	sub.Currency = "usd"
+
+	_, _, err := ts.handler.mapProductToTier(sub)
+	if err == nil {
+		t.Fatal("expected non-allowlisted subscription product to be rejected")
+	}
+	if !strings.Contains(err.Error(), "not allowlisted") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMapProductToTier_SubscriptionAllowlistUnsetPreservesMetadataMapping(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.SubscriptionProducts = nil
+	sub := testActiveSubscription("prod_legacy_metadata", tierEnterprise)
+
+	tier, founding, err := ts.handler.mapProductToTier(sub)
+	if err != nil {
+		t.Fatalf("mapProductToTier: %v", err)
+	}
+	if tier != tierEnterprise {
+		t.Fatalf("tier = %q, want %q", tier, tierEnterprise)
+	}
+	if founding {
+		t.Fatal("enterprise tier should not be founding")
+	}
+}
+
+func TestMapProductToTier_SubscriptionAllowlistRequiresCommercialFacts(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.SubscriptionProducts = []SubscriptionProductConfig{
+		{ProductID: testProductID, Tier: tierEnterprise, Interval: testIntervalMonth, AmountCents: 9900, Currency: "usd"},
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*PolarSubscription)
+	}{
+		{name: "tier mismatch", mutate: func(sub *PolarSubscription) { sub.Product.Metadata["pipelock_tier"] = tierPro }},
+		{name: "interval mismatch", mutate: func(sub *PolarSubscription) { sub.RecurringInterval = testIntervalYear }},
+		{name: "amount mismatch", mutate: func(sub *PolarSubscription) { sub.AmountCents = 100 }},
+		{name: "currency mismatch", mutate: func(sub *PolarSubscription) { sub.Currency = "eur" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sub := testActiveSubscription(testProductID, tierEnterprise)
+			sub.AmountCents = 9900
+			sub.Currency = "usd"
+			tt.mutate(sub)
+			if _, _, err := ts.handler.mapProductToTier(sub); err == nil {
+				t.Fatal("expected allowlist mismatch to be rejected")
+			}
+		})
+	}
+}
+
+func TestTierToFeatures(t *testing.T) {
+	ts := newTestSetup(t)
+
+	tests := []struct {
+		name string
+		tier string
+		want []string
+	}{
+		{"pro", tierPro, []string{license.FeatureAgents}},
+		{"founding pro", tierFoundingPro, []string{license.FeatureAgents}},
+		{"enterprise", tierEnterprise, []string{license.FeatureAgents, license.FeatureFleet}},
+		{"enterprise eval", tierEnterpriseEval, []string{license.FeatureAgents, license.FeatureFleet}},
+		{"enterprise trial", tierEnterpriseTrial, []string{license.FeatureAgents, license.FeatureFleet}},
+		{"trial", tierTrial, []string{license.FeatureAgents}},
+		{"assess", tierAssess, []string{license.FeatureAssess}},
+		{"unknown returns nil (fail-closed)", "unknown", nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ts.handler.tierToFeatures(tt.tier)
+			if len(got) != len(tt.want) {
+				t.Errorf("tierToFeatures(%q) = %v, want %v", tt.tier, got, tt.want)
+				return
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("feature[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestIsIdempotent(t *testing.T) {
+	ts := newTestSetup(t)
+	periodEnd := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name     string
+		current  *Entitlement
+		existing *Entitlement
+		want     bool
+	}{
+		{
+			name: "identical state is idempotent",
+			current: &Entitlement{
+				CurrentPeriodEnd: periodEnd,
+				Tier:             tierPro,
+				BillingInterval:  testIntervalMonth,
+				ProductID:        testProductID,
+			},
+			existing: &Entitlement{
+				LastLicensePeriodEnd: &periodEnd,
+				LastLicenseTier:      tierPro,
+				LastLicenseInterval:  testIntervalMonth,
+				LastLicenseProductID: testProductID,
+			},
+			want: true,
+		},
+		{
+			name: "different period end is not idempotent",
+			current: &Entitlement{
+				CurrentPeriodEnd: periodEnd.Add(30 * 24 * time.Hour),
+				Tier:             tierPro,
+				BillingInterval:  testIntervalMonth,
+				ProductID:        testProductID,
+			},
+			existing: &Entitlement{
+				LastLicensePeriodEnd: &periodEnd,
+				LastLicenseTier:      tierPro,
+				LastLicenseInterval:  testIntervalMonth,
+				LastLicenseProductID: testProductID,
+			},
+			want: false,
+		},
+		{
+			name: "different tier is not idempotent",
+			current: &Entitlement{
+				CurrentPeriodEnd: periodEnd,
+				Tier:             tierEnterprise,
+				BillingInterval:  testIntervalMonth,
+				ProductID:        testProductID,
+			},
+			existing: &Entitlement{
+				LastLicensePeriodEnd: &periodEnd,
+				LastLicenseTier:      tierPro,
+				LastLicenseInterval:  testIntervalMonth,
+				LastLicenseProductID: testProductID,
+			},
+			want: false,
+		},
+		{
+			name: "never issued before",
+			current: &Entitlement{
+				CurrentPeriodEnd: periodEnd,
+				Tier:             tierPro,
+				BillingInterval:  testIntervalMonth,
+				ProductID:        testProductID,
+			},
+			existing: &Entitlement{
+				LastLicensePeriodEnd: nil,
+			},
+			want: false,
+		},
+		{
+			name: "different interval is not idempotent",
+			current: &Entitlement{
+				CurrentPeriodEnd: periodEnd,
+				Tier:             tierPro,
+				BillingInterval:  testIntervalYear,
+				ProductID:        testProductID,
+			},
+			existing: &Entitlement{
+				LastLicensePeriodEnd: &periodEnd,
+				LastLicenseTier:      tierPro,
+				LastLicenseInterval:  testIntervalMonth,
+				LastLicenseProductID: testProductID,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ts.handler.isIdempotent(tt.current, tt.existing)
+			if got != tt.want {
+				t.Errorf("isIdempotent() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckFoundingCap_ReservesSlot(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.FoundingProCap = 5
+
+	ctx := t.Context()
+
+	ent := testEntitlement("sub_founding_new")
+	ent.Tier = tierFoundingPro
+	ent.Founding = true
+
+	if err := ts.handler.checkFoundingCap(ctx, ent); err != nil {
+		t.Fatalf("checkFoundingCap: %v", err)
+	}
+
+	if ent.Tier != tierFoundingPro {
+		t.Errorf("Tier = %q, want %q (should remain founding)", ent.Tier, tierFoundingPro)
+	}
+	if ts.handler.foundingCount != 1 {
+		t.Errorf("foundingCount = %d, want 1", ts.handler.foundingCount)
+	}
+	if ent.FoundingReservedAt == nil {
+		t.Error("FoundingReservedAt should be set after reservation")
+	}
+}
+
+func TestCheckFoundingCap_CapReached(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.FoundingProCap = 2
+	ctx := t.Context()
+
+	// Insert 2 founding entitlements so DB count matches the cap.
+	reserved := time.Now().UTC()
+	for i := 0; i < 2; i++ {
+		e := testEntitlement(fmt.Sprintf("sub_cap_fill_%d", i))
+		e.Founding = true
+		e.FoundingReservedAt = &reserved
+		e.Tier = tierFoundingPro
+		if err := ts.db.Upsert(ctx, e); err != nil {
+			t.Fatalf("Upsert cap fill %d: %v", i, err)
+		}
+	}
+	ts.handler.foundingCount = 2
+
+	ent := testEntitlement("sub_over_cap")
+	ent.Tier = tierFoundingPro
+	ent.Founding = true
+
+	if err := ts.handler.checkFoundingCap(ctx, ent); err != nil {
+		t.Fatalf("checkFoundingCap: %v", err)
+	}
+
+	// Should preserve founding_pro - customer paid the founding price.
+	if ent.Tier != tierFoundingPro {
+		t.Errorf("Tier = %q, want %q (paid checkout honored)", ent.Tier, tierFoundingPro)
+	}
+	if !ent.Founding {
+		t.Error("Founding should remain true (paid checkout honored)")
+	}
+}
+
+// A founding checkout below the cap must not be recorded as a cap hit. The
+// founding_cap_hit event used to be emitted from two conditions: the real cap,
+// and a calendar deadline that defaulted to a date already in the past. Every
+// founding checkout after that date therefore wrote a cap-hit record while
+// slots remained, which makes the audit trail unable to answer when the cap
+// was actually reached. With the deadline gone the event has one meaning, and
+// this test fails if a second condition is ever reintroduced.
+func TestCheckFoundingCap_BelowCapWritesNoCapHit(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.FoundingProCap = 50
+
+	ctx := t.Context()
+
+	ent := testEntitlement("sub_below_cap")
+	ent.Tier = tierFoundingPro
+	ent.Founding = true
+
+	if err := ts.handler.checkFoundingCap(ctx, ent); err != nil {
+		t.Fatalf("checkFoundingCap: %v", err)
+	}
+
+	// The entitlement half matters as much as the ledger half: a guard that
+	// only proves no cap-hit was written would still pass if the slot were
+	// never granted at all.
+	if ent.Tier != tierFoundingPro {
+		t.Errorf("Tier = %q, want %q", ent.Tier, tierFoundingPro)
+	}
+	if !ent.Founding {
+		t.Error("Founding should remain true below the cap")
+	}
+	if ent.FoundingReservedAt == nil {
+		t.Error("FoundingReservedAt should be stamped below the cap")
+	}
+
+	ledgerBytes, err := os.ReadFile(ts.handler.ledger.path)
+	if err != nil {
+		t.Fatalf("read audit ledger: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(ledgerBytes)), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode ledger line %q: %v", line, err)
+		}
+		if entry.Event == AuditFoundingCapHit {
+			t.Fatalf("founding checkout below the cap recorded %q: %s", AuditFoundingCapHit, line)
+		}
+	}
+}
+
+func TestCheckFoundingCap_AlreadyHasSlot(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.FoundingProCap = 1
+	ts.handler.foundingCount = 1 // at cap
+
+	ctx := t.Context()
+
+	// Insert an existing founding entitlement in the DB.
+	reserved := time.Now().UTC()
+	existing := testEntitlement("sub_existing_founding")
+	existing.Founding = true
+	existing.FoundingReservedAt = &reserved
+	existing.Tier = tierFoundingPro
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	ent := testEntitlement("sub_existing_founding")
+	ent.Tier = tierFoundingPro
+	ent.Founding = true
+
+	// Should not downgrade because this sub already has a founding slot.
+	if err := ts.handler.checkFoundingCap(ctx, ent); err != nil {
+		t.Fatalf("checkFoundingCap: %v", err)
+	}
+
+	if ent.Tier != tierFoundingPro {
+		t.Errorf("Tier = %q, want %q (already has slot)", ent.Tier, tierFoundingPro)
+	}
+}
+
+func TestCheckFoundingCap_ProductChangeCantReopenSlot(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.cfg.FoundingProCap = 1
+	ctx := t.Context()
+
+	// A subscriber reserved the only founding slot, then changed products.
+	// The founding bool is now false (current product), but
+	// FoundingReservedAt is still set (immutable reservation).
+	reserved := time.Now().UTC()
+	original := testEntitlement("sub_switched_product")
+	original.Founding = false // product changed away from founding
+	original.FoundingReservedAt = &reserved
+	original.Tier = tierPro
+	if err := ts.db.Upsert(ctx, original); err != nil {
+		t.Fatalf("Upsert original: %v", err)
+	}
+
+	// A new subscriber tries to claim the "freed" slot.
+	ent := testEntitlement("sub_new_claimant")
+	ent.Tier = tierFoundingPro
+	ent.Founding = true
+
+	if err := ts.handler.checkFoundingCap(ctx, ent); err != nil {
+		t.Fatalf("checkFoundingCap: %v", err)
+	}
+
+	// Should preserve founding_pro - customer paid the founding price.
+	// The slot is over cap but the checkout is honored; archiving the
+	// Polar product is the real enforcement.
+	if ent.Tier != tierFoundingPro {
+		t.Errorf("Tier = %q, want %q (paid checkout honored despite cap)", ent.Tier, tierFoundingPro)
+	}
+	if !ent.Founding {
+		t.Error("Founding should remain true (paid checkout honored)")
+	}
+}
+
+func TestProcessSubscription_ActiveMintsCertificate(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "testcorp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	// Point the email sender at our mock server.
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	// Verify entitlement was persisted.
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement not found after processSubscription")
+	}
+	if ent.Tier != tierPro {
+		t.Errorf("Tier = %q, want %q", ent.Tier, tierPro)
+	}
+	if ent.LastLicenseID == "" {
+		t.Error("LastLicenseID should be set after issuance")
+	}
+	if ent.LastLicenseIssuedAt == nil {
+		t.Error("LastLicenseIssuedAt should be set")
+	}
+	if ent.NextRefreshAt == nil {
+		t.Error("NextRefreshAt should be set")
+	}
+
+	// Verify the issued license is valid.
+	// We can't easily get the token from here, but we can verify the license ID format.
+	if len(ent.LastLicenseID) < 4 || ent.LastLicenseID[:4] != "lic_" {
+		t.Errorf("LastLicenseID format wrong: %q", ent.LastLicenseID)
+	}
+}
+
+func TestProcessSubscription_ExpiryClampedToIntermediateNotAfter(t *testing.T) {
+	db := openTestDB(t)
+	ledger, _ := openTestLedger(t)
+	signingPub, signingPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(signing): %v", err)
+	}
+	rootPub, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(root): %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	notAfter := now.Add(2 * time.Hour)
+	cfg := &Config{
+		IntermediateCert: testServiceIntermediateCertWithRoot(t, rootPriv, signingPub, "im_short", now.Add(-time.Minute), notAfter),
+		RootPublicKey:    rootPub,
+		FoundingProCap:   50,
+	}
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_clamp"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	handler, err := NewWebhookHandler(
+		cfg,
+		db,
+		NewPolarClient("token", "http://localhost", defaultPolarAPIVersion),
+		&EmailSender{apiKey: "re_" + "test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL},
+		ledger,
+		signingPriv,
+		zerolog.Nop(),
+	)
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+
+	sub := testActiveSubscription(testProductID, tierPro)
+	if err := handler.processSubscription(t.Context(), sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+	ent, err := db.GetBySubscriptionID(t.Context(), testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.LastLicenseExpiresAt == nil {
+		t.Fatal("LastLicenseExpiresAt is nil")
+	}
+	if !ent.LastLicenseExpiresAt.Equal(notAfter) {
+		t.Fatalf("LastLicenseExpiresAt = %s, want intermediate NotAfter %s", ent.LastLicenseExpiresAt.UTC(), notAfter)
+	}
+}
+
+func TestProcessSubscription_CanceledClearsRefresh(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Pre-insert an active entitlement with license state.
+	now := time.Now().UTC()
+	expires := now.Add(45 * 24 * time.Hour)
+	refresh := now.Add(30 * 24 * time.Hour)
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = testLicenseIDOld
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicenseExpiresAt = &expires
+	existing.NextRefreshAt = &refresh
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusCanceled,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	// Point email sender at mock (cancellation email).
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription canceled: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != testStatusCanceled {
+		t.Errorf("Status = %q, want %q", ent.Status, testStatusCanceled)
+	}
+	if ent.NextRefreshAt != nil {
+		t.Error("NextRefreshAt should be nil after cancellation")
+	}
+}
+
+func TestProcessSubscription_IdempotentSkipsReissue(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	periodEnd := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+
+	// Pre-insert an entitlement that matches the incoming subscription state
+	// exactly (email, org, tier, interval, product, period, delivery status).
+	now := time.Now().UTC()
+	existing := testEntitlement(testSubscriptionID)
+	existing.Org = "testcorp"
+	existing.LastLicenseID = testLicenseExisting
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicensePeriodEnd = &periodEnd
+	existing.LastLicenseTier = tierPro
+	existing.LastLicenseInterval = testIntervalMonth
+	existing.LastLicenseProductID = testProductID
+	existing.LastDeliveryStatus = testDeliveryStatusSent
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  periodEnd,
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "testcorp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription idempotent: %v", err)
+	}
+
+	// License ID should be preserved (not re-minted).
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.LastLicenseID != testLicenseExisting {
+		t.Errorf("LastLicenseID = %q, want %q (should be preserved)", ent.LastLicenseID, testLicenseExisting)
+	}
+}
+
+func TestProcessSubscription_RefreshDueBypassesIdempotency(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	periodEnd := time.Date(2027, 3, 12, 0, 0, 0, 0, time.UTC) // annual plan
+
+	// Pre-insert an entitlement with an overdue refresh (simulates cron pickup).
+	now := time.Now().UTC()
+	pastDue := now.Add(-1 * time.Hour) // refresh was due 1 hour ago
+	existing := testEntitlement(testSubscriptionID)
+	existing.Org = "testcorp"
+	existing.BillingInterval = testIntervalYear
+	existing.CurrentPeriodEnd = periodEnd
+	existing.LastLicenseID = "lic_annual_old"
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicensePeriodEnd = &periodEnd
+	existing.LastLicenseTier = tierPro
+	existing.LastLicenseInterval = testIntervalYear
+	existing.LastLicenseProductID = testProductID
+	existing.LastDeliveryStatus = testDeliveryStatusSent
+	existing.NextRefreshAt = &pastDue
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	// Same subscription state (annual plan, nothing changed).
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            "active",
+		RecurringInterval: testIntervalYear,
+		CurrentPeriodEnd:  periodEnd,
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "testcorp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	// Must get a new token even though subscription state is unchanged.
+	if ent.LastLicenseID == "lic_annual_old" {
+		t.Error("license should have been re-minted for due refresh")
+	}
+}
+
+func TestProcessSubscription_IdempotentReissuesOnEmailChange(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	periodEnd := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+
+	// Pre-insert an entitlement with a delivered license.
+	now := time.Now().UTC()
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = "lic_old_email"
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicensePeriodEnd = &periodEnd
+	existing.LastLicenseTier = tierPro
+	existing.LastLicenseInterval = testIntervalMonth
+	existing.LastLicenseProductID = testProductID
+	existing.LastDeliveryStatus = testDeliveryStatusSent
+	existing.CustomerEmail = "old@example.com"
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	// Same plan but different email. Should re-mint.
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  periodEnd,
+	}
+	sub.Customer.Email = testEmailNew
+	sub.Customer.Metadata = map[string]string{"org": "testcorp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.LastLicenseID == "lic_old_email" {
+		t.Error("license should have been re-minted for email change")
+	}
+}
+
+func TestProcessSubscription_IdempotentRetriesFailedDelivery(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	periodEnd := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+
+	// Pre-insert an entitlement where delivery failed.
+	now := time.Now().UTC()
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = "lic_failed_delivery"
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicensePeriodEnd = &periodEnd
+	existing.LastLicenseTier = tierPro
+	existing.LastLicenseInterval = testIntervalMonth
+	existing.LastLicenseProductID = testProductID
+	existing.LastDeliveryStatus = "failed"
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	// Same plan, same email. But delivery failed, so should re-mint and retry.
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  periodEnd,
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "testorg"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.LastLicenseID == "lic_failed_delivery" {
+		t.Error("license should have been re-minted to retry failed delivery")
+	}
+	if ent.LastDeliveryStatus != testDeliveryStatusSent {
+		t.Errorf("LastDeliveryStatus = %q, want %q", ent.LastDeliveryStatus, testDeliveryStatusSent)
+	}
+}
+
+func TestHandleEventDelivery_ReplayedWebhookIDDoesNotMintTwice(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Deliver with a failing email sender so the entitlement is left with
+	// LastDeliveryStatus != "sent". Without that, the replay is short-circuited
+	// by the already-delivered skip and this test passes even with the
+	// webhook-ID dedupe removed, i.e. it would not test what it is named for.
+	// Leaving delivery failed makes the dedupe the only thing standing between
+	// a replayed webhook and a second mint.
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventSubscriptionCreated,
+		Data: json.RawMessage(testSubscriptionJSON),
+	}
+	if err := ts.handler.HandleEventDelivery(ctx, event, "msg_subscription_replay"); err != nil {
+		t.Fatalf("HandleEventDelivery(first): %v", err)
+	}
+	first, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID(first): %v", err)
+	}
+	if first == nil || first.LastLicenseID == "" {
+		t.Fatalf("first delivery did not mint: %+v", first)
+	}
+	if err := ts.handler.HandleEventDelivery(ctx, event, "msg_subscription_replay"); err != nil {
+		t.Fatalf("HandleEventDelivery(replay): %v", err)
+	}
+	second, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID(second): %v", err)
+	}
+	if second.LastLicenseID != first.LastLicenseID {
+		t.Fatalf("replay minted a new license: first %q second %q", first.LastLicenseID, second.LastLicenseID)
+	}
+	if got := countLicenseIssuances(t, ts.db, testSubscriptionID); got != 1 {
+		t.Fatalf("license issuance count = %d, want 1", got)
+	}
+}
+
+func TestHandleEventDelivery_ReplayedWebhookRetriesFailedEmailWithoutRemint(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	failEmail := &atomic.Bool{}
+	failEmail.Store(true)
+	emailHits := &atomic.Int32{}
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		emailHits.Add(1)
+		if failEmail.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"boom"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_retry"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventSubscriptionCreated,
+		Data: json.RawMessage(testSubscriptionJSON),
+	}
+	if err := ts.handler.HandleEventDelivery(ctx, event, "msg_subscription_email_retry"); err != nil {
+		t.Fatalf("HandleEventDelivery(first): %v", err)
+	}
+	first, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID(first): %v", err)
+	}
+	if first.LastDeliveryStatus != "failed" {
+		t.Fatalf("first LastDeliveryStatus = %q, want failed", first.LastDeliveryStatus)
+	}
+
+	failEmail.Store(false)
+	if err := ts.handler.HandleEventDelivery(ctx, event, "msg_subscription_email_retry"); err != nil {
+		t.Fatalf("HandleEventDelivery(retry): %v", err)
+	}
+	second, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID(second): %v", err)
+	}
+	if second.LastLicenseID != first.LastLicenseID {
+		t.Fatalf("email retry minted a new license: first %q second %q", first.LastLicenseID, second.LastLicenseID)
+	}
+	if second.LastDeliveryStatus != testDeliveryStatusSent {
+		t.Fatalf("second LastDeliveryStatus = %q, want sent", second.LastDeliveryStatus)
+	}
+	if got := countLicenseIssuances(t, ts.db, testSubscriptionID); got != 1 {
+		t.Fatalf("license issuance count = %d, want 1", got)
+	}
+	if got := emailHits.Load(); got != 2 {
+		t.Fatalf("email hits = %d, want 2", got)
+	}
+}
+
+func TestProcessSubscription_RejectsUnknownTier(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	sub := &PolarSubscription{
+		ID:                "sub_bad_tier",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = "prod_misconfigured"
+	sub.Product.Name = "Bad Product"
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "premium"}
+
+	err := ts.handler.processSubscription(ctx, sub)
+	if err == nil {
+		t.Fatal("expected error for unrecognized tier, got nil")
+	}
+
+	// Verify no entitlement was created.
+	ent, _ := ts.db.GetBySubscriptionID(ctx, "sub_bad_tier")
+	if ent != nil {
+		t.Error("should not persist entitlement for rejected tier")
+	}
+}
+
+func TestProcessSubscription_UnknownStatusRecorded(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	sub := &PolarSubscription{
+		ID:                "sub_unknown_status",
+		Status:            testStatusPending,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription unknown status: %v", err)
+	}
+
+	// Should be recorded with the unknown status.
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_unknown_status")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement should be recorded for unknown status")
+	}
+	if ent.Status != testStatusPending {
+		t.Errorf("Status = %q, want %q", ent.Status, testStatusPending)
+	}
+}
+
+func TestProcessSubscription_UnknownStatusPreservesLicense(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Pre-insert an active entitlement with full license state.
+	now := time.Now().UTC()
+	expires := now.Add(45 * 24 * time.Hour)
+	refresh := now.Add(30 * 24 * time.Hour)
+	periodEnd := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	existing := testEntitlement("sub_unknown_preserve")
+	existing.LastLicenseID = "lic_preserve_me"
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicenseExpiresAt = &expires
+	existing.LastLicensePeriodEnd = &periodEnd
+	existing.LastLicenseTier = tierPro
+	existing.LastLicenseInterval = testIntervalMonth
+	existing.LastLicenseProductID = testProductID
+	existing.LastDeliveryStatus = testDeliveryStatusSent
+	existing.LastDeliveryAttemptAt = &now
+	existing.NextRefreshAt = &refresh
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	sub := &PolarSubscription{
+		ID:                "sub_unknown_preserve",
+		Status:            testStatusPending,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  periodEnd,
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription unknown status: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_unknown_preserve")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != testStatusPending {
+		t.Errorf("Status = %q, want %q", ent.Status, testStatusPending)
+	}
+	// License state must be preserved, not wiped.
+	if ent.LastLicenseID != "lic_preserve_me" {
+		t.Errorf("LastLicenseID = %q, want %q (should be preserved)", ent.LastLicenseID, "lic_preserve_me")
+	}
+	if ent.NextRefreshAt == nil {
+		t.Error("NextRefreshAt should be preserved for unknown status")
+	}
+	if ent.LastDeliveryStatus != testDeliveryStatusSent {
+		t.Errorf("LastDeliveryStatus = %q, want %q", ent.LastDeliveryStatus, testDeliveryStatusSent)
+	}
+}
+
+func TestHandleEvent_EndToEnd(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Point email sender at mock.
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventSubscriptionCreated,
+		Data: json.RawMessage(testSubscriptionJSON),
+	}
+
+	if err := ts.handler.HandleEvent(ctx, event); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+
+	// Verify entitlement was created.
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement not created after HandleEvent")
+	}
+	if ent.LastLicenseID == "" {
+		t.Error("license should have been issued")
+	}
+}
+
+func TestSubscriptionToEntitlement(t *testing.T) {
+	ts := newTestSetup(t)
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            "active",
+		RecurringInterval: testIntervalYear,
+		CurrentPeriodEnd:  time.Date(2027, 3, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "acme-corp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "enterprise"}
+
+	ent, err := ts.handler.subscriptionToEntitlement(sub)
+	if err != nil {
+		t.Fatalf("subscriptionToEntitlement: %v", err)
+	}
+
+	if ent.SubscriptionID != testSubscriptionID {
+		t.Errorf("SubscriptionID = %q, want %q", ent.SubscriptionID, testSubscriptionID)
+	}
+	if ent.Tier != tierEnterprise {
+		t.Errorf("Tier = %q, want %q", ent.Tier, tierEnterprise)
+	}
+	if ent.BillingInterval != testIntervalYear {
+		t.Errorf("BillingInterval = %q, want %q", ent.BillingInterval, testIntervalYear)
+	}
+	if ent.Org != "acme-corp" {
+		t.Errorf("Org = %q, want %q", ent.Org, "acme-corp")
+	}
+	if ent.Founding {
+		t.Error("enterprise tier should not be founding")
+	}
+
+	// Verify features JSON contains "agents".
+	var features []string
+	if err := json.Unmarshal([]byte(ent.Features), &features); err != nil {
+		t.Fatalf("unmarshal features: %v", err)
+	}
+	if len(features) == 0 || features[0] != license.FeatureAgents {
+		t.Errorf("features = %v, want [%q]", features, license.FeatureAgents)
+	}
+}
+
+func TestNewWebhookHandler_InitializesFoundingCount(t *testing.T) {
+	db := openTestDB(t)
+	ledger, _ := openTestLedger(t)
+	ctx := context.Background()
+
+	// Insert 3 founding entitlements with reservation timestamps.
+	reserved := time.Now().UTC()
+	for i := 0; i < 3; i++ {
+		ent := testEntitlement(fmt.Sprintf("sub_founding_%d", i))
+		ent.Founding = true
+		ent.FoundingReservedAt = &reserved
+		ent.Tier = tierFoundingPro
+		if err := db.Upsert(ctx, ent); err != nil {
+			t.Fatalf("Upsert founding %d: %v", i, err)
+		}
+	}
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	cert, rootPub := testServiceIntermediateCert(t, pub)
+
+	cfg := &Config{
+		IntermediateCert: cert,
+		RootPublicKey:    rootPub,
+		FoundingProCap:   50,
+	}
+	polar := NewPolarClient("token", "http://localhost", defaultPolarAPIVersion)
+	email := NewEmailSender("key", "from@test.com")
+
+	handler, err := NewWebhookHandler(cfg, db, polar, email, ledger, priv, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewWebhookHandler: %v", err)
+	}
+
+	if handler.foundingCount != 3 {
+		t.Errorf("foundingCount = %d, want 3", handler.foundingCount)
+	}
+}
+
+func TestNewWebhookHandler_RejectsIntermediateSigningKeyMismatch(t *testing.T) {
+	db := openTestDB(t)
+	ledger, _ := openTestLedger(t)
+
+	certPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(cert): %v", err)
+	}
+	_, signingPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(signing): %v", err)
+	}
+
+	cert, rootPub := testServiceIntermediateCert(t, certPub)
+	cfg := &Config{
+		IntermediateCert: cert,
+		RootPublicKey:    rootPub,
+		FoundingProCap:   50,
+	}
+	polar := NewPolarClient("token", "http://localhost", defaultPolarAPIVersion)
+	email := NewEmailSender("key", "from@test.com")
+
+	_, err = NewWebhookHandler(cfg, db, polar, email, ledger, signingPriv, zerolog.Nop())
+	if err == nil {
+		t.Fatal("expected intermediate/signing key mismatch error")
+	}
+	if !strings.Contains(err.Error(), "intermediate certificate public key does not match") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewWebhookHandler_RejectsMalformedIntermediate(t *testing.T) {
+	db := openTestDB(t)
+	ledger, _ := openTestLedger(t)
+
+	_, signingPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(signing): %v", err)
+	}
+	rootPub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(root): %v", err)
+	}
+
+	cfg := &Config{
+		IntermediateCert: []byte("{bad json"),
+		RootPublicKey:    rootPub,
+		FoundingProCap:   50,
+	}
+	polar := NewPolarClient("token", "http://localhost", defaultPolarAPIVersion)
+	email := NewEmailSender("key", "from@test.com")
+
+	_, err = NewWebhookHandler(cfg, db, polar, email, ledger, signingPriv, zerolog.Nop())
+	if err == nil {
+		t.Fatal("expected malformed intermediate error")
+	}
+	if !strings.Contains(err.Error(), "verify intermediate certificate") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewWebhookHandler_VerifiesIntermediateAtStartup(t *testing.T) {
+	now := time.Now().UTC()
+	tests := []struct {
+		name    string
+		cert    func(t *testing.T, rootPriv ed25519.PrivateKey, signingPub ed25519.PublicKey) []byte
+		root    func(goodRoot ed25519.PublicKey) ed25519.PublicKey
+		wantErr bool
+	}{
+		{
+			name: "valid",
+			cert: func(t *testing.T, rootPriv ed25519.PrivateKey, signingPub ed25519.PublicKey) []byte {
+				return testServiceIntermediateCertWithRoot(t, rootPriv, signingPub, "im_valid", now.Add(-time.Minute), now.Add(time.Hour))
+			},
+			root: func(goodRoot ed25519.PublicKey) ed25519.PublicKey { return goodRoot },
+		},
+		{
+			name: "expired",
+			cert: func(t *testing.T, rootPriv ed25519.PrivateKey, signingPub ed25519.PublicKey) []byte {
+				return testServiceIntermediateCertWithRoot(t, rootPriv, signingPub, "im_expired", now.Add(-2*time.Hour), now.Add(-time.Hour))
+			},
+			root:    func(goodRoot ed25519.PublicKey) ed25519.PublicKey { return goodRoot },
+			wantErr: true,
+		},
+		{
+			name: "wrong root",
+			cert: func(t *testing.T, rootPriv ed25519.PrivateKey, signingPub ed25519.PublicKey) []byte {
+				return testServiceIntermediateCertWithRoot(t, rootPriv, signingPub, "im_wrong_root", now.Add(-time.Minute), now.Add(time.Hour))
+			},
+			root: func(ed25519.PublicKey) ed25519.PublicKey {
+				wrongRoot, _, err := ed25519.GenerateKey(rand.Reader)
+				if err != nil {
+					t.Fatalf("GenerateKey(wrong root): %v", err)
+				}
+				return wrongRoot
+			},
+			wantErr: true,
+		},
+		{
+			name: "truncated",
+			cert: func(t *testing.T, rootPriv ed25519.PrivateKey, signingPub ed25519.PublicKey) []byte {
+				data := testServiceIntermediateCertWithRoot(t, rootPriv, signingPub, "im_truncated", now.Add(-time.Minute), now.Add(time.Hour))
+				return data[:len(data)/2]
+			},
+			root:    func(goodRoot ed25519.PublicKey) ed25519.PublicKey { return goodRoot },
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ledger, _ := openTestLedger(t)
+			signingPub, signingPriv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("GenerateKey(signing): %v", err)
+			}
+			rootPub, rootPriv, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatalf("GenerateKey(root): %v", err)
+			}
+			cfg := &Config{
+				IntermediateCert: tt.cert(t, rootPriv, signingPub),
+				RootPublicKey:    tt.root(rootPub),
+				FoundingProCap:   50,
+			}
+			_, err = NewWebhookHandler(cfg, db, NewPolarClient("token", "http://localhost", defaultPolarAPIVersion), NewEmailSender("key", "from@test.com"), ledger, signingPriv, zerolog.Nop())
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("NewWebhookHandler() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestHandleEvent_BadSubscriptionID(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Event data with no "id" field.
+	event := &PolarWebhookEvent{
+		Type: EventSubscriptionCreated,
+		Data: json.RawMessage(`{"status":"active"}`),
+	}
+
+	err := ts.handler.HandleEvent(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for missing subscription ID, got nil")
+	}
+}
+
+func TestHandleEvent_PolarFetchError(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Replace Polar with error server.
+	errorPolar := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"down"}`))
+	}))
+	defer errorPolar.Close()
+	ts.handler.polar = NewPolarClient(testPolarAPIToken, errorPolar.URL, defaultPolarAPIVersion)
+
+	event := &PolarWebhookEvent{
+		Type: EventSubscriptionCreated,
+		Data: json.RawMessage(testSubscriptionJSON),
+	}
+
+	err := ts.handler.HandleEvent(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for Polar fetch failure, got nil")
+	}
+}
+
+func TestProcessSubscription_RevokedClearsRefresh(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Pre-insert active entitlement with license.
+	now := time.Now().UTC()
+	expires := now.Add(45 * 24 * time.Hour)
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = "lic_revoked"
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicenseExpiresAt = &expires
+	refresh := now.Add(30 * 24 * time.Hour)
+	existing.NextRefreshAt = &refresh
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusRevoked,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	// Point email sender at mock.
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription revoked: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != statusRevoked {
+		t.Errorf("Status = %q, want %q", ent.Status, statusRevoked)
+	}
+	if ent.NextRefreshAt != nil {
+		t.Error("NextRefreshAt should be nil after revocation")
+	}
+}
+
+func TestProcessSubscription_RevokesAllUnexpiredIssuedLicenses(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	now := time.Now().UTC()
+	expires := now.Add(45 * 24 * time.Hour)
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = "lic_latest"
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicenseExpiresAt = &expires
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	for _, id := range []string{"lic_prior", "lic_latest"} {
+		if err := ts.db.InsertLicenseIssuance(ctx, LicenseIssuance{
+			LicenseID:      id,
+			SubscriptionID: testSubscriptionID,
+			ExpiresAt:      expires,
+			IssuedAt:       now.Add(-time.Hour),
+		}); err != nil {
+			t.Fatalf("InsertLicenseIssuance %s: %v", id, err)
+		}
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusRevoked,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription revoked: %v", err)
+	}
+	records, err := ts.db.ListLicenseRevocations(ctx)
+	if err != nil {
+		t.Fatalf("ListLicenseRevocations: %v", err)
+	}
+	got := make(map[string]bool, len(records))
+	for _, rec := range records {
+		got[rec.LicenseID] = true
+	}
+	for _, want := range []string{"lic_prior", "lic_latest"} {
+		if !got[want] {
+			t.Fatalf("missing revocation for %s; records=%+v", want, records)
+		}
+	}
+	crl, err := ts.handler.SignedCRL(ctx, now)
+	if err != nil {
+		t.Fatalf("SignedCRL: %v", err)
+	}
+	for _, revoked := range crl.Payload.Revoked {
+		if revoked.Reason != "" {
+			t.Fatalf("public CRL should omit reason, got %+v", revoked)
+		}
+	}
+}
+
+// TestSignedCRL_NoSigningKeyFailsClosed proves SignedCRL refuses to produce a
+// CRL when the dedicated CRL signing key is absent. The token signing key
+// (h.privateKey, the intermediate key) must never be reused to sign CRLs:
+// clients verify CRLs against the ROOT key, so an intermediate-signed CRL would
+// be silently rejected. Failing closed here surfaces the misconfiguration
+// instead of emitting an unverifiable CRL.
+func TestSignedCRL_NoSigningKeyFailsClosed(t *testing.T) {
+	ts := newTestSetup(t)
+	ts.handler.cfg.CRLPrivateKey = nil
+
+	_, err := ts.handler.SignedCRL(t.Context(), time.Now())
+	if err == nil {
+		t.Fatal("SignedCRL must fail closed when CRL signing key is not configured")
+	}
+	if !strings.Contains(err.Error(), "CRL signing key not configured") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSignedCRL_AdvancesGeneration(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	now := time.Now().UTC()
+
+	first, err := ts.handler.SignedCRL(ctx, now)
+	if err != nil {
+		t.Fatalf("first SignedCRL: %v", err)
+	}
+	second, err := ts.handler.SignedCRL(ctx, now)
+	if err != nil {
+		t.Fatalf("second SignedCRL: %v", err)
+	}
+	if first.Payload.Generation != 1 {
+		t.Fatalf("first CRL generation = %d, want 1", first.Payload.Generation)
+	}
+	if second.Payload.Generation != 2 {
+		t.Fatalf("second CRL generation = %d, want 2", second.Payload.Generation)
+	}
+}
+
+func TestSignedCRL_GenerationFailureFailsClosed(t *testing.T) {
+	ts := newTestSetup(t)
+	if _, err := ts.db.db.ExecContext(t.Context(), `DROP TABLE crl_generation`); err != nil {
+		t.Fatalf("drop crl_generation: %v", err)
+	}
+
+	_, err := ts.handler.SignedCRL(t.Context(), time.Now())
+	if err == nil {
+		t.Fatal("SignedCRL must fail closed when generation cannot advance")
+	}
+	if !strings.Contains(err.Error(), "advance CRL generation") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestSignedCRL_UsesDedicatedSigningKey(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	now := time.Now().UTC()
+
+	crlPub, crlPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey(CRL): %v", err)
+	}
+	ts.handler.cfg.CRLPrivateKey = crlPriv
+
+	if err := ts.db.UpsertLicenseRevocation(ctx, RevokedLicenseRecord{
+		LicenseID:      "lic_dedicated_crl_key",
+		SubscriptionID: "sub_dedicated_crl_key",
+		Reason:         "subscription_canceled",
+		RevokedAt:      now,
+	}); err != nil {
+		t.Fatalf("UpsertLicenseRevocation: %v", err)
+	}
+
+	crl, err := ts.handler.SignedCRL(ctx, now)
+	if err != nil {
+		t.Fatalf("SignedCRL: %v", err)
+	}
+	data, err := json.Marshal(crl)
+	if err != nil {
+		t.Fatalf("Marshal CRL: %v", err)
+	}
+	if _, err := license.ParseAndVerifyCRL(data, crlPub, now); err != nil {
+		t.Fatalf("CRL should verify with dedicated CRL key: %v", err)
+	}
+	if _, err := license.ParseAndVerifyCRL(data, ts.publicKey, now); err == nil {
+		t.Fatal("CRL unexpectedly verified with token signing key")
+	}
+}
+
+func TestProcessSubscription_StaleActiveAfterTerminalDoesNotIssue(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	existing := testEntitlement(testSubscriptionID)
+	existing.Status = statusCanceled
+	existing.LastLicenseID = testLicenseExisting
+	existing.LastLicensePeriodEnd = &existing.CurrentPeriodEnd
+	existing.LastLicenseTier = existing.Tier
+	existing.LastLicenseInterval = existing.BillingInterval
+	existing.LastLicenseProductID = existing.ProductID
+	existing.LastDeliveryStatus = testDeliveryStatusSent
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert terminal entitlement: %v", err)
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusActive,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription stale active: %v", err)
+	}
+	issuances, err := ts.db.ListUnexpiredLicenseIssuances(ctx, testSubscriptionID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("ListUnexpiredLicenseIssuances: %v", err)
+	}
+	if len(issuances) != 0 {
+		t.Fatalf("stale active event minted issuance: %+v", issuances)
+	}
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != statusCanceled {
+		t.Fatalf("status changed to %q, want canceled", ent.Status)
+	}
+}
+
+func TestProcessSubscription_EmailFailureStillPersists(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Email mock that always fails.
+	failEmailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"email down"}`))
+	}))
+	defer failEmailSrv.Close()
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_fail",
+		fromEmail: "test@pipelock.dev",
+		client:    failEmailSrv.Client(),
+		apiURL:    failEmailSrv.URL,
+	}
+
+	sub := &PolarSubscription{
+		ID:                "sub_email_fail",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	// Should NOT return error (email failure is non-fatal for persistence).
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_email_fail")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement should be persisted even with email failure")
+	}
+	if ent.LastLicenseID == "" {
+		t.Error("license should still be issued despite email failure")
+	}
+}
+
+func TestProcessSubscription_HandleEndedNoExistingLicense(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Canceled subscription with NO prior entitlement (no license to expire).
+	sub := &PolarSubscription{
+		ID:                "sub_cancel_fresh",
+		Status:            statusCanceled,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_cancel_fresh")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != testStatusCanceled {
+		t.Errorf("Status = %q, want %q", ent.Status, testStatusCanceled)
+	}
+}
+
+func TestProcessSubscription_EndedEmailFailure(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Pre-insert an existing entitlement with a license expiry so handleEnded
+	// will attempt to send a cancellation email.
+	now := time.Now().UTC()
+	expires := now.Add(45 * 24 * time.Hour)
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = testLicenseIDOld
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicenseExpiresAt = &expires
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	// Email mock that always fails.
+	failEmailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"email down"}`))
+	}))
+	defer failEmailSrv.Close()
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_fail",
+		fromEmail: "test@pipelock.dev",
+		client:    failEmailSrv.Client(),
+		apiURL:    failEmailSrv.URL,
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusCanceled,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	// handleEnded should NOT return error even when email fails.
+	// Email failure is logged but non-fatal.
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != testStatusCanceled {
+		t.Errorf("Status = %q, want %q", ent.Status, testStatusCanceled)
+	}
+}
+
+func TestHandleEnded_ReplayRetriesCancellationEmail(t *testing.T) {
+	ts := newTestSetup(t)
+	var deliveries atomic.Int32
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		deliveries.Add(1)
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"msg_ended"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@example.com",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	expires := time.Now().UTC().Add(24 * time.Hour)
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseExpiresAt = &expires
+	ended := testEntitlement(testSubscriptionID)
+	ended.Status = statusCanceled
+
+	const deliveryID = "msg_ended_replay"
+	if err := ts.handler.handleEnded(t.Context(), ended, existing, EventSubscriptionCanceled, deliveryID); err != nil {
+		t.Fatalf("handleEnded(first): %v", err)
+	}
+	if err := ts.handler.handleEnded(t.Context(), ended, existing, EventSubscriptionCanceled, deliveryID); err != nil {
+		t.Fatalf("handleEnded(replay): %v", err)
+	}
+	if got := deliveries.Load(); got != 2 {
+		t.Fatalf("cancellation email deliveries = %d, want 2 including committed-marker replay", got)
+	}
+}
+
+func TestProcessSubscription_EndedPreservesLicenseFields(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Pre-insert an entitlement with full license state.
+	now := time.Now().UTC()
+	expires := now.Add(45 * 24 * time.Hour)
+	periodEnd := time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC)
+	existing := testEntitlement(testSubscriptionID)
+	existing.LastLicenseID = testLicenseIDOld
+	existing.LastLicenseIssuedAt = &now
+	existing.LastLicenseExpiresAt = &expires
+	existing.LastLicensePeriodEnd = &periodEnd
+	existing.LastLicenseTier = tierPro
+	existing.LastLicenseInterval = testIntervalMonth
+	existing.LastLicenseProductID = testProductID
+	existing.LastDeliveryStatus = testDeliveryStatusSent
+	existing.LastDeliveryAttemptAt = &now
+	if err := ts.db.Upsert(ctx, existing); err != nil {
+		t.Fatalf("Upsert existing: %v", err)
+	}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@example.com",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	sub := &PolarSubscription{
+		ID:                testSubscriptionID,
+		Status:            statusCanceled,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  periodEnd,
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, testSubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+
+	// Verify cancellation was recorded.
+	if ent.Status != testStatusCanceled {
+		t.Errorf("Status = %q, want %q", ent.Status, testStatusCanceled)
+	}
+
+	// Verify LastLicense* fields survived the upsert.
+	if ent.LastLicenseID != testLicenseIDOld {
+		t.Errorf("LastLicenseID = %q, want %q", ent.LastLicenseID, testLicenseIDOld)
+	}
+	if ent.LastLicenseIssuedAt == nil {
+		t.Error("LastLicenseIssuedAt is nil, want non-nil")
+	}
+	if ent.LastLicenseExpiresAt == nil {
+		t.Error("LastLicenseExpiresAt is nil, want non-nil")
+	}
+	if ent.LastLicenseTier != tierPro {
+		t.Errorf("LastLicenseTier = %q, want %q", ent.LastLicenseTier, tierPro)
+	}
+	if ent.LastDeliveryStatus != testDeliveryStatusSent {
+		t.Errorf("LastDeliveryStatus = %q, want %q", ent.LastDeliveryStatus, testDeliveryStatusSent)
+	}
+}
+
+func TestNewWebhookHandler_DBError(t *testing.T) {
+	db := openTestDB(t)
+	ledger, _ := openTestLedger(t)
+
+	// Close the DB so CountFounding fails.
+	_ = db.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+	cert, rootPub := testServiceIntermediateCert(t, pub)
+
+	cfg := &Config{
+		IntermediateCert: cert,
+		RootPublicKey:    rootPub,
+		FoundingProCap:   50,
+	}
+	polar := NewPolarClient("token", "http://localhost", defaultPolarAPIVersion)
+	email := NewEmailSender("key", "from@test.com")
+
+	_, err = NewWebhookHandler(cfg, db, polar, email, ledger, priv, zerolog.Nop())
+	if err == nil {
+		t.Fatal("expected error when DB is closed, got nil")
+	}
+}
+
+func TestProcessSubscription_DBErrorOnGetExisting(t *testing.T) {
+	ts := newTestSetup(t)
+
+	// Close the DB so GetBySubscriptionID fails.
+	_ = ts.db.Close()
+
+	sub := &PolarSubscription{
+		ID:                "sub_db_error",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	err := ts.handler.processSubscription(t.Context(), sub)
+	if err == nil {
+		t.Fatal("expected DB error, got nil")
+	}
+}
+
+func TestProcessSubscription_LicenseIssueError(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Replace private key with an invalid one (wrong length).
+	ts.handler.privateKey = ed25519.PrivateKey([]byte("too-short"))
+
+	sub := &PolarSubscription{
+		ID:                "sub_bad_key",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	err := ts.handler.processSubscription(ctx, sub)
+	if err == nil {
+		t.Fatal("expected license issue error, got nil")
+	}
+}
+
+func TestProcessSubscription_FoundingCapDBError(t *testing.T) {
+	ts := newTestSetup(t)
+
+	// Close the DB so the founding cap check's DB lookup fails.
+	_ = ts.db.Close()
+
+	sub := &PolarSubscription{
+		ID:                "sub_founding_db_err",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "founding_pro"}
+
+	err := ts.handler.processSubscription(t.Context(), sub)
+	if err == nil {
+		t.Fatal("expected founding cap DB error, got nil")
+	}
+}
+
+func TestProcessSubscription_UnpaidStatus(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	sub := &PolarSubscription{
+		ID:                "sub_unpaid",
+		Status:            statusUnpaid,
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription unpaid: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_unpaid")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.Status != statusUnpaid {
+		t.Errorf("Status = %q, want %q", ent.Status, statusUnpaid)
+	}
+}
+
+func TestProcessSubscription_LicenseTierAndSubscriptionIDPopulated(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Capture the email request body to extract the minted token.
+	var capturedBody []byte
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test789"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+
+	sub := &PolarSubscription{
+		ID:                "sub_tier_check",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "tiercorp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@example.com",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	if err := ts.handler.processSubscription(ctx, sub); err != nil {
+		t.Fatalf("processSubscription: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_tier_check")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent.LastLicenseID == "" {
+		t.Fatal("no license issued")
+	}
+	if ent.LastLicenseTier != tierPro {
+		t.Errorf("LastLicenseTier = %q, want %q", ent.LastLicenseTier, tierPro)
+	}
+
+	// Decode the actual minted token from the email body to verify
+	// Tier and SubscriptionID are populated in the signed payload.
+	var emailReq resendRequest
+	if err := json.Unmarshal(capturedBody, &emailReq); err != nil {
+		t.Fatalf("unmarshal email request: %v", err)
+	}
+
+	// Extract token from HTML: it's between <pre ...> and </pre>.
+	html := emailReq.HTML
+	preStart := strings.Index(html, "<pre")
+	preEnd := strings.Index(html, "</pre>")
+	if preStart < 0 || preEnd < 0 {
+		t.Fatal("could not find token in email HTML")
+	}
+	// Find the closing > of the <pre> opening tag.
+	tokenStart := strings.Index(html[preStart:], ">") + preStart + 1
+	token := html[tokenStart:preEnd]
+
+	decoded, err := license.DecodeUnverified(token)
+	if err != nil {
+		t.Fatalf("decode minted token: %v", err)
+	}
+	if decoded.Tier != tierPro {
+		t.Errorf("token Tier = %q, want %q", decoded.Tier, tierPro)
+	}
+	if decoded.SubscriptionID != "sub_tier_check" {
+		t.Errorf("token SubscriptionID = %q, want %q", decoded.SubscriptionID, "sub_tier_check")
+	}
+}
+
+func TestProcessSubscription_ConcurrentCallsOnlyMintOnce(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Count email sends to prove single-mint under concurrent calls.
+	var emailCount atomic.Int32
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		emailCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_test789"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@example.com",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	sub := &PolarSubscription{
+		ID:                "sub_concurrent",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 4, 12, 0, 0, 0, 0, time.UTC),
+	}
+	sub.Customer.Email = testCustomerEmail
+	sub.Customer.Metadata = map[string]string{"org": "concorp"}
+	sub.Product.ID = testProductID
+	sub.Product.Name = testProductName
+	sub.Product.Metadata = map[string]string{"pipelock_tier": "pro"}
+
+	// Run two concurrent processSubscription calls for the same subscription.
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			errs <- ts.handler.processSubscription(ctx, sub)
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent processSubscription[%d]: %v", i, err)
+		}
+	}
+
+	// Verify only one license ID exists (second call should be idempotent).
+	ent, err := ts.db.GetBySubscriptionID(ctx, "sub_concurrent")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement not found")
+	}
+	if ent.LastLicenseID == "" {
+		t.Error("expected a license to be issued")
+	}
+	// The mutex ensures the second call sees the first call's result and
+	// takes the idempotent path (no double-mint).
+	if ent.LastDeliveryStatus != testDeliveryStatusSent {
+		t.Errorf("delivery status = %q, want %q", ent.LastDeliveryStatus, testDeliveryStatusSent)
+	}
+	// Email send count proves single-mint: the first call mints + sends,
+	// the second call hits the idempotent path and skips minting entirely.
+	if got := emailCount.Load(); got != 1 {
+		t.Errorf("email send count = %d, want 1 (single mint)", got)
+	}
+}
+
+func TestTokenLifetimeForTier(t *testing.T) {
+	ts := newTestSetup(t)
+
+	tests := []struct {
+		name string
+		tier string
+		want time.Duration
+	}{
+		{"trial gets 30 days", tierTrial, trialTokenLifetime},
+		{"pro gets 45 days", tierPro, tokenLifetime},
+		{"founding pro gets 45 days", tierFoundingPro, tokenLifetime},
+		{"enterprise gets 45 days", tierEnterprise, tokenLifetime},
+		{"enterprise eval gets 60 days", tierEnterpriseEval, evalTokenLifetime},
+		{"enterprise trial gets 60 days", tierEnterpriseTrial, enterpriseTrialTokenLifetime},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ts.handler.tokenLifetimeForTier(tt.tier)
+			if got != tt.want {
+				t.Errorf("tokenLifetimeForTier(%q) = %v, want %v", tt.tier, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProcessSubscription_TrialDoesNotCountAsFounding(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Point email sender at mock.
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    ts.emailSrv.Client(),
+		apiURL:    ts.emailSrv.URL,
+	}
+
+	// Process an order event for a trial product.
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             "order_trial_founding_test",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_trial_test",
+			"name":     "Pipelock Pro Trial",
+			"metadata": map[string]string{"pipelock_tier": "trial"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("HandleOrderEvent: %v", err)
+	}
+
+	// Verify founding count is still 0.
+	count, err := ts.db.CountFounding(ctx)
+	if err != nil {
+		t.Fatalf("CountFounding: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("CountFounding = %d, want 0 (trials should not count as founding)", count)
+	}
+
+	// Verify entitlement has founding=false and no founding_reserved_at.
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_trial_founding_test")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement not found")
+	}
+	if ent.Founding {
+		t.Error("trial entitlement should have founding=false")
+	}
+	if ent.FoundingReservedAt != nil {
+		t.Error("trial entitlement should have nil FoundingReservedAt")
+	}
+
+	// Now process a founding_pro subscription.
+	foundingSub := &PolarSubscription{
+		ID:                "sub_founding_after_trial",
+		Status:            "active",
+		RecurringInterval: testIntervalMonth,
+		CurrentPeriodEnd:  time.Date(2026, 5, 12, 0, 0, 0, 0, time.UTC),
+	}
+	foundingSub.Customer.Email = "founder@example.com"
+	foundingSub.Customer.Metadata = map[string]string{}
+	foundingSub.Product.ID = "prod_founding"
+	foundingSub.Product.Name = "Pipelock Founding Pro"
+	foundingSub.Product.Metadata = map[string]string{"pipelock_tier": "founding_pro"}
+
+	if err := ts.handler.processSubscription(ctx, foundingSub); err != nil {
+		t.Fatalf("processSubscription founding: %v", err)
+	}
+
+	// Verify founding count is now 1.
+	count, err = ts.db.CountFounding(ctx)
+	if err != nil {
+		t.Fatalf("CountFounding: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("CountFounding = %d, want 1 after founding subscription", count)
+	}
+}
+
+func TestHandleOrderEvent_OneTimeTrial(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Capture email to extract token.
+	var capturedBody []byte
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"msg_trial_test"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             "order_trial_123",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{"org": "trialcorp"},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_trial",
+			"name":     "Pipelock Pro Trial",
+			"metadata": map[string]string{"pipelock_tier": "trial"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("HandleOrderEvent: %v", err)
+	}
+
+	// Verify entitlement created in DB.
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_trial_123")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement not found after HandleOrderEvent")
+	}
+	if ent.Tier != tierTrial {
+		t.Errorf("Tier = %q, want %q", ent.Tier, tierTrial)
+	}
+	if ent.BillingInterval != billingIntervalOneTime {
+		t.Errorf("BillingInterval = %q, want %q", ent.BillingInterval, billingIntervalOneTime)
+	}
+	if ent.Status != statusActive {
+		t.Errorf("Status = %q, want %q", ent.Status, statusActive)
+	}
+	if ent.Founding {
+		t.Error("trial should not be founding")
+	}
+	if ent.Org != "trialcorp" {
+		t.Errorf("Org = %q, want %q", ent.Org, "trialcorp")
+	}
+
+	// Verify license token issued and valid.
+	if ent.LastLicenseID == "" {
+		t.Fatal("no license issued")
+	}
+	if !strings.HasPrefix(ent.LastLicenseID, "lic_") {
+		t.Errorf("LastLicenseID format wrong: %q", ent.LastLicenseID)
+	}
+
+	// Verify token expires in ~30 days (not 45).
+	if ent.LastLicenseExpiresAt == nil {
+		t.Fatal("LastLicenseExpiresAt is nil")
+	}
+	expiresIn := time.Until(*ent.LastLicenseExpiresAt)
+	// Allow 1 minute of tolerance for test execution time.
+	if expiresIn < 29*24*time.Hour || expiresIn > 31*24*time.Hour {
+		t.Errorf("token expires in %v, want ~30 days", expiresIn)
+	}
+
+	// Verify the minted token can be decoded and has correct fields.
+	var emailReq resendRequest
+	if err := json.Unmarshal(capturedBody, &emailReq); err != nil {
+		t.Fatalf("unmarshal email request: %v", err)
+	}
+
+	// Extract token from HTML: it's between <pre ...> and </pre>.
+	html := emailReq.HTML
+	preStart := strings.Index(html, "<pre")
+	preEnd := strings.Index(html, "</pre>")
+	if preStart < 0 || preEnd < 0 {
+		t.Fatal("could not find token in email HTML")
+	}
+	tokenStart := strings.Index(html[preStart:], ">") + preStart + 1
+	token := html[tokenStart:preEnd]
+
+	decoded, err := license.DecodeUnverified(token)
+	if err != nil {
+		t.Fatalf("decode minted token: %v", err)
+	}
+	if decoded.Tier != tierTrial {
+		t.Errorf("token Tier = %q, want %q", decoded.Tier, tierTrial)
+	}
+
+	// Verify email was sent (delivery status updated from "pending" to "sent").
+	entAfter, err := ts.db.GetBySubscriptionID(ctx, "order_trial_123")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID after email: %v", err)
+	}
+	if entAfter.LastDeliveryStatus != testDeliveryStatusSent {
+		t.Errorf("delivery status = %q, want %q", entAfter.LastDeliveryStatus, testDeliveryStatusSent)
+	}
+}
+
+func TestTrialSupportAccess(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	var delivered []resendRequest
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		var request resendRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode delivery: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		delivered = append(delivered, request)
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"msg_trial_support"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	const orderID = "order_free_520_support"
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, orderID, "support@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	issued, err := ts.db.GetBySubscriptionID(ctx, orderID)
+	if err != nil || issued == nil {
+		t.Fatalf("load issued trial: entitlement=%+v err=%v", issued, err)
+	}
+	if issued.LastLicenseExpiresAt == nil {
+		t.Fatal("issued trial has no expiry")
+	}
+	originalExpiry := *issued.LastLicenseExpiresAt
+	originalToken, err := ts.handler.regenerateToken(issued)
+	if err != nil {
+		t.Fatalf("regenerate issued token: %v", err)
+	}
+
+	access, err := ts.handler.InspectTrialAccess(ctx, orderID)
+	if err != nil {
+		t.Fatalf("inspect trial: %v", err)
+	}
+	if access.LicenseID != issued.LastLicenseID || access.ExpiresAt == nil || !access.ExpiresAt.Equal(originalExpiry) || access.Revoked {
+		t.Fatalf("unexpected support view: %+v", access)
+	}
+
+	if err := ts.handler.ResendTrialAccess(ctx, orderID, "buyer requested recovery", time.Now()); err != nil {
+		t.Fatalf("resend trial: %v", err)
+	}
+	if len(delivered) != 2 {
+		t.Fatalf("email deliveries = %d, want original plus resend", len(delivered))
+	}
+	if !strings.Contains(delivered[1].HTML, originalToken) {
+		t.Fatal("resend did not carry the original deterministic token")
+	}
+	resent, err := ts.db.GetBySubscriptionID(ctx, orderID)
+	if err != nil || resent == nil {
+		t.Fatalf("load resent trial: entitlement=%+v err=%v", resent, err)
+	}
+	if resent.LastLicenseID != issued.LastLicenseID || resent.LastLicenseExpiresAt == nil || !resent.LastLicenseExpiresAt.Equal(originalExpiry) {
+		t.Fatalf("resend changed trial identity or expiry: %+v", resent)
+	}
+	if got := countLicenseIssuances(t, ts.db, orderID); got != 1 {
+		t.Fatalf("resend minted %d issuances, want 1", got)
+	}
+
+	var slotExpiry time.Time
+	if err := ts.db.db.QueryRowContext(ctx, `SELECT expires_at FROM active_trial_slots WHERE subscription_id = ?`, orderID).Scan(&slotExpiry); err != nil {
+		t.Fatalf("load trial slot: %v", err)
+	}
+	if err := ts.handler.RevokeTrialAccess(ctx, orderID, "support revocation", time.Now()); err != nil {
+		t.Fatalf("revoke trial: %v", err)
+	}
+	revoked, err := ts.db.GetBySubscriptionID(ctx, orderID)
+	if err != nil || revoked == nil {
+		t.Fatalf("load revoked trial: entitlement=%+v err=%v", revoked, err)
+	}
+	if revoked.Status != statusRevoked {
+		t.Fatalf("status after revocation = %q, want %q", revoked.Status, statusRevoked)
+	}
+	var retainedSlotExpiry time.Time
+	if err := ts.db.db.QueryRowContext(ctx, `SELECT expires_at FROM active_trial_slots WHERE subscription_id = ?`, orderID).Scan(&retainedSlotExpiry); err != nil {
+		t.Fatalf("load retained trial slot: %v", err)
+	}
+	if !retainedSlotExpiry.Equal(slotExpiry) {
+		t.Fatalf("revocation changed immutable trial slot expiry: got %v want %v", retainedSlotExpiry, slotExpiry)
+	}
+	crl, err := ts.handler.SignedCRL(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("sign CRL after trial revoke: %v", err)
+	}
+	foundRevocation := false
+	for _, item := range crl.Payload.Revoked {
+		if item.ID == issued.LastLicenseID {
+			foundRevocation = true
+		}
+	}
+	if !foundRevocation {
+		t.Fatalf("signed CRL omitted revoked trial token %q", issued.LastLicenseID)
+	}
+	if err := ts.handler.RevokeTrialAccess(ctx, orderID, "replay", time.Now()); !errors.Is(err, ErrTrialAlreadyRevoked) {
+		t.Fatalf("replayed revocation error = %v, want ErrTrialAlreadyRevoked", err)
+	}
+	if err := ts.handler.ResendTrialAccess(ctx, orderID, "after revoke", time.Now()); err == nil {
+		t.Fatal("resend after revocation must fail")
+	}
+
+	ledgerData, err := os.ReadFile(ts.ledger.path)
+	if err != nil {
+		t.Fatalf("read audit ledger: %v", err)
+	}
+	wantEvents := map[string]int{
+		AuditTrialResendRequested: 0,
+		AuditTrialResent:          0,
+		AuditTrialRevokeRequested: 0,
+		AuditLicenseRevoked:       0,
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(ledgerData)), "\n") {
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode audit entry %q: %v", line, err)
+		}
+		if _, tracked := wantEvents[entry.Event]; !tracked {
+			continue
+		}
+		if entry.SubscriptionID != orderID || entry.LicenseID != issued.LastLicenseID {
+			t.Fatalf("audit event %q has wrong ownership: %+v", entry.Event, entry)
+		}
+		if entry.Detail == "" {
+			t.Fatalf("audit event %q omitted its operator reason: %+v", entry.Event, entry)
+		}
+		wantEvents[entry.Event]++
+	}
+	for event, count := range wantEvents {
+		if count != 1 {
+			t.Fatalf("audit event %q count = %d, want 1; ledger: %s", event, count, ledgerData)
+		}
+	}
+}
+
+func TestTrialSupportAccessRejectsInvalidState(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	nonTrial := &Entitlement{
+		SubscriptionID:   "sub_paid_not_trial",
+		CustomerEmail:    "paid@example.com",
+		ProductID:        "prod_paid",
+		Tier:             tierPro,
+		BillingInterval:  "month",
+		Status:           statusActive,
+		CurrentPeriodEnd: time.Now().Add(24 * time.Hour),
+		Features:         "[]",
+	}
+	if err := ts.db.Upsert(ctx, nonTrial); err != nil {
+		t.Fatalf("create non-trial entitlement: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		run  func() error
+		want string
+	}{
+		{
+			name: "unknown inspect",
+			run: func() error {
+				_, err := ts.handler.InspectTrialAccess(ctx, "order_missing")
+				return err
+			},
+			want: ErrTrialAccessNotFound.Error(),
+		},
+		{
+			name: "non-trial inspect",
+			run: func() error {
+				_, err := ts.handler.InspectTrialAccess(ctx, nonTrial.SubscriptionID)
+				return err
+			},
+			want: ErrTrialAccessNotFound.Error(),
+		},
+		{
+			name: "blank identifier",
+			run: func() error {
+				return ts.handler.ResendTrialAccess(ctx, "", "support", time.Now())
+			},
+			want: "subscription_id is required",
+		},
+		{
+			name: "blank resend reason",
+			run: func() error {
+				return ts.handler.ResendTrialAccess(ctx, "order_missing", "", time.Now())
+			},
+			want: "resend reason is required",
+		},
+		{
+			name: "blank revoke reason",
+			run: func() error {
+				return ts.handler.RevokeTrialAccess(ctx, "order_missing", "", time.Now())
+			},
+			want: "revocation reason is required",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := tt.run(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("invalid trial support request error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestInspectTrialAccessDetectsTokenRevocation(t *testing.T) {
+	ts := newTestSetup(t)
+	const orderID = "order_free_520_inspect_revoked_token"
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "inspect-revoked@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	ent, err := ts.db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil || ent == nil {
+		t.Fatalf("load issued trial: entitlement=%+v err=%v", ent, err)
+	}
+	if err := ts.db.UpsertLicenseRevocation(t.Context(), RevokedLicenseRecord{
+		LicenseID:      ent.LastLicenseID,
+		SubscriptionID: orderID,
+		Reason:         "support",
+		RevokedAt:      time.Now(),
+	}); err != nil {
+		t.Fatalf("record token revocation: %v", err)
+	}
+	access, err := ts.handler.InspectTrialAccess(t.Context(), orderID)
+	if err != nil {
+		t.Fatalf("inspect trial: %v", err)
+	}
+	if !access.Revoked {
+		t.Fatalf("inspect did not surface token revocation: %+v", access)
+	}
+}
+
+func TestRevokeTrialAccessCompletesPartialTokenRevocation(t *testing.T) {
+	ts := newTestSetup(t)
+	const orderID = "order_free_520_partial_token_revocation"
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "partial-revoke@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	ent, err := ts.db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil || ent == nil {
+		t.Fatalf("load issued trial: entitlement=%+v err=%v", ent, err)
+	}
+	now := time.Now().UTC()
+	older := LicenseIssuance{
+		LicenseID:      "lic_older_live_trial_token",
+		SubscriptionID: orderID,
+		IssuedAt:       now.Add(-time.Hour),
+		ExpiresAt:      now.Add(time.Hour),
+	}
+	if err := ts.db.InsertLicenseIssuance(t.Context(), older); err != nil {
+		t.Fatalf("record older trial issuance: %v", err)
+	}
+	issuances, err := ts.db.ListUnexpiredLicenseIssuances(t.Context(), orderID, now)
+	if err != nil {
+		t.Fatalf("list seeded trial issuances: %v", err)
+	}
+	if len(issuances) != 2 {
+		t.Fatalf("seeded trial issuances = %+v, want 2", issuances)
+	}
+	if err := ts.db.UpsertLicenseRevocation(t.Context(), RevokedLicenseRecord{
+		LicenseID:      ent.LastLicenseID,
+		SubscriptionID: orderID,
+		Reason:         "partial support revocation",
+		RevokedAt:      now,
+	}); err != nil {
+		t.Fatalf("record partial token revocation: %v", err)
+	}
+	if err := ts.handler.RevokeTrialAccess(t.Context(), orderID, "revoke every live token", now); err != nil {
+		t.Fatalf("revoke trial with newest token already revoked: %v", err)
+	}
+	records, err := ts.db.ListLicenseRevocations(t.Context())
+	if err != nil {
+		t.Fatalf("list token revocations: %v", err)
+	}
+	revokedIDs := make(map[string]bool, len(records))
+	for _, record := range records {
+		revokedIDs[record.LicenseID] = true
+	}
+	if !revokedIDs[ent.LastLicenseID] || !revokedIDs[older.LicenseID] {
+		t.Fatalf("trial revocation omitted a live issuance: %+v", records)
+	}
+}
+
+func TestRevokeTrialAccessDoesNotMislabelInactiveTrial(t *testing.T) {
+	ts := newTestSetup(t)
+	ent := &Entitlement{
+		SubscriptionID:   "order_free_520_inactive_revoke",
+		CustomerEmail:    "inactive-revoke@example.com",
+		ProductID:        "prod_trial",
+		Tier:             tierTrial,
+		BillingInterval:  billingIntervalOneTime,
+		Status:           statusCanceled,
+		CurrentPeriodEnd: time.Now().Add(time.Hour),
+		Features:         "[]",
+	}
+	if err := ts.db.Upsert(t.Context(), ent); err != nil {
+		t.Fatalf("create inactive trial: %v", err)
+	}
+	err := ts.handler.RevokeTrialAccess(t.Context(), ent.SubscriptionID, "support", time.Now())
+	if err == nil {
+		t.Fatal("inactive trial revocation must fail")
+	}
+	if errors.Is(err, ErrTrialAlreadyRevoked) {
+		t.Fatalf("inactive trial was mislabeled as already revoked: %v", err)
+	}
+}
+
+func TestResendTrialAccessFailsOnDeliveryAndAuditErrors(t *testing.T) {
+	t.Run("missing persisted issuance is rejected", func(t *testing.T) {
+		ts := newTestSetup(t)
+		const orderID = "order_free_520_missing_issuance"
+		if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "missing-issuance@example.com")); err != nil {
+			t.Fatalf("issue trial: %v", err)
+		}
+		if _, err := ts.db.db.ExecContext(t.Context(), `DELETE FROM license_issuances WHERE subscription_id = ?`, orderID); err != nil {
+			t.Fatalf("remove persisted issuance: %v", err)
+		}
+		var emailAttempts atomic.Int32
+		emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			emailAttempts.Add(1)
+			w.Header().Set("Content-Type", testContentTypeJSON)
+			_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+		}))
+		t.Cleanup(emailSrv.Close)
+		ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+
+		err := ts.handler.ResendTrialAccess(t.Context(), orderID, "support", time.Now())
+		if err == nil || !strings.Contains(err.Error(), "no matching persisted issuance") {
+			t.Fatalf("missing issuance error = %v", err)
+		}
+		if got := emailAttempts.Load(); got != 0 {
+			t.Fatalf("missing issuance sent %d emails, want 0", got)
+		}
+	})
+
+	t.Run("malformed persisted token metadata is rejected", func(t *testing.T) {
+		ts := newTestSetup(t)
+		const orderID = "order_free_520_malformed_resend"
+		if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "malformed-resend@example.com")); err != nil {
+			t.Fatalf("issue trial: %v", err)
+		}
+		if _, err := ts.db.db.ExecContext(t.Context(),
+			`UPDATE entitlements SET last_license_issued_at = NULL WHERE subscription_id = ?`, orderID); err != nil {
+			t.Fatalf("remove issue timestamp: %v", err)
+		}
+		var emailAttempts atomic.Int32
+		emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			emailAttempts.Add(1)
+			w.Header().Set("Content-Type", testContentTypeJSON)
+			_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+		}))
+		t.Cleanup(emailSrv.Close)
+		ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+		err := ts.handler.ResendTrialAccess(t.Context(), orderID, "support", time.Now())
+		if err == nil || !strings.Contains(err.Error(), "persisted issue and expiry timestamps") {
+			t.Fatalf("malformed metadata error = %v", err)
+		}
+		if got := emailAttempts.Load(); got != 0 {
+			t.Fatalf("malformed metadata sent %d emails, want 0", got)
+		}
+	})
+
+	t.Run("delivery state persistence failure is nonzero", func(t *testing.T) {
+		ts := newTestSetup(t)
+		const orderID = "order_free_520_delivery_state_failure"
+		if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "delivery-state@example.com")); err != nil {
+			t.Fatalf("issue trial: %v", err)
+		}
+		emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			if err := ts.db.Close(); err != nil {
+				t.Errorf("close entitlement database: %v", err)
+			}
+			w.Header().Set("Content-Type", testContentTypeJSON)
+			_, _ = w.Write([]byte(`{"id":"msg_without_delivery_state"}`))
+		}))
+		t.Cleanup(emailSrv.Close)
+		ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+		if err := ts.handler.ResendTrialAccess(t.Context(), orderID, "support", time.Now()); err == nil {
+			t.Fatal("delivery-state persistence failure must fail")
+		}
+	})
+
+	t.Run("email failure is nonzero and preserves the original trial", func(t *testing.T) {
+		ts := newTestSetup(t)
+		const orderID = "order_free_520_email_failure"
+		if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "email-failure@example.com")); err != nil {
+			t.Fatalf("issue trial: %v", err)
+		}
+		before, err := ts.db.GetBySubscriptionID(t.Context(), orderID)
+		if err != nil || before == nil {
+			t.Fatalf("load issued trial: entitlement=%+v err=%v", before, err)
+		}
+		failureSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+		}))
+		t.Cleanup(failureSrv.Close)
+		ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: failureSrv.Client(), apiURL: failureSrv.URL}
+
+		if err := ts.handler.ResendTrialAccess(t.Context(), orderID, "delivery retry", time.Now()); err == nil {
+			t.Fatal("email failure must make operator resend fail")
+		}
+		after, err := ts.db.GetBySubscriptionID(t.Context(), orderID)
+		if err != nil || after == nil {
+			t.Fatalf("load failed delivery state: entitlement=%+v err=%v", after, err)
+		}
+		if after.LastLicenseID != before.LastLicenseID || after.LastLicenseExpiresAt == nil || !after.LastLicenseExpiresAt.Equal(*before.LastLicenseExpiresAt) {
+			t.Fatalf("email failure changed trial token state: before=%+v after=%+v", before, after)
+		}
+		if after.LastDeliveryStatus != "failed" {
+			t.Fatalf("delivery status = %q, want failed", after.LastDeliveryStatus)
+		}
+	})
+
+	t.Run("audit failure is nonzero", func(t *testing.T) {
+		ts := newTestSetup(t)
+		const orderID = "order_free_520_audit_failure"
+		if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "audit-failure@example.com")); err != nil {
+			t.Fatalf("issue trial: %v", err)
+		}
+		var emailAttempts atomic.Int32
+		emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			emailAttempts.Add(1)
+			w.Header().Set("Content-Type", testContentTypeJSON)
+			_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+		}))
+		t.Cleanup(emailSrv.Close)
+		ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+		if err := ts.ledger.Close(); err != nil {
+			t.Fatalf("close ledger: %v", err)
+		}
+		if err := ts.handler.ResendTrialAccess(t.Context(), orderID, "audit failure", time.Now()); err == nil {
+			t.Fatal("audit failure must make operator resend fail")
+		}
+		if got := emailAttempts.Load(); got != 0 {
+			t.Fatalf("audit failure sent %d emails, want 0", got)
+		}
+	})
+
+	t.Run("completion audit failure does not retry a delivered email", func(t *testing.T) {
+		ts := newTestSetup(t)
+		var logOutput bytes.Buffer
+		ts.handler.log = zerolog.New(&logOutput)
+		const orderID = "order_free_520_completion_audit_failure"
+		if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "completion-audit@example.com")); err != nil {
+			t.Fatalf("issue trial: %v", err)
+		}
+		var emailAttempts atomic.Int32
+		emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			emailAttempts.Add(1)
+			if err := ts.ledger.Close(); err != nil {
+				t.Errorf("close ledger after send: %v", err)
+			}
+			w.Header().Set("Content-Type", testContentTypeJSON)
+			_, _ = w.Write([]byte(`{"id":"msg_delivered_before_audit_failure"}`))
+		}))
+		t.Cleanup(emailSrv.Close)
+		ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+
+		if err := ts.handler.ResendTrialAccess(t.Context(), orderID, "completion audit failure", time.Now()); err != nil {
+			t.Fatalf("delivered resend must not report failure after completion audit error: %v", err)
+		}
+		if got := emailAttempts.Load(); got != 1 {
+			t.Fatalf("email attempts = %d, want 1", got)
+		}
+		ent, err := ts.db.GetBySubscriptionID(t.Context(), orderID)
+		if err != nil {
+			t.Fatalf("load delivered trial: %v", err)
+		}
+		if ent == nil || ent.LastDeliveryStatus != "sent" {
+			t.Fatalf("delivery completion was not persisted: %+v", ent)
+		}
+		if !strings.Contains(logOutput.String(), "record trial resend completion") {
+			t.Fatalf("completion audit failure was not attempted: %s", logOutput.String())
+		}
+	})
+}
+
+func TestTrialSupportAccessRejectsExpiredResend(t *testing.T) {
+	ts := newTestSetup(t)
+	const orderID = "order_free_520_expired_resend"
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "expired-resend@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	if _, err := ts.db.db.ExecContext(t.Context(),
+		`UPDATE entitlements SET last_license_expires_at = ? WHERE subscription_id = ?`, time.Now().Add(-time.Minute), orderID); err != nil {
+		t.Fatalf("expire trial entitlement: %v", err)
+	}
+	var emailAttempts atomic.Int32
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		emailAttempts.Add(1)
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"unexpected"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	ts.handler.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+
+	if err := ts.handler.ResendTrialAccess(t.Context(), orderID, "expired recovery", time.Now()); err == nil {
+		t.Fatal("expired trial resend must fail")
+	}
+	if got := emailAttempts.Load(); got != 0 {
+		t.Fatalf("expired trial sent %d emails, want 0", got)
+	}
+}
+
+func TestTrialRevocationRequiresAuditIntentBeforeCommit(t *testing.T) {
+	ts := newTestSetup(t)
+	const orderID = "order_free_520_revoke_audit_failure"
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "revoke-audit@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	if err := ts.ledger.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	if err := ts.handler.RevokeTrialAccess(t.Context(), orderID, "audit unavailable", time.Now()); err == nil {
+		t.Fatal("audit failure must make operator revocation fail")
+	}
+	ent, err := ts.db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil {
+		t.Fatalf("load trial after failed revocation: %v", err)
+	}
+	if ent == nil || ent.Status != statusActive {
+		t.Fatalf("audit failure crossed revocation boundary: %+v", ent)
+	}
+	revocations, err := ts.db.ListLicenseRevocations(t.Context())
+	if err != nil {
+		t.Fatalf("list revocations: %v", err)
+	}
+	if len(revocations) != 0 {
+		t.Fatalf("audit failure wrote %d revocations, want 0", len(revocations))
+	}
+}
+
+func TestTrialRevocationAuditsZeroUnexpiredTokens(t *testing.T) {
+	ts := newTestSetup(t)
+	const orderID = "order_free_520_expired_revoke"
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "expired-revoke@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	expired := time.Now().Add(-time.Minute)
+	if _, err := ts.db.db.ExecContext(t.Context(),
+		`UPDATE entitlements SET last_license_expires_at = ? WHERE subscription_id = ?`, expired, orderID); err != nil {
+		t.Fatalf("expire trial entitlement: %v", err)
+	}
+	if _, err := ts.db.db.ExecContext(t.Context(),
+		`UPDATE license_issuances SET expires_at = ? WHERE subscription_id = ?`, expired, orderID); err != nil {
+		t.Fatalf("expire trial issuance: %v", err)
+	}
+	if err := ts.handler.RevokeTrialAccess(t.Context(), orderID, "expired trial cleanup", time.Now()); err != nil {
+		t.Fatalf("revoke expired trial: %v", err)
+	}
+	var revocationRows int
+	if err := ts.db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM license_revocations WHERE subscription_id = ?`, orderID).Scan(&revocationRows); err != nil {
+		t.Fatalf("count revocations: %v", err)
+	}
+	if revocationRows != 0 {
+		t.Fatalf("expired trial created %d token revocations, want 0", revocationRows)
+	}
+	ledgerData, err := os.ReadFile(ts.ledger.path)
+	if err != nil {
+		t.Fatalf("read audit ledger: %v", err)
+	}
+	if !strings.Contains(string(ledgerData), AuditTrialRevoked) {
+		t.Fatalf("zero-token trial revocation missing entitlement audit: %s", ledgerData)
+	}
+}
+
+func newFileBackedTrialSupportHandlers(t *testing.T) (*WebhookHandler, *WebhookHandler, *EntitlementDB) {
+	t.Helper()
+	ts := newTestSetup(t)
+	dbPath := filepath.Join(t.TempDir(), "trial-support.db")
+	firstDB, err := OpenEntitlementDB(t.Context(), dbPath)
+	if err != nil {
+		t.Fatalf("open first trial support database: %v", err)
+	}
+	t.Cleanup(func() { _ = firstDB.Close() })
+	secondDB, err := OpenEntitlementDB(t.Context(), dbPath)
+	if err != nil {
+		t.Fatalf("open second trial support database: %v", err)
+	}
+	t.Cleanup(func() { _ = secondDB.Close() })
+	first, err := NewWebhookHandler(ts.cfg, firstDB, ts.handler.polar, ts.handler.email, ts.ledger, ts.privateKey, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("create first trial support handler: %v", err)
+	}
+	second, err := NewWebhookHandler(ts.cfg, secondDB, ts.handler.polar, ts.handler.email, ts.ledger, ts.privateKey, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("create second trial support handler: %v", err)
+	}
+	return first, second, firstDB
+}
+
+func TestTrialSupportResendThenRefundProducesRevocation(t *testing.T) {
+	resender, revoker, db := newFileBackedTrialSupportHandlers(t)
+	const orderID = "order_free_520_cross_process_support"
+	if err := resender.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "cross-process@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+
+	emailEntered := make(chan struct{})
+	releaseEmail := make(chan struct{})
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(emailEntered)
+		<-releaseEmail
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"msg_cross_process_resend"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	resender.email = &EmailSender{apiKey: "re_test", fromEmail: "test@pipelock.dev", client: emailSrv.Client(), apiURL: emailSrv.URL}
+	refundSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = fmt.Fprintf(w, `{
+			"id": %q,
+			"billing_reason": "purchase",
+			"status": "refunded",
+			"paid": true,
+			"total_amount": 0,
+			"net_amount": 0,
+			"refunded_amount": 1,
+			"currency": "usd",
+			"customer": {"email": "cross-process@example.com", "metadata": {}},
+			"product": {"id": "prod_trial_free", "name": "Pipelock Pro Trial", "metadata": {"pipelock_tier": "trial"}}
+		}`, orderID)
+	}))
+	t.Cleanup(refundSrv.Close)
+	revoker.polar = NewPolarClient("polar_"+"test", refundSrv.URL, defaultPolarAPIVersion)
+
+	resendDone := make(chan error, 1)
+	go func() {
+		resendDone <- resender.ResendTrialAccess(t.Context(), orderID, "support resend", time.Now())
+	}()
+	select {
+	case <-emailEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("resend did not reach email delivery")
+	}
+	revokeDone := make(chan error, 1)
+	go func() {
+		revokeDone <- revoker.HandleOrderRefundEvent(t.Context(), &PolarWebhookEvent{
+			Type: EventOrderRefunded,
+			Data: json.RawMessage(fmt.Sprintf(`{"id":%q}`, orderID)),
+		}, "msg_cross_process_refund")
+	}()
+	close(releaseEmail)
+	if err := <-resendDone; err != nil {
+		t.Fatalf("resend trial: %v", err)
+	}
+	if err := <-revokeDone; err != nil {
+		t.Fatalf("revoke trial: %v", err)
+	}
+	ent, err := db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil || ent == nil || ent.Status != statusRevoked {
+		t.Fatalf("trial state after serialized support actions: entitlement=%+v err=%v", ent, err)
+	}
+}
+
+func TestTrialSupportOperationsHonorLockContextCancellation(t *testing.T) {
+	handler, _, db := newFileBackedTrialSupportHandlers(t)
+	const orderID = "order_free_520_lock_cancellation"
+	if err := handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "lock-cancellation@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+	release, err := acquireTrialSupportLock(t.Context(), db.trialSupportLockPath)
+	if err != nil {
+		t.Fatalf("hold trial support lock: %v", err)
+	}
+	defer release()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := handler.RevokeTrialAccess(ctx, orderID, "canceled lock wait", time.Now()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("revoke with canceled lock wait error = %v, want context canceled", err)
+	}
+	ent, err := db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil || ent == nil || ent.Status != statusActive {
+		t.Fatalf("canceled lock wait changed trial state: entitlement=%+v err=%v", ent, err)
+	}
+}
+
+func TestTrialRevocationConcurrentReplay(t *testing.T) {
+	first, second, _ := newFileBackedTrialSupportHandlers(t)
+	const orderID = "order_free_520_concurrent_revoke"
+	if err := first.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, orderID, "concurrent-revoke@example.com")); err != nil {
+		t.Fatalf("issue trial: %v", err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	var workers sync.WaitGroup
+	for _, handler := range []*WebhookHandler{first, second} {
+		workers.Add(1)
+		go func(handler *WebhookHandler) {
+			defer workers.Done()
+			<-start
+			results <- handler.RevokeTrialAccess(t.Context(), orderID, "concurrent support revoke", time.Now())
+		}(handler)
+	}
+	close(start)
+	workers.Wait()
+	close(results)
+
+	successes := 0
+	replays := 0
+	for err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		if errors.Is(err, ErrTrialAlreadyRevoked) {
+			replays++
+			continue
+		}
+		t.Fatalf("concurrent revocation error = %v", err)
+	}
+	if successes != 1 || replays != 1 {
+		t.Fatalf("concurrent results: successes=%d replays=%d, want one each", successes, replays)
+	}
+}
+
+func TestTrialSupportAccessDatabaseErrors(t *testing.T) {
+	t.Run("inspect fails when entitlement database is closed", func(t *testing.T) {
+		ts := newTestSetup(t)
+		if err := ts.db.Close(); err != nil {
+			t.Fatalf("close database: %v", err)
+		}
+		if _, err := ts.handler.InspectTrialAccess(t.Context(), "order_closed_db"); err == nil {
+			t.Fatal("closed database inspect must fail")
+		}
+	})
+
+	t.Run("revoke fails when revocation transaction cannot begin", func(t *testing.T) {
+		ts := newTestSetup(t)
+		if err := ts.db.Close(); err != nil {
+			t.Fatalf("close database: %v", err)
+		}
+		if err := ts.handler.RevokeTrialAccess(t.Context(), "order_closed_db", "database failure", time.Now()); err == nil {
+			t.Fatal("closed database revocation must fail")
+		}
+	})
+}
+
+func TestHandleOrderRefundEventLockedRechecksDelivery(t *testing.T) {
+	t.Run("already committed", func(t *testing.T) {
+		ts := newTestSetup(t)
+		const msgID = "msg_refund_recheck_committed"
+		if err := ts.db.MarkWebhookCommitted(t.Context(), msgID, EventOrderRefunded, "order_refund_recheck"); err != nil {
+			t.Fatalf("mark webhook committed: %v", err)
+		}
+		if err := ts.handler.handleOrderRefundEventLocked(t.Context(), &PolarWebhookEvent{Type: EventOrderRefunded}, msgID, &PolarOrder{ID: "order_refund_recheck"}); err != nil {
+			t.Fatalf("committed refund recheck: %v", err)
+		}
+	})
+
+	t.Run("database error", func(t *testing.T) {
+		ts := newTestSetup(t)
+		if err := ts.db.Close(); err != nil {
+			t.Fatalf("close database: %v", err)
+		}
+		err := ts.handler.handleOrderRefundEventLocked(t.Context(), &PolarWebhookEvent{Type: EventOrderRefunded}, "msg_refund_recheck_error", &PolarOrder{ID: "order_refund_recheck"})
+		if err == nil || !strings.Contains(err.Error(), "recheck webhook delivery") {
+			t.Fatalf("refund recheck error = %v", err)
+		}
+	})
+}
+
+func TestHandleActive_ConcurrentTrialClaimReturnsDenial(t *testing.T) {
+	ts := newTestSetup(t)
+	now := time.Now().UTC()
+	first := testEntitlement("order_first_trial")
+	first.CustomerEmail = "buyer@example.com"
+	first.Tier = tierTrial
+	first.BillingInterval = billingIntervalOneTime
+	first.CurrentPeriodEnd = now.Add(time.Hour)
+	if err := ts.db.UpsertWithLicenseIssuance(t.Context(), first, LicenseIssuance{
+		LicenseID:      "lic_first_trial",
+		SubscriptionID: first.SubscriptionID,
+		IssuedAt:       now,
+		ExpiresAt:      first.CurrentPeriodEnd,
+	}); err != nil {
+		t.Fatalf("seed first trial: %v", err)
+	}
+	second := testEntitlement("order_second_trial")
+	second.CustomerEmail = first.CustomerEmail
+	second.Tier = tierTrial
+	second.BillingInterval = billingIntervalOneTime
+	second.CurrentPeriodEnd = now.Add(time.Hour)
+	if err := ts.handler.handleActive(t.Context(), second, nil); err != nil {
+		t.Fatalf("active trial collision returned storage error: %v", err)
+	}
+	got, err := ts.db.GetBySubscriptionID(t.Context(), second.SubscriptionID)
+	if err != nil {
+		t.Fatalf("load denied trial: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("denied concurrent trial was persisted: %+v", got)
+	}
+}
+
+// TestHandleActive_TrialDenialIsNotAcknowledgedWithoutAudit pins the failure
+// direction of a denial the audit ledger cannot record. The trial is still
+// refused, but the webhook is NOT acknowledged, so the provider retries and the
+// decision reaches durable audit once the ledger recovers. Acknowledging here
+// would end the retries and leave no record that a trial was refused. This
+// matches the revocation path in eval.go, which also declines to acknowledge a
+// security decision the ledger could not record.
+func TestHandleActive_TrialDenialIsNotAcknowledgedWithoutAudit(t *testing.T) {
+	ts := newTestSetup(t)
+	now := time.Now().UTC()
+	first := testEntitlement("order_first_trial")
+	first.CustomerEmail = "buyer@example.com"
+	first.Tier = tierTrial
+	first.BillingInterval = billingIntervalOneTime
+	first.CurrentPeriodEnd = now.Add(time.Hour)
+	if err := ts.db.UpsertWithLicenseIssuance(t.Context(), first, LicenseIssuance{
+		LicenseID:      "lic_first_trial",
+		SubscriptionID: first.SubscriptionID,
+		IssuedAt:       now,
+		ExpiresAt:      first.CurrentPeriodEnd,
+	}); err != nil {
+		t.Fatalf("seed first trial: %v", err)
+	}
+	if err := ts.ledger.Close(); err != nil {
+		t.Fatalf("close denial ledger: %v", err)
+	}
+
+	second := testEntitlement("order_second_trial")
+	second.CustomerEmail = first.CustomerEmail
+	second.Tier = tierTrial
+	second.BillingInterval = billingIntervalOneTime
+	second.CurrentPeriodEnd = now.Add(time.Hour)
+	err := ts.handler.handleActive(t.Context(), second, nil)
+	if err == nil {
+		t.Fatal("denial with an unwritable audit ledger was acknowledged; the record would be lost")
+	}
+	// The trial is still refused: the security outcome never depended on the
+	// audit write succeeding.
+	got, lerr := ts.db.GetBySubscriptionID(t.Context(), second.SubscriptionID)
+	if lerr != nil {
+		t.Fatalf("load denied trial: %v", lerr)
+	}
+	if got != nil {
+		t.Fatalf("denied concurrent trial was persisted: %+v", got)
+	}
+}
+
+func TestMapOrderProductToTierFailsClosed(t *testing.T) {
+	ts := newTestSetup(t)
+	base := &PolarOrder{
+		ID:            "order_gate",
+		BillingReason: "purchase",
+		Status:        orderStatusPaid,
+		Paid:          true,
+		NetAmount:     100,
+		TotalAmount:   100,
+		Currency:      "usd",
+	}
+	base.Product.ID = "prod_trial"
+	base.Product.Metadata = map[string]string{"pipelock_tier": tierTrial}
+
+	tests := []struct {
+		name   string
+		mutate func(*PolarOrder)
+	}{
+		{name: "unpaid", mutate: func(o *PolarOrder) { o.Paid = false }},
+		{name: "wrong status", mutate: func(o *PolarOrder) { o.Status = "pending" }},
+		{name: "refunded", mutate: func(o *PolarOrder) { o.RefundedAmount = 1 }},
+		{name: "unallowlisted product", mutate: func(o *PolarOrder) { o.Product.ID = "prod_other" }},
+		{name: "metadata tier mismatch", mutate: func(o *PolarOrder) { o.Product.Metadata["pipelock_tier"] = tierPro }},
+		{name: "amount mismatch", mutate: func(o *PolarOrder) { o.NetAmount = 1 }},
+		{name: "currency mismatch", mutate: func(o *PolarOrder) { o.Currency = "eur" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			order := *base
+			order.Product = base.Product
+			order.Product.Metadata = maps.Clone(base.Product.Metadata)
+			tt.mutate(&order)
+			if _, err := ts.handler.mapOrderProductToTier(&order); err == nil {
+				t.Fatal("mapOrderProductToTier accepted unauthorized order")
+			}
+		})
+	}
+	if tier, err := ts.handler.mapOrderProductToTier(base); err != nil || tier != tierTrial {
+		t.Fatalf("valid order mapped to tier %q, err %v", tier, err)
+	}
+}
+
+func TestHandleOrderEvent_RejectsCurrentlyRefundedOrder(t *testing.T) {
+	ts := newTestSetup(t)
+	orderSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{
+			"id":"order_refunded",
+			"billing_reason":"purchase",
+			"status":"paid",
+			"paid":true,
+			"refunded_amount":100,
+			"net_amount":100,
+			"currency":"usd",
+			"customer":{"email":"customer@example.com","metadata":{}},
+			"product":{"id":"prod_trial","metadata":{"pipelock_tier":"trial"}}
+		}`))
+	}))
+	t.Cleanup(orderSrv.Close)
+	ts.handler.polar = NewPolarClient(testPolarAPIToken, orderSrv.URL, defaultPolarAPIVersion)
+
+	event := &PolarWebhookEvent{Type: EventOrderCreated, Data: json.RawMessage(`{
+		"id":"order_refunded",
+		"billing_reason":"purchase",
+		"status":"paid",
+		"paid":true,
+		"net_amount":100,
+		"currency":"usd",
+		"customer":{"email":"customer@example.com","metadata":{}},
+		"product":{"id":"prod_trial","metadata":{"pipelock_tier":"trial"}}
+	}`)}
+	err := ts.handler.HandleOrderEvent(t.Context(), event)
+	if err == nil || !strings.Contains(err.Error(), "order is refunded") {
+		t.Fatalf("HandleOrderEvent error = %v, want current refund rejection", err)
+	}
+}
+
+func TestHandleOrderEvent_EnterpriseEvalDoesNotMintOnOrderCreated(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	var emailCount atomic.Int32
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		emailCount.Add(1)
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"msg_eval_unexpected"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_key",
+		fromEmail: "test@pipelock.dev",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	const orderID = "order_eval_created"
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             orderID,
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{"org": "evalcorp"},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_eval",
+			"name":     "Pipelock Enterprise Eval",
+			"metadata": map[string]string{"pipelock_tier": tierEnterpriseEval},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("HandleOrderEvent: %v", err)
+	}
+
+	ent, err := ts.db.GetBySubscriptionID(ctx, orderID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent != nil {
+		t.Fatalf("enterprise eval order.created created entitlement: %+v", ent)
+	}
+	if got := emailCount.Load(); got != 0 {
+		t.Fatalf("enterprise eval order.created sent %d emails, want 0", got)
+	}
+}
+
+func TestHandleOrderEvent_IgnoresSubscriptionOrders(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// Create order event with billing_reason "subscription_cycle".
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             "order_sub_cycle",
+		"billing_reason": "subscription_cycle",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       testProductID,
+			"name":     testProductName,
+			"metadata": map[string]string{"pipelock_tier": "pro"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("HandleOrderEvent should not error for subscription orders: %v", err)
+	}
+
+	// Verify no entitlement was created.
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_sub_cycle")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent != nil {
+		t.Error("should not create entitlement for subscription-related order")
+	}
+}
+
+func TestHandleOrderEvent_RejectsInvalidOrderData(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(`{not valid json`),
+	}
+	err := ts.handler.HandleOrderEvent(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for invalid JSON order data")
+	}
+}
+
+func TestHandleOrderEvent_RejectsEmptyOrderID(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	orderData, _ := json.Marshal(map[string]interface{}{
+		"id":             "",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_trial",
+			"name":     "Trial",
+			"metadata": map[string]string{"pipelock_tier": "trial"},
+		},
+	})
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	err := ts.handler.HandleOrderEvent(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for empty order ID")
+	}
+}
+
+func TestHandleOrderEvent_RejectsMissingTierMetadata(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	orderData, _ := json.Marshal(map[string]interface{}{
+		"id":             "order_no_tier",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_bad",
+			"name":     "Bad Product",
+			"metadata": map[string]string{},
+		},
+	})
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	err := ts.handler.HandleOrderEvent(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for missing pipelock_tier metadata")
+	}
+	if !strings.Contains(err.Error(), "not allowlisted") {
+		t.Errorf("error = %q, want 'not allowlisted'", err)
+	}
+}
+
+func TestHandleOrderEvent_RejectsUnknownTier(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	orderData, _ := json.Marshal(map[string]interface{}{
+		"id":             "order_bad_tier",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_bad",
+			"name":     "Bad Product",
+			"metadata": map[string]string{"pipelock_tier": "premium"},
+		},
+	})
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	err := ts.handler.HandleOrderEvent(ctx, event)
+	if err == nil {
+		t.Fatal("expected error for unrecognized tier")
+	}
+	if !strings.Contains(err.Error(), "not allowlisted") {
+		t.Errorf("error = %q, want 'not allowlisted'", err)
+	}
+}
+
+func TestHandleOrderEvent_TrialNeverSchedulesRefresh(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             "order_no_refresh",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_trial",
+			"name":     "Pipelock Pro Trial",
+			"metadata": map[string]string{"pipelock_tier": "trial"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("HandleOrderEvent: %v", err)
+	}
+
+	// Verify trial entitlement has no refresh schedule.
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_no_refresh")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil {
+		t.Fatal("entitlement not found")
+	}
+	if ent.NextRefreshAt != nil {
+		t.Errorf("trial NextRefreshAt = %v, want nil (no cron refresh for one-time purchases)", ent.NextRefreshAt)
+	}
+
+	// Verify trial never appears in ListDueForRefresh, even with a past cutoff.
+	farFuture := time.Now().Add(365 * 24 * time.Hour)
+	due, err := ts.db.ListDueForRefresh(ctx, farFuture)
+	if err != nil {
+		t.Fatalf("ListDueForRefresh: %v", err)
+	}
+	for _, d := range due {
+		if d.SubscriptionID == "order_no_refresh" {
+			t.Error("trial entitlement should never appear in ListDueForRefresh")
+		}
+	}
+}
+
+func TestHandleOrderEvent_ReplayIsIdempotent(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             "order_replay_test",
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     100,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    testCustomerEmail,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_trial",
+			"name":     "Pipelock Pro Trial",
+			"metadata": map[string]string{"pipelock_tier": "trial"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+
+	event := &PolarWebhookEvent{
+		Type: EventOrderCreated,
+		Data: json.RawMessage(orderData),
+	}
+
+	// First delivery: should issue a license.
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("first HandleOrderEvent: %v", err)
+	}
+
+	ent1, err := ts.db.GetBySubscriptionID(ctx, "order_replay_test")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID after first: %v", err)
+	}
+	if ent1 == nil {
+		t.Fatal("entitlement not found after first delivery")
+	}
+	firstLicenseID := ent1.LastLicenseID
+	firstPeriodEnd := ent1.CurrentPeriodEnd
+	if firstLicenseID == "" {
+		t.Fatal("no license issued on first delivery")
+	}
+
+	// Second delivery (replay): should NOT mint a new token.
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("second HandleOrderEvent: %v", err)
+	}
+
+	ent2, err := ts.db.GetBySubscriptionID(ctx, "order_replay_test")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID after second: %v", err)
+	}
+	if ent2.LastLicenseID != firstLicenseID {
+		t.Errorf("replay minted new token: got %q, want %q (idempotent)", ent2.LastLicenseID, firstLicenseID)
+	}
+	if !ent2.CurrentPeriodEnd.Equal(firstPeriodEnd) {
+		t.Errorf("replay changed period end: got %v, want %v (stable)", ent2.CurrentPeriodEnd, firstPeriodEnd)
+	}
+}
+
+// zeroTrialOrderEvent builds an order.created event for the zero-amount trial
+// product with the given order ID and customer email.
+func zeroTrialOrderEvent(t *testing.T, orderID, email string) *PolarWebhookEvent {
+	t.Helper()
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             orderID,
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     0,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    email,
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_trial_free",
+			"name":     "Pipelock Pro Trial",
+			"metadata": map[string]string{"pipelock_tier": "trial"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal order data: %v", err)
+	}
+	return &PolarWebhookEvent{Type: EventOrderCreated, Data: json.RawMessage(orderData)}
+}
+
+func enterpriseTrialOrderEvent(t *testing.T, orderID string) *PolarWebhookEvent {
+	t.Helper()
+	orderData, err := json.Marshal(map[string]interface{}{
+		"id":             orderID,
+		"billing_reason": "purchase",
+		"status":         "paid",
+		"paid":           true,
+		"net_amount":     0,
+		"currency":       "usd",
+		"customer": map[string]interface{}{
+			"email":    "enterprise-trial@example.com",
+			"metadata": map[string]string{},
+		},
+		"product": map[string]interface{}{
+			"id":       "prod_enterprise_trial_free",
+			"name":     "Pipelock Enterprise Trial",
+			"metadata": map[string]string{"pipelock_tier": tierEnterpriseTrial},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal enterprise trial order data: %v", err)
+	}
+	return &PolarWebhookEvent{Type: EventOrderCreated, Data: json.RawMessage(orderData)}
+}
+
+func TestHandleOrderEvent_EnterpriseTrial(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_first")); err != nil {
+		t.Fatalf("HandleOrderEvent first enterprise trial: %v", err)
+	}
+	first, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_first")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID first: %v", err)
+	}
+	if first == nil || first.Tier != tierEnterpriseTrial || first.LastLicenseID == "" {
+		t.Fatalf("first enterprise trial did not mint: %+v", first)
+	}
+	if first.BillingInterval != billingIntervalOneTime {
+		t.Fatalf("BillingInterval = %q, want %q", first.BillingInterval, billingIntervalOneTime)
+	}
+	farFuture := time.Now().Add(365 * 24 * time.Hour)
+	due, err := ts.db.ListDueForRefresh(ctx, farFuture)
+	if err != nil {
+		t.Fatalf("ListDueForRefresh: %v", err)
+	}
+	for _, entitlement := range due {
+		if entitlement.SubscriptionID == first.SubscriptionID {
+			t.Fatal("enterprise trial entitlement appeared in ListDueForRefresh")
+		}
+	}
+	var features []string
+	if err := json.Unmarshal([]byte(first.Features), &features); err != nil {
+		t.Fatalf("unmarshal enterprise trial features: %v", err)
+	}
+	if !slices.Equal(features, []string{license.FeatureAgents, license.FeatureFleet}) {
+		t.Fatalf("enterprise trial features = %v, want Enterprise features", features)
+	}
+	if first.LastLicenseExpiresAt == nil {
+		t.Fatal("enterprise trial token expiry is nil")
+	}
+	expiresIn := time.Until(*first.LastLicenseExpiresAt)
+	if expiresIn < 59*24*time.Hour || expiresIn > 61*24*time.Hour {
+		t.Fatalf("enterprise trial token expires in %v, want ~60 days", expiresIn)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_duplicate")); err != nil {
+		t.Fatalf("HandleOrderEvent duplicate enterprise trial: %v", err)
+	}
+	duplicate, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_duplicate")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID duplicate: %v", err)
+	}
+	if duplicate != nil {
+		t.Fatalf("second active enterprise trial minted an entitlement: %+v", duplicate)
+	}
+
+	// Simulate that the slot-owned claim window has passed.
+	expiredAt := time.Now().Add(-time.Minute).UTC()
+	var initialSlotOwner string
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT subscription_id FROM active_trial_slots WHERE subscription_id = ?`,
+		first.SubscriptionID,
+	).Scan(&initialSlotOwner); err != nil {
+		t.Fatalf("read initial enterprise trial slot: %v", err)
+	}
+	if initialSlotOwner != first.SubscriptionID {
+		t.Fatalf("initial enterprise trial slot owner = %q, want %q", initialSlotOwner, first.SubscriptionID)
+	}
+	result, err := ts.db.db.ExecContext(ctx,
+		`UPDATE active_trial_slots SET expires_at = ? WHERE subscription_id = ?`,
+		expiredAt, first.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("expire first enterprise trial slot: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("expire first enterprise trial slot affected %d rows, want 1: %v", affected, err)
+	}
+
+	// The slot is only half the state: aging it alone leaves the owner's trial
+	// running, and takeover refuses a slot whose owner trial has not ended. End
+	// the owner entitlement too, which is what "the first trial is over" means.
+	ownerResult, err := ts.db.db.ExecContext(ctx,
+		`UPDATE entitlements SET current_period_end = ? WHERE subscription_id = ?`,
+		expiredAt, first.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("end the first enterprise trial: %v", err)
+	}
+	if affected, err := ownerResult.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("end the first enterprise trial affected %d rows, want 1: %v", affected, err)
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_after_expiry")); err != nil {
+		t.Fatalf("HandleOrderEvent enterprise trial after expiry: %v", err)
+	}
+	replacement, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_after_expiry")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID replacement: %v", err)
+	}
+	if replacement == nil || replacement.LastLicenseID == "" {
+		t.Fatalf("enterprise trial after expiry did not mint: %+v", replacement)
+	}
+}
+
+func TestHandleOrderRefund_RevokesMintedEnterpriseTrial(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	expiresAt := time.Now().Add(60 * 24 * time.Hour).UTC()
+	issuedAt := time.Now().UTC()
+	entitlement := &Entitlement{
+		SubscriptionID:   "order_enterprise_trial_refunded",
+		CustomerEmail:    "enterprise-trial@example.com",
+		ProductID:        "prod_enterprise_trial_free",
+		Tier:             tierEnterpriseTrial,
+		BillingInterval:  billingIntervalOneTime,
+		Status:           statusActive,
+		CurrentPeriodEnd: expiresAt,
+		Features:         `[]`,
+	}
+	issuance := LicenseIssuance{
+		LicenseID:      "lic_enterprise_trial_refunded",
+		SubscriptionID: entitlement.SubscriptionID,
+		IssuedAt:       issuedAt,
+		ExpiresAt:      expiresAt,
+	}
+	if err := ts.db.UpsertWithLicenseIssuance(ctx, entitlement, issuance); err != nil {
+		t.Fatalf("seed enterprise trial: %v", err)
+	}
+
+	event := &PolarWebhookEvent{Type: EventOrderRefunded, Data: json.RawMessage(`{"id":"order_enterprise_trial_refunded"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(ctx, event, "msg_enterprise_trial_refund"); err != nil {
+		t.Fatalf("HandleOrderRefundEvent: %v", err)
+	}
+
+	refunded, err := ts.db.GetBySubscriptionID(ctx, entitlement.SubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID refunded: %v", err)
+	}
+	if refunded == nil || refunded.Status != statusRevoked {
+		t.Fatalf("refunded enterprise trial status = %+v, want %q", refunded, statusRevoked)
+	}
+	revocations, err := ts.db.ListLicenseRevocations(ctx)
+	if err != nil {
+		t.Fatalf("ListLicenseRevocations: %v", err)
+	}
+	if len(revocations) != 1 || revocations[0].LicenseID != issuance.LicenseID {
+		t.Fatalf("revocations = %+v, want %q", revocations, issuance.LicenseID)
+	}
+	ledgerBytes, err := os.ReadFile(ts.handler.ledger.path)
+	if err != nil {
+		t.Fatalf("read audit ledger: %v", err)
+	}
+	foundRevocationEntry := false
+	for _, line := range strings.Split(strings.TrimSpace(string(ledgerBytes)), "\n") {
+		var entry AuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode ledger line %q: %v", line, err)
+		}
+		if entry.Event == AuditTrialRefundRevoked && entry.LicenseID == issuance.LicenseID && entry.SubscriptionID == entitlement.SubscriptionID {
+			foundRevocationEntry = true
+		}
+	}
+	if !foundRevocationEntry {
+		t.Fatalf("audit ledger lacks a %s record for %s:\n%s", AuditTrialRefundRevoked, issuance.LicenseID, ledgerBytes)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_replacement")); err != nil {
+		t.Fatalf("replacement enterprise trial while original period remains active: %v", err)
+	}
+	replacement, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_replacement")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID replacement: %v", err)
+	}
+	if replacement != nil {
+		t.Fatalf("replacement enterprise trial minted before original period ended: %+v", replacement)
+	}
+
+	// Revocation must not have moved the slot's expiry (it is immutable once
+	// claimed), so aging the trial out requires advancing the SLOT itself,
+	// not the entitlement's CurrentPeriodEnd. Mutating the entitlement alone
+	// used to reopen the slot early through a since-removed sync path; this
+	// advances the slot-owned expiry to simulate a healthy expiry and prove the
+	// removed sync path does not reopen a slot early.
+	expiredAt := time.Now().Add(-time.Minute).UTC()
+	var initialSlotOwner string
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT subscription_id FROM active_trial_slots WHERE normalized_email = ?`,
+		"enterprise-trial@example.com",
+	).Scan(&initialSlotOwner); err != nil {
+		t.Fatalf("read initial enterprise trial slot: %v", err)
+	}
+	if initialSlotOwner != entitlement.SubscriptionID {
+		t.Fatalf("initial enterprise trial slot owner = %q, want %q", initialSlotOwner, entitlement.SubscriptionID)
+	}
+	result, err := ts.db.db.ExecContext(ctx,
+		`UPDATE active_trial_slots SET expires_at = ? WHERE normalized_email = ?`,
+		expiredAt, "enterprise-trial@example.com",
+	)
+	if err != nil {
+		t.Fatalf("age enterprise trial slot: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("age enterprise trial slot affected %d rows, want 1: %v", affected, err)
+	}
+
+	// The slot is only half the state: aging it alone leaves the owner's trial
+	// running, and takeover refuses a slot whose owner trial has not ended. End
+	// the owner entitlement too, which is what "the first trial is over" means.
+	ownerResult, err := ts.db.db.ExecContext(ctx,
+		`UPDATE entitlements SET current_period_end = ? WHERE subscription_id = ?`,
+		expiredAt, entitlement.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("end the enterprise trial owner: %v", err)
+	}
+	if affected, err := ownerResult.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("end the enterprise trial owner affected %d rows, want 1: %v", affected, err)
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_replacement_after_expiry")); err != nil {
+		t.Fatalf("replacement enterprise trial after original period expiry: %v", err)
+	}
+	replacement, err = ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_replacement_after_expiry")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID replacement after expiry: %v", err)
+	}
+	if replacement == nil || replacement.LastLicenseID == "" {
+		t.Fatalf("replacement enterprise trial after original period expiry did not mint: %+v", replacement)
+	}
+}
+
+// TestOneTimeTrialRevocation_SlotExpiryIsImmutable proves the decided
+// behavior for a FULL refund on a Pro trial: revoking the trial (status ->
+// revoked) must not move the trial slot's expiry. A second trial for the same
+// email stays denied until the ORIGINAL slot expiry passes, then a new trial
+// is allowed without consulting mutable entitlement state.
+func TestOneTimeTrialRevocation_SlotExpiryIsImmutable(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	const email = "trial-slot-immutable@example.com"
+	originalExpiry := time.Now().Add(30 * 24 * time.Hour).UTC()
+
+	entitlement := &Entitlement{
+		SubscriptionID:   "order_trial_refund_full_1",
+		CustomerEmail:    email,
+		ProductID:        "prod_trial",
+		Tier:             tierTrial,
+		BillingInterval:  billingIntervalOneTime,
+		Status:           statusActive,
+		CurrentPeriodEnd: originalExpiry,
+		Features:         `[]`,
+	}
+	issuance := LicenseIssuance{
+		LicenseID:      "lic_trial_refund_full_1",
+		SubscriptionID: entitlement.SubscriptionID,
+		IssuedAt:       time.Now().UTC(),
+		ExpiresAt:      originalExpiry,
+	}
+	if err := ts.db.UpsertWithLicenseIssuance(ctx, entitlement, issuance); err != nil {
+		t.Fatalf("seed pro trial: %v", err)
+	}
+
+	// Revoke via a full refund.
+	event := &PolarWebhookEvent{Type: EventOrderRefunded, Data: json.RawMessage(`{"id":"order_trial_refund_full_1"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(ctx, event, "msg_trial_refund_full_1"); err != nil {
+		t.Fatalf("HandleOrderRefundEvent: %v", err)
+	}
+	revoked, err := ts.db.GetBySubscriptionID(ctx, entitlement.SubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if revoked == nil || revoked.Status != statusRevoked {
+		t.Fatalf("revoked trial status = %+v, want %q", revoked, statusRevoked)
+	}
+
+	// The slot must still hold the ORIGINAL expiry, unmoved by revocation.
+	var gotExpiry time.Time
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM active_trial_slots WHERE normalized_email = ?`, email,
+	).Scan(&gotExpiry); err != nil {
+		t.Fatalf("read slot expiry: %v", err)
+	}
+	if !gotExpiry.UTC().Equal(originalExpiry) {
+		t.Fatalf("slot expires_at = %s, want unchanged original %s", gotExpiry.UTC(), originalExpiry)
+	}
+
+	// Retry within the original window: denied.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_20_trial-slot-immutable", email)); err != nil {
+		t.Fatalf("retry within window: %v", err)
+	}
+	if retry, err := ts.db.GetBySubscriptionID(ctx, "order_free_20_trial-slot-immutable"); err != nil || retry != nil {
+		t.Fatalf("retry minted before original expiry: ent=%+v err=%v", retry, err)
+	}
+
+	// Age the healthy slot past the original expiry and confirm a new trial is
+	// allowed.
+	expiredAt := time.Now().Add(-time.Minute).UTC()
+	var initialSlotOwner string
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT subscription_id FROM active_trial_slots WHERE normalized_email = ?`,
+		email,
+	).Scan(&initialSlotOwner); err != nil {
+		t.Fatalf("read initial trial slot: %v", err)
+	}
+	if initialSlotOwner != entitlement.SubscriptionID {
+		t.Fatalf("initial trial slot owner = %q, want %q", initialSlotOwner, entitlement.SubscriptionID)
+	}
+	result, err := ts.db.db.ExecContext(ctx,
+		`UPDATE active_trial_slots SET expires_at = ? WHERE normalized_email = ?`,
+		expiredAt, email,
+	)
+	if err != nil {
+		t.Fatalf("age trial slot: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("age trial slot affected %d rows, want 1: %v", affected, err)
+	}
+
+	// The slot is only half the state: aging it alone leaves the owner's trial
+	// running, and takeover refuses a slot whose owner trial has not ended. End
+	// the owner entitlement too, which is what "the first trial is over" means.
+	ownerResult, err := ts.db.db.ExecContext(ctx,
+		`UPDATE entitlements SET current_period_end = ? WHERE subscription_id = ?`,
+		expiredAt, entitlement.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("end the trial owner: %v", err)
+	}
+	if affected, err := ownerResult.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("end the trial owner affected %d rows, want 1: %v", affected, err)
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_21_trial-slot-immutable", email)); err != nil {
+		t.Fatalf("retry after original expiry: %v", err)
+	}
+	if retry, err := ts.db.GetBySubscriptionID(ctx, "order_free_21_trial-slot-immutable"); err != nil || retry == nil || retry.LastLicenseID == "" {
+		t.Fatalf("retry after original expiry did not mint: ent=%+v err=%v", retry, err)
+	}
+}
+
+// TestOneTimeTrialCancellation_PartialRefundSlotExpiryIsImmutable mirrors the
+// revocation test above for a PARTIAL refund, the cancellation-shaped case:
+// same code path, same immutability requirement, different revocation reason.
+func TestOneTimeTrialCancellation_PartialRefundSlotExpiryIsImmutable(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	const email = "trial-slot-immutable@example.com"
+	originalExpiry := time.Now().Add(30 * 24 * time.Hour).UTC()
+
+	entitlement := &Entitlement{
+		SubscriptionID:   "order_trial_refund_partial_1",
+		CustomerEmail:    email,
+		ProductID:        "prod_trial",
+		Tier:             tierTrial,
+		BillingInterval:  billingIntervalOneTime,
+		Status:           statusActive,
+		CurrentPeriodEnd: originalExpiry,
+		Features:         `[]`,
+	}
+	issuance := LicenseIssuance{
+		LicenseID:      "lic_trial_refund_partial_1",
+		SubscriptionID: entitlement.SubscriptionID,
+		IssuedAt:       time.Now().UTC(),
+		ExpiresAt:      originalExpiry,
+	}
+	if err := ts.db.UpsertWithLicenseIssuance(ctx, entitlement, issuance); err != nil {
+		t.Fatalf("seed pro trial: %v", err)
+	}
+
+	event := &PolarWebhookEvent{Type: EventOrderUpdated, Data: json.RawMessage(`{"id":"order_trial_refund_partial_1"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(ctx, event, "msg_trial_refund_partial_1"); err != nil {
+		t.Fatalf("HandleOrderRefundEvent: %v", err)
+	}
+	canceled, err := ts.db.GetBySubscriptionID(ctx, entitlement.SubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if canceled == nil || canceled.Status != statusRevoked {
+		t.Fatalf("partially-refunded trial status = %+v, want %q", canceled, statusRevoked)
+	}
+	revocations, err := ts.db.ListLicenseRevocations(ctx)
+	if err != nil {
+		t.Fatalf("ListLicenseRevocations: %v", err)
+	}
+	if len(revocations) != 1 || revocations[0].Reason != "order_partially_refunded" {
+		t.Fatalf("revocations = %+v, want one partial-refund revocation", revocations)
+	}
+
+	var gotExpiry time.Time
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM active_trial_slots WHERE normalized_email = ?`, email,
+	).Scan(&gotExpiry); err != nil {
+		t.Fatalf("read slot expiry: %v", err)
+	}
+	if !gotExpiry.UTC().Equal(originalExpiry) {
+		t.Fatalf("slot expires_at = %s, want unchanged original %s", gotExpiry.UTC(), originalExpiry)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_22_trial-slot-immutable", email)); err != nil {
+		t.Fatalf("retry within window: %v", err)
+	}
+	if retry, err := ts.db.GetBySubscriptionID(ctx, "order_free_22_trial-slot-immutable"); err != nil || retry != nil {
+		t.Fatalf("retry minted before original expiry: ent=%+v err=%v", retry, err)
+	}
+}
+
+func TestHandleOrderRefund_EnterpriseTrialWithoutEntitlementPersistsPendingRefusal(t *testing.T) {
+	ts := newTestSetup(t)
+	event := &PolarWebhookEvent{Type: EventOrderRefunded, Data: json.RawMessage(`{"id":"order_enterprise_trial_refunded"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(t.Context(), event, "msg_enterprise_trial_missing"); err != nil {
+		t.Fatalf("refund without entitlement: %v", err)
+	}
+	committed, err := ts.db.WebhookCommitted(t.Context(), "msg_enterprise_trial_missing")
+	if err != nil {
+		t.Fatalf("WebhookCommitted: %v", err)
+	}
+	if !committed {
+		t.Fatal("refund without entitlement was not committed")
+	}
+	pending, err := ts.db.GetEvalOrder(t.Context(), "order_enterprise_trial_refunded")
+	if err != nil {
+		t.Fatalf("GetEvalOrder pending refund: %v", err)
+	}
+	if pending == nil || pending.RefundState != refundStateFull || pending.RevocationState != revocationPendingNoLicense {
+		t.Fatalf("pending trial refund = %+v, want full pending-no-license refusal", pending)
+	}
+	entries, err := os.ReadFile(ts.ledger.path)
+	if err != nil {
+		t.Fatalf("read audit ledger: %v", err)
+	}
+	if !strings.Contains(string(entries), "record pending one-time trial refund") {
+		t.Fatalf("audit ledger lacks pending-refund record: %s", entries)
+	}
+
+	paid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"order_enterprise_trial_refunded","billing_reason":"purchase","status":"paid","paid":true,"net_amount":0,"currency":"usd","customer":{"email":"enterprise-trial@example.com","metadata":{}},"product":{"id":"prod_enterprise_trial_free","name":"Pipelock Enterprise Trial","metadata":{"pipelock_tier":"enterprise_trial"}}}`))
+	}))
+	t.Cleanup(paid.Close)
+	ts.handler.polar.baseURL = paid.URL
+	if err := ts.handler.HandleOrderEvent(t.Context(), enterpriseTrialOrderEvent(t, "order_enterprise_trial_refunded")); err == nil || !strings.Contains(err.Error(), "pending refund") {
+		t.Fatalf("later paid delivery error = %v, want pending-refund refusal", err)
+	}
+	ent, err := ts.db.GetBySubscriptionID(t.Context(), "order_enterprise_trial_refunded")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID after pending refund: %v", err)
+	}
+	if ent != nil {
+		t.Fatalf("pending-refunded trial minted an entitlement: %+v", ent)
+	}
+	if issuances := countLicenseIssuances(t, ts.db, "order_enterprise_trial_refunded"); issuances != 0 {
+		t.Fatalf("pending-refunded trial minted %d license issuances", issuances)
+	}
+	entries, err = os.ReadFile(ts.ledger.path)
+	if err != nil {
+		t.Fatalf("read audit ledger after refusal: %v", err)
+	}
+	if !strings.Contains(string(entries), "one-time trial fulfillment refused: pending refund") {
+		t.Fatalf("audit ledger lacks pending-refund refusal: %s", entries)
+	}
+}
+
+func TestHandleOrderEvent_EnterpriseTrialRetryIdentityMismatchRefuses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Entitlement)
+	}{
+		{name: "email", mutate: func(ent *Entitlement) { ent.CustomerEmail = "other@example.com" }},
+		{name: "org", mutate: func(ent *Entitlement) { ent.Org = "other-org" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := newTestSetup(t)
+			issuedAt := time.Now().UTC().Add(-time.Minute)
+			expiresAt := time.Now().UTC().Add(60 * 24 * time.Hour)
+			ent := &Entitlement{
+				SubscriptionID: "order_enterprise_trial_retry",
+				CustomerEmail:  "enterprise-trial@example.com",
+				ProductID:      "prod_enterprise_trial_free",
+				Tier:           tierEnterpriseTrial, BillingInterval: billingIntervalOneTime, Status: statusActive,
+				CurrentPeriodEnd: expiresAt, Features: `[]`, LastLicenseID: "lic_existing",
+				LastLicenseIssuedAt: &issuedAt, LastLicenseExpiresAt: &expiresAt,
+				LastLicensePeriodEnd: &expiresAt, LastLicenseTier: tierEnterpriseTrial,
+				LastLicenseInterval: billingIntervalOneTime, LastLicenseProductID: "prod_enterprise_trial_free",
+				LastDeliveryStatus: "failed",
+			}
+			tc.mutate(ent)
+			if err := ts.db.UpsertWithLicenseIssuance(t.Context(), ent, LicenseIssuance{LicenseID: ent.LastLicenseID, SubscriptionID: ent.SubscriptionID, IssuedAt: issuedAt, ExpiresAt: expiresAt}); err != nil {
+				t.Fatalf("seed one-time trial issuance: %v", err)
+			}
+			if err := ts.handler.HandleOrderEvent(t.Context(), enterpriseTrialOrderEvent(t, ent.SubscriptionID)); err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+				t.Fatalf("mismatched one-time trial replay error = %v, want identity-mismatch refusal", err)
+			}
+			if issuances := countLicenseIssuances(t, ts.db, ent.SubscriptionID); issuances != 1 {
+				t.Fatalf("mismatched one-time trial replay minted %d issuances, want 1", issuances)
+			}
+			entries, err := os.ReadFile(ts.ledger.path)
+			if err != nil {
+				t.Fatalf("read audit ledger: %v", err)
+			}
+			if !strings.Contains(string(entries), "one-time trial retry identity mismatch") {
+				t.Fatalf("audit ledger lacks identity-mismatch refusal: %s", entries)
+			}
+		})
+	}
+}
+
+func TestHandleOrderEvent_EnterpriseTrialRetryResendsPersistedIssuance(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	var attempts atomic.Int32
+	emailSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", testContentTypeJSON)
+		_, _ = w.Write([]byte(`{"id":"msg_enterprise_trial_retry"}`))
+	}))
+	t.Cleanup(emailSrv.Close)
+	ts.handler.email = &EmailSender{
+		apiKey:    "re_" + "test_retry",
+		fromEmail: "test@pipelock.dev",
+		client:    emailSrv.Client(),
+		apiURL:    emailSrv.URL,
+	}
+
+	event := enterpriseTrialOrderEvent(t, "order_enterprise_trial_retry")
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("first HandleOrderEvent: %v", err)
+	}
+	first, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_retry")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID first: %v", err)
+	}
+	if first == nil || first.LastDeliveryStatus != "failed" {
+		t.Fatalf("first delivery = %+v, want failed persisted issuance", first)
+	}
+	firstID := first.LastLicenseID
+	firstExpiry := *first.LastLicenseExpiresAt
+
+	if err := ts.handler.HandleOrderEvent(ctx, event); err != nil {
+		t.Fatalf("replay HandleOrderEvent: %v", err)
+	}
+	replayed, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_retry")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID replay: %v", err)
+	}
+	if replayed.LastLicenseID != firstID {
+		t.Fatalf("replay license ID = %q, want persisted %q", replayed.LastLicenseID, firstID)
+	}
+	if !replayed.LastLicenseExpiresAt.Equal(firstExpiry) {
+		t.Fatalf("replay expiry = %v, want persisted %v", replayed.LastLicenseExpiresAt, firstExpiry)
+	}
+	if issuances := countLicenseIssuances(t, ts.db, replayed.SubscriptionID); issuances != 1 {
+		t.Fatalf("license issuances = %d, want 1", issuances)
+	}
+}
+
+func TestHandleOrderEvent_EnterpriseTrialRefusesUnknownMetadataTier(t *testing.T) {
+	ts := newTestSetup(t)
+	err := ts.handler.HandleOrderEvent(t.Context(), enterpriseTrialOrderEvent(t, "order_enterprise_trial_unknown_tier"))
+	if err == nil || !strings.Contains(err.Error(), "tier metadata") {
+		t.Fatalf("expected unknown metadata tier refusal, got %v", err)
+	}
+	ent, dbErr := ts.db.GetBySubscriptionID(t.Context(), "order_enterprise_trial_unknown_tier")
+	if dbErr != nil {
+		t.Fatalf("GetBySubscriptionID: %v", dbErr)
+	}
+	if ent != nil {
+		t.Fatalf("unknown metadata tier minted an entitlement: %+v", ent)
+	}
+}
+
+// TestHandleOrderEvent_EnterpriseTrialCountEligibilityRetired proves the
+// retired entitlements-table pre-count is no longer consulted for
+// eligibility: forcing it to fail no longer affects whether a trial mints,
+// because the atomic slot claim is the sole authority now.
+type countEligibilityError struct {
+	calls atomic.Int32
+}
+
+func (e *countEligibilityError) Error() string {
+	e.calls.Add(1)
+	return "forced count failure"
+}
+
+// assertCountEligibilityNotConsulted proves the mint path never consults the
+// retired entitlements-table count. The injected error counts Error() calls:
+// production formats the error into its wrapper ("count active %s for %s: %w"),
+// so any consultation by the mint path increments the counter. A direct call
+// through the same helper is the positive control: if the counting error or the
+// read path is ever too broken to detect a call, the assertion reports that
+// instead of passing vacuously.
+func assertCountEligibilityNotConsulted(t *testing.T, db *EntitlementDB, countErr *countEligibilityError, tier, email string) {
+	t.Helper()
+	calls := countErr.calls.Load()
+	if calls != 0 {
+		t.Fatalf("retired count helper was consulted %d time(s) during mint; eligibility must come from the atomic slot claim alone", calls)
+	}
+	if _, err := db.CountActiveTierForEmail(t.Context(), tier, email, time.Now()); err == nil {
+		t.Fatal("counting error stopped being returned by the count helper; this assertion can no longer detect consultation")
+	}
+	if got := countErr.calls.Load(); got <= calls {
+		t.Fatalf("count-helper probe did not register (calls %d -> %d); consultation would go undetected", calls, got)
+	}
+}
+
+func TestHandleOrderEvent_EnterpriseTrialCountEligibilityRetired(t *testing.T) {
+	ts := newTestSetup(t)
+	countErr := &countEligibilityError{}
+	errForceCountActiveTier = countErr
+	t.Cleanup(func() { errForceCountActiveTier = nil })
+
+	if err := ts.handler.HandleOrderEvent(t.Context(), enterpriseTrialOrderEvent(t, "order_enterprise_trial_count_error")); err != nil {
+		t.Fatalf("HandleOrderEvent must not consult the retired count path: %v", err)
+	}
+	ent, dbErr := ts.db.GetBySubscriptionID(t.Context(), "order_enterprise_trial_count_error")
+	if dbErr != nil {
+		t.Fatalf("GetBySubscriptionID: %v", dbErr)
+	}
+	if ent == nil {
+		t.Fatal("enterprise trial did not mint despite a forced, now-irrelevant count failure")
+	}
+	assertCountEligibilityNotConsulted(t, ts.db, countErr, tierEnterpriseTrial, ent.CustomerEmail)
+}
+
+func TestHandleOrderEvent_ZeroAmountTrialMintsOncePerEmail(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	// First zero-amount trial order mints.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_1_alpha", "alpha@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent first trial: %v", err)
+	}
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_free_1_alpha")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent == nil || ent.Tier != tierTrial || ent.LastLicenseID == "" {
+		t.Fatalf("first zero-amount trial did not mint: %+v", ent)
+	}
+
+	// A webhook replay of the SAME order stays idempotent: no error, no
+	// second entitlement, no new license, and no state drift. The per-email
+	// dedupe must not trip on the entitlement this order created itself.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_1_alpha", "alpha@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent replay: %v", err)
+	}
+	replayed, err := ts.db.GetBySubscriptionID(ctx, "order_free_1_alpha")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID after replay: %v", err)
+	}
+	if replayed == nil {
+		t.Fatal("entitlement vanished after replay")
+	}
+	if replayed.LastLicenseID != ent.LastLicenseID {
+		t.Fatalf("replay minted a new license: %q -> %q", ent.LastLicenseID, replayed.LastLicenseID)
+	}
+	if replayed.LastDeliveryStatus != ent.LastDeliveryStatus {
+		t.Fatalf("replay changed delivery status: %q -> %q", ent.LastDeliveryStatus, replayed.LastDeliveryStatus)
+	}
+	if ent.LastLicenseExpiresAt == nil || replayed.LastLicenseExpiresAt == nil || !replayed.LastLicenseExpiresAt.Equal(*ent.LastLicenseExpiresAt) {
+		t.Fatalf("replay changed license expiry: %v -> %v", ent.LastLicenseExpiresAt, replayed.LastLicenseExpiresAt)
+	}
+
+	// A SECOND order for the same email is refused: acknowledged without a
+	// mint, so webhook retries stop, but no new entitlement appears.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_2_alpha", "alpha@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent duplicate-email trial: %v", err)
+	}
+	dup, err := ts.db.GetBySubscriptionID(ctx, "order_free_2_alpha")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID duplicate: %v", err)
+	}
+	if dup != nil {
+		t.Fatalf("second trial for the same email minted an entitlement: %+v", dup)
+	}
+
+	// A case variant of the same email is also refused: the entitlement
+	// stores the normalized email, so the canonical keys collide.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_4_alphaupper", "ALPHA@Example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent variant-email trial: %v", err)
+	}
+	variant, err := ts.db.GetBySubscriptionID(ctx, "order_free_4_alphaupper")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID variant: %v", err)
+	}
+	if variant != nil {
+		t.Fatalf("case-variant email minted a second trial: %+v", variant)
+	}
+
+	// A different email still mints normally.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_3_beta", "beta@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent second email: %v", err)
+	}
+	other, err := ts.db.GetBySubscriptionID(ctx, "order_free_3_beta")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID other: %v", err)
+	}
+	if other == nil || other.LastLicenseID == "" {
+		t.Fatalf("trial for a different email did not mint: %+v", other)
+	}
+}
+
+func TestHandleOrderEvent_TrialDenialSurvivesAuditLedgerFailure(t *testing.T) {
+	// The slot claim is now the sole eligibility authority, and its denial
+	// path (handleActiveDelivery's ErrActiveTrialExists handling) refuses to
+	// acknowledge a denial the ledger cannot record, so the provider retries
+	// rather than an unaudited refusal being silently accepted.
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_7_delta", "delta@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent first trial: %v", err)
+	}
+	if err := ts.handler.ledger.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_8_delta", "delta@example.com")); err == nil {
+		t.Fatal("duplicate trial denial with a failed ledger must not be acknowledged")
+	}
+	dup, err := ts.db.GetBySubscriptionID(ctx, "order_free_8_delta")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if dup != nil {
+		t.Fatalf("duplicate trial minted despite denial: %+v", dup)
+	}
+}
+
+func TestHandleOrderEvent_TrialVariantEmailCannotDoubleDip(t *testing.T) {
+	// The FIRST order arrives with a non-canonical email form. If the
+	// entitlement stored the raw order email, a later canonical-form order
+	// would not match the count query and would mint a second trial. Storing
+	// the normalized email closes that variant bypass.
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_5_gammaupper", "GAMMA@Example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent uppercase first trial: %v", err)
+	}
+	first, err := ts.db.GetBySubscriptionID(ctx, "order_free_5_gammaupper")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID first: %v", err)
+	}
+	if first == nil || first.LastLicenseID == "" {
+		t.Fatalf("uppercase-email trial did not mint: %+v", first)
+	}
+	if first.CustomerEmail != "gamma@example.com" {
+		t.Fatalf("entitlement stored a non-canonical email: %q", first.CustomerEmail)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_6_gamma", "gamma@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent canonical second trial: %v", err)
+	}
+	second, err := ts.db.GetBySubscriptionID(ctx, "order_free_6_gamma")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID second: %v", err)
+	}
+	if second != nil {
+		t.Fatalf("canonical-form order double-dipped past an uppercase first trial: %+v", second)
+	}
+}
+
+func TestHandleOrderEvent_TrialLegacyCaseVariantRowStillCounts(t *testing.T) {
+	// A trial entitlement persisted before canonical storage may hold a raw
+	// case-variant email. The active-trial count canonicalizes stored emails
+	// in Go, so that legacy row still denies a new trial for the normalized form.
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	legacy := &Entitlement{
+		SubscriptionID:   "order_legacy_delta",
+		CustomerEmail:    "DELTA@Example.com",
+		ProductID:        "prod_trial_free",
+		Tier:             tierTrial,
+		Status:           statusActive,
+		CurrentPeriodEnd: time.Now().Add(10 * 24 * time.Hour),
+	}
+	if err := ts.db.Upsert(ctx, legacy); err != nil {
+		t.Fatalf("seed legacy trial entitlement: %v", err)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_7_delta", "delta@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent canonical trial after legacy row: %v", err)
+	}
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_free_7_delta")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent != nil {
+		t.Fatalf("canonical trial minted past an active legacy case-variant row: %+v", ent)
+	}
+}
+
+func TestHandleOrderEvent_TrialLegacyNonASCIICaseVariantRowStillCounts(t *testing.T) {
+	// SQLite LOWER is ASCII-only. A legacy row stored as ÜSER@Example.com must
+	// still block üser@example.com; SQL LOWER would miss it and mint a second trial.
+	ts := newTestSetup(t)
+	ctx := t.Context()
+
+	legacy := &Entitlement{
+		SubscriptionID:   "order_legacy_umlaut",
+		CustomerEmail:    "ÜSER@Example.com",
+		ProductID:        "prod_trial_free",
+		Tier:             tierTrial,
+		Status:           statusActive,
+		CurrentPeriodEnd: time.Now().Add(10 * 24 * time.Hour),
+	}
+	if err := ts.db.Upsert(ctx, legacy); err != nil {
+		t.Fatalf("seed legacy non-ASCII trial entitlement: %v", err)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_10_umlaut", "üser@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent canonical trial after non-ASCII legacy row: %v", err)
+	}
+	ent, err := ts.db.GetBySubscriptionID(ctx, "order_free_10_umlaut")
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if ent != nil {
+		t.Fatalf("canonical trial minted past an active legacy non-ASCII case-variant row: %+v", ent)
+	}
+}
+
+// TestHandleOrderEvent_TrialCountEligibilityRetired mirrors the enterprise
+// trial case above for the Pro trial tier.
+func TestHandleOrderEvent_TrialCountEligibilityRetired(t *testing.T) {
+	ts := newTestSetup(t)
+	countErr := &countEligibilityError{}
+	errForceCountActiveTier = countErr
+	t.Cleanup(func() { errForceCountActiveTier = nil })
+
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, "order_free_12_epsilon", "epsilon@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent must not consult the retired count path: %v", err)
+	}
+	ent, dbErr := ts.db.GetBySubscriptionID(t.Context(), "order_free_12_epsilon")
+	if dbErr != nil {
+		t.Fatalf("GetBySubscriptionID: %v", dbErr)
+	}
+	if ent == nil {
+		t.Fatal("trial did not mint despite a forced, now-irrelevant count failure")
+	}
+	assertCountEligibilityNotConsulted(t, ts.db, countErr, tierTrial, ent.CustomerEmail)
+}
+
+func TestHandleOrderEvent_TrialUnnormalizableEmailFailsClosed(t *testing.T) {
+	ts := newTestSetup(t)
+	err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, "order_free_9_bademail", "not-an-email"))
+	if err == nil || !strings.Contains(err.Error(), "normalize trial email") {
+		t.Fatalf("expected a normalize failure, got %v", err)
+	}
+	ent, dbErr := ts.db.GetBySubscriptionID(t.Context(), "order_free_9_bademail")
+	if dbErr != nil {
+		t.Fatalf("GetBySubscriptionID: %v", dbErr)
+	}
+	if ent != nil {
+		t.Fatalf("trial with an unnormalizable email must not mint: %+v", ent)
+	}
+}
+
+// One trial slot per email spans both trial tiers: an active Pro trial blocks an
+// Enterprise trial for the same identity and the reverse, so the two zero-dollar
+// products cannot be stacked.
+func TestHandleOrderEvent_TrialSlotSharedAcrossTiers(t *testing.T) {
+	const email = "enterprise-trial@example.com"
+	t.Run("pro then enterprise", func(t *testing.T) {
+		ts := newTestSetup(t)
+		ctx := t.Context()
+		if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_9_enterprise-trial", email)); err != nil {
+			t.Fatalf("pro trial: %v", err)
+		}
+		if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_cross_second")); err != nil {
+			t.Fatalf("enterprise trial after pro: %v", err)
+		}
+		if ent, err := ts.db.GetBySubscriptionID(ctx, "order_enterprise_trial_cross_second"); err != nil || ent != nil {
+			t.Fatalf("enterprise trial minted despite an active pro trial: ent=%+v err=%v", ent, err)
+		}
+	})
+	t.Run("enterprise then pro", func(t *testing.T) {
+		ts := newTestSetup(t)
+		ctx := t.Context()
+		if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_cross_first")); err != nil {
+			t.Fatalf("enterprise trial: %v", err)
+		}
+		if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_9_enterprise-trial", email)); err != nil {
+			t.Fatalf("pro trial after enterprise: %v", err)
+		}
+		if ent, err := ts.db.GetBySubscriptionID(ctx, "order_free_9_enterprise-trial"); err != nil || ent != nil {
+			t.Fatalf("pro trial minted despite an active enterprise trial: ent=%+v err=%v", ent, err)
+		}
+	})
+}
+
+// A pending refund that the ledger cannot record is not acknowledged: the
+// webhook stays uncommitted so the provider retries once the ledger is back.
+func TestHandleOrderRefund_EnterpriseTrialPendingRefusalFailsWithoutLedger(t *testing.T) {
+	ts := newTestSetup(t)
+	if err := ts.handler.ledger.Close(); err != nil {
+		t.Fatalf("close ledger: %v", err)
+	}
+	event := &PolarWebhookEvent{Type: EventOrderRefunded, Data: json.RawMessage(`{"id":"order_enterprise_trial_refunded"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(t.Context(), event, "msg_enterprise_trial_missing_noledger"); err == nil {
+		t.Fatal("pending refund with a closed ledger must not be acknowledged")
+	}
+	committed, err := ts.db.WebhookCommitted(t.Context(), "msg_enterprise_trial_missing_noledger")
+	if err != nil {
+		t.Fatalf("WebhookCommitted: %v", err)
+	}
+	if committed {
+		t.Fatal("pending refund webhook was committed despite the missing audit record")
+	}
+}
+
+// TestHandleActive_UncanonicalizableTrialEmailIsDenied pins the grant refusal
+// for an address the service cannot canonicalize: no slot can bound it, so the
+// order is denied and audited rather than minting an unbounded trial. The
+// refusal is permanent for that address, so it is a denial, not a retry.
+func TestHandleActive_UncanonicalizableTrialEmailIsDenied(t *testing.T) {
+	ts := newTestSetup(t)
+	now := time.Now().UTC()
+
+	ent := testEntitlement("order_bad_email")
+	ent.CustomerEmail = "not-an-email"
+	ent.Tier = tierTrial
+	ent.BillingInterval = billingIntervalOneTime
+	ent.CurrentPeriodEnd = now.Add(time.Hour)
+	if err := ts.handler.handleActive(t.Context(), ent, nil); err != nil {
+		t.Fatalf("denied trial returned storage error: %v", err)
+	}
+	got, err := ts.db.GetBySubscriptionID(t.Context(), ent.SubscriptionID)
+	if err != nil {
+		t.Fatalf("load denied trial: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("trial with an uncanonicalizable email was persisted: %+v", got)
+	}
+}

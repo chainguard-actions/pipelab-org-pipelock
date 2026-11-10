@@ -1,0 +1,192 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/httpstream"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+)
+
+const sessionCloseReasonGracefulShutdown = "graceful_shutdown"
+
+type receiptHeartbeatEmitter func() *receipt.Emitter
+
+func startReceiptHeartbeat(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	interval time.Duration,
+	emitterFn receiptHeartbeatEmitter,
+	logW io.Writer,
+	requireReceipts bool,
+	onRequiredFailure func(error),
+) {
+	if wg == nil || emitterFn == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	emitHeartbeat := func() bool {
+		// receipt.Emitter.EmitHeartbeat is nil-safe, so this needs no nil guard of
+		// its own and adding one would create a branch nothing can exercise.
+		e := emitterFn()
+		if err := e.EmitHeartbeat(); err != nil && !errors.Is(err, receipt.ErrChainSealed) {
+			if logW != nil {
+				_, _ = fmt.Fprintf(logW, "pipelock: receipt heartbeat emit failed: %v\n", err)
+			}
+			if requireReceipts {
+				e.MarkUnhealthy(err)
+				if onRequiredFailure != nil {
+					onRequiredFailure(err)
+				}
+				return false
+			}
+		}
+		return true
+	}
+
+	// Emit a first non-durable heartbeat before waiting for the cadence ticker.
+	// Every production caller starts this only after its durable session_open
+	// succeeds, so the paired native AEL stream is necessarily open first. This
+	// makes hmax truthful even for a run that ends before one full interval.
+	// Failures retain the existing heartbeat failure direction: optional
+	// recording logs and continues; required recording marks the emitter
+	// unhealthy and asks the owning runtime to stop.
+	if ctx.Err() != nil {
+		return
+	}
+	if !emitHeartbeat() {
+		return
+	}
+	// Cancellation can arrive while that first emission is in flight, and there is
+	// no point registering a cadence loop for a lifecycle that is already over.
+	// The loop would select ctx.Done() and exit immediately, so this changes no
+	// observable behavior beyond not scheduling the work at all, which is also why
+	// no test accompanies it: distinguishing the two requires cancelling inside
+	// the emission and then racing the ticker against ctx.Done(), and a test
+	// asserting that either flakes or proves nothing.
+	if ctx.Err() != nil {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !emitHeartbeat() {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func startStandaloneReceiptLifecycle(
+	parent context.Context,
+	interval time.Duration,
+	e *receipt.Emitter,
+	logW io.Writer,
+	requireReceipts bool,
+	onRequiredFailure func(error),
+) func(error) {
+	if !receiptEmitterReady(e) {
+		return func(error) {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	startReceiptHeartbeat(ctx, &wg, interval, func() *receipt.Emitter { return e }, logW, requireReceipts, onRequiredFailure)
+	return func(drainErr error) {
+		cancel()
+		wg.Wait()
+		// A missed drain can leave outcome receipts outstanding. Stop heartbeats
+		// without claiming a complete session or group.
+		if errors.Is(drainErr, httpstream.ErrShutdownIncomplete) {
+			return
+		}
+		if err := emitSessionCloseAndTranscriptRoot(e, e.Session()); err != nil {
+			reportReceiptShutdownFailure(logW, "receipt shutdown seal failed", err, requireReceipts, onRequiredFailure)
+			if requireReceipts {
+				e.MarkUnhealthy(err)
+			}
+		}
+	}
+}
+
+func startStandaloneReceiptGroupLifecycle(
+	parent context.Context,
+	interval time.Duration,
+	shards *receipt.ReceiptShardSet,
+	logW io.Writer,
+	requireReceipts bool,
+	onRequiredFailure func(error),
+) func(error) {
+	if shards == nil {
+		return func(error) {}
+	}
+	ctx, cancel := context.WithCancel(parent)
+	var wg sync.WaitGroup
+	for _, shard := range shards.Emitters() {
+		e := shard
+		startReceiptHeartbeat(ctx, &wg, interval, func() *receipt.Emitter { return e }, logW, requireReceipts, func(err error) {
+			shards.MarkUnhealthy(err)
+			if onRequiredFailure != nil {
+				onRequiredFailure(err)
+			}
+		})
+	}
+	return func(drainErr error) {
+		cancel()
+		wg.Wait()
+		// A missed drain can leave outcome receipts outstanding. Stop heartbeats
+		// without claiming a complete session or group.
+		if errors.Is(drainErr, httpstream.ErrShutdownIncomplete) {
+			return
+		}
+		for _, shard := range shards.Emitters() {
+			if err := emitSessionCloseAndTranscriptRoot(shard, shard.Session()); err != nil {
+				reportReceiptShutdownFailure(logW, "receipt shutdown seal failed", err, requireReceipts, onRequiredFailure)
+				if requireReceipts {
+					shards.MarkUnhealthy(err)
+				}
+			}
+		}
+		if _, err := shards.PublishClose(); err != nil {
+			reportReceiptShutdownFailure(logW, "receipt group remains incomplete", err, requireReceipts, onRequiredFailure)
+			if requireReceipts {
+				shards.MarkUnhealthy(err)
+			}
+		}
+	}
+}
+
+func reportReceiptShutdownFailure(logW io.Writer, message string, err error, required bool, onRequiredFailure func(error)) {
+	if logW != nil {
+		_, _ = fmt.Fprintf(logW, "pipelock: %s: %v\n", message, err)
+	}
+	if required && onRequiredFailure != nil {
+		onRequiredFailure(err)
+	}
+}
+
+func emitSessionCloseAndTranscriptRoot(e *receipt.Emitter, sessionID string) error {
+	if e == nil {
+		return nil
+	}
+	if err := e.EmitSessionClose(sessionCloseReasonGracefulShutdown); err != nil && !errors.Is(err, receipt.ErrChainSealed) {
+		return err
+	}
+	return e.EmitTranscriptRoot(sessionID)
+}

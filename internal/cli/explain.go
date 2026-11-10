@@ -1,0 +1,1024 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/destination"
+	"github.com/luckyPipewrench/pipelock/internal/evidence/display"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// explain output view labels. For a raw URL the matching surface is URL
+// scanning; we report which component of the URL the blocking scanner
+// inspects so the operator knows whether the credential is in the host, the
+// path, or the query string.
+const (
+	explainViewURLQuery = "url_query"
+	explainViewHost     = "host"
+	explainViewPath     = "path"
+	explainViewURL      = "url"
+	explainViewScheme   = "scheme"
+
+	explainConfigLabelDefaults = "(built-in defaults)"
+
+	explainSurfaceCommand = "command"
+	explainSurfaceTool    = "tool"
+	explainSurfaceFile    = "file"
+
+	explainFileReadLimitBytes = 1 << 20
+	explainSummaryMaxBytes    = 240
+)
+
+const (
+	explainResponseScanExemptNarrowAdvice = "response_scanning.exempt_domains configured: prefer narrower knobs first - use `response_scanning.size_exempt_domains` for large-response false positives, or `dlp.patterns[].exempt_domains` for one noisy DLP pattern."
+	explainResponseScanExemptDisabled     = "With `response_scanning.enabled=false`, the full-trust streaming bypass is inactive; immutable core response findings may still be treated as trusted/warn-only for matching hosts."
+	explainResponseScanExemptBlastRadius  = "Use `response_scanning.exempt_domains` only when the whole host is trusted: responses are fully unscanned for injection, including oversized over-cap responses that stream unscanned."
+)
+
+// explainReport is the structured form of an `explain` verdict. It mirrors the
+// doctorReport JSON-report pattern: a stable, machine-readable shape that the
+// human renderer also consumes. The remediation block is the load-bearing part
+// of this command — it names the EXACT knob the blocking scanner consults.
+type explainReport struct {
+	URL           string              `json:"url"`
+	Surface       string              `json:"surface,omitempty"`
+	BlockedAction string              `json:"blocked_action,omitempty"`
+	ConfigFile    string              `json:"config_file"`
+	Mode          string              `json:"mode"`
+	Version       string              `json:"version"`
+	Allowed       bool                `json:"allowed"`
+	Scanner       string              `json:"scanner,omitempty"`
+	Layer         string              `json:"layer,omitempty"`
+	TargetView    string              `json:"target_view,omitempty"`
+	Host          string              `json:"host,omitempty"`
+	PatternName   string              `json:"pattern_name,omitempty"`
+	Reason        string              `json:"reason,omitempty"`
+	Score         float64             `json:"score"`
+	DNSDependent  bool                `json:"dns_dependent"`
+	Notes         []string            `json:"notes,omitempty"`
+	WarnMatches   []explainWarnMatch  `json:"warn_matches,omitempty"`
+	AgentReason   string              `json:"agent_reason,omitempty"`
+	Remediation   *explainRemediation `json:"remediation,omitempty"`
+}
+
+type explainWarnMatch struct {
+	PatternName string `json:"pattern_name"`
+	Severity    string `json:"severity"`
+}
+
+// explainRemediation carries the correct, per-scanner remediation guidance.
+// Knob is the narrowest verified change; Broader is an option with a wider
+// blast radius (and its tradeoff). Both are empty when a block is structural
+// and has no legitimate exemption (CRLF, path traversal, bad scheme, core
+// immutable floors).
+type explainRemediation struct {
+	// Knob is the narrowest config change that lifts THIS block for a
+	// known-good destination, named for the scanner that actually consults it.
+	Knob string `json:"knob,omitempty"`
+	// Broader is a wider exemption and the tradeoff of using it. Empty when
+	// none applies.
+	Broader string `json:"broader,omitempty"`
+	// Immutable is set when the block comes from a safety floor that cannot be
+	// disabled by config (core DLP/SSRF/response).
+	Immutable bool `json:"immutable,omitempty"`
+}
+
+func explainCmd() *cobra.Command {
+	var configFile string
+	var jsonOutput bool
+	var commandInput string
+	var toolName string
+	var toolInput string
+	var filePath string
+	var showRaw bool
+	var hexdump bool
+
+	cmd := &cobra.Command{
+		Use:   "explain <url> [--command <command> | --tool <name> --input <json> | --file <path>]",
+		Short: "Explain a URL, command, tool, or file verdict and the exact remediation for a block",
+		Long: `Run a URL through the scanner pipeline, or run a hook surface through
+the decide path, using the loaded config and explain the verdict so a block is
+remediable. For a block, explain prints the scanner/layer that produced the
+verdict, the matching pattern or policy rule, the inspected surface, the
+effective config path, and — most importantly — the EXACT remediation knob
+that scanner or decide label consults, plus any broader option and its
+tradeoff.
+
+explain does not perform network access. It runs the layers that fire before
+DNS resolution (scheme, CRLF, path traversal, allowlist, blocklist, core SSRF
+literal, core/URL DLP, path and subdomain entropy). The hostname-based SSRF
+layer resolves DNS at runtime, so explain reports when a verdict
+would additionally depend on resolution rather than reaching out itself. IP
+literals that resolve to private ranges are still caught here by the immutable
+core SSRF literal check, which needs no resolution.
+
+Examples:
+  pipelock explain https://example.com/path
+  pipelock explain --config pipelock.yaml https://example.com/download?id=42
+  pipelock explain --json https://10.0.0.1/internal
+  pipelock explain --command "grep .env.example"
+  pipelock explain --tool "mcp__x__run" --input '{"cmd":"grep .env.example"}'
+  pipelock explain --file ./fixture.txt`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          validateExplainArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mode := explainModeFromFlags(cmd)
+			cfg, cfgLabel, err := explainLoadConfigForMode(configFile, mode)
+			if err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+			}
+			var report explainReport
+			if mode == "" {
+				report, err = buildExplainReport(cmd, cfg, cfgLabel, args[0])
+			} else {
+				action, blockedAction, actionErr := explainActionForMode(mode, commandInput, toolName, toolInput, filePath)
+				if actionErr != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig, actionErr)
+				}
+				report, err = buildExplainSurfaceReport(cmd, cfg, cfgLabel, mode, blockedAction, action)
+			}
+			if err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+			}
+			if jsonOutput {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(report); err != nil {
+					return fmt.Errorf("encode explain report JSON: %w", err)
+				}
+			} else {
+				printExplainReport(cmd.OutOrStdout(), report, explainPrintOptions{ShowRaw: showRaw, Hexdump: hexdump})
+			}
+			// A blocked verdict exits non-zero so scripts can branch on it,
+			// matching `pipelock check --url`'s contract.
+			if !report.Allowed {
+				blockErr := errExplainBlocked
+				if report.Surface != "" {
+					blockErr = errExplainActionBlocked
+				}
+				return cliutil.ExitCodeError(cliutil.ExitSecurity, blockErr)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path (default: built-in defaults)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output report as JSON")
+	cmd.Flags().StringVar(&commandInput, "command", "", "explain a shell command hook verdict")
+	cmd.Flags().StringVar(&toolName, "tool", "", "explain a tool-use hook verdict for this tool name")
+	cmd.Flags().StringVar(&toolInput, "input", "", "JSON tool input for --tool")
+	cmd.Flags().StringVar(&filePath, "file", "", "explain a file-write hook verdict by scanning this file's content")
+	cmd.Flags().BoolVar(&showRaw, "show-raw", false, "append raw field bytes in human output")
+	cmd.Flags().BoolVar(&hexdump, "hexdump", false, "append canonical raw field hexdumps in human output")
+
+	// `explain mcp-response` explains an MCP response block and names the
+	// per-server suppress knob (the stdio MCP equivalent of a URL verdict).
+	cmd.AddCommand(explainEventCmd())
+	cmd.AddCommand(explainMCPResponseCmd())
+	cmd.AddCommand(explainResponseCmd())
+
+	return cmd
+}
+
+// errExplainBlocked is the sentinel returned when explain reports a blocked
+// URL. It carries the security exit code so callers can branch on a block
+// without parsing output.
+var errExplainBlocked = errors.New("url blocked")
+
+var errExplainActionBlocked = errors.New("action blocked")
+
+// explainEnvScanSkippedNote is reported by the command, tool and file modes when
+// the config enables `dlp.scan_env`.
+const explainEnvScanSkippedNote = "environment-variable leak matching (`dlp.scan_env`) did not run: explain does not read the runtime's environment, so input containing one of its values can still be blocked at runtime as an Environment Variable Leak"
+
+func explainLoadConfig(path string) (*config.Config, string, error) {
+	if path == "" {
+		return config.Defaults(), explainConfigLabelDefaults, nil
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("config load error: %w", err)
+	}
+	return cfg, path, nil
+}
+
+func explainLoadConfigForMode(path, mode string) (*config.Config, string, error) {
+	if mode == "" {
+		return explainLoadConfig(path)
+	}
+	return explainLoadSurfaceConfig(path)
+}
+
+func explainLoadSurfaceConfig(path string) (*config.Config, string, error) {
+	if path != "" {
+		cfg, err := config.Load(path)
+		if err != nil {
+			return nil, "", fmt.Errorf("config load error: %w", err)
+		}
+		cfg.ApplyDefaults()
+		return cfg, path, nil
+	}
+
+	cfg := config.Defaults()
+	cfg.MCPToolPolicy = config.MCPToolPolicy{
+		Enabled: true,
+		Action:  config.ActionBlock,
+		Rules:   policy.DefaultToolPolicyRules(),
+	}
+	cfg.MCPInputScanning.Enabled = true
+	cfg.MCPInputScanning.Action = config.ActionBlock
+	cfg.ResponseScanning.Enabled = true
+	cfg.ResponseScanning.Action = config.ActionBlock
+	cfg.ApplyDefaults()
+
+	return cfg, explainConfigLabelDefaults, nil
+}
+
+func validateExplainArgs(cmd *cobra.Command, args []string) error {
+	if len(args) > 1 {
+		return fmt.Errorf("explain accepts at most one positional URL")
+	}
+
+	modeCount := 0
+	modeNames := make([]string, 0, 4)
+	if len(args) == 1 {
+		modeCount++
+		modeNames = append(modeNames, "url")
+	}
+	for _, name := range []string{explainSurfaceCommand, explainSurfaceTool, explainSurfaceFile} {
+		if cmd.Flags().Changed(name) {
+			modeCount++
+			modeNames = append(modeNames, "--"+name)
+		}
+	}
+	if cmd.Flags().Changed("input") && !cmd.Flags().Changed(explainSurfaceTool) {
+		return fmt.Errorf("--input can only be used with --tool")
+	}
+
+	switch modeCount {
+	case 0:
+		return fmt.Errorf("provide exactly one explain target: URL, --command, --tool, or --file")
+	case 1:
+		return validateExplainModeValues(cmd)
+	default:
+		return fmt.Errorf("provide exactly one explain target, got %s", strings.Join(modeNames, " and "))
+	}
+}
+
+func validateExplainModeValues(cmd *cobra.Command) error {
+	commandValue, _ := cmd.Flags().GetString(explainSurfaceCommand)
+	if cmd.Flags().Changed(explainSurfaceCommand) && strings.TrimSpace(commandValue) == "" {
+		return fmt.Errorf("--command cannot be empty")
+	}
+	toolValue, _ := cmd.Flags().GetString(explainSurfaceTool)
+	if cmd.Flags().Changed(explainSurfaceTool) {
+		if strings.TrimSpace(toolValue) == "" {
+			return fmt.Errorf("--tool cannot be empty")
+		}
+		inputValue, _ := cmd.Flags().GetString("input")
+		if !cmd.Flags().Changed("input") || strings.TrimSpace(inputValue) == "" {
+			return fmt.Errorf("--input is required with --tool")
+		}
+		if !json.Valid([]byte(inputValue)) {
+			return fmt.Errorf("--input must be valid JSON")
+		}
+	}
+	fileValue, _ := cmd.Flags().GetString(explainSurfaceFile)
+	if cmd.Flags().Changed(explainSurfaceFile) && strings.TrimSpace(fileValue) == "" {
+		return fmt.Errorf("--file cannot be empty")
+	}
+	return nil
+}
+
+func explainModeFromFlags(cmd *cobra.Command) string {
+	switch {
+	case cmd.Flags().Changed(explainSurfaceCommand):
+		return explainSurfaceCommand
+	case cmd.Flags().Changed(explainSurfaceTool):
+		return explainSurfaceTool
+	case cmd.Flags().Changed(explainSurfaceFile):
+		return explainSurfaceFile
+	default:
+		return ""
+	}
+}
+
+func explainActionForMode(mode, commandInput, toolName, toolInput, filePath string) (decide.Action, string, error) {
+	switch mode {
+	case explainSurfaceCommand:
+		commandInput = strings.TrimSpace(commandInput)
+		return decide.Action{
+			Source: "explain",
+			Kind:   decide.EventShellExecution,
+			Shell:  &decide.ShellPayload{Command: commandInput},
+		}, explainLimitSummary(commandInput), nil
+	case explainSurfaceTool:
+		toolName = strings.TrimSpace(toolName)
+		return decide.Action{
+			Source: "explain",
+			Kind:   decide.EventToolUse,
+			ToolUse: &decide.ToolUsePayload{
+				ToolName:  toolName,
+				ToolInput: toolInput,
+			},
+		}, explainLimitSummary("tool " + toolName), nil
+	case explainSurfaceFile:
+		cleanPath, content, err := explainReadFileContent(filePath)
+		if err != nil {
+			return decide.Action{}, "", err
+		}
+		return decide.Action{
+			Source: "explain",
+			Kind:   decide.EventWriteFile,
+			Write: &decide.WritePayload{
+				FilePath: cleanPath,
+				Content:  content,
+			},
+		}, explainLimitSummary("write_file " + cleanPath), nil
+	default:
+		return decide.Action{}, "", fmt.Errorf("unknown explain mode %q", mode)
+	}
+}
+
+func explainReadFileContent(path string) (string, string, error) {
+	cleanPath := filepath.Clean(path)
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read --file %q: %w", cleanPath, err)
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	data, err := io.ReadAll(io.LimitReader(f, explainFileReadLimitBytes+1))
+	if err != nil {
+		return "", "", fmt.Errorf("read --file %q: %w", cleanPath, err)
+	}
+	if len(data) > explainFileReadLimitBytes {
+		return "", "", fmt.Errorf("--file %q exceeds explain read cap of %d bytes", cleanPath, explainFileReadLimitBytes)
+	}
+	return cleanPath, string(data), nil
+}
+
+func explainLimitSummary(s string) string {
+	if len(s) <= explainSummaryMaxBytes {
+		return s
+	}
+	return s[:explainSummaryMaxBytes] + "..."
+}
+
+func buildExplainReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, rawURL string) (explainReport, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return explainReport{}, errors.New("empty URL: provide a URL to explain")
+	}
+	// A URL the parser cannot even read is an input error (exit 2), not a
+	// security block (exit 3). Genuine scheme/scanner rejections of a
+	// well-formed URL still flow through as a blocked verdict below.
+	if _, err := url.Parse(rawURL); err != nil {
+		return explainReport{}, fmt.Errorf("invalid URL %q: %w", rawURL, err)
+	}
+
+	report := explainReport{
+		URL:        rawURL,
+		ConfigFile: cfgLabel,
+		Mode:       cfg.Mode,
+		Version:    cliutil.Version,
+	}
+
+	for i, pattern := range cfg.DLP.Patterns {
+		if len(pattern.Keywords) > 0 {
+			report.Notes = append(report.Notes, fmt.Sprintf("dlp.patterns[%d] %q requires a complete nearby keyword outside the candidate within %d Unicode scalar values on either side, in source or producing decoded context; missing labels produce no finding; action follows the pattern and surface", i, pattern.Name, pattern.EffectiveKeywordWindow()))
+		}
+	}
+	if notice := cfg.PromptInjectionNotice(); notice != "" {
+		report.Notes = append(report.Notes, notice)
+	}
+
+	// Merge any installed rule bundles into the config exactly as the runtime
+	// scanner would, so URL-DLP patterns from bundles are reflected in the
+	// verdict. Surface bundle load errors as warnings, not a hard failure.
+	bundleResult := rules.MergeIntoConfig(cfg, cliutil.Version)
+	for _, e := range bundleResult.Errors {
+		report.Notes = append(report.Notes, fmt.Sprintf("rule bundle %s skipped: %s", e.Name, e.Reason))
+	}
+	for _, w := range bundleResult.Warnings {
+		report.Notes = append(report.Notes, "rule bundle warning: "+w)
+	}
+
+	// Disable the hostname-based SSRF layer so explain performs no DNS. The
+	// immutable core SSRF literal check still runs (it inspects IP literals,
+	// not resolved names), so private-IP literals are still caught. Detect
+	// whether the running config WOULD consult the DNS-dependent SSRF layer so
+	// we can flag the verdict as resolution-dependent.
+	ssrfActive := cfg.Internal != nil
+	cfg.Internal = nil
+
+	sc, err := scanner.New(cfg)
+	if err != nil {
+		return report, fmt.Errorf("create scanner: %w", err)
+	}
+	defer sc.Close()
+	// A URL explanation models a fetch, which always dispatches GET. A native
+	// OAuth endpoint grant depends on that method, so say when it decided the
+	// verdict: any other method at this URL keeps the ordinary gates.
+	result := sc.Scan(scanner.WithOAuthAuthorizationMethod(cmd.Context(), http.MethodGet), rawURL)
+	if result.Allowed && len(cfg.FetchProxy.Monitoring.OAuthAuthorizationEndpoints) > 0 {
+		if other := sc.ScanPreflight(cmd.Context(), rawURL); !other.Allowed {
+			report.Notes = append(report.Notes, "Explained as GET: `fetch_proxy.monitoring.oauth_authorization_endpoints` admits this native OAuth authorization request only for GET; another method at this URL is refused by "+other.Scanner+".")
+		}
+	}
+
+	report.Allowed = result.Allowed
+	report.Scanner = result.Scanner
+	report.Layer = result.Scanner
+	report.Reason = result.Reason
+	if strings.Contains(result.Reason, "outside its validity window") {
+		report.Notes = append(report.Notes, "The grant allowance is withheld because its validity window does not include the current host clock. URL explanations use the current clock, so a URL from an earlier log may have expired; check the host clock or obtain a current URL.")
+	}
+	report.Score = result.Score
+	report.Host = explainHost(rawURL)
+	report.TargetView = explainTargetView(result, rawURL)
+	for _, w := range result.WarnMatches {
+		report.WarnMatches = append(report.WarnMatches, explainWarnMatch{
+			PatternName: w.PatternName,
+			Severity:    w.Severity,
+		})
+	}
+	report.PatternName = explainPatternName(result)
+	report.Notes = append(report.Notes, explainResponseScanExemptNotes(cfg, report.Host)...)
+
+	if result.Allowed {
+		for _, allow := range result.CredentialAudienceAllows {
+			report.PatternName = allow.PatternName
+			report.Notes = append(report.Notes, fmt.Sprintf("allowed: credential audience match (pattern %s, canonical destination %s)", allow.PatternName, allow.Destination))
+		}
+		// Even an allowed verdict can depend on DNS: if the hostname-based
+		// SSRF layer is active in the live config and the host is not an IP
+		// literal, the runtime verdict could still block on resolution.
+		if ssrfActive && !explainHostIsIPLiteral(report.Host) {
+			report.DNSDependent = true
+			report.Notes = append(report.Notes,
+				"this config's SSRF layer resolves DNS at runtime; explain did not resolve, so a private/metadata IP or DNS failure could still block this URL when proxied")
+		}
+		report.Notes = append(report.Notes, explainUnevaluatedLayerNotes(cfg, report.Host)...)
+		return report, nil
+	}
+	if len(result.CredentialAudienceMismatches) > 0 {
+		mismatch := result.CredentialAudienceMismatches[0]
+		report.PatternName = mismatch.PatternName
+		report.Reason = fmt.Sprintf("blocked: credential audience mismatch (pattern %s, canonical destination %s, immutable audience hosts %s)", mismatch.PatternName, mismatch.Destination, strings.Join(mismatch.Hosts, ", "))
+		report.Remediation = &explainRemediation{
+			Knob:      "This built-in credential audience host set is immutable. Correct the destination or use a credential intended for that destination; do not use a URL-only exemption or a global bypass.",
+			Immutable: true,
+		}
+		return report, nil
+	}
+
+	report.Remediation = explainRemediationFor(result)
+	return report, nil
+}
+
+// explainUnevaluatedContentLayers names the enabled scanners that inspect
+// fetched content, which explain cannot evaluate because it never issues the
+// request.
+//
+// Without this, an allowed verdict reads as a promise the command cannot make.
+// A vendor documentation page that the proxy blocks with
+// `response contains prompt injection` still explains as ALLOWED, because
+// every layer explain does evaluate genuinely passes: the block comes from the
+// response body, which only exists after a fetch. An operator who hits a block
+// and runs the command named explain is then told the opposite of what they
+// just saw, and the tool built to make a block understandable becomes the
+// reason they cannot understand it.
+//
+// Only enabled scanners are named. Listing a disabled one would be its own
+// false alarm, and an advisory that cries wolf gets ignored along with the
+// ones that matter.
+// explainUnevaluatedLayerNotes reports every enabled control that can deny this
+// request but that explain did not evaluate.
+//
+// explain runs one URL through the pre-resolution layers with no network access
+// and no session history, so it cannot evaluate anything that depends on state
+// it does not hold. There are three such kinds, and they fail an operator
+// differently, so they are reported differently:
+//
+//   - fetched content: response and request-body scanning, which need the
+//     response or body that explain never requests;
+//   - accumulated state: cross-request detection and adaptive enforcement,
+//     which decide from request history rather than from this one URL;
+//   - runtime activation: the kill switch, which is different in kind because
+//     explain CAN see it in the config it already loaded, and while it is
+//     active every request is denied regardless of any verdict printed here.
+//
+// Naming only the content layers, which is where this started, fixed two
+// instances of one class and left the rest reporting ALLOWED over controls that
+// deny. Only enabled controls are named; listing a switched-off one would be
+// the false alarm that gets the whole disclosure ignored.
+func explainUnevaluatedLayerNotes(cfg *config.Config, host string) []string {
+	if cfg == nil {
+		return nil
+	}
+	var notes []string
+
+	// Reported first and stated as fact rather than possibility: this is not a
+	// caveat about something that might apply, it is a control that is denying
+	// traffic right now.
+	if cfg.KillSwitch.Enabled {
+		notes = append(notes,
+			"`kill_switch.enabled` is set: the kill switch is ACTIVE and denies every request except exempt endpoints and allowlisted IPs, so this URL is refused at runtime regardless of the verdict above")
+	}
+
+	if layers := explainUnevaluatedContentLayers(cfg, host); len(layers) > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"this verdict covers URL-layer checks only; explain does not fetch the URL, so %s did not run and can still block this request at runtime",
+			strings.Join(layers, " and ")))
+	}
+
+	if layers := explainUnevaluatedStatefulLayers(cfg); len(layers) > 0 {
+		notes = append(notes, fmt.Sprintf(
+			"explain evaluates this URL on its own, so %s did not run; those decide from accumulated request history and can block a URL that is allowed in isolation",
+			strings.Join(layers, " and ")))
+	}
+
+	return notes
+}
+
+// explainUnevaluatedStatefulLayers names enabled controls whose verdict depends
+// on request history rather than on this URL.
+//
+// A single-URL evaluation cannot reach them even in principle: the entropy
+// budget accumulates across a session, and adaptive enforcement escalates from
+// prior signals. Both routinely block a URL that is individually clean, which
+// is exactly the surprise this disclosure exists to prevent.
+func explainUnevaluatedStatefulLayers(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var layers []string
+	if cfg.CrossRequestDetection.Enabled {
+		layers = append(layers, "cross-request detection")
+	}
+	if cfg.AdaptiveEnforcement.Enabled {
+		layers = append(layers, "adaptive enforcement")
+	}
+	return layers
+}
+
+func explainUnevaluatedContentLayers(cfg *config.Config, host string) []string {
+	if cfg == nil {
+		return nil
+	}
+	var layers []string
+	// An exempt host narrows what response scanning does; it does not switch it
+	// off. `response_scanning.exempt_domains` skips INJECTION scanning only and
+	// response DLP still applies (internal/config/schema.go on the field, and
+	// internal/mcp/sse_generic.go where the flag gates injection findings
+	// alone). Dropping the whole disclosure here would hide a check that can
+	// still block this request, so the exemption changes the WORDING rather
+	// than removing the entry.
+	if cfg.ResponseScanning.Enabled {
+		layer := "response scanning"
+		if _, exempt := explainResponseScanExemptDomain(cfg, host); exempt {
+			layer = "response DLP (injection scanning is exempt for this host, DLP is not)"
+		}
+		layers = append(layers, layer)
+	}
+	// Request body scanning has no whole-scanner host exemption. Its host
+	// patterns (content_entropy_exclusions) narrow one sub-check rather than
+	// the credential matching, so the scanner can still block an exempted host.
+	if cfg.RequestBodyScanning.Enabled {
+		layers = append(layers, "request body scanning")
+	}
+	return layers
+}
+
+// explainResponseScanExemptDomain reports the configured exempt domain matching
+// this host, if any.
+//
+// One predicate, shared with the exemption advisory below, so the two cannot
+// disagree about whether a host is exempt. An empty host is NOT treated as
+// exempt: with nothing to match, exemption is unproven, and the honest default
+// is to keep disclosing the scanner rather than quietly drop it.
+func explainResponseScanExemptDomain(cfg *config.Config, host string) (string, bool) {
+	if cfg == nil || host == "" {
+		return "", false
+	}
+	for _, domain := range cfg.ResponseScanning.ExemptDomains {
+		if scanner.MatchDomain(host, domain) {
+			return domain, true
+		}
+	}
+	return "", false
+}
+
+func explainResponseScanExemptNotes(cfg *config.Config, host string) []string {
+	if cfg == nil || len(cfg.ResponseScanning.ExemptDomains) == 0 {
+		return nil
+	}
+	if !cfg.ResponseScanning.Enabled {
+		return []string{explainResponseScanExemptNarrowAdvice + " " + explainResponseScanExemptDisabled}
+	}
+	notes := []string{explainResponseScanExemptNarrowAdvice + " " + explainResponseScanExemptBlastRadius}
+	if domain, exempt := explainResponseScanExemptDomain(cfg, host); exempt {
+		notes = append(notes, fmt.Sprintf("this host matches `response_scanning.exempt_domains` (%s): responses are fully unscanned for injection, including oversized over-cap responses that stream unscanned", domain))
+	}
+	return notes
+}
+
+func buildExplainSurfaceReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, surface, blockedAction string, action decide.Action) (explainReport, error) {
+	// Bundle merging and offline-only overrides must not alter the caller's
+	// config or hide skipped checks on subsequent reports.
+	cfg = cfg.Clone()
+	report := explainReport{
+		Surface:       surface,
+		BlockedAction: blockedAction,
+		ConfigFile:    cfgLabel,
+		Mode:          cfg.Mode,
+		Version:       cliutil.Version,
+		TargetView:    surface,
+	}
+	if notice := cfg.PromptInjectionNotice(); notice != "" {
+		report.Notes = append(report.Notes, notice)
+	}
+
+	bundleResult := rules.MergeIntoConfig(cfg, cliutil.Version)
+	for _, e := range bundleResult.Errors {
+		report.Notes = append(report.Notes, fmt.Sprintf("rule bundle %s skipped: %s", e.Name, e.Reason))
+	}
+	for _, w := range bundleResult.Warnings {
+		report.Notes = append(report.Notes, "rule bundle warning: "+w)
+	}
+
+	// Explain runs in its own process, not the hooked agent's, so the values
+	// env-leak matching would compare against are not the ones the runtime
+	// sees. The check is switched off here, and said so: otherwise ALLOWED
+	// reads as covering a check that never ran.
+	if cfg.DLP.ScanEnv {
+		cfg.DLP.ScanEnv = false
+		report.Notes = append(report.Notes, explainEnvScanSkippedNote)
+	}
+
+	sc, err := scanner.New(cfg)
+	if err != nil {
+		return report, fmt.Errorf("create scanner: %w", err)
+	}
+	defer sc.Close()
+	pc := policy.New(cfg.MCPToolPolicy)
+	// Explain answers what an agent hook on this host would decide, so it
+	// resolves paths here the same way the hooks do.
+	pc.EnableLocalPathIdentity()
+	decision := decide.Decide(cmd.Context(), cfg, sc, pc, action)
+
+	report.Allowed = decision.Outcome == decide.Allow
+	if report.Allowed {
+		return report, nil
+	}
+
+	primary := explainPrimaryEvidence(decision)
+	report.Scanner = primary.Scanner
+	report.Layer = primary.Scanner
+	report.PatternName = primary.Pattern
+	report.Reason = explainEvidenceReason(primary, decision)
+	report.Remediation = explainRemediationForEvidence(primary)
+	if report.Remediation != nil {
+		if g, ok := scanner.GuidanceForResultWithPatterns(primary.Scanner, report.Reason, []string{primary.Pattern}); ok {
+			report.AgentReason = g.AgentReason
+		}
+	}
+	return report, nil
+}
+
+func explainPrimaryEvidence(decision decide.Decision) decide.Evidence {
+	for _, e := range decision.Evidence {
+		if e.Action == config.ActionBlock {
+			return e
+		}
+	}
+	if len(decision.Evidence) > 0 {
+		return decision.Evidence[0]
+	}
+	return decide.Evidence{
+		Scanner: scanner.DecideStructuralLabel,
+		Detail:  decision.UserMessage,
+		Action:  config.ActionBlock,
+	}
+}
+
+func explainEvidenceReason(e decide.Evidence, decision decide.Decision) string {
+	if e.Detail != "" {
+		return e.Detail
+	}
+	if e.Pattern != "" {
+		return e.Pattern
+	}
+	return decision.UserMessage
+}
+
+func explainRemediationForEvidence(e decide.Evidence) *explainRemediation {
+	reason := e.Detail
+	if reason == "" {
+		reason = e.Pattern
+	}
+	if g, ok := scanner.GuidanceForResultWithPatterns(e.Scanner, reason, []string{e.Pattern}); ok {
+		return &explainRemediation{
+			Knob:      g.OperatorKnob,
+			Broader:   g.OperatorBroader,
+			Immutable: g.Immutable,
+		}
+	}
+	return &explainRemediation{
+		Knob: "No specific remediation is mapped for this scanner. Inspect the reason and the effective config before changing policy.",
+	}
+}
+
+// explainHost returns the lowercased hostname for display, or empty if the URL
+// cannot be parsed (a parse failure is itself a verdict, reported separately).
+func explainHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Hostname())
+}
+
+func explainHostIsIPLiteral(host string) bool {
+	return destination.ParseIPLiteral(host) != nil
+}
+
+// explainTargetView reports which component of the URL the blocking scanner
+// inspected. For a URL scan the surface is always URL scanning; this names the
+// specific view so the operator knows where the offending content lives.
+func explainTargetView(result scanner.Result, rawURL string) string {
+	if view := explainTargetViewFromSpans(result.Spans()); view != "" {
+		return view
+	}
+	switch result.Scanner {
+	case scanner.ScannerScheme:
+		return explainViewScheme
+	case scanner.ScannerDLP, scanner.ScannerCoreDLP:
+		if view := explainURLComponentView(rawURL); view != "" {
+			return view
+		}
+		return explainViewURL
+	case scanner.ScannerEntropy:
+		if scanner.IsQueryEntropyResult(result) {
+			return explainViewURLQuery
+		}
+		return explainViewPath
+	case scanner.ScannerSubdomainEntropy, scanner.ScannerSSRF, scanner.ScannerSSRFMetadata,
+		scanner.ScannerCoreSSRF, scanner.ScannerBlocklist, scanner.ScannerAllowlist:
+		return explainViewHost
+	case scanner.ScannerPathTraversal:
+		return explainViewPath
+	default:
+		return explainViewURL
+	}
+}
+
+func explainTargetViewFromSpans(spans []scanner.MatchSpan) string {
+	for _, span := range spans {
+		label := span.ViewLabel
+		switch {
+		case strings.Contains(label, "query"):
+			return explainViewURLQuery
+		case strings.Contains(label, "subdomain"):
+			return explainViewHost
+		case strings.Contains(label, "path"):
+			return explainViewPath
+		case strings.Contains(label, "url"):
+			return explainViewURL
+		}
+	}
+	return ""
+}
+
+func explainURLComponentView(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	switch {
+	case u.RawQuery != "":
+		return explainViewURLQuery
+	case u.Path != "" && u.Path != "/":
+		return explainViewPath
+	case u.Hostname() != "":
+		return explainViewHost
+	default:
+		return explainViewURL
+	}
+}
+
+// dlpReasonPatternPrefixes are the DLP reason-string prefixes the scanner
+// emits before the matched pattern name. The scanner Result has no dedicated
+// pattern-name field for a hard block, so we recover the name from the reason
+// string, which is formatted as `[core ]DLP match: <name> (<severity>)`.
+var dlpReasonPatternPrefixes = []string{"core DLP match: ", "DLP match: "}
+
+// explainPatternName extracts the matched pattern name when one is available.
+// For warn-mode matches the name is on the WarnMatch; for a DLP hard block the
+// name is embedded in the reason string. Returns empty when no pattern name is
+// recoverable (e.g. entropy, SSRF, scheme blocks have no named pattern).
+func explainPatternName(result scanner.Result) string {
+	if result.Allowed {
+		return ""
+	}
+	switch result.Scanner {
+	case scanner.ScannerDLP, scanner.ScannerCoreDLP:
+		for _, prefix := range dlpReasonPatternPrefixes {
+			if rest, ok := strings.CutPrefix(result.Reason, prefix); ok {
+				// Trim the trailing " (<severity>)" suffix.
+				if idx := strings.LastIndex(rest, " ("); idx >= 0 {
+					return rest[:idx]
+				}
+				return rest
+			}
+		}
+	case scanner.ScannerBlocklist:
+		if _, pattern, ok := strings.Cut(result.Reason, " matches "); ok {
+			return pattern
+		}
+	}
+	return ""
+}
+
+// explainRemediationFor maps a blocking scanner to its CORRECT remediation
+// knob. This mapping is the entire point of the command: a hint must name a
+// knob the blocking scanner ACTUALLY consults. The knob→scanner facts are
+// authoritative per internal/scanner and internal/config:
+//
+//   - URL DLP (dlp / core_dlp) does NOT consult top-level suppress:. The
+//     correct knob is per-pattern dlp.patterns[].exempt_domains. (core_dlp is
+//     an immutable floor and cannot be exempted.)
+//   - Query entropy is a SEPARATE gate from DLP, tuned by
+//     fetch_proxy.monitoring.query_entropy_exclusions.
+//   - Path entropy is tuned by fetch_proxy.monitoring.path_entropy_exclusions
+//     (host + literal path prefix, path gate only). subdomain_entropy_exclusions
+//     also lifts path entropy but is host-wide AND disables subdomain entropy,
+//     so it gives up a second detection.
+//   - Subdomain entropy uses
+//     fetch_proxy.monitoring.subdomain_entropy_exclusions.
+//   - Domain blocklist is fetch_proxy.monitoring.blocklist.
+//   - Allowlist (strict mode) is api_allowlist (or switch mode).
+//   - SSRF (hostname/metadata) is trusted_domains / ssrf.ip_allowlist;
+//     core_ssrf is an immutable private-range floor.
+//   - CRLF / path traversal / scheme are never legitimate and have no knob.
+//   - Rate limit / length / data budget are protective ceilings, tuned by
+//     their own numeric knobs.
+func explainRemediationFor(result scanner.Result) *explainRemediation {
+	// scanner.GuidanceForResult is the single source: it draws from the label-
+	// keyed guidance table and uses the scan Reason to pick same-label variants
+	// (query vs path entropy), so explain and the audit remediation_hint cannot
+	// drift. The default covers a label with no mapped guidance.
+	if g, ok := scanner.GuidanceForResult(result.Scanner, result.Reason); ok {
+		return &explainRemediation{
+			Knob:      g.OperatorKnob,
+			Broader:   g.OperatorBroader,
+			Immutable: g.Immutable,
+		}
+	}
+	return &explainRemediation{
+		Knob: "No specific remediation is mapped for this scanner. Inspect the reason and the effective config before changing policy.",
+	}
+}
+
+type explainPrintOptions struct {
+	ShowRaw bool
+	Hexdump bool
+}
+
+func printExplainReport(w io.Writer, report explainReport, opts explainPrintOptions) {
+	_, _ = fmt.Fprintln(w, "Pipelock Explain")
+	_, _ = fmt.Fprintln(w, "================")
+	if report.Surface != "" {
+		printExplainField(w, "Surface", report.Surface, false, opts)
+		if report.BlockedAction != "" {
+			printExplainField(w, "Action", report.BlockedAction, false, opts)
+		}
+	} else {
+		printExplainField(w, "URL", report.URL, true, opts)
+	}
+	printExplainField(w, "Config", report.ConfigFile, false, opts)
+	printExplainField(w, "Mode", report.Mode, false, opts)
+	if report.Host != "" {
+		printExplainField(w, "Host", report.Host, true, opts)
+	}
+	_, _ = fmt.Fprintln(w)
+
+	if report.Allowed {
+		_, _ = fmt.Fprintln(w, "Verdict: ALLOWED")
+		_, _ = fmt.Fprintf(w, "Score:   %.2f\n", report.Score)
+		for _, note := range report.Notes {
+			printExplainField(w, "note", note, false, opts)
+		}
+		return
+	}
+
+	_, _ = fmt.Fprintln(w, "Verdict: BLOCKED")
+	printExplainField(w, "Scanner", report.Scanner, false, opts)
+	printExplainField(w, "Layer", report.Layer, false, opts)
+	if report.TargetView != "" {
+		printExplainField(w, "Target", report.TargetView, true, opts)
+	}
+	if report.PatternName != "" {
+		printExplainField(w, "Pattern", report.PatternName, false, opts)
+	}
+	if report.Reason != "" {
+		printExplainField(w, "Reason", report.Reason, false, opts)
+	}
+	_, _ = fmt.Fprintf(w, "Score:   %.2f\n", report.Score)
+
+	if len(report.WarnMatches) > 0 {
+		_, _ = fmt.Fprintln(w, "Warn matches:")
+		for _, m := range report.WarnMatches {
+			printExplainField(w, "  -", fmt.Sprintf("%s (%s)", m.PatternName, m.Severity), false, opts)
+		}
+	}
+
+	if report.Remediation != nil {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "Remediation:")
+		printExplainField(w, "  ", report.Remediation.Knob, false, opts)
+		if report.Remediation.Broader != "" {
+			printExplainField(w, "  broader", report.Remediation.Broader, false, opts)
+		}
+	}
+	if report.AgentReason != "" {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "Agent reason:")
+		printExplainField(w, "  ", report.AgentReason, false, opts)
+	}
+	for _, note := range report.Notes {
+		printExplainField(w, "note", note, false, opts)
+	}
+}
+
+func printExplainField(w io.Writer, label, raw string, hostAware bool, opts explainPrintOptions) {
+	res := display.Sanitize(raw)
+	if hostAware {
+		if host := explainDisplayHost(raw); host != "" {
+			hostRes := display.SanitizeHost(host)
+			res.Annotations = append(res.Annotations, hostRes.Annotations...)
+			res.PunycodeASCII = hostRes.PunycodeASCII
+			res.PunycodeUnicode = hostRes.PunycodeUnicode
+			res.Suspicious = res.Suspicious || hostRes.Suspicious
+		} else {
+			res = display.SanitizeHost(raw)
+		}
+	}
+	switch {
+	case label == "note":
+		_, _ = fmt.Fprintf(w, "note: %s\n", res.Safe)
+	case label == "  -":
+		_, _ = fmt.Fprintf(w, "  - %s\n", res.Safe)
+	case strings.TrimSpace(label) == "":
+		_, _ = fmt.Fprintf(w, "  %s\n", res.Safe)
+	default:
+		_, _ = fmt.Fprintf(w, "%-8s %s\n", label+":", res.Safe)
+	}
+	if res.Suspicious {
+		for _, ann := range res.Annotations {
+			_, _ = fmt.Fprintf(w, "  ⚠ display anomaly: %s at byte %d: %s\n", ann.Class, ann.Offset, ann.Detail)
+		}
+		if res.PunycodeASCII != "" && res.PunycodeASCII != res.PunycodeUnicode {
+			_, _ = fmt.Fprintf(w, "  punycode: ASCII %s / Unicode %s\n", res.PunycodeASCII, res.PunycodeUnicode)
+		}
+	}
+	if opts.ShowRaw {
+		_, _ = fmt.Fprintf(w, "  raw: %q\n", raw)
+	}
+	if opts.Hexdump {
+		_, _ = fmt.Fprintf(w, "  hexdump:\n%s\n", display.Hexdump(raw))
+	}
+}
+
+func explainDisplayHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err == nil && parsed.Hostname() != "" {
+		return parsed.Hostname()
+	}
+	if strings.Contains(raw, ".") || strings.HasPrefix(strings.ToLower(raw), "xn--") {
+		return raw
+	}
+	return ""
+}

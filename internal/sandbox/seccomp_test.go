@@ -1,0 +1,751 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux && amd64
+
+package sandbox
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+const seccompTestEnv = "__SANDBOX_SECCOMP_TEST"
+
+// The kernel never permits clearing an inherited no_new_privs bit, so that
+// environment cannot construct the missing-prerequisite migration case.
+const seccompPrerequisiteInheritedExit = 77
+
+// seccompChildTimeout bounds each re-exec'd helper child so a wedged child fails
+// its own test in seconds instead of riding out the 10m package timeout and
+// failing the whole job. Far above real child runtime (<1s), far below the
+// package deadline.
+const seccompChildTimeout = 60 * time.Second
+
+func init() {
+	// If we're the seccomp test child, run the operation and exit.
+	if op := os.Getenv(seccompTestEnv); op != "" {
+		runSeccompTestChild(op)
+		os.Exit(0) // should not reach here
+	}
+}
+
+func runSeccompTestChild(op string) {
+	if op == "prerequisite-denied" {
+		runSeccompPrerequisiteDeniedChild()
+		return
+	}
+	if op == "prerequisite-other-thread" || op == "prerequisite-other-thread-strict" {
+		runSeccompPrerequisiteThreadChild(op == "prerequisite-other-thread-strict")
+		return
+	}
+	// Apply no_new_privs + seccomp filter.
+	if err := SetNoNewPrivs(); err != nil {
+		_, _ = os.Stderr.WriteString("no_new_privs: " + err.Error() + "\n")
+		os.Exit(2)
+	}
+
+	status, err := ApplySeccomp()
+	if err != nil {
+		_, _ = os.Stderr.WriteString("seccomp: " + err.Error() + "\n")
+		os.Exit(2)
+	}
+	if !status.Active {
+		_, _ = os.Stderr.WriteString("seccomp not active: " + status.Reason + "\n")
+		os.Exit(2)
+	}
+
+	switch op {
+	case "ptrace":
+		// ptrace should return EPERM.
+		err := syscall.PtraceAttach(os.Getppid())
+		if errors.Is(err, syscall.EPERM) {
+			os.Exit(0) // expected: blocked
+		}
+		_, _ = os.Stderr.WriteString("ptrace returned: " + err.Error() + "\n")
+		os.Exit(1) // bad: should have been EPERM
+
+	case "mount":
+		// mount should return EPERM.
+		err := syscall.Mount("none", "/tmp", "tmpfs", 0, "")
+		if errors.Is(err, syscall.EPERM) {
+			os.Exit(0) // expected: blocked
+		}
+		_, _ = os.Stderr.WriteString("mount returned: " + err.Error() + "\n")
+		os.Exit(1)
+
+	case "file-io":
+		// Normal file I/O should work.
+		f, err := os.CreateTemp("", "seccomp-test-*")
+		if err != nil {
+			_, _ = os.Stderr.WriteString("create temp: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		if _, err := f.WriteString("hello"); err != nil {
+			_, _ = os.Stderr.WriteString("write: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+		os.Exit(0) // expected: allowed
+
+	case "goroutine":
+		// Goroutines require clone3/futex - verify Go runtime still works.
+		ch := make(chan int, 1)
+		go func() { ch <- 42 }()
+		if v := <-ch; v != 42 {
+			os.Exit(1)
+		}
+		os.Exit(0) // expected: allowed
+
+	case "exec-child":
+		// fork+exec should work (clone + execve are allowed).
+		ctx := context.Background()
+		cmd := exec.CommandContext(ctx, "echo", "child-ok")
+		out, err := cmd.Output()
+		if err != nil {
+			_, _ = os.Stderr.WriteString("exec: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(string(out)) != "child-ok" {
+			os.Exit(1)
+		}
+		os.Exit(0) // expected: allowed
+
+	case "network":
+		// Socket creation should work (network calls are allowed;
+		// network ISOLATION is handled by namespace, not seccomp).
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("socket: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		_ = syscall.Close(fd)
+		os.Exit(0) // expected: allowed
+
+	case "getrandom":
+		// crypto/rand needs getrandom.
+		buf := make([]byte, 32)
+		_, err := unix.Getrandom(buf, 0)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("getrandom: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		os.Exit(0) // expected: allowed
+
+	case "clone-newuser":
+		// clone with CLONE_NEWUSER should be blocked by arg filtering.
+		_, _, errno := unix.RawSyscall6(
+			unix.SYS_CLONE,
+			uintptr(syscall.CLONE_NEWUSER|syscall.SIGCHLD),
+			0, 0, 0, 0, 0,
+		)
+		if errno == syscall.EPERM {
+			os.Exit(0) // expected: blocked
+		}
+		// If clone succeeded, reap the child and report failure.
+		_, _ = os.Stderr.WriteString("clone CLONE_NEWUSER returned: " + errno.Error() + "\n")
+		os.Exit(1)
+
+	case "clone-normal":
+		// clone without CLONE_NEW* flags should work (basic fork).
+		r, _, errno := unix.RawSyscall6(
+			unix.SYS_CLONE,
+			uintptr(syscall.SIGCHLD), // no CLONE_NEW* flags
+			0, 0, 0, 0, 0,
+		)
+		if errno != 0 {
+			_, _ = os.Stderr.WriteString("clone normal: " + errno.Error() + "\n")
+			os.Exit(1)
+		}
+		if r == 0 {
+			// Child of a bare clone() shares a duplicated, inconsistent Go
+			// runtime: sibling OS threads vanished at clone and may have held
+			// runtime locks (scheduler, allocator, GC). Touching the runtime
+			// from this child — including os.Exit's stack-growth/scheduler path —
+			// can deadlock it, so it never exits and the parent's Wait4 below
+			// blocks until the whole-package test timeout (the ~50% CI hang).
+			// Exit via a raw, no-split syscall so the child does ZERO runtime
+			// work. exit_group matches what os.Exit ultimately issued.
+			_, _, _ = unix.RawSyscall(unix.SYS_EXIT_GROUP, 0, 0, 0)
+		}
+		// Parent: reap child.
+		var ws syscall.WaitStatus
+		_, _ = syscall.Wait4(int(r), &ws, 0, nil) //nolint:gosec // G115: clone returns pid
+		os.Exit(0)                                // expected: allowed
+
+	case "socket-vsock":
+		// AF_VSOCK (family 40) should be blocked.
+		fd, err := syscall.Socket(afVSOCK, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			if errors.Is(err, syscall.EPERM) {
+				os.Exit(0) // expected: blocked by seccomp
+			}
+			// EAFNOSUPPORT is also acceptable (kernel has no vsock module).
+			if errors.Is(err, syscall.EAFNOSUPPORT) {
+				os.Exit(0) // no vsock support, also acceptable
+			}
+			_, _ = os.Stderr.WriteString("socket AF_VSOCK: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		_ = syscall.Close(fd)
+		_, _ = os.Stderr.WriteString("socket AF_VSOCK succeeded unexpectedly\n")
+		os.Exit(1)
+
+	case "socket-inet":
+		// AF_INET should be allowed (normal network socket).
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+		if err != nil {
+			_, _ = os.Stderr.WriteString("socket AF_INET: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		_ = syscall.Close(fd)
+		os.Exit(0) // expected: allowed
+
+	default:
+		_, _ = os.Stderr.WriteString("unknown operation: " + op + "\n")
+		os.Exit(1)
+	}
+}
+
+// runSeccompPrerequisiteThreadChild holds two distinct OS threads alive so the
+// installing thread cannot inherit the other thread's no_new_privs bit. This
+// deterministically exercises migration between a caller's prerequisite and
+// filter installation, without relying on scheduler load or user namespaces.
+func runSeccompPrerequisiteThreadChild(strict bool) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	inherited, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "read inherited no_new_privs: %v\n", err)
+		os.Exit(2)
+	}
+	if inherited == 1 {
+		_, _ = fmt.Fprintln(os.Stdout, "inherited no_new_privs cannot be cleared for the migration proof")
+		os.Exit(seccompPrerequisiteInheritedExit)
+	}
+	ready := make(chan error, 1)
+	checkFilter := make(chan struct{})
+	checked := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		ready <- SetNoNewPrivs()
+		<-checkFilter
+		checked <- unix.Setns(-1, 0)
+	}()
+	if err := <-ready; err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "other thread no_new_privs: %v\n", err)
+		os.Exit(2)
+	}
+	nnp, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+	if err != nil || nnp != 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "installing thread no_new_privs = %d, %v; want 0\n", nnp, err)
+		os.Exit(2)
+	}
+	// With an invalid descriptor, the kernel reports EBADF before filtering.
+	// EPERM after installation must therefore come from our syscall filter.
+	if err := unix.Setns(-1, 0); !errors.Is(err, unix.EBADF) {
+		_, _ = fmt.Fprintf(os.Stderr, "unfiltered setns = %v; want EBADF\n", err)
+		os.Exit(2)
+	}
+	status, err := ApplySeccomp(strict)
+	if err != nil || !status.Active {
+		_, _ = fmt.Fprintf(os.Stderr, "cross-thread seccomp: active=%v err=%v reason=%s\n", status.Active, err, status.Reason)
+		os.Exit(2)
+	}
+	if err := unix.Setns(-1, 0); !errors.Is(err, unix.EPERM) {
+		_, _ = fmt.Fprintf(os.Stderr, "installing thread setns = %v; want EPERM\n", err)
+		os.Exit(1)
+	}
+	close(checkFilter)
+	if err := <-checked; !errors.Is(err, unix.EPERM) {
+		_, _ = fmt.Fprintf(os.Stderr, "other thread setns = %v; want EPERM\n", err)
+		os.Exit(1)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "seccomp active on both threads")
+	os.Exit(0)
+}
+
+func TestSeccomp_PrerequisiteOnInstallingThread(t *testing.T) {
+	for _, op := range []string{"prerequisite-other-thread", "prerequisite-other-thread-strict"} {
+		t.Run(op, func(t *testing.T) {
+			out, code := runSeccompChild(t, op)
+			if code == seccompPrerequisiteInheritedExit {
+				t.Skip(strings.TrimSpace(out))
+			}
+			if code != 0 || strings.TrimSpace(out) != "seccomp active on both threads" {
+				t.Fatalf("cross-thread prerequisite proof exited %d: %s", code, out)
+			}
+		})
+	}
+}
+
+func runSeccompPrerequisiteDeniedChild() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetNoNewPrivs(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "prepare prerequisite denial: %v\n", err)
+		os.Exit(2)
+	}
+	// Deny only attempts to set no_new_privs, leaving filter installation and
+	// the setns control available. This makes the real prerequisite fail even
+	// though this thread already has the bit needed to install a filter.
+	filter := []unix.SockFilter{
+		bpfLoad(offsetNR),
+		bpfJumpEq(unix.SYS_PRCTL, 0, 3),
+		bpfLoad(offsetArgs0),
+		bpfJumpEq(unix.PR_SET_NO_NEW_PRIVS, 0, 1),
+		bpfRet(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)),
+		bpfRet(unix.SECCOMP_RET_ALLOW),
+	}
+	prog := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]} // #nosec G115 -- fixed small filter
+	failedThread, _, errno := unix.Syscall(unix.SYS_SECCOMP,
+		unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC,
+		uintptr(unsafe.Pointer(&prog)), // #nosec G103 -- seccomp syscall ABI
+	)
+	if errno != 0 || failedThread != 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "prepare prerequisite denial filter: thread=%d errno=%v\n", failedThread, errno)
+		os.Exit(2)
+	}
+	status, err := ApplySeccomp()
+	if status.Active || !errors.Is(err, unix.EPERM) || !strings.Contains(status.Reason, "no_new_privs") {
+		_, _ = fmt.Fprintf(os.Stderr, "denied prerequisite: active=%v err=%v reason=%s\n", status.Active, err, status.Reason)
+		os.Exit(1)
+	}
+	if err := unix.Setns(-1, 0); !errors.Is(err, unix.EBADF) {
+		_, _ = fmt.Fprintf(os.Stderr, "filter installed after denied prerequisite: setns = %v; want EBADF\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestSeccomp_PrerequisiteFailureRefusesFilter(t *testing.T) {
+	if out, code := runSeccompChild(t, "prerequisite-denied"); code != 0 {
+		t.Fatalf("denied prerequisite proof exited %d: %s", code, out)
+	}
+}
+
+func runSeccompChild(t *testing.T, op string) (string, int) {
+	t.Helper()
+	if runtime.GOOS != osLinux {
+		t.Skip("seccomp requires linux")
+	}
+
+	// Bound every re-exec'd child. A child that wedges (e.g. a post-clone child
+	// deadlocking in the duplicated Go runtime) must fail THIS test fast and
+	// attributably, never ride out the 10m package timeout and take every other
+	// test in the package down with it (the root cause of the recurring CI
+	// flake). The window is generous vs. real child runtime (<1s) yet far under
+	// the package deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), seccompChildTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^$")
+	cmd.Env = append(os.Environ(), seccompTestEnv+"="+op)
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		// CommandContext SIGKILLs the child when the deadline trips; surface a
+		// clear, fast failure instead of an opaque whole-package timeout.
+		t.Fatalf("seccomp child %q did not exit within %s (hung): %v\noutput so far: %s",
+			op, seccompChildTimeout, ctx.Err(), out)
+	}
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("exec error: %v", err)
+		}
+	}
+	return string(out), exitCode
+}
+
+func TestSeccomp_BlocksPtrace(t *testing.T) {
+	out, code := runSeccompChild(t, "ptrace")
+	if code != 0 {
+		t.Errorf("expected exit 0 (ptrace blocked with EPERM), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_BlocksMount(t *testing.T) {
+	out, code := runSeccompChild(t, "mount")
+	if code != 0 {
+		t.Errorf("expected exit 0 (mount blocked with EPERM), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsFileIO(t *testing.T) {
+	out, code := runSeccompChild(t, "file-io")
+	if code != 0 {
+		t.Errorf("expected exit 0 (file I/O allowed), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsGoroutines(t *testing.T) {
+	out, code := runSeccompChild(t, "goroutine")
+	if code != 0 {
+		t.Errorf("expected exit 0 (goroutines work), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsExecChild(t *testing.T) {
+	out, code := runSeccompChild(t, "exec-child")
+	if code != 0 {
+		t.Errorf("expected exit 0 (fork+exec allowed), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsNetwork(t *testing.T) {
+	out, code := runSeccompChild(t, "network")
+	if code != 0 {
+		t.Errorf("expected exit 0 (socket creation allowed), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsGetrandom(t *testing.T) {
+	out, code := runSeccompChild(t, "getrandom")
+	if code != 0 {
+		t.Errorf("expected exit 0 (getrandom allowed), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_BlocksCloneNewUser(t *testing.T) {
+	out, code := runSeccompChild(t, "clone-newuser")
+	if code != 0 {
+		t.Errorf("expected exit 0 (clone CLONE_NEWUSER blocked), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsCloneNormal(t *testing.T) {
+	out, code := runSeccompChild(t, "clone-normal")
+	if code != 0 {
+		t.Errorf("expected exit 0 (normal clone allowed), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_BlocksSocketVSOCK(t *testing.T) {
+	out, code := runSeccompChild(t, "socket-vsock")
+	if code != 0 {
+		t.Errorf("expected exit 0 (AF_VSOCK blocked or unsupported), got %d: %s", code, out)
+	}
+}
+
+func TestSeccomp_AllowsSocketINET(t *testing.T) {
+	out, code := runSeccompChild(t, "socket-inet")
+	if code != 0 {
+		t.Errorf("expected exit 0 (AF_INET allowed), got %d: %s", code, out)
+	}
+}
+
+func TestBuildSeccompFilter_NonEmpty(t *testing.T) {
+	filter := buildSeccompFilter(false)
+	// Minimum: arch check (3 insns) + default deny (1 insn) = 4
+	if len(filter) < 4 {
+		t.Errorf("filter too short: %d instructions", len(filter))
+	}
+}
+
+func TestBuildSeccompFilter_StrictBlocksClone3(t *testing.T) {
+	strict := buildSeccompFilter(true)
+	// In strict mode, clone3 should return ENOSYS.
+	// Scan filter for a JEQ matching SYS_CLONE3 followed by RET ENOSYS.
+	foundClone3Deny := false
+	for i := 0; i < len(strict)-1; i++ {
+		insn := strict[i]
+		next := strict[i+1]
+		isJEQ := insn.Code == (unix.BPF_JMP|0x10|unix.BPF_K) && insn.K == unix.SYS_CLONE3
+		isDeny := next.Code == (unix.BPF_RET|unix.BPF_K) && next.K == (unix.SECCOMP_RET_ERRNO|uint32(unix.ENOSYS))
+		if isJEQ && isDeny {
+			foundClone3Deny = true
+			break
+		}
+	}
+	if !foundClone3Deny {
+		t.Error("strict filter should deny clone3 with ENOSYS")
+	}
+
+	// Best-effort should allow clone3.
+	bestEffort := buildSeccompFilter(false)
+	foundClone3Allow := false
+	for i := 0; i < len(bestEffort)-1; i++ {
+		insn := bestEffort[i]
+		next := bestEffort[i+1]
+		isJEQ := insn.Code == (unix.BPF_JMP|0x10|unix.BPF_K) && insn.K == unix.SYS_CLONE3
+		isAllow := next.Code == (unix.BPF_RET|unix.BPF_K) && next.K == unix.SECCOMP_RET_ALLOW
+		if isJEQ && isAllow {
+			foundClone3Allow = true
+			break
+		}
+	}
+	if !foundClone3Allow {
+		t.Error("best-effort filter should allow clone3")
+	}
+}
+
+func TestConditionalFilters_Structure(t *testing.T) {
+	// Verify each conditional block is self-contained and has the right length.
+	clone := cloneConditional()
+	if len(clone) != 5 {
+		t.Errorf("cloneConditional: expected 5 instructions, got %d", len(clone))
+	}
+	sock := socketConditional()
+	if len(sock) != 5 {
+		t.Errorf("socketConditional: expected 5 instructions, got %d", len(sock))
+	}
+	pers := personalityConditional()
+	if len(pers) != 9 {
+		t.Errorf("personalityConditional: expected 9 instructions, got %d", len(pers))
+	}
+}
+
+func TestCloneNewMask_IncludesAllNamespaceFlags(t *testing.T) {
+	// Verify the mask covers all CLONE_NEW* flags and only those flags.
+	namespaceFlags := []struct {
+		name string
+		val  uint32
+	}{
+		{"CLONE_NEWNS", 0x00020000},
+		{"CLONE_NEWCGROUP", 0x02000000},
+		{"CLONE_NEWUTS", 0x04000000},
+		{"CLONE_NEWIPC", 0x08000000},
+		{"CLONE_NEWUSER", 0x10000000},
+		{"CLONE_NEWPID", 0x20000000},
+		{"CLONE_NEWNET", 0x40000000},
+	}
+	for _, f := range namespaceFlags {
+		if cloneNewMask&f.val == 0 {
+			t.Errorf("cloneNewMask missing %s (0x%08x)", f.name, f.val)
+		}
+	}
+
+	nonNamespaceFlags := []struct {
+		name string
+		val  uint32
+	}{
+		{"CLONE_CHILD_SETTID", 0x01000000},
+		{"CLONE_SETTLS", 0x00080000},
+		{"CLONE_PARENT_SETTID", 0x00100000},
+	}
+	for _, f := range nonNamespaceFlags {
+		if cloneNewMask&f.val != 0 {
+			t.Errorf("cloneNewMask includes non-namespace %s (0x%08x)", f.name, f.val)
+		}
+	}
+}
+
+// A legacy path-based syscall and its *at successor reach the same Landlock
+// hooks, so the filter must treat them alike. Allowing only one form breaks
+// runtimes whose libc picks the other (glibc on x86_64 issues mkdir, unlink,
+// rename and access directly) without making the sandbox any tighter.
+func TestAllowedSyscalls_LegacyFormsMatchAtSiblings(t *testing.T) {
+	allowed := allowedSyscalls()
+	set := make(map[uint32]bool, len(allowed))
+	for _, nr := range allowed {
+		set[nr] = true
+	}
+
+	pairs := []struct {
+		legacy, sibling string
+		legacyNR, atNR  uint32
+	}{
+		{"access", "faccessat", unix.SYS_ACCESS, unix.SYS_FACCESSAT},
+		{"open", "openat", unix.SYS_OPEN, unix.SYS_OPENAT},
+		{"creat", "openat", unix.SYS_CREAT, unix.SYS_OPENAT},
+		{"stat", "newfstatat", unix.SYS_STAT, unix.SYS_NEWFSTATAT},
+		{"lstat", "newfstatat", unix.SYS_LSTAT, unix.SYS_NEWFSTATAT},
+		{"getdents", "getdents64", unix.SYS_GETDENTS, unix.SYS_GETDENTS64},
+		{"mkdir", "mkdirat", unix.SYS_MKDIR, unix.SYS_MKDIRAT},
+		{"rmdir", "unlinkat", unix.SYS_RMDIR, unix.SYS_UNLINKAT},
+		{"unlink", "unlinkat", unix.SYS_UNLINK, unix.SYS_UNLINKAT},
+		{"rename", "renameat", unix.SYS_RENAME, unix.SYS_RENAMEAT},
+		{"chmod", "fchmodat", unix.SYS_CHMOD, unix.SYS_FCHMODAT},
+		{"chown", "fchownat", unix.SYS_CHOWN, unix.SYS_FCHOWNAT},
+		{"lchown", "fchownat", unix.SYS_LCHOWN, unix.SYS_FCHOWNAT},
+		{"link", "linkat", unix.SYS_LINK, unix.SYS_LINKAT},
+		{"symlink", "symlinkat", unix.SYS_SYMLINK, unix.SYS_SYMLINKAT},
+		{"readlink", "readlinkat", unix.SYS_READLINK, unix.SYS_READLINKAT},
+		{"epoll_create", "epoll_create1", unix.SYS_EPOLL_CREATE, unix.SYS_EPOLL_CREATE1},
+	}
+	for _, p := range pairs {
+		if set[p.legacyNR] != set[p.atNR] {
+			t.Errorf("%s allowed=%v but %s allowed=%v; legacy and *at forms must match",
+				p.legacy, set[p.legacyNR], p.sibling, set[p.atNR])
+		}
+		// Parity alone would pass if both forms were dropped, which
+		// reintroduces the EPERM failures for glibc programs.
+		if !set[p.legacyNR] {
+			t.Errorf("%s must be allowed", p.legacy)
+		}
+	}
+}
+
+func TestAllowedSyscalls_ContainsGoRuntime(t *testing.T) {
+	allowed := allowedSyscalls()
+	set := make(map[uint32]bool, len(allowed))
+	for _, nr := range allowed {
+		set[nr] = true
+	}
+
+	// Critical Go runtime syscalls that MUST be in the allowlist.
+	// Note: clone3 is now in the conditional set (allowed in best-effort,
+	// blocked in strict). It's not in the flat allowlist.
+	critical := map[string]uint32{
+		"futex":         unix.SYS_FUTEX,
+		"mmap":          unix.SYS_MMAP,
+		"epoll_create1": unix.SYS_EPOLL_CREATE1,
+		"rt_sigaction":  unix.SYS_RT_SIGACTION,
+		"clock_gettime": unix.SYS_CLOCK_GETTIME,
+	}
+	for name, nr := range critical {
+		if !set[nr] {
+			t.Errorf("missing critical Go runtime syscall: %s (%d)", name, nr)
+		}
+	}
+}
+
+func TestKillSyscalls_ContainsCritical(t *testing.T) {
+	kill := killSyscalls()
+	set := make(map[uint32]bool, len(kill))
+	for _, nr := range kill {
+		set[nr] = true
+	}
+
+	// These MUST be in the kill list.
+	critical := map[string]uint32{
+		"kexec_load":  unix.SYS_KEXEC_LOAD,
+		"init_module": unix.SYS_INIT_MODULE,
+		"reboot":      unix.SYS_REBOOT,
+	}
+	for name, nr := range critical {
+		if !set[nr] {
+			t.Errorf("missing critical kill syscall: %s (%d)", name, nr)
+		}
+	}
+}
+
+func TestDenySyscalls_ContainsIOUring(t *testing.T) {
+	deny := denySyscalls()
+	set := make(map[uint32]bool, len(deny))
+	for _, nr := range deny {
+		set[nr] = true
+	}
+
+	// io_uring returns EPERM (not KILL) so runtimes like Node.js can fall back to epoll.
+	iouring := map[string]uint32{
+		"io_uring_setup":    unix.SYS_IO_URING_SETUP,
+		"io_uring_enter":    unix.SYS_IO_URING_ENTER,
+		"io_uring_register": unix.SYS_IO_URING_REGISTER,
+	}
+	for name, nr := range iouring {
+		if !set[nr] {
+			t.Errorf("missing deny syscall: %s (%d)", name, nr)
+		}
+	}
+}
+
+func TestSetNoNewPrivs_InProcess(t *testing.T) {
+	if runtime.GOOS != osLinux {
+		t.Skip("linux only")
+	}
+	// Safe to call in-process - only prevents suid escalation.
+	if err := SetNoNewPrivs(); err != nil {
+		t.Fatalf("SetNoNewPrivs: %v", err)
+	}
+}
+
+func TestApplyRlimits_InProcess(t *testing.T) {
+	if runtime.GOOS != osLinux {
+		t.Skip("rlimits require linux")
+	}
+	// Only test RLIMIT_CORE in-process (setting NPROC would break
+	// subsequent child-spawning tests). Full verification in child process.
+	rlim := unix.Rlimit{Cur: 0, Max: 0}
+	if err := unix.Setrlimit(unix.RLIMIT_CORE, &rlim); err != nil {
+		t.Fatalf("setrlimit CORE: %v", err)
+	}
+	var got unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_CORE, &got); err != nil {
+		t.Fatalf("getrlimit: %v", err)
+	}
+	if got.Cur != 0 {
+		t.Errorf("RLIMIT_CORE = %d, want 0", got.Cur)
+	}
+}
+
+func TestApplyRlimits_ChildVerifiesAll(t *testing.T) {
+	if runtime.GOOS != osLinux {
+		t.Skip("rlimits require linux")
+	}
+	// Child process verifies all four limits. Bounded so a wedged child fails
+	// fast instead of hanging the whole package (see seccompChildTimeout).
+	ctx, cancel := context.WithTimeout(context.Background(), seccompChildTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^$")
+	cmd.Env = append(os.Environ(), "__SANDBOX_RLIMIT_TEST=1")
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		t.Fatalf("rlimit test child did not exit within %s (hung): %v\n%s", seccompChildTimeout, ctx.Err(), out)
+	}
+	if err != nil {
+		t.Errorf("rlimit test child failed: %v\n%s", err, out)
+	}
+}
+
+func init() {
+	if os.Getenv("__SANDBOX_RLIMIT_TEST") == "1" {
+		var inheritedNProc syscall.Rlimit
+		if err := syscall.Getrlimit(unix.RLIMIT_NPROC, &inheritedNProc); err != nil {
+			_, _ = os.Stderr.WriteString("get inherited RLIMIT_NPROC: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		if err := ApplyRlimits(); err != nil {
+			_, _ = os.Stderr.WriteString("rlimits: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		var nproc syscall.Rlimit
+		if err := syscall.Getrlimit(unix.RLIMIT_NPROC, &nproc); err != nil {
+			_, _ = os.Stderr.WriteString("getrlimit RLIMIT_NPROC: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		nprocCeiling := boundedNProcLimit(unix.Rlimit{Cur: inheritedNProc.Cur, Max: inheritedNProc.Max})
+		if nproc.Cur > nprocCeiling || nproc.Cur != nproc.Max {
+			_, _ = fmt.Fprintf(os.Stderr, "RLIMIT_NPROC cur=%d max=%d, want equal values no greater than shared-UID ceiling %d\n", nproc.Cur, nproc.Max, nprocCeiling)
+			os.Exit(1)
+		}
+		// Verify the three per-process limits keep their fixed values.
+		checks := []struct {
+			resource int
+			name     string
+			want     uint64
+		}{
+			{syscall.RLIMIT_CORE, "RLIMIT_CORE", 0},
+			{syscall.RLIMIT_NOFILE, "RLIMIT_NOFILE", 4096},
+			{unix.RLIMIT_FSIZE, "RLIMIT_FSIZE", 1 << 30},
+		}
+		for _, c := range checks {
+			var rlim syscall.Rlimit
+			if err := syscall.Getrlimit(c.resource, &rlim); err != nil {
+				_, _ = os.Stderr.WriteString("getrlimit " + c.name + ": " + err.Error() + "\n")
+				os.Exit(1)
+			}
+			if rlim.Cur != c.want {
+				_, _ = os.Stderr.WriteString(c.name + " cur=" + strconv.FormatUint(rlim.Cur, 10) + " want=" + strconv.FormatUint(c.want, 10) + "\n")
+				os.Exit(1)
+			}
+		}
+		os.Exit(0)
+	}
+}

@@ -1,0 +1,1027 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package setup
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/spf13/cobra"
+)
+
+const (
+	decisionAllow = "allow"
+	decisionDeny  = "deny"
+
+	// claudeHookEventPreToolUse is the hook event name for pre-tool-use hooks.
+	claudeHookEventPreToolUse = "PreToolUse"
+)
+
+// claudeCodePayload is the JSON structure Claude Code sends on stdin.
+type claudeCodePayload struct {
+	SessionID     string          `json:"session_id"`
+	HookEventName string          `json:"hook_event_name"`
+	ToolName      string          `json:"tool_name"`
+	ToolInput     json.RawMessage `json:"tool_input"`
+	ToolUseID     string          `json:"tool_use_id"`
+	// Cwd is the session's working directory, where a pathless Grep searches.
+	Cwd string `json:"cwd"`
+}
+
+// Tool-specific input structs parsed from tool_input.
+
+type bashToolInput struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+type webFetchToolInput struct {
+	URL string `json:"url"`
+}
+
+type writeToolInput struct {
+	FilePath string `json:"file_path"`
+	Content  string `json:"content"`
+}
+
+type editToolInput struct {
+	FilePath  string `json:"file_path"`
+	OldString string `json:"old_string"`
+	NewString string `json:"new_string"`
+}
+
+// readToolInput is Claude Code's built-in Read tool schema.
+type readToolInput struct {
+	FilePath string `json:"file_path"`
+}
+
+// grepToolInput is Claude Code's built-in Grep tool schema. Only the fields
+// pipelock acts on are declared; Grep prints matching file contents, so a
+// populated path is a file (or directory) read, not just a name lookup.
+type grepToolInput struct {
+	Path string `json:"path"`
+}
+
+// notebookEditToolInput is Claude Code's built-in NotebookEdit tool schema.
+// Only the fields pipelock acts on are declared.
+type notebookEditToolInput struct {
+	NotebookPath string `json:"notebook_path"`
+	NewSource    string `json:"new_source"`
+}
+
+// claudeCodeHookOutput is the hook-specific output for Claude Code.
+type claudeCodeHookOutput struct {
+	HookEventName            string `json:"hookEventName"`
+	PermissionDecision       string `json:"permissionDecision"`
+	PermissionDecisionReason string `json:"permissionDecisionReason,omitempty"`
+}
+
+// claudeCodeFullResponse is the complete JSON response to Claude Code.
+type claudeCodeFullResponse struct {
+	HookSpecificOutput claudeCodeHookOutput `json:"hookSpecificOutput"`
+}
+
+func ClaudeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "claude",
+		Short: "Claude Code integration",
+		Long: `Commands for integrating pipelock with Claude Code hooks.
+
+The hook subcommand is called by Claude Code before agent actions and returns
+allow/deny decisions via structured JSON.
+
+The setup subcommand writes hooks to Claude Code's settings.json.
+The remove subcommand removes pipelock hooks from settings.json.`,
+	}
+
+	cmd.AddCommand(
+		claudeHookCmd(),
+		claudeSetupCmd(),
+		claudeRemoveCmd(),
+	)
+
+	return cmd
+}
+
+func claudeHookCmd() *cobra.Command {
+	var (
+		configFile string
+		exitCode   bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "hook",
+		Short: "Evaluate a Claude Code hook event from stdin",
+		Long: `Reads a Claude Code hook event as JSON from stdin and writes an allow/deny
+decision as JSON to stdout.
+
+Without --config, uses a security-focused default profile with tool policy
+enabled and MCP input scanning. With --config, respects all settings from
+the provided file.
+
+By default, always exits 0 and writes structured JSON with permissionDecision.
+With --exit-code, exits 0 for allow and 2 for deny (reason on stderr).`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runClaudeHook(cmd, configFile, exitCode)
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "path to pipelock config file")
+	cmd.Flags().BoolVar(&exitCode, "exit-code", false, "use exit code 2 for deny instead of structured JSON")
+
+	return cmd
+}
+
+// runClaudeHook is the core hook logic for Claude Code.
+// In default mode, it guarantees valid JSON on stdout and exit 0 in all paths.
+// In exit-code mode, it exits 0 for allow and returns ExitCodeError(2) for deny.
+func runClaudeHook(cmd *cobra.Command, configFile string, exitCodeMode bool) (retErr error) {
+	stdout := cmd.OutOrStdout()
+
+	// Panic recovery: fail-closed in both modes.
+	defer func() {
+		if r := recover(); r != nil {
+			if exitCodeMode {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "pipelock: internal error")
+				retErr = cliutil.ExitCodeError(2, errors.New("internal error"))
+			} else {
+				writeClaudeResponse(stdout, claudeCodeFullResponse{
+					HookSpecificOutput: claudeCodeHookOutput{
+						HookEventName:            claudeHookEventPreToolUse,
+						PermissionDecision:       decisionDeny,
+						PermissionDecisionReason: "pipelock: internal error",
+					},
+				})
+			}
+		}
+	}()
+
+	// Read stdin with size cap (reuses maxStdinBytes from cursor.go).
+	reader := io.LimitReader(cmd.InOrStdin(), maxStdinBytes+1)
+	data, err := io.ReadAll(reader)
+	if err != nil || len(data) == 0 {
+		return claudeResult(cmd, exitCodeMode, claudeHookEventPreToolUse, decisionDeny, "pipelock: failed to read stdin")
+	}
+
+	if len(data) > maxStdinBytes {
+		return claudeResult(cmd, exitCodeMode, claudeHookEventPreToolUse, decisionDeny, "pipelock: input too large")
+	}
+
+	// Parse the hook payload.
+	var payload claudeCodePayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return claudeResult(cmd, exitCodeMode, claudeHookEventPreToolUse, decisionDeny, "pipelock: invalid JSON input")
+	}
+
+	// Fail-closed on unsupported hook events. Today pipelock only scans PreToolUse;
+	// other Claude Code hook events (UserPromptSubmit, Notification, Stop, SubagentStop,
+	// PostToolUse, PreCompact, SessionStart) have no scanner path. Returning allow for
+	// those would let secrets and injection through unscanned. Empty event name is
+	// treated as PreToolUse for backwards compatibility with configs that pre-date
+	// this check.
+	if payload.HookEventName != "" && payload.HookEventName != claudeHookEventPreToolUse {
+		return claudeResult(cmd, exitCodeMode, payload.HookEventName, decisionDeny,
+			"pipelock: hook event "+payload.HookEventName+" is not supported by pipelock claude hook; remove this hook entry or upgrade pipelock when support lands")
+	}
+
+	// Load or build config (reuses cursor hook config defaults).
+	cfg, err := loadCursorConfig(configFile)
+	if err != nil {
+		return claudeResult(cmd, exitCodeMode, payload.HookEventName, decisionDeny,
+			"pipelock: config error: "+err.Error())
+	}
+
+	// Merge community rules into config before building scanner.
+	// Keep stdout JSON contract intact; warnings go to stderr.
+	if err := reportBundleLoadResult(cmd.ErrOrStderr(), cfg, rules.MergeIntoConfig(cfg, cliutil.Version)); err != nil {
+		return claudeResult(cmd, exitCodeMode, payload.HookEventName, decisionDeny, "pipelock: "+err.Error())
+	}
+
+	// Route tool_name to decide.Action.
+	action, err := claudePayloadToAction(payload)
+	if err != nil {
+		// Known tool with unparseable tool_input: fail-closed.
+		return claudeResult(cmd, exitCodeMode, payload.HookEventName, decisionDeny,
+			"pipelock: "+err.Error())
+	}
+
+	// Build scanner and policy. A shell command is code about to run, so its
+	// scanner treats an environment lookup assignment as code, not a credential.
+	sc, err := scanner.NewWithOptions(cfg, scanner.Options{ToolCommandEnvLookups: action.Kind == decide.EventShellExecution})
+	if err != nil {
+		return fmt.Errorf("create scanner: %w", err)
+	}
+	defer sc.Close()
+	pc := policy.New(cfg.MCPToolPolicy)
+	// The agent's file tools act on this host, so a submitted path is also
+	// matched by the file it resolves to here.
+	pc.EnableLocalPathIdentity()
+	// A relative path in tool_input is relative to the session's directory,
+	// which is the payload's cwd and not necessarily this process's.
+	if filepath.IsAbs(payload.Cwd) {
+		pc.AddLocalPathBases(payload.Cwd)
+	}
+
+	// Decide.
+	decision := decide.Decide(cmd.Context(), cfg, sc, pc, *action)
+	logIncompleteCheck(cmd, decision)
+	// Path-routed built-in tools add file-path policy on top of the content
+	// scan every tool_input string gets on the generic path; they must not
+	// lose it. Deny from either wins.
+	if decision.Outcome != decide.Deny && claudePathRoutedTools[payload.ToolName] {
+		decision = decide.Decide(cmd.Context(), cfg, sc, pc, claudeGenericAction(payload))
+		logIncompleteCheck(cmd, decision)
+	}
+
+	// Map outcome.
+	perm := decisionAllow
+	reason := decision.UserMessage
+	if decision.Outcome == decide.Deny {
+		perm = decisionDeny
+	}
+
+	return claudeResult(cmd, exitCodeMode, payload.HookEventName, perm, reason)
+}
+
+// logIncompleteCheck writes the incomplete tool policy check line, if any,
+// to stderr (see decide.IncompleteCheckLine).
+func logIncompleteCheck(cmd *cobra.Command, d decide.Decision) {
+	if line := decide.IncompleteCheckLine(d); line != "" {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), line)
+	}
+}
+
+// claudeResult writes the response (JSON or exit code) based on mode.
+func claudeResult(cmd *cobra.Command, exitCodeMode bool, hookEventName, permission, reason string) error {
+	if exitCodeMode {
+		if permission == decisionDeny {
+			if reason != "" {
+				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), reason)
+			}
+			return cliutil.ExitCodeError(2, errors.New("action denied"))
+		}
+		return nil
+	}
+
+	writeClaudeResponse(cmd.OutOrStdout(), claudeCodeFullResponse{
+		HookSpecificOutput: claudeCodeHookOutput{
+			HookEventName:            hookEventName,
+			PermissionDecision:       permission,
+			PermissionDecisionReason: reason,
+		},
+	})
+	return nil
+}
+
+// claudePathRoutedTools are built-in tools claudePayloadToAction routes to a
+// file-path event. runClaudeHook also runs the generic content scan for them.
+var claudePathRoutedTools = map[string]bool{"Read": true, "Grep": true, "NotebookEdit": true}
+
+// claudeGenericAction is the catch-all: DLP and injection over every string in
+// tool_input, for tools without a tool-aware pipeline.
+func claudeGenericAction(p claudeCodePayload) decide.Action {
+	return decide.Action{
+		Source: "claude-code",
+		Kind:   decide.EventToolUse,
+		ToolUse: &decide.ToolUsePayload{
+			ToolName:  p.ToolName,
+			ToolInput: string(p.ToolInput),
+		},
+	}
+}
+
+// claudePayloadToAction routes a Claude Code tool_name to a decide.Action.
+// Known built-in tools (Bash, WebFetch, Write, Edit, Read, Grep, NotebookEdit)
+// and MCP tools route to their tool-aware scanning pipelines. Read's file_path
+// and Grep's populated path field carry the same credential-path policy as
+// other file reads (decide.EventReadFile), because both return file contents
+// to the agent. NotebookEdit's notebook_path is a write target, so it routes
+// like Write/Edit. Glob is deliberately left on the generic catch-all below:
+// it returns matching file NAMES only, never file content, so there is no
+// content-disclosure surface for the file-path policy to guard. Everything
+// else (Glob included) falls through to a generic catch-all that runs DLP +
+// injection on every string in tool_input, so unknown or future tools cannot
+// silently exfiltrate secrets.
+// Returns error for known tools with unparseable tool_input (fail-closed).
+func claudePayloadToAction(p claudeCodePayload) (*decide.Action, error) {
+	if strings.TrimSpace(string(p.ToolInput)) == "null" {
+		return nil, errors.New("tool_input must not be null")
+	}
+
+	action := decide.Action{Source: "claude-code"}
+
+	switch {
+	case p.ToolName == "Bash":
+		var input bashToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing Bash tool_input: %w", err)
+		}
+		action.Kind = decide.EventShellExecution
+		action.Shell = &decide.ShellPayload{Command: input.Command}
+		return &action, nil
+
+	case p.ToolName == "WebFetch":
+		var input webFetchToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing WebFetch tool_input: %w", err)
+		}
+		action.Kind = decide.EventWebFetch
+		action.WebFetch = &decide.WebFetchPayload{URL: input.URL}
+		return &action, nil
+
+	case p.ToolName == "Write":
+		var input writeToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing Write tool_input: %w", err)
+		}
+		action.Kind = decide.EventWriteFile
+		action.Write = &decide.WritePayload{
+			FilePath: input.FilePath,
+			Content:  input.Content,
+		}
+		return &action, nil
+
+	case p.ToolName == "Edit":
+		var input editToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing Edit tool_input: %w", err)
+		}
+		action.Kind = decide.EventWriteFile
+		action.Write = &decide.WritePayload{
+			FilePath:  input.FilePath,
+			Content:   input.NewString,
+			OldString: input.OldString,
+		}
+		return &action, nil
+
+	case p.ToolName == "Read":
+		var input readToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing Read tool_input: %w", err)
+		}
+		action.Kind = decide.EventReadFile
+		action.File = &decide.FilePayload{FilePath: input.FilePath}
+		return &action, nil
+
+	case p.ToolName == "Grep":
+		var input grepToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing Grep tool_input: %w", err)
+		}
+		// A recursive search reads every file under its target, so a target
+		// that is, contains, or sits inside a credential directory is refused
+		// before any path is checked. A pathless search targets the session's
+		// working directory.
+		target := input.Path
+		if target == "" {
+			target = p.Cwd
+		}
+		if target == "" {
+			// No path and no cwd: the search runs in the hook's own
+			// working directory, so check that instead of skipping.
+			target = "."
+		}
+		if dir, ok := grepTargetCoversCredentialDir(target, p.Cwd); ok {
+			return nil, fmt.Errorf("refusing Grep over %s, which covers the credential directory %s; search a narrower path", target, dir)
+		}
+		if input.Path != "" {
+			// Grep prints matching file contents, so a populated path is a
+			// file-path read and gets the same credential-path policy as
+			// Read. An empty path searches the working directory tree with
+			// no single file identity to check, so it keeps the generic
+			// catch-all, which still scans the pattern/glob strings for DLP
+			// and injection.
+			action.Kind = decide.EventReadFile
+			action.File = &decide.FilePayload{FilePath: input.Path}
+			return &action, nil
+		}
+		generic := claudeGenericAction(p)
+		return &generic, nil
+
+	case p.ToolName == "NotebookEdit":
+		var input notebookEditToolInput
+		if err := json.Unmarshal(p.ToolInput, &input); err != nil {
+			return nil, fmt.Errorf("parsing NotebookEdit tool_input: %w", err)
+		}
+		if input.NotebookPath != "" {
+			// NotebookEdit writes cell content into the notebook file, so it
+			// is a write, not a read: route it like Write/Edit.
+			action.Kind = decide.EventWriteFile
+			action.Write = &decide.WritePayload{
+				FilePath: input.NotebookPath,
+				Content:  input.NewSource,
+			}
+			return &action, nil
+		}
+		generic := claudeGenericAction(p)
+		return &generic, nil
+
+	case strings.HasPrefix(p.ToolName, "mcp__"):
+		// MCP tool name format: mcp__<server>__<tool>
+		parts := strings.SplitN(p.ToolName, "__", 3)
+		server := ""
+		toolName := p.ToolName
+		if len(parts) >= 3 {
+			server = parts[1]
+			toolName = parts[2]
+		}
+		action.Kind = decide.EventMCPExecution
+		action.MCP = &decide.MCPPayload{
+			Server:    server,
+			ToolName:  toolName,
+			ToolInput: string(p.ToolInput),
+		}
+		return &action, nil
+
+	default:
+		// Generic catch-all: scan every string in tool_input for DLP +
+		// injection. Closes the fail-open path for tools we don't parse
+		// specifically (WebSearch, Task, Glob, future tools, etc.).
+		generic := claudeGenericAction(p)
+		return &generic, nil
+	}
+}
+
+// writeClaudeResponse marshals the response to JSON and writes it to w.
+// On marshal failure, writes a hardcoded deny response.
+func writeClaudeResponse(w io.Writer, resp claudeCodeFullResponse) {
+	data, err := json.Marshal(resp)
+	if err != nil {
+		// Hardcoded fallback: if we can't even marshal, write raw JSON.
+		_, _ = io.WriteString(w, `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pipelock: marshal error"}}`)
+		_, _ = io.WriteString(w, "\n")
+		return
+	}
+	_, _ = w.Write(data)
+	_, _ = io.WriteString(w, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Settings.json types and merge/remove logic
+// ---------------------------------------------------------------------------
+
+// claudeSettings represents the hooks section of Claude Code's settings.json.
+type claudeSettings struct {
+	Hooks map[string][]claudeMatcherGroup `json:"hooks"`
+}
+
+// claudeMatcherGroup is one matcher + its hooks within a hook event.
+type claudeMatcherGroup struct {
+	Matcher string            `json:"matcher,omitempty"`
+	Hooks   []claudeHookEntry `json:"hooks"`
+}
+
+// claudeHookEntry is a single hook within a matcher group.
+type claudeHookEntry struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// claudeHookTimeout is the default timeout (seconds) for pipelock hook entries.
+const claudeHookTimeout = 10
+
+// claudeToolMatcher matches every tool call. Built-in tools (Bash, WebFetch,
+// Write, Edit, Read, Grep, NotebookEdit) and MCP tools route to tool-aware
+// scanning; all others fall through to a generic DLP + injection catch-all
+// in claudePayloadToAction.
+const claudeToolMatcher = ".*"
+
+// parseClaudeSettings parses the hooks section from settings.json data.
+func parseClaudeSettings(data []byte) (*claudeSettings, error) {
+	var settings claudeSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, err
+	}
+	if settings.Hooks == nil {
+		settings.Hooks = make(map[string][]claudeMatcherGroup)
+	}
+	return &settings, nil
+}
+
+// isClaudePipelockHook returns true if a hook entry was installed by pipelock.
+// mergeClaudeHooks only ever produces "<binary> claude hook" (bare) or
+// "<binary> claude hook --config <path>". Match exactly those two forms so an
+// unrelated user hook that merely contains "claude hook" mid-command is never
+// clobbered. Mirrors cursor.go's isPipelockHook detection pattern.
+func isClaudePipelockHook(h claudeHookEntry) bool {
+	return isGeneratedPipelockHookCommand(h.Command, "claude")
+}
+
+// mergeClaudeHooks removes existing pipelock hooks from PreToolUse and adds
+// fresh ones. Non-pipelock hooks are preserved even if they share a matcher
+// group with a pipelock hook. All other events are copied unchanged.
+func mergeClaudeHooks(settings *claudeSettings, exe, configFile string) *claudeSettings {
+	result := &claudeSettings{
+		Hooks: make(map[string][]claudeMatcherGroup),
+	}
+
+	// Copy existing groups, filtering out pipelock hooks from PreToolUse.
+	for event, groups := range settings.Hooks {
+		for _, g := range groups {
+			if event == claudeHookEventPreToolUse {
+				// Filter individual hooks, keeping non-pipelock ones.
+				var kept []claudeHookEntry
+				for _, h := range g.Hooks {
+					if !isClaudePipelockHook(h) {
+						kept = append(kept, h)
+					}
+				}
+				if len(kept) > 0 {
+					result.Hooks[event] = append(result.Hooks[event], claudeMatcherGroup{
+						Matcher: g.Matcher,
+						Hooks:   kept,
+					})
+				}
+				continue
+			}
+			result.Hooks[event] = append(result.Hooks[event], g)
+		}
+	}
+
+	// Add fresh pipelock group to PreToolUse. A single .* matcher catches
+	// every tool; dispatch in claudePayloadToAction decides what to scan.
+	quoted := shellQuote(exe)
+	hookCommand := quoted + " claude hook"
+	if configFile != "" {
+		hookCommand += " --config " + shellQuote(configFile)
+	}
+
+	result.Hooks[claudeHookEventPreToolUse] = append(
+		result.Hooks[claudeHookEventPreToolUse],
+		claudeMatcherGroup{
+			Matcher: claudeToolMatcher,
+			Hooks: []claudeHookEntry{{
+				Type:    "command",
+				Command: hookCommand,
+				Timeout: claudeHookTimeout,
+			}},
+		},
+	)
+
+	return result
+}
+
+// removeClaudeHooks removes all pipelock hooks from all events.
+// Non-pipelock hooks are preserved even if they share a matcher group.
+func removeClaudeHooks(settings *claudeSettings) *claudeSettings {
+	result := &claudeSettings{
+		Hooks: make(map[string][]claudeMatcherGroup),
+	}
+
+	for event, groups := range settings.Hooks {
+		for _, g := range groups {
+			var kept []claudeHookEntry
+			for _, h := range g.Hooks {
+				if !isClaudePipelockHook(h) {
+					kept = append(kept, h)
+				}
+			}
+			if len(kept) > 0 {
+				result.Hooks[event] = append(result.Hooks[event], claudeMatcherGroup{
+					Matcher: g.Matcher,
+					Hooks:   kept,
+				})
+			}
+		}
+	}
+
+	return result
+}
+
+// ---------------------------------------------------------------------------
+// Setup command
+// ---------------------------------------------------------------------------
+
+func claudeSetupCmd() *cobra.Command {
+	var (
+		global     bool
+		project    bool
+		dryRun     bool
+		configFile string
+		quiet      bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Install pipelock hooks into Claude Code",
+		Long: `Writes hooks to Claude Code's settings.json to register pipelock as a
+PreToolUse hook for security-relevant tools (Bash, WebFetch, Write, Edit,
+and all MCP tools).
+
+By default writes to ~/.claude/settings.json (user-level). Use --project
+to write to .claude/settings.json in the current directory.
+
+If settings.json already exists, pipelock entries are merged without
+overwriting other hooks or settings. A .bak backup is created before
+modification. Runs are idempotent: running twice produces the same result.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runClaudeSetup(cmd, global, project, dryRun, configFile, quiet)
+		},
+	}
+
+	cmd.Flags().BoolVar(&global, "global", false, "install to ~/.claude/settings.json (default)")
+	cmd.Flags().BoolVar(&project, "project", false, "install to .claude/settings.json in current directory")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be written without modifying files")
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "path to pipelock config file for installed hooks")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress config provenance output")
+
+	return cmd
+}
+
+func runClaudeSetup(cmd *cobra.Command, global, project, dryRun bool, configFile string, quiet bool) error {
+	if global && project {
+		return fmt.Errorf("--global and --project are mutually exclusive")
+	}
+
+	resolvedConfig, err := cliutil.ResolveConfigForInstall(configFile)
+	if err != nil {
+		return err
+	}
+	cliutil.WriteInstallConfigProvenance(cmd.ErrOrStderr(), "claude setup", resolvedConfig, quiet)
+
+	// Determine target path.
+	targetDir, err := claudeSettingsDir(project)
+	if err != nil {
+		return err
+	}
+	targetPath := filepath.Join(targetDir, "settings.json")
+
+	// Find pipelock binary path.
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("finding pipelock binary: %w", err)
+	}
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return fmt.Errorf("resolving pipelock binary path: %w", err)
+	}
+
+	// Read existing settings.json (raw bytes to preserve unknown fields).
+	var rawData []byte
+	existingData, readErr := os.ReadFile(filepath.Clean(targetPath))
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("reading existing %s: %w", targetPath, readErr)
+	}
+	if readErr == nil {
+		rawData = existingData
+	}
+
+	// Parse or create settings.
+	settings, rawMap, err := parseClaudeSettingsRaw(rawData)
+	if err != nil {
+		return fmt.Errorf("parsing existing %s: %w", targetPath, err)
+	}
+
+	// Merge pipelock hooks.
+	merged := mergeClaudeHooks(settings, exe, resolvedConfig.Path)
+
+	// Serialize with raw field preservation.
+	output, err := marshalClaudeSettings(merged, rawMap)
+	if err != nil {
+		return fmt.Errorf("marshaling settings.json: %w", err)
+	}
+
+	if dryRun {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Would write to %s:\n%s", targetPath, output)
+		return nil
+	}
+
+	return writeClaudeSettingsFile(cmd, targetPath, targetDir, existingData, readErr, output)
+}
+
+// ---------------------------------------------------------------------------
+// Remove command
+// ---------------------------------------------------------------------------
+
+func claudeRemoveCmd() *cobra.Command {
+	var (
+		global  bool
+		project bool
+		dryRun  bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "remove",
+		Short: "Remove pipelock hooks from Claude Code",
+		Long: `Removes all pipelock-managed hooks from Claude Code's settings.json.
+Non-pipelock hooks and all other settings are preserved.
+
+A .bak backup is created before modification.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runClaudeRemove(cmd, global, project, dryRun)
+		},
+	}
+
+	cmd.Flags().BoolVar(&global, "global", false, "remove from ~/.claude/settings.json (default)")
+	cmd.Flags().BoolVar(&project, "project", false, "remove from .claude/settings.json in current directory")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be written without modifying files")
+
+	return cmd
+}
+
+func runClaudeRemove(cmd *cobra.Command, global, project, dryRun bool) error {
+	if global && project {
+		return fmt.Errorf("--global and --project are mutually exclusive")
+	}
+
+	targetDir, err := claudeSettingsDir(project)
+	if err != nil {
+		return err
+	}
+	targetPath := filepath.Join(targetDir, "settings.json")
+
+	// Read existing settings.json.
+	existingData, readErr := os.ReadFile(filepath.Clean(targetPath))
+	if readErr != nil {
+		if errors.Is(readErr, os.ErrNotExist) {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "no settings.json found, nothing to remove")
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", targetPath, readErr)
+	}
+
+	settings, rawMap, err := parseClaudeSettingsRaw(existingData)
+	if err != nil {
+		return fmt.Errorf("parsing %s: %w", targetPath, err)
+	}
+
+	removed := removeClaudeHooks(settings)
+
+	output, err := marshalClaudeSettings(removed, rawMap)
+	if err != nil {
+		return fmt.Errorf("marshaling settings.json: %w", err)
+	}
+
+	if dryRun {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Would write to %s:\n%s", targetPath, output)
+		return nil
+	}
+
+	return writeClaudeSettingsFile(cmd, targetPath, targetDir, existingData, readErr, output)
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers for setup/remove
+// ---------------------------------------------------------------------------
+
+// claudeSettingsDir returns the directory for settings.json.
+func claudeSettingsDir(project bool) (string, error) {
+	if project {
+		return filepath.Join(".", ".claude"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("finding home directory: %w", err)
+	}
+	return filepath.Join(home, ".claude"), nil
+}
+
+// parseClaudeSettingsRaw parses settings.json while preserving unknown fields
+// via a raw JSON map. Returns the parsed hooks settings and the raw map for
+// round-tripping. Handles nil/empty data as fresh settings.
+func parseClaudeSettingsRaw(data []byte) (*claudeSettings, map[string]json.RawMessage, error) {
+	rawMap := make(map[string]json.RawMessage)
+
+	if len(data) == 0 {
+		return &claudeSettings{Hooks: make(map[string][]claudeMatcherGroup)}, rawMap, nil
+	}
+
+	if err := json.Unmarshal(data, &rawMap); err != nil {
+		return nil, nil, err
+	}
+
+	settings := &claudeSettings{Hooks: make(map[string][]claudeMatcherGroup)}
+	if hooksRaw, ok := rawMap["hooks"]; ok {
+		if err := json.Unmarshal(hooksRaw, &settings.Hooks); err != nil {
+			return nil, nil, fmt.Errorf("parsing hooks section: %w", err)
+		}
+	}
+
+	return settings, rawMap, nil
+}
+
+// marshalClaudeSettings serializes settings back to JSON, merging the hooks
+// section into the raw map to preserve unknown fields.
+func marshalClaudeSettings(settings *claudeSettings, rawMap map[string]json.RawMessage) ([]byte, error) {
+	hooksJSON, err := json.Marshal(settings.Hooks)
+	if err != nil {
+		return nil, err
+	}
+
+	if rawMap == nil {
+		rawMap = make(map[string]json.RawMessage)
+	}
+	rawMap["hooks"] = hooksJSON
+
+	output, err := json.MarshalIndent(rawMap, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(output, '\n'), nil
+}
+
+// writeClaudeSettingsFile writes settings.json atomically with backup.
+func writeClaudeSettingsFile(cmd *cobra.Command, targetPath, targetDir string, existingData []byte, readErr error, output []byte) error {
+	// Create directory if needed.
+	if err := os.MkdirAll(targetDir, 0o750); err != nil {
+		return fmt.Errorf("creating directory %s: %w", targetDir, err)
+	}
+
+	// Backup existing file.
+	if readErr == nil {
+		backupPath := targetPath + ".bak"
+		if err := os.WriteFile(backupPath, existingData, 0o600); err != nil {
+			return fmt.Errorf("creating backup %s: %w", backupPath, err)
+		}
+	}
+
+	// Atomic write: temp file + chmod + rename.
+	tmpFile, err := os.CreateTemp(targetDir, "settings-*.json.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(output); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("writing temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("closing temp file: %w", err)
+	}
+
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("setting permissions: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, targetPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("renaming temp file to %s: %w", targetPath, err)
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Wrote pipelock hooks to %s\n", targetPath)
+	return nil
+}
+
+// claudeGrepCredentialDirs are locations the shipped Credential File Access
+// rule protects, each with one file the rule denies, so a parity test fails
+// if the rule and this list disagree. A relative dir is a home directory
+// whose every file is sensitive: a search of it, inside it, or above it is
+// refused. An absolute dir holds one sensitive file (probe): only a search
+// whose target contains that file is refused.
+var claudeGrepCredentialDirs = []struct{ dir, probe string }{
+	{".ssh", "id_ed25519"},
+	{".aws", "credentials"},
+	{"/etc", "shadow"},
+}
+
+// claudeGrepCredentialDirPath returns the absolute path of a listed dir.
+func claudeGrepCredentialDirPath(home, dir string) string {
+	if filepath.IsAbs(dir) {
+		return dir
+	}
+	return filepath.Join(home, dir)
+}
+
+// grepTargetCoversCredentialDir reports whether a recursive search of target
+// would read inside a credential directory: the target is one, sits inside
+// one, or is an ancestor of one. Paths are resolved against cwd, "~" expands
+// to the home directory, and symlinks are followed where they exist.
+func grepTargetCoversCredentialDir(target, cwd string) (string, bool) {
+	if target == "" {
+		return "", false
+	}
+	homes := grepCredentialHomes()
+	if len(homes) == 0 {
+		// Without the home directory the credential directories cannot be
+		// located, so refuse rather than let the search run unchecked.
+		return "an unresolvable home directory", true
+	}
+	for _, home := range homes {
+		if dir, ok := grepTargetCoversCredentialDirUnder(home, target, cwd); ok {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
+// accountHomeDir overrides the account-database home lookup in tests. Nil
+// uses the policy package's lookup, so the Grep check and the tool-policy
+// resolver protect the same homes.
+var accountHomeDir func() (string, error)
+
+// grepCredentialHomes returns every distinct absolute home directory whose
+// credential directories a search must not cover. The tool-policy resolver
+// builds its protected locations from the same set.
+func grepCredentialHomes() []string {
+	return policy.CredentialHomes(accountHomeDir)
+}
+
+// grepTargetCoversCredentialDirUnder is grepTargetCoversCredentialDir for one
+// home directory.
+func grepTargetCoversCredentialDirUnder(home, target, cwd string) (string, bool) {
+	resolve := func(path string) string {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			return resolved
+		}
+		return filepath.Clean(path)
+	}
+	// Build the absolute target by concatenation, not filepath.Join or Abs:
+	// both clean lexically, which turns "link/.." into the link's parent
+	// before the link is followed. EvalSymlinks then applies ".." to the
+	// resolved path, as the kernel does.
+	switch {
+	case target == "~":
+		target = home
+	case strings.HasPrefix(target, "~/"):
+		target = home + string(filepath.Separator) + target[2:]
+	case !filepath.IsAbs(target):
+		target = cwd + string(filepath.Separator) + target
+		if cwd == "" {
+			target = target[1:]
+		}
+	}
+	// A relative cwd, or none, is relative to this process's directory.
+	// Anchor it so every comparison below is between absolute paths.
+	if !filepath.IsAbs(target) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "an unresolvable working directory", true
+		}
+		target = wd + string(filepath.Separator) + target
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	switch {
+	case err == nil:
+		target = resolved
+	case hasDotDotSegment(target):
+		// A ".." that cannot be resolved against the real filesystem could
+		// land anywhere, so refuse rather than fall back to a lexical guess.
+		return "an unresolvable path containing ..", true
+	default:
+		target = filepath.Clean(target)
+	}
+	// A single regular file is not a recursive search: the file-path policy
+	// that follows decides it, including the SSH public-key exception.
+	if info, err := os.Stat(target); err == nil && info.Mode().IsRegular() {
+		return "", false
+	}
+	for _, c := range claudeGrepCredentialDirs {
+		listed := claudeGrepCredentialDirPath(home, c.dir)
+		if filepath.IsAbs(c.dir) {
+			file := filepath.Join(listed, c.probe)
+			for _, protected := range []string{file, resolve(file)} {
+				if pathWithin(protected, target) {
+					return file, true
+				}
+			}
+			continue
+		}
+		for _, dir := range []string{listed, resolve(listed)} {
+			if pathWithin(target, dir) || pathWithin(dir, target) {
+				return listed, true
+			}
+		}
+	}
+	return "", false
+}
+
+// pathWithin reports whether path is dir or lies below it.
+func pathWithin(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
+}
+
+// hasDotDotSegment reports whether path contains a ".." element.
+func hasDotDotSegment(path string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}

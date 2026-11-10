@@ -1,0 +1,208 @@
+<!--
+Copyright 2026 Josh Waldrep
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Media policy
+
+The media policy controls how pipelock handles media responses (image, audio,
+video Content-Type). Pipelock is not a multimodal inspector -- it cannot detect
+instructions embedded in pixels, audio frames, or video. Instead, the media
+policy reduces exposure by stripping unused media types, enforcing size limits,
+surgically removing metadata from allowed images, and emitting exposure events
+for downstream taint systems.
+
+## When to use
+
+The media policy is enabled by default with secure defaults. You only need to
+configure it explicitly when:
+
+- You want to allow audio or video (both stripped by default).
+- You want to add image types beyond JPEG and PNG (e.g. WebP, GIF).
+- You need to raise or lower the image size limit (default 5 MiB).
+- You want to disable metadata stripping for a specific workflow.
+- You want to turn off media exposure event emission.
+
+## Configuration
+
+```yaml
+media_policy:
+  enabled: true
+  strip_images: false
+  strip_audio: true
+  strip_video: true
+  allowed_image_types:
+    - image/png
+    - image/jpeg
+  strip_image_metadata: true
+  max_image_bytes: 5242880
+  log_media_exposure: true
+```
+
+All boolean fields use nil-means-security-default semantics: omitting a field
+produces the protective default. You only need to set fields you want to
+change from the default.
+
+### Minimal config (accept all defaults)
+
+```yaml
+# media_policy section omitted entirely -- defaults apply:
+# - enabled: true
+# - strip_audio: true, strip_video: true
+# - allowed images: PNG, JPEG with metadata stripped
+# - max_image_bytes: 5 MiB
+# - exposure events emitted
+```
+
+### Strict config (no media at all)
+
+```yaml
+media_policy:
+  strip_images: true
+  strip_audio: true
+  strip_video: true
+```
+
+## Field reference
+
+| Field | Default (omitted) | Description |
+|-------|-------------------|-------------|
+| `enabled` | `true` | Master switch. When false, media passes through unchanged. |
+| `strip_images` | `false` | Reject all `image/*` responses. |
+| `strip_audio` | `true` | Reject all `audio/*` responses. |
+| `strip_video` | `true` | Reject all `video/*` responses. |
+| `allowed_image_types` | `[image/png, image/jpeg]` | Image types allowed when `strip_images` is false. |
+| `strip_image_metadata` | `true` | Remove EXIF/XMP/IPTC/ICC from allowed images. |
+| `max_image_bytes` | `5242880` (5 MiB) | Reject images larger than this before any parsing. |
+| `log_media_exposure` | `true` | Emit `media_exposure` events for allowed media. |
+
+## Repeated Content-Type values
+
+An HTTP response can declare its type more than once, in repeated
+`Content-Type` headers or a comma-separated list. Pipelock reads them with the
+Fetch standard's rule that browsers use: entries that don't parse and `*/*` are
+skipped, and the last valid entry becomes the declared type that media policy
+starts from. The body's leading bytes can still change that type, as described
+under [Exposure events](#exposure-events). Where Pipelock would otherwise skip
+text scanning for a binary media body, it does so only when every valid entry
+names the same type. A response whose entries disagree stays on the scanned
+path.
+
+## Image metadata stripping
+
+Pipelock performs byte-level surgery on image streams. It never decodes and
+re-encodes pixel data, so the forwarded image is pixel-identical to the
+original minus metadata segments.
+
+### JPEG
+
+Strips these marker segments:
+
+- **APP1** (0xE1): EXIF metadata, XMP sidecar data
+- **APP2** (0xE2): ICC color profiles, FlashPix metadata
+- **APP13** (0xED): IPTC/IIM metadata, Photoshop resource blocks
+
+Preserves APP0 (JFIF header) because some viewers require it. All other
+markers (SOF, DHT, DQT, SOS, RST, EOI) pass through unchanged. Entropy-coded
+scan data is copied byte-for-byte.
+
+If bytes appear after the canonical JPEG EOI marker, metadata stripping truncates
+the response at EOI and forwards the cleaned image instead of failing closed.
+
+### PNG
+
+Strips these chunk types:
+
+- **tEXt**: Latin-1 text metadata
+- **iTXt**: International UTF-8 text metadata
+- **zTXt**: Compressed Latin-1 text metadata
+- **eXIf**: EXIF metadata container (PNG 1.5+)
+
+All other chunks (IHDR, PLTE, tRNS, IDAT, IEND) pass through with their
+original CRCs intact.
+
+If bytes appear after the canonical PNG IEND chunk, metadata stripping truncates
+the response at IEND and forwards the cleaned image instead of failing closed.
+
+### Other formats
+
+GIF and WebP are not stripped by default because the metadata parser does not
+yet handle their chunk formats. If you add them to `allowed_image_types`, be
+aware that XMP in WebP and comment blocks in GIF will pass through unstripped.
+
+## SVG active content hardening
+
+SVG (`image/svg+xml`) is never in the allowed image types list. SVG is active
+content, not a static image.
+
+The browser shield pipeline handles SVG separately, stripping:
+
+- `<foreignObject>` elements (HTML embedding, XSS/injection vector)
+- `on*` event handler attributes (`onload`, `onclick`, `onerror`, etc.)
+- External `xlink:href` and `href` references (beacon/exfiltration)
+- Hidden `<text>` elements (invisible prompt injection via `opacity:0`,
+  `display:none`, or `visibility:hidden`)
+- `<script>` blocks
+- Animation injection (`<set>`, `<animate>` targeting href attributes)
+
+Namespace-prefixed variants (e.g. `svg:foreignObject`) are also caught.
+
+## MCP tool-result media
+
+Media policy also enforces on MCP tool results. MCP servers can return base64 payloads in the `data`, `blob`, or `raw` fields of a tool-result `content` block.
+
+Pipelock applies the HTTP media rules when the block declares an `image/*`, `audio/*`, or `video/*` MIME type, or when the decoded bytes match a supported media header.
+
+All three payload slots are evaluated. A malicious tool result can't stash blocked media in `blob` while keeping a benign value in `data`. Pure-media tool results (no `text` blocks) go directly to media policy and aren't fed as raw text into response-injection scanning. Pipelock checks the decoded bytes even when the server labels them as generic or non-media content. It validates the complete format header before overriding that label, so ordinary text that starts with a short media prefix isn't treated as media.
+
+For a recognized media payload, Pipelock reads runs of readable text out of the decoded bytes and scans that text in place of the base64. A payload with no readable text stays out of text scanning. This is byte-level text recovery, not OCR or speech recognition, so it doesn't find instructions drawn in pixels or spoken in audio.
+
+Text recovered from media shares one inspection budget across the whole response: 10 MiB, the MCP message size limit, counted over every field and payload together. A response that runs past it is refused as an incomplete scan, even when the configured response action is `warn`, `strip`, or `ask`. `max_image_bytes` is a separate limit on each image and doesn't change this budget. If a server hits it, return fewer or smaller media payloads per response.
+
+Blocked MCP media returns a media-policy-specific JSON-RPC error to the client (distinct from the generic prompt-injection block response) so operators can tell the two enforcement paths apart.
+
+## Decompression bomb protection
+
+The `max_image_bytes` limit is checked on the raw response body before any
+parsing begins. This prevents malicious images that decompress to gigabytes
+from consuming memory. The default 5 MiB limit handles most legitimate
+images. Raise it if your agents work with high-resolution photography or
+medical imaging.
+
+## Exposure events
+
+When `log_media_exposure` is true (default), pipelock emits a
+`media_exposure` event for every allowed media response. These events feed
+into the taint/authority policy system as exposure signals. A downstream
+system can use them to escalate scanning when an agent has recently consumed
+rich media before attempting a sensitive action.
+
+The event's `content_type` is one of a fixed set of labels, so an upstream
+server can't write arbitrary text into the audit log. Common image, audio, and
+video types keep their own names. Any other type is recorded as
+`image/unknown`, `audio/unknown`, `video/unknown`, or `unknown`. The label only
+describes the event: enforcement uses the full effective type, not the label.
+That type is the declared one unless the body starts with a recognized header
+for a media format the declaration doesn't name. Only that leading header is
+checked to choose the type; it doesn't validate the rest of the body. For
+example, a body starting with a JPEG header served as `text/html` is handled
+as `image/jpeg`, and a body declared as JPEG or PNG that starts with another
+allowed image format's header is handled as that format. The label comes from
+the same effective type, and an `unknown` label doesn't mean the media was
+allowed.
+
+## Validation rules
+
+- `allowed_image_types` entries must be `image/*` media types with a concrete
+  subtype (no wildcards, no whitespace, no nested slashes).
+- `image/svg+xml` is rejected in `allowed_image_types`.
+- `max_image_bytes` must be non-negative (0 means use the default).
+- Validation runs even when `enabled` is false, so toggling the feature on
+  via hot-reload cannot introduce malformed values.
+
+## See also
+
+- [MCP media policy example](../../examples/mcp-media-policy/README.md) for runnable media allow and block cases
+- [Configuration reference](../configuration.md#media-policy-v21) for all fields
+- [Bypass resistance](../bypass-resistance.md) for steganography limitations
+- [Attacks blocked](../attacks-blocked.md) for SVG and media attack examples

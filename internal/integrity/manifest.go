@@ -1,0 +1,131 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package integrity provides file integrity monitoring for agent workspaces.
+//
+// It generates SHA256 manifests of directory contents and detects unauthorized
+// modifications, additions, and deletions - the foundation for securing
+// inter-agent communication channels.
+package integrity
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/atomicfile"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/securefile"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// ManifestVersion is the current manifest schema version.
+const ManifestVersion = 1
+
+const maxManifestBytes = 32 << 20
+
+// DefaultManifestFile is the default manifest filename within a workspace.
+const DefaultManifestFile = ".integrity-manifest.json"
+
+// Manifest records the integrity state of a workspace directory.
+type Manifest struct {
+	Version  int                  `json:"version"`
+	Created  time.Time            `json:"created"`
+	Updated  time.Time            `json:"updated"`
+	Files    map[string]FileEntry `json:"files"`
+	Excludes []string             `json:"excludes"`
+}
+
+// FileEntry records integrity data for a single file.
+type FileEntry struct {
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	Mode   string `json:"mode"`
+}
+
+// Load reads and parses a manifest from disk.
+func Load(path string) (*Manifest, error) {
+	data, err := securefile.Read(path, securefile.Options{MaxBytes: maxManifestBytes, DisallowedPerms: securefile.DisallowGroupOrWorldWrite})
+	if err != nil {
+		return nil, fmt.Errorf("reading manifest: %w", err)
+	}
+	return parseManifest(data)
+}
+
+// LoadVerified parses the exact manifest bytes authenticated by its detached signature.
+func LoadVerified(path string, pubKey ed25519.PublicKey) (*Manifest, error) {
+	data, err := securefile.Read(path, securefile.Options{MaxBytes: maxManifestBytes, DisallowedPerms: securefile.DisallowGroupOrWorldWrite})
+	if err != nil {
+		return nil, fmt.Errorf("reading manifest: %w", err)
+	}
+	sig, err := signing.LoadSignature(path + signing.SigExtension)
+	if err != nil {
+		return nil, err
+	}
+	if !ed25519.Verify(pubKey, data, sig) {
+		return nil, fmt.Errorf("signature verification failed")
+	}
+	return parseManifest(data)
+}
+
+func parseManifest(data []byte) (*Manifest, error) {
+	var m Manifest
+	if err := jsonscan.RejectNonCanonicalFields(data, new(Manifest)); err != nil {
+		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
+
+	if m.Version != ManifestVersion {
+		return nil, fmt.Errorf("unsupported manifest version %d (expected %d)", m.Version, ManifestVersion)
+	}
+	if m.Files == nil {
+		return nil, fmt.Errorf("parsing manifest: missing or null 'files' field")
+	}
+
+	return &m, nil
+}
+
+// Save atomically writes the manifest to disk with restrictive permissions.
+// It writes to a temporary file and renames to prevent corruption on crash.
+func (m *Manifest) Save(path string) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling manifest: %w", err)
+	}
+
+	data = append(data, '\n')
+
+	return atomicfile.Write(path, data, 0o600)
+}
+
+// HashFile computes the SHA256 hash and stats a single file.
+func HashFile(path string) (FileEntry, error) {
+	f, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return FileEntry{}, fmt.Errorf("opening file: %w", err)
+	}
+	defer f.Close() //nolint:errcheck // read-only
+
+	info, err := f.Stat()
+	if err != nil {
+		return FileEntry{}, fmt.Errorf("stat file: %w", err)
+	}
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return FileEntry{}, fmt.Errorf("hashing file: %w", err)
+	}
+
+	return FileEntry{
+		SHA256: fmt.Sprintf("%x", h.Sum(nil)),
+		Size:   info.Size(),
+		Mode:   fmt.Sprintf("%04o", info.Mode().Perm()),
+	}, nil
+}

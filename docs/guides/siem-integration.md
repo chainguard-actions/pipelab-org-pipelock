@@ -1,0 +1,818 @@
+# SIEM Integration Guide
+
+Pipelock pushes structured security events to external systems via webhook
+(HTTP POST), syslog (RFC 5424), and OTLP (OpenTelemetry HTTP/protobuf) sinks.
+Enterprise builds also provide a durable HTTP forwarder for at-least-once
+delivery from a local append-only spool.
+This guide covers the event schema, forwarding setup for common SIEM
+platforms, detection rule examples, and automated kill switch response.
+
+## Event Schema
+
+All three sinks default to the same JSON envelope (OTLP wraps it as an OTLP LogRecord); the webhook and syslog sinks can also emit CEF (`format: cef`) or OCSF (`format: ocsf`) instead of JSON (see the format options below):
+
+```json
+{
+  "severity": "warn",
+  "type": "blocked",
+  "timestamp": "2026-02-25T12:34:56.789Z",
+  "pipelock_instance": "prod-node-1",
+  "fields": {
+    "method": "GET",
+    "url": "https://attacker.com/steal?key=AKIA...",
+    "scanner": "dlp",
+    "reason": "AWS access key pattern detected",
+    "client_ip": "10.0.0.50",
+    "request_id": "req-abc-123"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `severity` | string | `info`, `warn`, or `critical`. Hardcoded per event type. |
+| `type` | string | Event type identifier (see tables below) |
+| `timestamp` | string | RFC 3339, nanosecond precision, UTC. Trailing zeros are trimmed. Use ISO 8601 parsing, not fixed-width extraction. |
+| `pipelock_instance` | string | Hostname, `emit.instance_id` config override, or `"pipelock"` fallback |
+| `fields` | object | Event-specific key-value pairs (vary by type) |
+
+## Event Types
+
+Every event type below can reach an emit sink (webhook, syslog, OTLP). Each sink
+drops events below its own `min_severity`, which defaults to `warn`, so a default
+configuration sends only the warn and critical events. Set `min_severity: info`
+on a sink to receive the info events as well.
+
+### Critical (requires immediate response)
+
+| Type | Description | Key Fields |
+|------|-------------|------------|
+| `kill_switch_deny` | All traffic denied by emergency kill switch | `transport`, `endpoint`, `source`, `deny_message`, `client_ip` |
+| `adaptive_escalation`* | Session threat score escalated. Adaptive enforcement v2 upgrades actions at all enforcement points (elevated, high, critical levels). | `session`, `from`, `to`, `client_ip`, `request_id`, `score` |
+| `chain_detection`† | Tool-call chain pattern matched | `pattern`, `pattern_severity`, `action`, `tool`, `session`, `mitre_technique` |
+
+\* Critical when `to` is `block`. Otherwise warn. In v1, escalation is scoring and event emission only.
+
+† Critical when the configured action is `block`. Otherwise warn. The severity comes from the action, not from the pattern's own `pattern_severity` field.
+
+### Warn (suspicious activity)
+
+| Type | Description | Key Fields |
+|------|-------------|------------|
+| `blocked` | Request blocked by scanner pipeline | `method`, `url`, `scanner`, `reason`, `client_ip`, `request_id` |
+| `anomaly` | Behavioral anomaly detected | `method`, `url`, `reason`, `client_ip`, `request_id`, `score` |
+| `session_anomaly` | Session-level anomaly | `session`, `anomaly_type`, `detail`, `client_ip`, `request_id`, `score` |
+| `mcp_unknown_tool` | Unregistered MCP tool call attempted | `tool`, `action` |
+| `ws_blocked` | WebSocket frame blocked | `target`, `direction`, `scanner`, `reason`, `client_ip`, `request_id` |
+| `response_scan` | Prompt injection detected in response | `url`, `client_ip`, `request_id`, `action`, `match_count`, `patterns` |
+| `ws_scan` | Prompt injection in WebSocket frame | `target`, `direction`, `client_ip`, `request_id`, `action`, `match_count`, `patterns` |
+| `adaptive_escalation`* | Session threat score escalated (not to block level) | `session`, `from`, `to`, `client_ip`, `request_id`, `score` |
+| `dlp_warn` | Warn-mode DLP match, or a finding deliberately not enforced | `mode` (`warn` or `informational`), `pattern`, `severity`, `transport`, `reason` (informational only: `suppressed`, `disabled`, or `low_confidence`), `client_ip`, `request_id` |
+| `response_scan_suppressed` | Response-scan finding withheld from enforcement | `mode`, `pattern`, `surface`, `reason` (`suppressed` or `core_observed`), `observe_host`, `observe_owner`, `observe_expires`, `observe_reason` (`core_observed` only), `client_ip`, `request_id` |
+| `error` | Internal error during request processing | `method`, `url`, `client_ip`, `request_id`, `error` |
+
+MCP `blocked` events use `fields.scanner` for the gate that denied the call.
+The labels below are checked against the MCP denial catalog by a test. `block_class` separates content findings from
+protective, configuration, and inspection refusals.
+
+<!-- BEGIN MCP blocked scanner labels -->
+| Scanner | MCP denial |
+|---------|------------|
+| `a2a_scan` | A2A input finding, inspection limit, or inspection failure |
+| `adaptive_enforcement` | Session-level action upgrade |
+| `address_protection` | Address protection finding |
+| `agent_identity` | Server identity revoked |
+| `airlock` | Session airlock refusal |
+| `allowlist` | Embedded URL destination check; see the scanner guidance for this label |
+| `blocklist` | Embedded URL destination check; see the scanner guidance for this label |
+| `chain_detection` | Tool-call chain finding |
+| `context` | Embedded URL destination check; see the scanner guidance for this label |
+| `contract` | Contract refusal or evaluation failure |
+| `core_dlp` | Embedded URL destination check; see the scanner guidance for this label |
+| `core_ssrf` | Embedded URL destination check; see the scanner guidance for this label |
+| `crlf_injection` | Embedded URL destination check; see the scanner guidance for this label |
+| `cross_request_entropy` | Cross-request entropy budget refusal |
+| `cross_request_fragment` | Reassembled credential or inspection-limit refusal |
+| `cross_request_fragment_capacity` | Fragment inspection state capacity exhausted |
+| `cross_request_fragment_owner_mismatch` | Fragment stream belongs to another identity |
+| `databudget` | Embedded URL destination check; see the scanner guidance for this label |
+| `denial_of_wallet` | Tool-use budget or expansion finding |
+| `dlp` | Embedded URL destination check; see the scanner guidance for this label |
+| `entropy` | Embedded URL destination check; see the scanner guidance for this label |
+| `frozen_tool` | Tool absent from frozen inventory |
+| `kill_switch` | Active kill switch, including held-call cancellation |
+| `length` | Embedded URL destination check; see the scanner guidance for this label |
+| `mcp_defer` | Defer unavailable, hold failure, or terminal deferred refusal |
+| `mcp_header_dlp` | Text DLP finding in a selected listener request header |
+| `mcp_header_injection` | Injection finding in a decoded `Mcp-Param-*` value |
+| `mcp_header_inspection` | Parameter-header inspection failure |
+| `mcp_input_dlp` | Credential in a request |
+| `mcp_input_injection` | Instruction in request arguments |
+| `mcp_input_inspection` | Request inspection failure |
+| `mcp_protocol` | Listener admission, protocol or state-capacity refusal; unsupported request or response batch |
+| `mcp_redirect` | Redirect profile or handler failure, or unsupported batch redirect |
+| `mcp_redirect_output_dlp` | Credential in redirect handler output |
+| `mcp_redirect_output_injection` | Instruction in redirect handler output |
+| `mcp_response_inspection` | Uninspectable upstream response |
+| `mcp_session_binding` | Session inventory mismatch |
+| `mcp_tool_policy` | Matched tool rule |
+| `media_policy` | Response media policy or inspection refusal |
+| `mediation_envelope` | Mediation envelope injection failure |
+| `parser` | Embedded URL destination check; see the scanner guidance for this label |
+| `path_traversal` | Embedded URL destination check; see the scanner guidance for this label |
+| `provenance` | Tool signature verification refusal |
+| `ratelimit` | Embedded URL destination check; see the scanner guidance for this label |
+| `receipt_emission` | Required receipt unavailable |
+| `redaction` | Request redaction could not complete safely |
+| `request_policy` | Action authority refusal |
+| `response_scan` | Upstream response content or inspection refusal |
+| `scanner_unavailable` | Scanner unavailable |
+| `scheme` | Embedded URL destination check; see the scanner guidance for this label |
+| `session_anomaly` | Behavioral baseline deviation |
+| `ssrf` | Embedded URL destination check; see the scanner guidance for this label |
+| `ssrf_metadata` | Embedded URL destination check; see the scanner guidance for this label |
+| `subdomain_entropy` | Embedded URL destination check; see the scanner guidance for this label |
+| `taint_policy` | Tainted action refusal |
+| `tool_scanning` | Tool definition finding or operational inventory refusal |
+<!-- END MCP blocked scanner labels -->
+
+Listener header DLP scans selected request header names and values as text.
+Decoded `Mcp-Param-*` values receive response injection scanning too.
+`Last-Event-ID`, `Mcp-Param-*`, and `Mcp-Session-Id` are always selected;
+`Authorization` is selected by default. The other selections follow
+`request_body_scanning.scan_headers`, `header_mode`, `sensitive_headers`, and
+`ignore_headers`. A tools/list capacity refusal under `tool_scanning` and
+an uninspectable response under `mcp_response_inspection` use
+`block_class: infrastructure_error`, carry no MITRE technique, and omit
+agent-threat attributes. MCP operational blocks retain their native OTLP
+record. Each finalized denial attempts one canonical `blocked` emission before
+reply delivery or a deliberate silent drop. Sink delivery remains best effort.
+
+Local blocked logging also records pre-authentication listener refusals, one
+record per refusal when `logging.include_blocked` is enabled (the default).
+Before exposing a listener with local blocked logging enabled, configure log
+rotation by size or time and retention in the log collector. Alert on sustained
+increases in `mcp_protocol` events with reason `MCP listener admission refused`
+and on log storage approaching the collector's configured capacity. Set
+thresholds from the deployment's normal request rate and storage budget. External sink queues are bounded and may drop events under
+load. Operators who need only external blocked events can disable
+`logging.include_blocked`; this does not disable external emission.
+
+`protocol: mcp`, `transport`, and `direction` identify the trusted MCP route,
+including CEE events. HTTP events retain their existing field set. MCP `resource` values follow these contracts. Existing content-bearing
+resources retain audit redaction; route fields do not make their content safe.
+
+| Denial surface | Serialized `resource` |
+|---|---|
+| Tool inventory scanning (`tool_scanning`) | `[redacted]` |
+| Frozen tool inventory (`frozen_tool`) | Refused tool name, or `invalid-mcp-resource` when omitted or empty |
+| Response content, provenance, media policy, denial-of-wallet, and CEE | `[redacted]` |
+| Newly logged input failures | `mcp_input` |
+| Listener header failures | `mcp_listener_header` |
+| Newly logged response failures | `mcp_response` |
+| Redirect output failures | `mcp_redirect_output` |
+| Upstream error reply scanning | `upstream_error_reply` |
+| Listener admission and inspection failures | `mcp_listener` |
+| Startup refusals | `mcp_startup` |
+
+Tool inventory blocks preserve the released `tool_scanning` label and `[redacted]` resource. The configuration section remains `mcp_tool_scanning`. Frozen-tool blocks retain the refused tool name. New failure markers omit request arguments, header values, and response bodies. Rules filtering `fields.scanner == "dlp"` for credentials should also
+select `mcp_input_dlp`, `mcp_header_dlp`, and `mcp_redirect_output_dlp` when MCP
+blocks are in scope.
+
+### Info (sent only when a sink sets `min_severity: info`)
+
+These go to the local log (except the seven events named below when `logging.include_allowed` is `false`), and reach a sink only when that sink's
+`min_severity` is `info`. With the default `warn` threshold they stay local. To
+see allowed traffic without turning on info delivery, use Prometheus metrics or
+ship the local logs through a log collector (Promtail, Filebeat, Fluentd).
+
+`allowed`, `tunnel_open`, `tunnel_close`, `forward_http`, `intercept_http`, `ws_open`
+and `ws_close` are also gated by `logging.include_allowed` (default `true`). When it is
+`false`, they are neither logged nor emitted, whatever `min_severity` says.
+
+| Type | Description | Key Fields |
+|------|-------------|------------|
+| `allowed` | Request allowed | `method`, `url`, `client_ip`, `request_id`, `status_code`, `size_bytes`, `duration_ms` |
+| `tunnel_open` | CONNECT tunnel established | `target`, `client_ip`, `request_id` |
+| `tunnel_close` | CONNECT tunnel closed | `target`, `client_ip`, `request_id`, `total_bytes`, `duration_ms` |
+| `ws_open` | WebSocket connection opened | `target`, `client_ip`, `request_id`, `agent` |
+| `ws_close` | WebSocket connection closed | `target`, `client_ip`, `request_id`, `agent`, `client_to_server_bytes`, `server_to_client_bytes`, `text_frames`, `binary_frames`, `duration_ms` |
+| `config_reload` | Config file reloaded (also emitted) | `status`, `detail` |
+| `redirect` | HTTP redirect observed before target admission; not proof the target was contacted | `original_url`, `redirect_url`, `client_ip`, `request_id`, `hop` |
+| `forward_http` | Forward proxy request completed | `method`, `url`, `client_ip`, `request_id`, `status_code`, `size_bytes`, `duration_ms` |
+| `intercept_http` | TLS-intercepted request finished, allowed or blocked. `url` is the destination only, never a path or query. `upstream_ms` is the wait for the destination's response headers. It starts when the request has finished sending; in the rare case where the response arrives before the send is reported complete, it starts when the connection was ready and so also includes sending. It appears only when the request was sent. The rest of `duration_ms` covers Pipelock's checks before sending, DNS lookup and connecting, sending the request when `upstream_ms` does not already include it, and reading, scanning and delivering the response body. `request_canceled` is true when the request was canceled before it finished, normally because the client gave up, and also when the proxy is shutting down | `method`, `url`, `client_ip`, `request_id`, `status_code`, `size_bytes`, `duration_ms`, `upstream_ms`, `request_canceled` |
+
+> **Note:** Chain detection events (`chain_detection`) are both counted in
+> Prometheus (`pipelock_chain_detections_total`) and emitted to the sinks, at
+> warn or critical severity. The Alertmanager rules below alert on the metric;
+> a SIEM rule on the `chain_detection` event sees the pattern, tool and session.
+
+> **Not every event type is listed.** The tables show the common ones. The
+> full set of severities is the `EventSeverity` map in `internal/emit/event.go`,
+> and a few events (for example `chain_detection`, `adaptive_upgrade`) take their
+> severity from the action at emit time rather than from a fixed value.
+
+## Pipelock Configuration
+
+Add an `emit` block to your pipelock config to enable any combination of sinks:
+
+```yaml
+emit:
+  instance_id: "pipelock-prod-1"      # optional, defaults to hostname
+
+  webhook:
+    url: "https://siem.example.com/api/events"
+    min_severity: "warn"              # info, warn, or critical
+    auth_token: "your-bearer-token"   # optional Authorization header
+    timeout_seconds: 5
+    queue_size: 64                    # async buffer capacity
+    format: "ocsf"                   # json, cef, or ocsf
+
+  syslog:
+    address: "udp://syslog.example.com:514"
+    min_severity: "warn"
+    facility: "local0"                # local0-local7, auth, daemon, etc.
+    tag: "pipelock"
+    format: "json"                    # json, cef, or ocsf
+```
+
+### Durable HTTP forwarding (Enterprise)
+
+Use `emit.forwarder` when delivery must resume after a restart. This is a
+narrow forwarding pipe into an operator-owned endpoint; it is not a SIEM,
+search index, or second evidence database.
+
+```yaml
+# pipelock-enterprise-skip-id: siem-durable-forwarder
+emit:
+  forwarder:
+    url: "https://api.vendor.example/events"
+    destination_allowlist: ["api.vendor.example"]
+    spool_file: "/var/lib/pipelock/siem-forward.spool"
+    cursor_file: "/var/lib/pipelock/siem-forward.cursor"
+    auth_token: "" # optional Bearer token; requires an https:// url
+    min_severity: "warn"
+    timeout_seconds: 5
+    queue_size: 256
+    max_spool_bytes: 104857600 # 100 MiB spool ceiling (default)
+    allow_insecure_http: false # permit plaintext http to a non-loopback host
+```
+
+The destination allowlist is mandatory and matches exact hostnames only. The
+forwarder resolves and rejects loopback, private, link-local, multicast, and
+cloud-metadata addresses at startup and again in the connection path. The
+connection uses the already-checked address, which closes the DNS-rebinding
+gap. Redirects are refused. An empty allowlist or invalid destination prevents
+startup; there is no forward-anywhere default.
+
+Transport confidentiality is enforced. A plaintext `http://` url to a
+non-loopback host is rejected unless `allow_insecure_http: true` is set, and an
+`auth_token` over `http://` to a non-loopback host is rejected regardless —
+a bearer token must not travel in cleartext. Loopback destinations (a local
+collector) may use `http://` without the flag.
+
+An operator may deliberately target an internal service only by using that IP
+literal as the URL host and listing the same literal exactly. An allowlisted
+hostname that later resolves to an internal address is still denied.
+If DNS is unavailable at startup, Pipelock starts with forwarding degraded
+rather than taking down the mediation proxy. No event is sent until a later
+dial-time resolution succeeds and passes the same SSRF checks.
+
+Accepted events are appended to `spool_file` with mode `0600`. After the
+endpoint returns a 2xx response, `cursor_file` advances atomically with the
+source path, byte offset, and SHA-256 hash of the acknowledged record. A
+restart verifies that binding before replay. A corrupt cursor fails closed
+instead of silently skipping evidence. Delivery is at least once, so a remote
+receiver should deduplicate if a response is lost after it accepted an event.
+Once every spooled record has been acknowledged the spool is truncated, so
+healthy operation stays bounded rather than growing without limit.
+
+The on-disk spool is capped at `max_spool_bytes` (default 100 MiB). When the
+endpoint is unreachable and an append would exceed the cap, the new event is
+dropped and counted rather than retried, so a stalled endpoint cannot exhaust
+host disk. An event that can never be encoded (for example a non-finite number
+in its fields) is likewise dropped with a sanitized diagnostic instead of
+blocking every later event behind an unencodable one.
+
+The producer-facing queue remains bounded and non-blocking. A full queue drops
+the new event and increments `pipelock_siem_forwarder_dropped_total`; it does
+not stall proxy traffic. The durable guarantee begins after an event reaches
+the spool. Health is exposed through these Prometheus series:
+
+- `pipelock_siem_forwarder_queued`
+- `pipelock_siem_forwarder_delivered_total`
+- `pipelock_siem_forwarder_failed_total`
+- `pipelock_siem_forwarder_dropped_total`
+- `pipelock_siem_forwarder_last_success_timestamp_seconds`
+- `pipelock_siem_forwarder_spool_bytes`
+
+The durable wire envelope is versioned:
+
+```json
+{
+  "schema": "pipelock.siem.event.v1",
+  "event": {
+    "severity": "warn",
+    "type": "blocked",
+    "timestamp": "2026-02-25T12:34:56.789Z",
+    "pipelock_instance": "agent-a",
+    "fields": {"scanner": "dlp", "action": "block"}
+  }
+}
+```
+
+The existing syslog sink supports JSON, CEF (`format: cef`), and OCSF
+(`format: ocsf`) for receivers that require one of those wire formats, but it
+is best-effort and does not use the durable cursor.
+
+Operator lifecycle:
+
+- Create: configure both state paths; Pipelock creates parent directories and
+  files with restrictive permissions. Give every Pipelock process its own
+  spool/cursor pair; the files are not a shared multi-process queue. This is
+  enforced by an exclusive advisory lock on a `<spool_file>.lock` sidecar — a
+  second process pointed at the same spool fails to start delivery rather than
+  racing the cursor.
+
+  For two MCP wrappers, use separate config files with stable pairs: set
+  `emit.forwarder.spool_file: /var/lib/pipelock/mcp-calendar.spool` and
+  `emit.forwarder.cursor_file: /var/lib/pipelock/mcp-calendar.cursor` in the
+  calendar wrapper's config, and use `mcp-files.spool` / `mcp-files.cursor`
+  for the files wrapper. Keep each pair across that wrapper's restarts so
+  pending events can replay.
+- Inspect: watch the forwarder metrics and the cursor's offset/hash while
+  treating the spool as the delivery source of truth.
+- Rotate: stop Pipelock, confirm the cursor offset equals the spool size,
+  archive the pair, then restart with new paths. Never rotate only one file.
+- Recover: restore a matching spool/cursor pair. If only the cursor is corrupt,
+  moving it aside replays the spool from offset zero (duplicates, but no silent
+  skip). Preserve the corrupt pair for investigation first.
+- Revoke: remove `emit.forwarder.url` and restart Pipelock. The stopped worker
+  leaves its state files for operator-controlled retention or deletion.
+- Approve changes: all `emit` settings require a restart, including filters,
+  `instance_id`, webhook, syslog, OTLP, forwarder destinations, and state paths.
+  Pipelock validates the new settings before the replacement workers start.
+
+**Severity filtering:** Events below `min_severity` are silently dropped before
+reaching the sink. Set to `warn` for all security events (recommended), or
+`critical` for emergency alerts only. Setting `info` adds the info-level events
+(`allowed`, `tunnel_open`, `tunnel_close`, `forward_http`, `intercept_http`, `ws_open`, `ws_close`,
+`config_reload`, `redirect` and the others in the Info table), which can be high
+volume on a busy proxy.
+
+**`min_severity` defaults to `warn`** when omitted. Valid values are `info`,
+`warn`, and `critical`. Invalid values fail config validation.
+
+**You can't change event severity:** it's hardcoded per event type. What you
+control is the emission *threshold* (`min_severity`). This is intentional: it
+prevents misconfiguration from silently hiding critical events.
+
+### OCSF over HTTP
+
+Set `emit.webhook.format: ocsf` for SIEM HTTP ingestion endpoints that accept
+OCSF Detection Finding JSON. Webhook and syslog use the same OCSF encoder, so
+the class, severity, finding, network, and Pipelock extension fields stay
+identical across transports. OCSF webhook requests use
+`Content-Type: application/json`.
+
+## Forwarding Patterns
+
+### Webhook to Splunk HEC
+
+```yaml
+emit:
+  webhook:
+    url: "https://splunk.example.com:8088/services/collector/event"
+    auth_token: "your-splunk-hec-token"
+    min_severity: "warn"
+    format: "json"
+```
+
+Splunk HEC expects `Authorization: Splunk <token>`, but pipelock sends
+`Authorization: Bearer <token>`. You have two options:
+
+**Option A (preferred):** Put n8n or a reverse proxy in front of HEC to
+rewrite the auth header from `Bearer` to `Splunk`.
+
+**Option B:** Use Splunk's raw endpoint with the token in the URL. Be aware
+this exposes the token in access logs, proxy logs, and URL fields, so only
+use this behind TLS with restricted network access.
+
+```yaml
+emit:
+  webhook:
+    url: "https://splunk.example.com:8088/services/collector/raw"
+    # For Splunk HEC auth, append your HEC credential as a query param
+    min_severity: "warn"
+```
+
+### Webhook to n8n
+
+The simplest path if you're self-hosting. n8n accepts raw JSON webhooks
+with no auth transformation needed:
+
+```yaml
+emit:
+  webhook:
+    url: "https://n8n.example.com/webhook/pipelock-events"
+    min_severity: "warn"
+```
+
+In n8n, create a Webhook node that receives POST requests. From there, route
+to any destination: Slack, PagerDuty, Grafana OnCall, a database, or trigger
+the kill switch API for automated response.
+
+### Webhook to Microsoft Sentinel
+
+Use an Azure Logic App or Function App as the webhook receiver, then ingest
+into a custom Log Analytics table:
+
+```yaml
+emit:
+  webhook:
+    url: "https://your-logic-app.azurewebsites.net/api/pipelock"
+    auth_token: "function-key-here"
+    min_severity: "warn"
+```
+
+### Syslog to rsyslog / syslog-ng
+
+```yaml
+emit:
+  syslog:
+    address: "udp://syslog.example.com:514"
+    facility: "local0"
+    tag: "pipelock"
+    min_severity: "warn"
+    format: "json"                    # json, cef, or ocsf
+```
+
+On the receiver, filter by program name:
+
+```conf
+# rsyslog
+if $programname == 'pipelock' then /var/log/pipelock.log
+& stop
+
+# syslog-ng
+filter f_pipelock { program("pipelock"); };
+destination d_pipelock { file("/var/log/pipelock.log"); };
+log { source(s_network); filter(f_pipelock); destination(d_pipelock); };
+```
+
+### Syslog to Elasticsearch (via Logstash)
+
+```conf
+# logstash.conf
+input {
+  syslog {
+    port => 514
+    type => "pipelock"
+  }
+}
+
+filter {
+  if [type] == "pipelock" {
+    json {
+      source => "message"
+      target => "pipelock"
+    }
+    date {
+      match => [ "[pipelock][timestamp]", "ISO8601" ]
+    }
+    mutate {
+      add_field => {
+        "event.severity" => "%{[pipelock][severity]}"
+        "event.type" => "%{[pipelock][type]}"
+        "event.instance" => "%{[pipelock][pipelock_instance]}"
+      }
+    }
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["https://es.example.com:9200"]
+    index => "pipelock-%{+YYYY.MM.dd}"
+  }
+}
+```
+
+## Detection Rules
+
+### Splunk (SPL)
+
+All blocked requests in the last hour:
+
+```spl
+index=pipelock severity="warn" type="blocked"
+| stats count by fields.scanner, fields.reason
+| sort -count
+```
+
+DLP exfiltration attempts:
+
+```spl
+index=pipelock type="blocked" fields.scanner="dlp"
+| table _time, fields.client_ip, fields.url, fields.reason
+```
+
+Kill switch activations:
+
+```spl
+index=pipelock severity="critical" type="kill_switch_deny"
+| stats count by fields.source, fields.deny_message
+```
+
+High anomaly scores (behavioral profiling):
+
+```spl
+index=pipelock type IN ("anomaly", "session_anomaly") fields.score>0.7
+| timechart span=5m count by type
+```
+
+Adaptive escalation events reaching block level:
+
+```spl
+index=pipelock type="adaptive_escalation" fields.to="block"
+| table _time, fields.session, fields.from, fields.to, fields.score
+```
+
+### Microsoft Sentinel (KQL)
+
+All blocked requests in the last hour:
+
+```kql
+PipelockEvents_CL
+| where severity_s == "warn" and type_s == "blocked"
+| summarize count() by fields_scanner_s, fields_reason_s
+| sort by count_ desc
+```
+
+DLP exfiltration attempts:
+
+```kql
+PipelockEvents_CL
+| where type_s == "blocked" and fields_scanner_s == "dlp"
+| project TimeGenerated, fields_client_ip_s, fields_url_s, fields_reason_s
+```
+
+Kill switch activations:
+
+```kql
+PipelockEvents_CL
+| where severity_s == "critical" and type_s == "kill_switch_deny"
+| summarize count() by fields_source_s, fields_deny_message_s
+```
+
+Anomaly score trending:
+
+```kql
+PipelockEvents_CL
+| where type_s in ("anomaly", "session_anomaly")
+| where todouble(fields_score_s) > 0.7
+| summarize count() by bin(TimeGenerated, 5m), type_s
+| render timechart
+```
+
+### Elasticsearch (EQL / KQL)
+
+Blocked requests (Kibana KQL):
+
+```kql
+pipelock.severity: "warn" AND pipelock.type: "blocked"
+```
+
+DLP exfiltration:
+
+```kql
+pipelock.type: "blocked" AND pipelock.fields.scanner: "dlp"
+```
+
+Kill switch events:
+
+```kql
+pipelock.severity: "critical" AND pipelock.type: "kill_switch_deny"
+```
+
+EQL sequence: blocked request followed by kill switch within 60 seconds:
+
+```eql
+sequence by pipelock.pipelock_instance with maxspan=60s
+  [any where pipelock.type == "blocked"]
+  [any where pipelock.type == "kill_switch_deny"]
+```
+
+### Grafana (LogQL / Loki)
+
+Blocked requests rate:
+
+```logql
+sum(rate({job="pipelock"} | json | type="blocked" [5m])) by (fields_scanner)
+```
+
+> **Note:** After `| json`, nested field names depend on your Loki version's
+> JSON flattening behavior. Fields like `fields.scanner` typically become
+> `fields_scanner`. Verify field names in your Loki Explorer.
+
+Critical events:
+
+```logql
+{job="pipelock"} | json | severity="critical"
+```
+
+Kill switch deny events:
+
+```logql
+{job="pipelock"} | json | type="kill_switch_deny"
+```
+
+## Automated Response: Closing the Loop
+
+Detection without response is just logging. The real value comes from wiring
+pipelock's webhook output into an automation platform that can POST back to
+the kill switch API and shut the agent down.
+
+```text
+Agent violates policy
+  → Pipelock blocks request + emits webhook event
+    → SIEM/n8n receives event
+      → Automation POSTs to kill switch API
+        → Pipelock denies ALL subsequent traffic
+          → Alert sent to operator
+```
+
+### Kill Switch API
+
+The examples below use port 9090. Replace with whatever you set in
+`kill_switch.api_listen`. If `api_listen` is not set, the API lives on the
+main proxy port (default 8888). This API belongs to `pipelock run`: a standalone
+`pipelock mcp proxy` listener serves only the deferred-action routes, so these
+paths return 404 there.
+
+**Toggle:**
+
+```bash
+# Activate kill switch
+curl -X POST http://pipelock:9090/api/v1/killswitch \
+  -H "Authorization: Bearer $KILL_SWITCH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"active": true}'
+
+# Response (message field only present when configured in kill_switch.message)
+{"active": true, "source": "api"}
+
+# With a custom message configured:
+{"active": true, "source": "api", "message": "Emergency shutdown by SOC"}
+```
+
+**Query status:**
+
+```bash
+curl http://pipelock:9090/api/v1/killswitch/status \
+  -H "Authorization: Bearer $KILL_SWITCH_TOKEN"
+
+# Response
+{
+  "active": true,
+  "sources": {
+    "config": false,
+    "api": true,
+    "conductor_remote": false,
+    "conductor_stale": false,
+    "conductor_apply_failure": false,
+    "signal": false,
+    "sentinel": false
+  }
+}
+```
+
+The kill switch uses OR logic across seven independent sources: config, API, Conductor remote kill, Conductor stale-bundle detection, uncertain Conductor apply state, SIGUSR1 signal, and sentinel file. If any source is active, all traffic is denied. Deactivating one doesn't affect the others. When the Enterprise follower isn't in use, the three Conductor-driven sources stay false.
+
+**Rate limiting:** `POST /api/v1/killswitch` is limited to 10 authenticated
+requests per 60-second window. Exceeding it returns `429` with a
+`Retry-After: 60` header. `GET` status requests are not rate-limited.
+
+**Failed authentication:** a client address that presents 10 wrong bearer
+tokens within 60 seconds is refused with `429` and a `Retry-After` header
+before any further token from that address is compared, so the API cannot be
+used as an online guessing oracle. Requests with no token are not counted. A
+correct token clears the address's count while the address is still under the
+limit; once the limit is reached, even the correct token is refused with `429`
+until the 60-second window passes. The same bound applies to the Scan API, the
+session admin API, and the MCP HTTP listener's bearer credential.
+
+**Port isolation:** When `kill_switch.api_listen` is set, the API runs on a
+dedicated port that isn't exposed to the agent. This matters. Without it, a
+compromised agent could call the API to deactivate its own kill switch.
+
+### n8n Workflow Example
+
+1. **Webhook node:** receives pipelock events at `/webhook/pipelock-events`
+2. **Switch node:** route by `severity`:
+   - `critical` → kill switch + PagerDuty
+   - `warn` with `type == "blocked"` and `fields.scanner == "dlp"` → kill switch + Slack
+   - `warn` with `type == "blocked"` → Slack only
+   - other → log to database
+3. **HTTP Request node:** POST to kill switch API:
+   - URL: `http://pipelock-api:9090/api/v1/killswitch`
+   - Auth: Bearer token
+   - Body: `{"active": true}`
+4. **Slack node:** post alert to `#security-alerts` channel
+5. **Postgres node:** archive all events for compliance
+
+### Alertmanager Integration
+
+Pipelock exposes Prometheus metrics at `/metrics` on the dedicated `metrics_listen` listener. If you already run
+Alertmanager, you can alert on counters directly, which is useful for events like
+chain detection that aren't emitted to webhook/syslog.
+
+A complete set of alert rules covering traffic anomalies, security events,
+session profiling, and operational health is available at
+[`examples/prometheus/pipelock-alerts.yaml`](../../examples/prometheus/pipelock-alerts.yaml).
+Here are the three most important rules to start with:
+
+```yaml
+groups:
+  - name: pipelock
+    rules:
+      - alert: PipelockKillSwitchActive
+        expr: increase(pipelock_kill_switch_denials_total[1m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Kill switch denying traffic on {{ $labels.instance }}"
+
+      - alert: PipelockChainDetection
+        expr: increase(pipelock_chain_detections_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Chain attack detected on {{ $labels.instance }}"
+
+      - alert: PipelockDown
+        expr: up{job=~".*pipelock.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pipelock instance {{ $labels.instance }} is down"
+```
+
+## Operational Notes
+
+**Queue overflow.** If the webhook queue fills up (slow SIEM, network blip),
+new events are dropped and `"emit: webhook queue full, event dropped"` is
+logged to stderr. If you see these regularly, bump `queue_size` in the config.
+
+**Syslog is asynchronous.** Pipelock queues each syslog event and returns
+without waiting for network delivery. If the queue is full, the event is
+dropped. Creating the sink connects to the syslog server, and shutdown waits up
+to 10 seconds for queued events to drain. Delivery is best effort: a write
+that fails after an event leaves the queue isn't retried. TCP adds reliable
+stream transport for writes that succeed; UDP doesn't. Syslog is not available
+on Windows.
+
+**Multiple instances.** Set `emit.instance_id` when running more than one
+pipelock instance so you can tell events apart in your SIEM. Defaults to the
+OS hostname.
+
+**Local logs vs emission.** `logging.include_blocked` only affects local log
+output (stderr/file); a blocked request is emitted to the sinks whether or not
+it is set. `logging.include_allowed` is different: it also gates emission of
+`allowed`, `tunnel_open`, `tunnel_close`, `forward_http`, `intercept_http`, `ws_open`
+and `ws_close`, so turning it off removes them from the sinks as well as the log.
+Whatever those two settings say, a sink only receives events at or above its own
+`min_severity`.
+
+**Auth header.** Pipelock sends `Authorization: Bearer <token>`. If your SIEM
+expects a different scheme (Splunk HEC wants `Splunk <token>`), put a reverse
+proxy in front or use the SIEM's raw ingestion endpoint.
+
+## Testing Your Setup
+
+Trigger a known block to verify events flow end-to-end:
+
+```bash
+# Send a request containing a fake AWS key. Pipelock will block and emit the event.
+FAKE_KEY="AKIA""IOSFODNN7EXAMPLE"
+curl -x http://localhost:8888 "https://example.com/?key=${FAKE_KEY}"
+```
+
+You should see a `blocked` event in your SIEM within a few seconds. If not,
+check:
+
+1. Is `emit.webhook.url` (or `emit.syslog.address`) reachable from the
+   pipelock host?
+2. Is `min_severity` set low enough? A `blocked` event is severity `warn`.
+3. Scrape the sink-health metrics below and inspect stderr for the matching
+   sanitized delivery diagnostic.
+
+The Prometheus endpoint exposes current delivery accounting for every built-in
+audit sink under `pipelock_audit_sink_*`, labeled only by `sink` (`webhook`,
+`syslog`, or `otlp`). Alert on `pipelock_audit_sink_degraded == 1` or increases
+in the `failed_total`, `dropped_total`, and `abandoned_total` series. The
+`last_error_present` gauge reports unresolved error state without exporting
+error text or endpoint secrets as labels.

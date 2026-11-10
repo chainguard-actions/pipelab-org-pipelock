@@ -1,0 +1,173 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build !js
+
+package replaycapture
+
+import (
+	"fmt"
+	"net/http"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+// Fixture hostnames are RFC-reserved .test names that resolve to the local
+// httptest backends through dns.host_overrides. The signed receipt records the
+// stable synthetic hostname, not a loopback literal.
+const (
+	labFixtureIP    = "127.0.0.1"
+	labDocsHost     = "docs.fixture.test"
+	labContentHost  = "content.fixture.test"
+	labAPIHost      = "api.fixture.test"
+	labIntakeHost   = "intake.fixture.test"
+	labWSHost       = "socket.fixture.test"
+	labWorkflowHost = "workflow.fixture.test"
+)
+
+// awsKeyRegex matches the AWS access key id shape (AKIA + 16 upper/digits). The
+// synthetic example key is the only value it will ever see in the lab.
+const awsKeyRegex = `AKIA[0-9A-Z]{16}`
+
+// injectionPatternName / injectionRegex detect the stock prompt-injection
+// string the lab page returns. The name is a boring public rule id.
+const (
+	injectionPatternName = "Prompt Injection: ignore-instructions"
+	injectionRegex       = `(?i)ignore\s+(all\s+)?previous\s+instructions`
+)
+
+// operationPolicyRuleName is a public-safe request_policy rule id surfaced in
+// the operation-aware policy scenario's block receipt.
+const operationPolicyRuleName = "block-destructive-graphql-mutation"
+
+// labConfig returns a public-safe Pipelock config tuned for one scenario. It
+// starts from product defaults and flips only the knobs that scenario exercises,
+// so the captured decision comes from the real default pipeline wherever
+// possible.
+func labConfig(s Scenario) (*config.Config, error) {
+	cfg := config.Defaults()
+
+	switch s.ID {
+	case "allowed-safe-read":
+		allowFixtureHosts(cfg, labDocsHost)
+	case "secret-exfil-url-blocked":
+		disableConfiguredSSRF(cfg) // blocked at DLP, before any DNS
+		ensureAWSPattern(cfg)
+	case "prompt-injection-response-blocked":
+		allowFixtureHosts(cfg, labContentHost)
+		enableResponseInjection(cfg)
+	case "ssrf-internal-target-blocked":
+		// Leave SSRF active (cfg.Internal stays at defaults) so the link-local
+		// metadata target is blocked by the SSRF layer.
+	case "operation-aware-policy":
+		allowFixtureHosts(cfg, labAPIHost)
+		enableOperationPolicy(cfg)
+	case "poisoned-ticket-webhook-exfil", "poisoned-readme-key-paste", "hostile-page-session-keys":
+		disableConfiguredSSRF(cfg)
+		enableForwardBodyDLP(cfg)
+	case "amber-warning-observed":
+		allowFixtureHosts(cfg, labIntakeHost)
+		enableForwardBodyDLP(cfg)
+		cfg.RequestBodyScanning.Action = config.ActionWarn
+		warnRule := syntheticWarnRule()
+		cfg.RequestBodyScanning.PatternActions = map[string]string{warnRule.Name: config.ActionWarn}
+		cfg.DLP.Patterns = append(cfg.DLP.Patterns, warnRule)
+	case "websocket-fragmented-secret":
+		allowFixtureHosts(cfg, labWSHost)
+		cfg.WebSocketProxy.Enabled = true
+		cfg.WebSocketProxy.MaxConnectionSeconds = 10
+		cfg.WebSocketProxy.IdleTimeoutSeconds = 5
+		ensureAWSPattern(cfg)
+	case "mcp-poisoned-tool-description":
+		disableConfiguredSSRF(cfg)
+	case "multi-step-policy-chain":
+		allowFixtureHosts(cfg, labWorkflowHost)
+		enableForwardBodyDLP(cfg)
+		ensureAWSPattern(cfg)
+	default:
+		return nil, fmt.Errorf("unknown scenario id %q", s.ID)
+	}
+
+	cfg.ApplyDefaults()
+	return cfg, nil
+}
+
+// syntheticWarnRule constructs the lab-only marker rule at runtime so secret
+// scanners do not mistake the inert fixture regex for a deployable credential.
+func syntheticWarnRule() config.DLPPattern {
+	return config.DLPPattern{
+		Name:     "Lab observation marker",
+		Regex:    "LAB" + `WARN[0-9A-Z]{16}`,
+		Severity: config.SeverityMedium,
+	}
+}
+
+// disableConfiguredSSRF disables DNS-based configured SSRF checks for scenarios
+// whose proof must stop at an earlier scanner layer. Core literal-IP SSRF still
+// runs inside the scanner safety floor.
+func disableConfiguredSSRF(cfg *config.Config) {
+	cfg.Internal = []string{}
+}
+
+// allowFixtureHosts lets the proxy reach local httptest fixtures through stable
+// reserved names. Raw loopback IP targets still hit the normal SSRF controls.
+func allowFixtureHosts(cfg *config.Config, hosts ...string) {
+	cfg.TrustedDomains = append(cfg.TrustedDomains, hosts...)
+	if cfg.DNS.HostOverrides == nil {
+		cfg.DNS.HostOverrides = make(map[string][]string, len(hosts))
+	}
+	for _, host := range hosts {
+		cfg.DNS.HostOverrides[host] = []string{labFixtureIP}
+	}
+}
+
+// ensureAWSPattern guarantees the synthetic AWS example key is detected and
+// surfaced under a boring, public rule id regardless of default drift.
+func ensureAWSPattern(cfg *config.Config) {
+	cfg.DLP.Patterns = append(cfg.DLP.Patterns, config.DLPPattern{
+		Name:     awsKeyPatternName,
+		Regex:    awsKeyRegex,
+		Severity: config.SeverityCritical,
+	})
+}
+
+// enableResponseInjection turns on response scanning in block mode with an
+// explicit injection pattern so the lab page's hijack attempt is blocked.
+func enableResponseInjection(cfg *config.Config) {
+	cfg.ResponseScanning.Enabled = true
+	cfg.ResponseScanning.Action = config.ActionBlock
+	cfg.ResponseScanning.Patterns = append(cfg.ResponseScanning.Patterns, config.ResponseScanPattern{
+		Name:  injectionPatternName,
+		Regex: injectionRegex,
+	})
+}
+
+// enableOperationPolicy blocks a destructive GraphQL mutation while allowing
+// safe queries on the same synthetic API route.
+func enableOperationPolicy(cfg *config.Config) {
+	cfg.ForwardProxy.Enabled = true
+	cfg.RequestPolicy.Enabled = true
+	cfg.RequestPolicy.Rules = []config.RequestPolicyRule{{
+		Name:   operationPolicyRuleName,
+		Action: config.ActionBlock,
+		Route: config.RequestPolicyRoute{
+			Hosts:        []string{labAPIHost},
+			Methods:      []string{http.MethodPost},
+			PathPrefixes: []string{"/graphql"},
+			ContentTypes: []string{"application/json"},
+		},
+		GraphQL: &config.RequestPolicyGraphQL{
+			OperationTypes:    []string{"mutation"},
+			RootFieldPatterns: []string{`^deleteRecord$`},
+		},
+		Reason: "destructive mutations require review",
+	}}
+}
+
+// enableForwardBodyDLP drives request-body DLP in block mode while keeping the
+// default DLP pattern set intact.
+func enableForwardBodyDLP(cfg *config.Config) {
+	cfg.ForwardProxy.Enabled = true
+	cfg.RequestBodyScanning.Enabled = true
+	cfg.RequestBodyScanning.Action = config.ActionBlock
+}

@@ -1,0 +1,72 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package session
+
+import (
+	"context"
+	"fmt"
+	"io"
+
+	"github.com/spf13/cobra"
+)
+
+const (
+	resetUse   = "reset <key>"
+	resetShort = "Clear adaptive score and scoped airlock without tearing down connections"
+)
+
+func resetCmd(flags *rootFlags) *cobra.Command {
+	var jsonOutput bool
+	cmd := &cobra.Command{
+		Use:   resetUse,
+		Short: resetShort,
+		Long: `Clear this identity session's adaptive threat score, escalation
+level, destination-scoped airlock, and block_all flags. In-flight
+connections are left running. Taint and task-boundary state are left
+alone; use terminate when those must go too.
+
+This is the operator command for "the session is at critical because
+a blocked destination keeps retrying", not for changing airlock tier.
+Release sets the session-wide airlock and every destination-scoped
+airlock to the tier it names, but leaves the adaptive score and
+escalation level in place. If inspect shows the session at critical
+from a destination that keeps retrying, reset is the command that
+clears the blocker.
+
+Invocation sessions (mcp-stdio-/mcp-http-/mcp-ws-) cannot be reset
+via the admin API — they are rejected with a 400 error.
+
+Examples:
+  pipelock session reset "agent|10.0.0.1"
+  pipelock session reset "agent|10.0.0.1" --json`,
+		Args:          cobra.ExactArgs(1),
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	cmd.Flags().BoolVar(&jsonOutput, flagJSON, false, usageJSON)
+
+	cmd.RunE = func(c *cobra.Command, args []string) error {
+		key := args[0]
+		return runClientCmd(flags, c.Context(), c.OutOrStdout(), func(ctx context.Context, client *Client, out io.Writer) error {
+			resp, err := client.Reset(ctx, key)
+			if err != nil {
+				return err
+			}
+			if jsonOutput {
+				return writeJSON(out, resp)
+			}
+			if _, err := fmt.Fprintf(out, "reset %s: reset=%t previous_level=%s previous_score=%.2f ip_cleared=%t cee_cleared=%t\n",
+				resp.Key, resp.Reset, resp.PreviousLevel, resp.PreviousScore, resp.IPStateCleared, resp.CEEStateCleared); err != nil {
+				return err
+			}
+			if !resp.Reset {
+				if _, err := fmt.Fprintln(out, "no session matched that key; nothing was reset. check the key with `pipelock session list`."); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	return cmd
+}

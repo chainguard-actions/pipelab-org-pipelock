@@ -1,0 +1,3632 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/user"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/serviceenv"
+)
+
+type fakeFileInfo struct {
+	mode os.FileMode
+	sys  any
+}
+
+func (f fakeFileInfo) Name() string       { return "fake" }
+func (f fakeFileInfo) Size() int64        { return 0 }
+func (f fakeFileInfo) Mode() os.FileMode  { return f.mode }
+func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (f fakeFileInfo) IsDir() bool        { return f.mode.IsDir() }
+func (f fakeFileInfo) Sys() any           { return f.sys }
+
+func TestDefaultInstallEnvWiresContainmentDefaults(t *testing.T) {
+	env := defaultInstallEnv(io.Discard)
+	if env.runCmd == nil || env.checkServiceConfig == nil || env.stat == nil || env.lstat == nil || env.writeFile == nil || env.lookupUser == nil {
+		t.Fatal("default env has nil OS hooks")
+	}
+	if env.proxyUserName != defaultProxyUser || env.agentUserName != defaultAgentUser {
+		t.Fatalf("users: proxy=%q agent=%q", env.proxyUserName, env.agentUserName)
+	}
+	if env.configDir != defaultConfigDir || env.nftRulesPath != defaultNFTRulesPath {
+		t.Fatalf("paths not wired to defaults: config=%q nft=%q", env.configDir, env.nftRulesPath)
+	}
+	// nftMainPath must be populated so rollback's legacy-include cleanup
+	// (gated on env.nftMainPath != "") is reachable for systems upgraded
+	// from a pre-portability build. A regression here silently orphans the
+	// `include` line in the distro nft config on rollback.
+	if env.nftMainPath != defaultNFTMainConfigPath {
+		t.Fatalf("nftMainPath: got %q, want %q (legacy rollback cleanup must stay wired)", env.nftMainPath, defaultNFTMainConfigPath)
+	}
+	if env.proxyPort != defaultProxyPort {
+		t.Fatalf("proxy port: got %d want %d", env.proxyPort, defaultProxyPort)
+	}
+}
+
+func TestRenderNFTRulesAddsClassedRawEgressLogs(t *testing.T) {
+	body := renderNFTRules(1000, 1001, 1002, 8888, defaultNFTTable, defaultNFTChain)
+	for _, want := range []string{
+		`udp dport 53 counter log prefix "pipelock-contain class=direct_dns_blocked " drop`,
+		`tcp dport 53 counter log prefix "pipelock-contain class=direct_dns_blocked " drop`,
+		`counter log prefix "pipelock-contain class=not_routing_through_pipelock " drop`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("nft rules missing %q:\n%s", want, body)
+		}
+	}
+}
+
+const containInstallOperatorUser = "operator"
+
+// fakeCall records one invocation through env.runCmd.
+type fakeCall struct {
+	name string
+	args []string
+}
+
+// fakeRunner is a programmable runCmd stand-in. tests register responses
+// keyed by full argv joined with spaces. unmatched calls return ("",0,nil)
+// so the orchestration doesn't fail just because a test didn't pre-bake a
+// response for an idempotent no-op invocation.
+type fakeRunner struct {
+	mu        sync.Mutex
+	calls     []fakeCall
+	responses map[string]struct {
+		out  string
+		code int
+		err  error
+	}
+}
+
+func newFakeRunner() *fakeRunner {
+	return &fakeRunner{responses: map[string]struct {
+		out  string
+		code int
+		err  error
+	}{}}
+}
+
+func (f *fakeRunner) on(argv string, out string, code int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.responses[argv] = struct {
+		out  string
+		code int
+		err  error
+	}{out, code, err}
+}
+
+func (f *fakeRunner) run(_ context.Context, name string, args ...string) (string, int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+	key := name + " " + strings.Join(args, " ")
+	if r, ok := f.responses[key]; ok && (r.err != nil || r.code != 0 || len(args) != 2 || args[0] != "-f") {
+		if filepath.Base(name) == testNFT && strings.HasPrefix(strings.Join(args, " "), "-n -a list chain ") {
+			return nftListingForTest(r.out), r.code, r.err
+		}
+		return r.out, r.code, r.err
+	}
+	if filepath.Base(name) == testNFT && len(args) == 2 && args[0] == "-f" {
+		data, err := os.ReadFile(args[1])
+		if err == nil && strings.Contains(string(data), "# Pipelock containment ruleset") && !strings.HasPrefix(string(data), "delete table") {
+			query := argvFor(name, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain)
+			before := f.responses[query]
+			live, applyErr := applyNFTScriptForTest(before.out, string(data))
+			if applyErr != nil {
+				return "", 1, applyErr
+			}
+			before.out, before.code, before.err = live, 0, nil
+			f.responses[query] = before
+		}
+	}
+	if name == testSystemctl && len(args) == 4 && args[0] == "show" && args[1] == "--property=ActiveState" && args[2] == "--value" {
+		unit := args[3]
+		for i := len(f.calls) - 2; i >= 0; i-- {
+			call := f.calls[i]
+			if call.name != testSystemctl || len(call.args) < 2 || call.args[len(call.args)-1] != unit {
+				continue
+			}
+			if call.args[0] == "stop" || (call.args[0] == "disable" && slices.Contains(call.args, "--now")) {
+				return "inactive\n", 0, nil
+			}
+			if call.args[0] == "start" || call.args[0] == "restart" || (call.args[0] == "enable" && slices.Contains(call.args, "--now")) {
+				return "active\n", 0, nil
+			}
+		}
+		return "inactive\n", 0, nil
+	}
+	if key == "id -u "+viewerUserName {
+		return "900\n", 0, nil
+	}
+	if name == "getfacl" {
+		return "user::rwx\ngroup::r-x\nother::---\n", 0, nil
+	}
+	return "", 0, nil
+}
+
+// argvFor builds the lookup key matching fakeRunner.run.
+func argvFor(name string, args ...string) string {
+	return name + " " + strings.Join(args, " ")
+}
+
+func renderTestNFTPersistUnit(rulesPath, pipelockTarget string) string {
+	return renderNFTPersistUnit(&installEnv{
+		nftRulesPath:   rulesPath,
+		pipelockTarget: pipelockTarget,
+	})
+}
+
+func managedChainReloadPath(env *installEnv) string {
+	return env.nftRulesPath + ".reload"
+}
+
+func assertManagedChainReload(t *testing.T, runner *fakeRunner, env *installEnv) {
+	t.Helper()
+	reloadPath := managedChainReloadPath(env)
+	var sawValidate, sawLoad bool
+	for _, c := range runner.calls {
+		if c.name != testNFT {
+			continue
+		}
+		args := strings.Join(c.args, " ")
+		if args == "delete chain inet "+defaultNFTTable+" "+defaultNFTChain {
+			t.Fatalf("managed chain reload used standalone chain delete instead of validated reload script: %v", runner.calls)
+		}
+		if args == "delete table inet "+defaultNFTTable {
+			t.Fatalf("managed chain reload deleted the whole table: %v", runner.calls)
+		}
+		if len(c.args) == 3 && c.args[0] == "-c" && c.args[1] == "-f" && c.args[2] == reloadPath {
+			sawValidate = true
+		}
+		if len(c.args) == 2 && c.args[0] == "-f" && c.args[1] == reloadPath {
+			sawLoad = true
+		}
+	}
+	if !sawValidate || !sawLoad {
+		t.Fatalf("expected validated managed chain reload script %s, got %v", reloadPath, runner.calls)
+	}
+}
+
+// newFakeEnv builds an installEnv backed by tmpdirs and fake hooks. The
+// filesystem-side fields (chown, mkdirAll, etc.) are wired to real os
+// calls operating under root, the tmpdir constructed for the test; the
+// shell-out fields use a fakeRunner.
+func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
+	t.Helper()
+	root := t.TempDir()
+	runner := newFakeRunner()
+	out := &bytes.Buffer{}
+	env := &installEnv{
+		displayTmpfilesPath: filepath.Join(root, "etc", "tmpfiles.d", "pipelock-agent-display.conf"),
+		rfbSocketPath:       filepath.Join(root, "run", "pipelock-agent-display", "rfb.sock"),
+		runCmd:              runner.run,
+		dialCtx: func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+			client, server := net.Pipe()
+			_ = server.Close()
+			return client, nil
+		},
+		wait:  func(context.Context, time.Duration) error { return nil },
+		stat:  os.Stat,
+		lstat: os.Lstat,
+		readFile: func(p string) ([]byte, error) {
+			return os.ReadFile(filepath.Clean(p))
+		},
+		readDir:   os.ReadDir,
+		writeFile: writeFileAtomic,
+		removeFile: func(p string) error {
+			err := os.Remove(p)
+			if err != nil && errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			return err
+		},
+		mkdirAll: os.MkdirAll,
+		// chown/lchown can't really run under non-root tests; no-op so the
+		// orchestration progresses. Tests that need to assert ownership calls
+		// can substitute their own hooks.
+		chown:                func(string, int, int) error { return nil },
+		lchown:               func(string, int, int) error { return nil },
+		agentBrowserFchown:   func(*os.File, int, int) error { return nil },
+		agentBrowserDirOwner: func(*os.File, int) bool { return true },
+		// Unprivileged stand-in for the descriptor-based owner: keeps the
+		// symlink refusal and the mode change, drops only the chown, which
+		// needs root. The real one is exercised in browser_ca_test.go.
+		ownLeafNoFollow: func(path string, mode os.FileMode, _, _ int) error {
+			info, err := os.Lstat(path)
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("open %s without following symlinks: is a symlink", path)
+			}
+			return os.Chmod(path, mode)
+		},
+		rename:  os.Rename,
+		chmod:   os.Chmod,
+		symlink: os.Symlink,
+		lookupUser: func(name string) (*user.User, error) {
+			switch name {
+			case "pipelock-proxy":
+				return &user.User{Uid: "988", Gid: "988", Username: name, HomeDir: "/var/lib/pipelock-proxy"}, nil
+			case "pipelock-agent":
+				return &user.User{Uid: "987", Gid: "987", Username: name, HomeDir: "/home/pipelock-agent"}, nil
+			case containInstallOperatorUser:
+				return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: "/home/operator"}, nil
+			}
+			return nil, user.UnknownUserError(name)
+		},
+		selfPath: func() (string, error) { return filepath.Join(root, "src", "pipelock"), nil },
+		hashFile: func(p string) (string, error) {
+			data, err := os.ReadFile(filepath.Clean(p))
+			if err != nil {
+				return "", err
+			}
+			h := sha256.Sum256(data)
+			return hex.EncodeToString(h[:]), nil
+		},
+		out:                           out,
+		errOut:                        out,
+		operatorUser:                  containInstallOperatorUser,
+		proxyUserName:                 "pipelock-proxy",
+		agentUserName:                 "pipelock-agent",
+		configDir:                     filepath.Join(root, "etc", "pipelock"),
+		dataDir:                       filepath.Join(root, "var", "lib", "pipelock"),
+		wrapperDir:                    filepath.Join(root, "usr", "local", "bin"),
+		systemUnitPath:                filepath.Join(root, "etc", "systemd", "system", "pipelock.service"),
+		nftRulesPath:                  filepath.Join(root, "etc", "nftables.d", "50-pipelock-containment.nft"),
+		nftMainPath:                   filepath.Join(root, "etc", "sysconfig", "nftables.conf"),
+		nftPersistUnitPath:            filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-nft.service"),
+		networkNamespaceUnitPath:      filepath.Join(root, "etc", "systemd", "system", containedNetworkNamespaceUnit),
+		proxyForwarderSocketPath:      filepath.Join(root, "etc", "systemd", "system", containedProxyForwarderUnit+".socket"),
+		proxyForwarderServicePath:     filepath.Join(root, "etc", "systemd", "system", containedProxyForwarderUnit+".service"),
+		namespaceForwarderServicePath: filepath.Join(root, "etc", "systemd", "system", containedNamespaceForwarderUnit),
+		ownedLoopbackAnchorUnitPath:   filepath.Join(root, "etc", "systemd", "system", "pipelock-contained-anchor.service"),
+		nftExpiryServicePath:          filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-expiry.service"),
+		nftExpiryTimerPath:            filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-expiry.timer"),
+		sudoersPath:                   filepath.Join(root, "etc", "sudoers.d", "50-pipelock-agent"),
+		caBundlePath:                  filepath.Join(root, "etc", "pipelock", "combined-ca.pem"),
+		systemCABundlePath:            filepath.Join(root, "etc", "ssl", "certs", "ca-certificates.crt"),
+		caExportPath:                  filepath.Join(root, "etc", "pipelock", "ca.pem"),
+		integrityDir:                  filepath.Join(root, "etc", "pipelock", "integrity"),
+		integrityPin:                  filepath.Join(root, "etc", "pipelock", "integrity", "binary-pin.sha256"),
+		wrapperInvPath:                filepath.Join(root, "etc", "pipelock", "contain", "wrappers.json"),
+		toolsListPath:                 filepath.Join(root, "etc", "pipelock", "contain", "tools.list"),
+		workspaceInvPath:              filepath.Join(root, "etc", "pipelock", "contain", "workspaces.json"),
+		loopbackForwarderInvPath:      filepath.Join(root, "etc", "pipelock", "contain", "loopback-forwarders.json"),
+		evidenceACLInvPath:            filepath.Join(root, "etc", "pipelock", "contain", "evidence-acls.json"),
+		viewerAccountMarkerPath:       filepath.Join(root, "etc", "pipelock", "contain", "viewer-account.marker"),
+		guardScriptPath:               filepath.Join(root, "usr", "local", "bin", "plk-cred-guard"),
+		guardServiceUnit:              filepath.Join(root, "etc", "systemd", "system", "pipelock-cred-guard.service"),
+		guardPathUnit:                 filepath.Join(root, "etc", "systemd", "system", "pipelock-cred-guard.path"),
+		undiciShimPath:                filepath.Join(root, "etc", "pipelock", "contain", "undici-shim.cjs"),
+		profileScriptPath:             filepath.Join(root, "etc", "profile.d", "pipelock-contain.sh"),
+		agentHome:                     filepath.Join(root, "home", "pipelock-agent"),
+		displayAuthorityPath:          filepath.Join(root, "var", "lib", "pipelock-agent", "Xauthority"),
+		pipelockTarget:                filepath.Join(root, "usr", "local", "bin", "pipelock"),
+		bashPath:                      "/bin/bash",
+		nologinPath:                   "/usr/sbin/nologin",
+		nftPath:                       testNFT,
+		curlPath:                      "/usr/bin/curl",
+		proxyPort:                     8888,
+	}
+
+	// Plant the source binary the install will copy.
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o750); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "src", "pipelock"), []byte("fake pipelock binary"), 0o755); err != nil { //nolint:gosec // test binary fixture must be executable
+		t.Fatalf("write fake src: %v", err)
+	}
+	env.pipelockBinary = filepath.Join(root, "src", "pipelock")
+	// Pre-create the wrapperDir so wrapper writes don't fail.
+	if err := os.MkdirAll(env.wrapperDir, 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir wrapperDir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(env.sudoersPath), 0o750); err != nil {
+		t.Fatalf("mkdir sudoers parent: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(env.systemUnitPath), 0o750); err != nil {
+		t.Fatalf("mkdir unit parent: %v", err)
+	}
+	// Plant a fake system CA bundle the install will read.
+	systemBundle := env.systemCABundlePath
+	if err := os.MkdirAll(filepath.Dir(systemBundle), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir system bundle parent: %v", err)
+	}
+	if err := os.WriteFile(systemBundle, []byte("# system bundle\n"), 0o600); err != nil {
+		t.Fatalf("write fake system bundle: %v", err)
+	}
+	// Plant a CA export file (will be created during install but we
+	// pre-create it so the runner doesn't need to mock the export
+	// subprocess writing through pipelock).
+	if err := os.MkdirAll(env.configDir, 0o750); err != nil {
+		t.Fatalf("mkdir configDir: %v", err)
+	}
+	// Rollback removes these units before asking systemd to confirm they are
+	// inactive. A fresh fake host has no active expiry units unless a test
+	// overrides this state to exercise an error or activity path.
+	for _, unit := range []string{filepath.Base(env.nftExpiryTimerPath), filepath.Base(env.nftExpiryServicePath)} {
+		runner.on(argvFor(testSystemctl, "is-active", unit), "inactive\n", 3, nil)
+	}
+	runner.on(argvFor(testSudoCmd, "-n", "-u", env.proxyUserName, "--", env.pipelockTarget, "tls", "show-ca"), testPEMCA(t), 0, nil)
+
+	runner.on(argvFor(env.nftPath, "-n", "list", "chain", "inet", env.nftTableOrDefault(), legacyOwnedLoopbackInputChain),
+		"No such file or directory", 1, nil)
+
+	nss := &fakeNSS{db: filepath.Join(env.agentHome, nssDBRelLegacy()), entries: make(map[string]fakeNSSEntry)}
+	env.lookPath = func(string) (string, error) { return "/usr/bin/certutil", nil }
+	env.runCmd = func(ctx context.Context, name string, args ...string) (string, int, error) {
+		if name == browserCACertutilName {
+			return nss.run(ctx, name, args...)
+		}
+		return runner.run(ctx, name, args...)
+	}
+
+	uid := uint32(os.Getuid()) // #nosec G115 -- Linux uid_t is uint32.
+	env.viewerACLUID = &uid
+	env.runViewerACL = func(ctx context.Context, file *os.File, name string, args ...string) (string, int, error) {
+		args = append([]string(nil), args...)
+		args[len(args)-1] = file.Name()
+		return runner.run(ctx, name, args...)
+	}
+	env.checkServiceConfig = func(ctx context.Context, opts serviceenv.CheckOptions) error {
+		// Isolate installer tests from the actual manager and child process.
+		// Resolver/identity/secret behavior is tested in serviceenv itself.
+		_, code, err := env.runCmd(ctx, opts.Binary, "check", "--config", opts.ConfigFile, "--require-build-compatibility")
+		if err != nil {
+			return errors.New("validator command failed")
+		}
+		if code != 0 {
+			return fmt.Errorf("pipelock check exited %d; validator output withheld", code)
+		}
+		return nil
+	}
+	return env, runner, out
+}
+
+// ---------------------------------------------------------------------------
+// runInstall: root-check coverage lives in TestMutatingSubcommandsRequireRoot
+// (verify_test.go). The functions below cover the post-root-check branches.
+// ---------------------------------------------------------------------------
+
+func TestRunInstall_RejectsMissingOperatorUser(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.operatorUser = ""
+	err := runInstall(context.Background(), env, installOpts{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Errorf("exit code: %d", cliutil.ExitCodeOf(err))
+	}
+	if !strings.Contains(err.Error(), "operator user not set") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestRunInstall_RejectsInvalidOperatorUser(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	err := runInstall(context.Background(), env, installOpts{operatorUser: "operator\nroot ALL=(ALL) NOPASSWD:ALL"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Errorf("exit code: %d", cliutil.ExitCodeOf(err))
+	}
+	if !strings.Contains(err.Error(), "invalid operator user") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestRunInstall_RejectsUnknownOperatorUserBeforeMutation(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	err := runInstall(context.Background(), env, installOpts{operatorUser: "ghost"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Errorf("exit code: %d", cliutil.ExitCodeOf(err))
+	}
+	if !strings.Contains(err.Error(), "lookup operator user ghost") {
+		t.Errorf("err: %v", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("expected no mutating commands before operator lookup succeeds, got %v", runner.calls)
+	}
+}
+
+func TestRunInstall_RejectsMissingConfigSource(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	err := runInstall(context.Background(), env, installOpts{configSource: "/nonexistent/pipelock.yaml"})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Errorf("exit code: %d", cliutil.ExitCodeOf(err))
+	}
+}
+
+func TestRunInstall_RejectsDirectoryConfigSource(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	err := runInstall(context.Background(), env, installOpts{configSource: dir})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Errorf("exit code: %d", cliutil.ExitCodeOf(err))
+	}
+	if !strings.Contains(err.Error(), "is a directory") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestRunInstall_RejectsMissingBinary(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.pipelockBinary = ""
+	env.selfPath = func() (string, error) { return "/nonexistent/pipelock", nil }
+	err := runInstall(context.Background(), env, installOpts{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Errorf("exit code: %d", cliutil.ExitCodeOf(err))
+	}
+}
+
+func TestRunInstall_RejectsBinaryIsDirectory(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.pipelockBinary = t.TempDir() // a dir
+	err := runInstall(context.Background(), env, installOpts{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "is a directory") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestRunInstall_SelfPathFallback(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.pipelockBinary = ""
+	env.selfPath = func() (string, error) { return "", errors.New("no exe") }
+	err := runInstall(context.Background(), env, installOpts{})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "locate pipelock binary") {
+		t.Errorf("err: %v", err)
+	}
+}
+
+func TestRunInstall_DryRunSucceedsWithoutMutation(t *testing.T) {
+	env, runner, buf := newFakeEnv(t)
+	src := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(src, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	err := runInstall(context.Background(), env, installOpts{dryRun: true, configSource: src})
+	if err != nil {
+		t.Fatalf("dry-run err: %v", err)
+	}
+	// Dry-run may validate the config, but it must not shell out for
+	// service or nft mutation.
+	assertNoServiceOrNFTMutationAfterPreflightFailure(t, runner)
+	if len(runner.calls) != 1 {
+		t.Errorf("dry-run calls: got %v, want only config preflight", runner.calls)
+	}
+	if !strings.Contains(buf.String(), "planned steps") {
+		t.Errorf("missing 'planned steps' header: %q", buf.String())
+	}
+}
+
+func TestRunInstall_DryRunPrintsPlan(t *testing.T) {
+	if os.Geteuid() != 0 {
+		// We can't bypass the root check from a unit test. Instead, drive
+		// installSteps directly and print the plan to verify content.
+		opts := installOpts{dryRun: true}
+		steps := installSteps(opts)
+		var buf bytes.Buffer
+		printPlan(&buf, "header:", steps)
+		out := buf.String()
+		if !strings.Contains(out, "preflight") || !strings.Contains(out, "install pipelock binary") || !strings.Contains(out, "/etc/sudoers.d/50-pipelock-agent") {
+			t.Errorf("plan missing required steps: %q", out)
+		}
+		// Sanity: the plan should NOT execute anything in dry-run.
+		if strings.Contains(out, "[FAIL]") || strings.Contains(out, "[ OK ]") {
+			t.Errorf("dry-run plan should not include step outcomes: %q", out)
+		}
+		return
+	}
+	t.Skip("root path covered in TestRunInstall_EndToEnd")
+}
+
+func TestRunInstall_EndToEndWithExistingUsers(t *testing.T) {
+	env, runner, buf := newFakeEnv(t)
+	binDir := installContainCommandFixtures(t)
+	env.nftPath = filepath.Join(binDir, "nft")
+
+	// Let the default allow-list find one agent tool without depending on
+	// host-global /usr/local/bin contents.
+	origStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		if path == "/usr/local/bin/claude" {
+			return origStat(env.pipelockBinary)
+		}
+		if path == env.nftPath {
+			return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+		}
+		return origStat(path)
+	}
+	if err := os.WriteFile(env.caExportPath, []byte(testPEMCA(t)), 0o600); err != nil {
+		t.Fatalf("write ca export: %v", err)
+	}
+	src := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(src, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if err := runInstall(context.Background(), env, installOpts{configSource: src}); err != nil {
+		t.Fatalf("runInstall: %v\noutput:\n%s\ncalls:%+v", err, buf.String(), runner.calls)
+	}
+	for _, path := range []string{
+		env.pipelockTarget,
+		env.integrityPin,
+		env.systemUnitPath,
+		env.nftRulesPath,
+		filepath.Join(env.wrapperDir, "plk-launch"),
+		filepath.Join(env.wrapperDir, "plk-contained-launch"),
+		filepath.Join(env.wrapperDir, "plk"),
+		filepath.Join(env.wrapperDir, "plk-claude"),
+		env.wrapperInvPath,
+		env.sudoersPath,
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected install artifact %s: %v", path, err)
+		}
+	}
+	if !strings.Contains(buf.String(), "install complete") {
+		t.Fatalf("missing success output:\n%s", buf.String())
+	}
+}
+
+func TestRunInstall_UpgradeRotatesExistingBackups(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	binDir := installContainCommandFixtures(t)
+	env.nftPath = filepath.Join(binDir, "nft")
+
+	cfgDir := t.TempDir()
+	cfg1 := filepath.Join(cfgDir, "pipelock-1.yaml")
+	cfg2 := filepath.Join(cfgDir, "pipelock-2.yaml")
+	if err := os.WriteFile(cfg1, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write cfg1: %v", err)
+	}
+	if err := os.WriteFile(cfg2, []byte("mode: strict\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write cfg2: %v", err)
+	}
+
+	enabledTools := map[string]bool{"claude": true}
+	env.toolCanExecute = func(path string) bool {
+		return filepath.Dir(path) == "/usr/local/bin" && enabledTools[filepath.Base(path)]
+	}
+	origStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		if path == env.nftPath {
+			return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+		}
+		for _, tool := range defaultToolNames() {
+			for _, dir := range filepath.SplitList(agentExecPath(env.agentUserName)) {
+				if path != filepath.Join(dir, tool) {
+					continue
+				}
+				if enabledTools[tool] && dir == "/usr/local/bin" {
+					return fakeFileInfo{mode: 0o755}, nil
+				}
+				return nil, os.ErrNotExist
+			}
+		}
+		return origStat(path)
+	}
+
+	origLookup := env.lookupUser
+	env.lookupUser = func(name string) (*user.User, error) {
+		switch name {
+		case "operator2":
+			return &user.User{Uid: "1001", Gid: "1001", Username: name, HomeDir: "/home/operator2"}, nil
+		case "pipelock-agent2":
+			return &user.User{Uid: "986", Gid: "986", Username: name, HomeDir: "/home/pipelock-agent2"}, nil
+		default:
+			return origLookup(name)
+		}
+	}
+
+	systemBundle := []byte("# system bundle v1\n")
+	origReadFile := env.readFile
+	env.readFile = func(path string) ([]byte, error) {
+		if path == env.systemCABundlePath {
+			return append([]byte(nil), systemBundle...), nil
+		}
+		return origReadFile(path)
+	}
+
+	if err := os.WriteFile(env.caExportPath, []byte(testPEMCA(t)), 0o600); err != nil {
+		t.Fatalf("write ca export: %v", err)
+	}
+
+	configPath := filepath.Join(env.configDir, "pipelock.yaml")
+	tracked := []string{
+		configPath,
+		env.pipelockTarget,
+		env.integrityPin,
+		env.systemUnitPath,
+		env.caBundlePath,
+		env.nftRulesPath,
+		env.toolsListPath,
+		filepath.Join(env.wrapperDir, "plk-launch"),
+		filepath.Join(env.wrapperDir, "plk"),
+		filepath.Join(env.wrapperDir, "plk-claude"),
+		env.wrapperInvPath,
+		env.sudoersPath,
+	}
+	legacyBodies := map[string][]byte{
+		env.toolsListPath:  []byte("custom\t/usr/bin/custom\n"),
+		env.wrapperInvPath: []byte("{\"wrappers\":[\"plk-old\"]}\n"),
+	}
+	seedLegacyInstallFiles(t, tracked, legacyBodies)
+
+	if err := runInstall(context.Background(), env, installOpts{configSource: cfg1}); err != nil {
+		t.Fatalf("first runInstall: %v\noutput:\n%s\ncalls:%+v", err, envOutput(env), runner.calls)
+	}
+
+	firstLive := readInstallFiles(t, tracked)
+	firstBackupMode := statBackupModes(t, tracked)
+	for _, path := range tracked {
+		assertFileContents(t, path+".bak", legacyBody(path, legacyBodies))
+	}
+
+	if err := os.WriteFile(env.pipelockBinary, []byte("fake pipelock binary v2"), 0o755); err != nil { //nolint:gosec // test binary fixture must be executable
+		t.Fatalf("write second source binary: %v", err)
+	}
+	systemBundle = []byte("# system bundle v2\n")
+	enabledTools["codex"] = true
+	env.proxyPort = 9999
+	env.dataDir += "-v2"
+	env.agentUserName = "pipelock-agent2"
+
+	if err := runInstall(context.Background(), env, installOpts{configSource: cfg2, operatorUser: "operator2", proxyPort: 9999}); err != nil {
+		t.Fatalf("second runInstall: %v\noutput:\n%s\ncalls:%+v", err, envOutput(env), runner.calls)
+	}
+
+	for _, path := range tracked {
+		if path == filepath.Join(env.wrapperDir, "plk") || path == filepath.Join(env.wrapperDir, "plk-claude") {
+			// These dispatchers now target the fixed contained-launch boundary,
+			// so changing the agent identity does not rewrite them. Their
+			// first-install backups therefore remain in place unchanged.
+			assertFileContents(t, path+".bak", legacyBody(path, legacyBodies))
+			if archives := backupArchives(t, path); len(archives) != 0 {
+				t.Fatalf("unchanged %s unexpectedly rotated backups: %v", path, archives)
+			}
+			continue
+		}
+		assertFileContents(t, path+".bak", firstLive[path])
+		archives := backupArchives(t, path)
+		if len(archives) != 1 {
+			t.Fatalf("archives for %s: got %d want 1 (%v)", path, len(archives), archives)
+		}
+		assertFileContents(t, archives[0], legacyBody(path, legacyBodies))
+		info, err := os.Stat(archives[0])
+		if err != nil {
+			t.Fatalf("stat archive %s: %v", archives[0], err)
+		}
+		if got := info.Mode().Perm(); got != firstBackupMode[path] {
+			t.Fatalf("archive mode for %s: got %s want %s", path, got, firstBackupMode[path])
+		}
+		live, err := os.ReadFile(path) //nolint:gosec // tmpdir-scoped test path
+		if err != nil {
+			t.Fatalf("read live %s: %v", path, err)
+		}
+		if bytesEqual(live, firstLive[path]) {
+			t.Fatalf("live file did not update on second install: %s", path)
+		}
+	}
+}
+
+func TestRunInstallResetsArchiveTrackingPerInvocation(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.archivedBackups = map[string][]string{
+		env.integrityPin + ".bak": {env.integrityPin + ".bak.archived-old"},
+	}
+	err := runInstall(context.Background(), env, installOpts{operatorUser: "ghost"})
+	if err == nil {
+		t.Fatal("expected invalid operator error")
+	}
+	if len(env.archivedBackups) != 0 {
+		t.Fatalf("archive tracking not reset: %+v", env.archivedBackups)
+	}
+}
+
+func legacyBody(path string, overrides map[string][]byte) []byte {
+	if override, ok := overrides[path]; ok {
+		return override
+	}
+	return []byte("legacy:" + filepath.Base(path) + "\n")
+}
+
+func installContainCommandFixtures(t *testing.T) string {
+	t.Helper()
+	binDir := t.TempDir()
+	for _, name := range []string{"useradd", "userdel", "systemctl", "nft", "visudo", "sudo", "setfacl", "find", "chmod"} {
+		path := filepath.Join(binDir, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // executable fixture required for preflight PATH lookup.
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", binDir)
+	return binDir
+}
+
+func writeNFTPersistUnitFixture(t *testing.T, env *installEnv) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(env.nftPersistUnitPath), 0o750); err != nil {
+		t.Fatalf("mkdir persistence unit parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftPersistUnitPath, []byte(renderNFTPersistUnit(env)), 0o600); err != nil {
+		t.Fatalf("write persistence unit: %v", err)
+	}
+	if err := os.WriteFile(env.nftExpiryServicePath, []byte(renderNFTExpiryService(env)), 0o600); err != nil {
+		t.Fatalf("write expiry service: %v", err)
+	}
+	if err := os.WriteFile(env.nftExpiryTimerPath, []byte(renderNFTExpiryTimer(env)), 0o600); err != nil {
+		t.Fatalf("write expiry timer: %v", err)
+	}
+}
+
+func seedLegacyInstallFiles(t *testing.T, paths []string, overrides map[string][]byte) {
+	t.Helper()
+	for _, path := range paths {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		body := []byte("legacy:" + filepath.Base(path) + "\n")
+		if override, ok := overrides[path]; ok {
+			body = override
+		}
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatalf("seed %s: %v", path, err)
+		}
+	}
+}
+
+func readInstallFiles(t *testing.T, paths []string) map[string][]byte {
+	t.Helper()
+	out := make(map[string][]byte, len(paths))
+	for _, path := range paths {
+		data, err := os.ReadFile(path) //nolint:gosec // tmpdir-scoped test path
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		out[path] = data
+	}
+	return out
+}
+
+func statBackupModes(t *testing.T, paths []string) map[string]os.FileMode {
+	t.Helper()
+	out := make(map[string]os.FileMode, len(paths))
+	for _, path := range paths {
+		info, err := os.Stat(path + ".bak")
+		if err != nil {
+			t.Fatalf("stat %s.bak: %v", path, err)
+		}
+		out[path] = info.Mode().Perm()
+	}
+	return out
+}
+
+func assertFileContents(t *testing.T, path string, want []byte) {
+	t.Helper()
+	got, err := os.ReadFile(path) //nolint:gosec // tmpdir-scoped test path
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !bytesEqual(got, want) {
+		t.Fatalf("%s contents: got %q want %q", path, got, want)
+	}
+}
+
+func backupArchives(t *testing.T, path string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(path + ".bak.archived-*")
+	if err != nil {
+		t.Fatalf("glob archives for %s: %v", path, err)
+	}
+	return matches
+}
+
+func envOutput(env *installEnv) string {
+	if buf, ok := env.out.(*bytes.Buffer); ok {
+		return buf.String()
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// step-level idempotency and rollback
+// ---------------------------------------------------------------------------
+
+func TestStepCreateUser_SkipsWhenExists(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	s := stepCreateUser(true) // proxy
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied {
+		t.Errorf("expected skip (user already exists in fake lookup), got applied=true; runner=%v", runner.calls)
+	}
+	if len(runner.calls) != 0 {
+		t.Errorf("expected no useradd shell-out, got %v", runner.calls)
+	}
+}
+
+func TestStepPreflightChecksRequiredBinaries(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	s := stepPreflight(installOpts{})
+
+	t.Run("success", func(t *testing.T) {
+		binDir := t.TempDir()
+		for _, name := range []string{"useradd", "userdel", "systemctl", "nft", "visudo", "sudo", "setfacl", "find", "chmod"} {
+			path := filepath.Join(binDir, name)
+			if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil { //nolint:gosec // executable fixture required for preflight PATH lookup.
+				t.Fatalf("write %s: %v", name, err)
+			}
+		}
+		env.nftPath = filepath.Join(binDir, "nft")
+		origStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == env.nftPath {
+				return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+			}
+			return origStat(path)
+		}
+		t.Setenv("PATH", binDir)
+		writeRunnableToolsList(t, env)
+		agentIsCurrentUser(t, env)
+		applied, err := s.apply(context.Background(), env)
+		if err != nil {
+			t.Fatalf("preflight: %v", err)
+		}
+		if !applied {
+			t.Fatal("preflight should report applied=true")
+		}
+	})
+
+	t.Run("missing binary", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		applied, err := s.apply(context.Background(), env)
+		if err == nil {
+			t.Fatal("expected missing executable error")
+		}
+		if applied {
+			t.Fatal("missing executable must not report applied")
+		}
+		if !strings.Contains(err.Error(), "required executable") {
+			t.Fatalf("err: %v", err)
+		}
+	})
+}
+
+// preflightReadyEnv returns an env whose required binaries, nft path and
+// agent allow-list all satisfy stepPreflight.
+func preflightReadyEnv(t *testing.T) *installEnv {
+	t.Helper()
+	env, _, _ := newFakeEnv(t)
+	binDir := installContainCommandFixtures(t)
+	env.nftPath = filepath.Join(binDir, "nft")
+	realStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		if path == env.nftPath {
+			return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+		}
+		return realStat(path)
+	}
+	writeRunnableToolsList(t, env)
+	hideDefaultTools(env)
+	agentIsCurrentUser(t, env)
+	return env
+}
+
+// agentIsCurrentUser maps pipelock-agent to the test process's uid and gid, so
+// fixtures under t.TempDir (0700, owned by the test user) are reachable by the
+// agent identity that agentCanExecute judges.
+func agentIsCurrentUser(t *testing.T, env *installEnv) {
+	t.Helper()
+	me, err := user.Current()
+	if err != nil {
+		t.Fatalf("current user: %v", err)
+	}
+	orig := env.lookupUser
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == env.agentUserName {
+			return &user.User{Uid: me.Uid, Gid: me.Gid, Username: name, HomeDir: "/home/pipelock-agent"}, nil
+		}
+		return orig(name)
+	}
+}
+
+// runnableFixtureTarget returns a real executable regular file outside the
+// agent PATH: a copy of the running test binary in a fresh temp dir, so a test
+// can chmod it without touching the binary itself.
+func runnableFixtureTarget(t *testing.T) string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test binary: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Clean(self))
+	if err != nil {
+		t.Fatalf("read test binary: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "custom")
+	if err := os.WriteFile(target, data, 0o600); err != nil {
+		t.Fatalf("write tool target: %v", err)
+	}
+	info, err := os.Stat(filepath.Clean(self))
+	if err != nil {
+		t.Fatalf("stat test binary: %v", err)
+	}
+	if err := os.Chmod(target, info.Mode().Perm()); err != nil {
+		t.Fatalf("chmod tool target: %v", err)
+	}
+	return target
+}
+
+// writeRunnableToolsList writes a tools.list whose only entry pins a real
+// executable outside the agent PATH, and returns that target.
+func writeRunnableToolsList(t *testing.T, env *installEnv) string {
+	t.Helper()
+	target := runnableFixtureTarget(t)
+	if err := os.MkdirAll(filepath.Dir(env.toolsListPath), 0o750); err != nil {
+		t.Fatalf("mkdir tools.list parent: %v", err)
+	}
+	if err := os.WriteFile(env.toolsListPath, []byte("custom\t"+target+"\n"), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+	return target
+}
+
+// hideDefaultTools makes every default tool name unresolvable through env.stat,
+// so a test does not depend on which agent tools the test host has installed.
+func hideDefaultTools(env *installEnv) {
+	realStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		for _, name := range defaultToolNames() {
+			if filepath.Base(path) == name {
+				return nil, os.ErrNotExist
+			}
+		}
+		return realStat(path)
+	}
+}
+
+func TestStepPreflightRefusesMissingLaterPrerequisites(t *testing.T) {
+	t.Run("ready host passes", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err != nil || !applied {
+			t.Fatalf("applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("missing curl", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == env.curlPath {
+				return nil, os.ErrNotExist
+			}
+			return realStat(path)
+		}
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err == nil || applied || !strings.Contains(err.Error(), "curl") {
+			t.Fatalf("preflight must refuse a host without curl: applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("missing certutil", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		env.platformFamily = platformFamilyDebian
+		env.lookPath = func(string) (string, error) { return "", os.ErrNotExist }
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err == nil || applied {
+			t.Fatalf("preflight must refuse a host without certutil: applied=%v err=%v", applied, err)
+		}
+		if !strings.Contains(err.Error(), "certutil not found") || !strings.Contains(err.Error(), "libnss3-tools") {
+			t.Fatalf("err: %v", err)
+		}
+	})
+
+	t.Run("no agent tool and no allow-list", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		if err := os.Remove(env.toolsListPath); err != nil {
+			t.Fatalf("remove tools.list: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == env.nftPath || path == env.toolsListPath {
+				return realStat(path)
+			}
+			for _, name := range defaultToolNames() {
+				if filepath.Base(path) == name {
+					return nil, os.ErrNotExist
+				}
+			}
+			return realStat(path)
+		}
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err == nil || applied || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("only target not executable", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		target := writeRunnableToolsList(t, env)
+		if err := os.Chmod(target, 0o600); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("a tools.list whose only target cannot run must be refused: err=%v", err)
+		}
+	})
+
+	t.Run("malformed allow-list refused even with a default tool", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		if err := os.WriteFile(env.toolsListPath, []byte("not-a-valid-line\n"), 0o600); err != nil {
+			t.Fatalf("write tools.list: %v", err)
+		}
+		hidden := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if filepath.Base(path) == "claude" && filepath.Dir(path) == "/usr/local/bin" {
+				return fakeFileInfo{mode: 0o755}, nil
+			}
+			return hidden(path)
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "tools.list") {
+			t.Fatalf("malformed tools.list must fail preflight, not a later step: err=%v", err)
+		}
+	})
+
+	t.Run("empty allow-list and no agent tool", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		if err := os.WriteFile(env.toolsListPath, []byte("# only a comment\n"), 0o600); err != nil {
+			t.Fatalf("write tools.list: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			for _, name := range defaultToolNames() {
+				if filepath.Base(path) == name {
+					return nil, os.ErrNotExist
+				}
+			}
+			return realStat(path)
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("err: %v", err)
+		}
+	})
+}
+
+func TestAgentCanExecuteJudgesAsPipelockAgent(t *testing.T) {
+	t.Run("owner-only target owned by another uid", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		target := writeRunnableToolsList(t, env)
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == target {
+				return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+			}
+			return realStat(path)
+		}
+		if agentCanExecute(env, target) {
+			t.Fatal("a 0700 target owned by root must not count as runnable by pipelock-agent")
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("preflight: %v", err)
+		}
+	})
+
+	t.Run("directory the agent cannot search", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		target := writeRunnableToolsList(t, env)
+		orig := env.lookupUser
+		env.lookupUser = func(name string) (*user.User, error) {
+			if name == env.agentUserName {
+				return &user.User{Uid: "4000000001", Gid: "4000000001", Username: name}, nil
+			}
+			return orig(name)
+		}
+		if agentCanExecute(env, target) {
+			t.Fatalf("a target under a 0700 directory owned by another user must not be runnable: %s", target)
+		}
+	})
+
+	t.Run("symlink into a directory the agent cannot search", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		hiddenDir := t.TempDir()
+		target := filepath.Join(hiddenDir, "tool")
+		if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		link := filepath.Join(t.TempDir(), "tool-link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			switch path {
+			case hiddenDir:
+				return fakeFileInfo{mode: os.ModeDir | 0o700, sys: fakeFileSysWithUID(0)}, nil
+			case link, target:
+				return fakeFileInfo{mode: 0o755}, nil
+			}
+			return realStat(path)
+		}
+		if agentCanExecute(env, link) {
+			t.Fatal("a link into a root-only directory must not count as runnable by pipelock-agent")
+		}
+	})
+
+	t.Run("nested symlink through a directory the agent cannot search", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		openDir := t.TempDir()
+		tool := runnableFixtureTarget(t)
+		hiddenDir := t.TempDir()
+		inner := filepath.Join(hiddenDir, "inner")
+		if err := os.Symlink(tool, inner); err != nil {
+			t.Fatalf("inner symlink: %v", err)
+		}
+		outer := filepath.Join(openDir, "outer")
+		if err := os.Symlink(inner, outer); err != nil {
+			t.Fatalf("outer symlink: %v", err)
+		}
+		if !agentCanExecute(env, outer) {
+			t.Fatal("positive control: the chain is runnable while every directory is searchable")
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == hiddenDir {
+				return fakeFileInfo{mode: os.ModeDir | 0o700, sys: fakeFileSysWithUID(0)}, nil
+			}
+			return realStat(path)
+		}
+		if agentCanExecute(env, outer) {
+			t.Fatal("a link chain through a root-only directory must not count as runnable, even when it ends somewhere searchable")
+		}
+	})
+
+	t.Run("dot, trailing slash and dot-dot after a file are not runnable", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		tool := runnableFixtureTarget(t)
+		if !agentCanExecute(env, tool) {
+			t.Fatal("positive control: the plain target is runnable")
+		}
+		// The kernel refuses each of these with ENOTDIR; a lexical clean would
+		// have turned every one back into the runnable file.
+		for _, p := range []string{tool + "/.", tool + "/", tool + "/./", tool + "/../" + filepath.Base(tool)} {
+			if agentCanExecute(env, p) {
+				t.Errorf("%q must not count as runnable", p)
+			}
+		}
+	})
+
+	t.Run("symlink whose target ends in a dot component is not runnable", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		tool := runnableFixtureTarget(t)
+		link := filepath.Join(t.TempDir(), "tool-link")
+		if err := os.Symlink(tool+"/.", link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if agentCanExecute(env, link) {
+			t.Fatal("a link to file/. must not count as runnable")
+		}
+	})
+
+	t.Run("dot-dot resolves after the symlink, not lexically", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		tool := runnableFixtureTarget(t)
+		realDir := filepath.Dir(tool)
+		sub := filepath.Join(realDir, "sub")
+		if err := os.Mkdir(sub, 0o750); err != nil {
+			t.Fatalf("mkdir sub: %v", err)
+		}
+		linkDir := t.TempDir()
+		link := filepath.Join(linkDir, "link")
+		if err := os.Symlink(sub, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		// link/.. is the physical parent of sub (where the tool lives); read as
+		// text it would be linkDir, which holds no tool.
+		if !agentCanExecute(env, link+"/../"+filepath.Base(tool)) {
+			t.Fatal("link/../tool must resolve through the link's target")
+		}
+		if agentCanExecute(env, filepath.Join(linkDir, filepath.Base(tool))) {
+			t.Fatal("control: the tool is not in the link's own directory")
+		}
+	})
+
+	t.Run("symlink loop", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		dir := t.TempDir()
+		a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+		if err := os.Symlink(b, a); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if err := os.Symlink(a, b); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if agentCanExecute(env, a) {
+			t.Fatal("a symlink loop must not count as runnable")
+		}
+	})
+
+	t.Run("agent not created yet uses other bits", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		env.lookupUser = func(name string) (*user.User, error) { return nil, user.UnknownUserError(name) }
+		if !agentCanExecute(env, "/bin/sh") {
+			t.Fatal("/bin/sh is world-executable and must be runnable before the agent exists")
+		}
+	})
+}
+
+func TestStepPreflightChecksFirstEntryPerName(t *testing.T) {
+	env := preflightReadyEnv(t)
+	good := runnableFixtureTarget(t)
+	broken := filepath.Join(t.TempDir(), "custom")
+	if err := os.WriteFile(broken, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write broken target: %v", err)
+	}
+	list := "custom\t" + broken + "\ncustom\t" + good + "\n"
+	if err := os.WriteFile(env.toolsListPath, []byte(list), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+	if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+		t.Fatalf("plk-launch uses the first matching line, so a broken first entry must be refused: err=%v", err)
+	}
+}
+
+func TestStepWriteToolsListRepairsModeWhenContentUnchanged(t *testing.T) {
+	env := preflightReadyEnv(t)
+	plan, err := plannedToolsList(env)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if err := os.WriteFile(env.toolsListPath, []byte(renderToolsList(plan.entries)), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+	if err := os.Chmod(env.toolsListPath, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if again, err := plannedToolsList(env); err != nil || again.changed {
+		t.Fatalf("fixture must have unchanged content: changed=%v err=%v", again.changed, err)
+	}
+	applied, err := stepWriteToolsList().apply(context.Background(), env)
+	if err != nil || !applied {
+		t.Fatalf("a root-only tools.list must be rewritten: applied=%v err=%v", applied, err)
+	}
+	info, err := os.Stat(env.toolsListPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != modeAllowListReadable {
+		t.Fatalf("tools.list mode = %v, want %v", info.Mode().Perm(), modeAllowListReadable)
+	}
+	applied, err = stepWriteToolsList().apply(context.Background(), env)
+	if err != nil || applied {
+		t.Fatalf("a correct tools.list must be left alone: applied=%v err=%v", applied, err)
+	}
+}
+
+func TestMergeDefaultToolEntriesKeepsUnresolvedPinnedDefault(t *testing.T) {
+	existing := []toolsListEntry{{name: "claude", target: "/opt/agent/bin/claude"}, {name: "custom", target: "/opt/agent/bin/custom"}}
+	merged, changed := mergeDefaultToolEntries(existing, nil)
+	if changed || len(merged) != 2 || merged[0].name != "claude" {
+		t.Fatalf("an unresolved default must not delete its pinned entry: merged=%v changed=%v", merged, changed)
+	}
+	merged, changed = mergeDefaultToolEntries(existing, []toolsListEntry{{name: "claude", target: "/usr/local/bin/claude"}})
+	if !changed || len(merged) != 2 || merged[0].target != "/usr/local/bin/claude" {
+		t.Fatalf("a resolved default replaces the same name: merged=%v changed=%v", merged, changed)
+	}
+}
+
+func TestStepPreflightRejectsUntrustedNFTPath(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		mode    os.FileMode
+		uid     uint32
+		wantErr string
+	}{
+		{
+			name:    "relative path",
+			path:    "nft",
+			mode:    0o700,
+			uid:     0,
+			wantErr: "absolute path",
+		},
+		{
+			name:    "operator owned",
+			path:    "/tmp/nft",
+			mode:    0o700,
+			uid:     1000,
+			wantErr: "root-owned",
+		},
+		{
+			name:    "world writable",
+			path:    "/tmp/nft",
+			mode:    0o722,
+			uid:     0,
+			wantErr: "group- or world-writable",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _, _ := newFakeEnv(t)
+			binDir := installContainCommandFixtures(t)
+			env.nftPath = tc.path
+			env.stat = func(path string) (os.FileInfo, error) {
+				if path == filepath.Clean(tc.path) {
+					return fakeFileInfo{mode: tc.mode, sys: fakeFileSysWithUID(tc.uid)}, nil
+				}
+				return os.Stat(path)
+			}
+			t.Setenv("PATH", binDir)
+
+			_, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+			if err == nil {
+				t.Fatal("expected preflight error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error: got %q, want substring %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestStepCreateUser_CallsUseradd(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	// Make the proxy user unknown so apply has to call useradd.
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == "pipelock-proxy" {
+			return nil, user.UnknownUserError(name)
+		}
+		return &user.User{Uid: "987", Gid: "987", Username: name}, nil
+	}
+	s := stepCreateUser(true)
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Errorf("expected applied=true")
+	}
+	if len(runner.calls) != 1 || runner.calls[0].name != "useradd" {
+		t.Errorf("expected one useradd call, got %v", runner.calls)
+	}
+	if !containsArg(runner.calls[0].args, "pipelock-proxy") {
+		t.Errorf("useradd missing target user: %v", runner.calls[0].args)
+	}
+}
+
+func TestStepWriteSystemUnit_IdempotentOnReapply(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	s := stepWriteSystemUnit()
+	a1, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	if !a1 {
+		t.Errorf("first apply should write the unit")
+	}
+	a2, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if a2 {
+		t.Errorf("second apply should skip (unit already correct)")
+	}
+}
+
+func TestStepWriteSystemUnit_UndoRestoresBackup(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	// Pre-create a unit file so write triggers backup.
+	prior := []byte("[Unit]\nDescription=original\n")
+	if err := os.WriteFile(env.systemUnitPath, prior, 0o600); err != nil {
+		t.Fatalf("seed unit: %v", err)
+	}
+	s := stepWriteSystemUnit()
+	if _, err := s.apply(context.Background(), env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Backup must exist with original contents.
+	bak, err := os.ReadFile(env.systemUnitPath + ".bak")
+	if err != nil {
+		t.Fatalf("read bak: %v", err)
+	}
+	if string(bak) != string(prior) {
+		t.Errorf(".bak contents drift: got %q", bak)
+	}
+	// Undo must restore.
+	if err := s.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	restored, err := os.ReadFile(env.systemUnitPath)
+	if err != nil {
+		t.Fatalf("read restored: %v", err)
+	}
+	if string(restored) != string(prior) {
+		t.Errorf("restore drift: got %q", restored)
+	}
+}
+
+func TestStepInstallPipelockBinary_SkipsWhenIdentical(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	// Run apply once.
+	s := stepInstallPipelockBinary()
+	if _, err := s.apply(context.Background(), env); err != nil {
+		t.Fatalf("apply 1: %v", err)
+	}
+	// Re-run apply; should skip because hashes match.
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if applied {
+		t.Errorf("expected skip when binary already matches")
+	}
+}
+
+func TestStepWriteIntegrityPin_WritesAndIsIdempotent(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	var chowned []string
+	env.chown = func(path string, _, _ int) error {
+		chowned = append(chowned, path)
+		return nil
+	}
+	// Plant the target binary.
+	if err := os.MkdirAll(filepath.Dir(env.pipelockTarget), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(env.pipelockTarget, []byte("installed pipelock"), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("plant target: %v", err)
+	}
+
+	pinStep := stepWriteIntegrityPin()
+	a1, err := pinStep.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !a1 {
+		t.Errorf("first apply should write pin")
+	}
+
+	pin, err := os.ReadFile(env.integrityPin)
+	if err != nil {
+		t.Fatalf("read pin: %v", err)
+	}
+	want := sha256.Sum256([]byte("installed pipelock"))
+	if strings.TrimSpace(string(pin)) != hex.EncodeToString(want[:]) {
+		t.Errorf("pin: got %q, want %q", pin, hex.EncodeToString(want[:]))
+	}
+	if !containsString(chowned, env.integrityDir) {
+		t.Errorf("integrity dir was not chowned: %v", chowned)
+	}
+	if !containsString(chowned, env.integrityPin) {
+		t.Errorf("integrity pin was not chowned: %v", chowned)
+	}
+
+	a2, err := pinStep.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if a2 {
+		t.Errorf("second apply should skip when pin matches")
+	}
+}
+
+func TestRenderNFTRules_ContainsExpectedRules(t *testing.T) {
+	body := renderNFTRules(1000, 988, 987, 8888, "pipelock_containment", "output_filter")
+	wantSubstrings := []string{
+		`table inet pipelock_containment`,
+		`chain output_filter`,
+		"meta skuid 1000 accept",
+		"meta skuid 988 accept",
+		"meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept",
+		`meta skuid 987 counter log prefix "pipelock-contain class=not_routing_through_pipelock " drop`,
+	}
+	for _, s := range wantSubstrings {
+		if !strings.Contains(body, s) {
+			t.Errorf("rules missing %q in:\n%s", s, body)
+		}
+	}
+}
+
+func TestRenderLaunchWrapper_HasExpectedEnv(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	body := renderLaunchWrapper(env)
+	wants := []string{
+		"#!/bin/bash",
+		"HTTPS_PROXY=http://127.0.0.1:8888",
+		"https_proxy=http://127.0.0.1:8888",
+		"NO_PROXY=127.0.0.1,localhost,::1",
+		"NODE_EXTRA_CA_CERTS=" + env.caBundlePath,
+		"SSL_CERT_FILE=" + env.caBundlePath,
+		"GIT_SSL_CAINFO=" + env.caBundlePath,
+		"NODE_OPTIONS='--require " + env.undiciShimPath + "'",
+		`"$TARGET"`,
+	}
+	for _, s := range wants {
+		if !strings.Contains(body, s) {
+			t.Errorf("plk-launch body missing %q", s)
+		}
+	}
+	// plk-launch must never call sudo as a command - the per-tool wrapper
+	// does the outer sudo. We allow the word "sudo" to appear inside
+	// comments (describing why we set our own PATH instead of inheriting
+	// sudo's secure_path), but NOT as an actual command invocation.
+	for _, l := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(l)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "sudo ") || strings.HasPrefix(trimmed, "sudo") {
+			t.Errorf("plk-launch must NOT use inner sudo (found: %q)", l)
+		}
+	}
+}
+
+func TestRenderToolWrapper_UsesSudo(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	body := renderToolWrapper(env, "claude")
+	if !strings.Contains(body, "sudo -n ") || strings.Contains(body, "sudo -n -u") {
+		t.Errorf("missing outer non-interactive sudo: %s", body)
+	}
+	if !strings.Contains(body, "plk-contained-launch claude") {
+		t.Errorf("missing contained launcher dispatch: %s", body)
+	}
+}
+
+func TestRenderMetaWrapper_UsesSudoAndDispatchesArgs(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	body := renderMetaWrapper(env)
+	if !strings.Contains(body, "usage: plk <tool> [args...]") {
+		t.Errorf("missing usage: %s", body)
+	}
+	if !strings.Contains(body, "sudo -n ") || strings.Contains(body, "sudo -n -u") {
+		t.Errorf("missing outer non-interactive sudo: %s", body)
+	}
+	if !strings.Contains(body, `=~ ^[a-z0-9][a-z0-9_-]{0,30}$`) {
+		t.Errorf("missing tool-name regex guard: %s", body)
+	}
+	if !strings.Contains(body, "missing or empty allow-list") {
+		t.Errorf("missing allow-list precheck: %s", body)
+	}
+	if !strings.Contains(body, "plk-contained-launch") || !strings.Contains(body, `"$@"`) {
+		t.Errorf("missing full argv dispatch to contained launcher: %s", body)
+	}
+}
+
+func TestRenderSudoers_HasOperatorAndLauncher(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	body := renderSudoers(env)
+	if !strings.Contains(body, "operator ALL=(root) NOPASSWD: ") {
+		t.Errorf("sudoers missing rule: %s", body)
+	}
+	if !strings.Contains(body, "plk-contained-launch *") {
+		t.Errorf("sudoers missing glob: %s", body)
+	}
+}
+
+func TestStepInstallSudoers_VisudoRejectsBadFile(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	// Make visudo fail validation. The step must roll the file back via
+	// restoreBackup so a bad sudoers never persists.
+	runner.on(argvFor("visudo", "-cf", env.sudoersPath), "syntax error", 1, nil)
+	s := stepInstallSudoers()
+	applied, err := s.apply(context.Background(), env)
+	if err == nil {
+		t.Fatalf("expected visudo rejection error; applied=%v", applied)
+	}
+	if !strings.Contains(err.Error(), "visudo rejected") {
+		t.Errorf("err: %v", err)
+	}
+	if _, err := os.Stat(env.sudoersPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("bad sudoers must be removed after visudo failure; stat err=%v", err)
+	}
+}
+
+func TestStepInstallSudoers_IdempotentExistingRule(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	if err := os.MkdirAll(filepath.Dir(env.sudoersPath), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(env.sudoersPath, []byte(renderSudoers(env)), 0o600); err != nil {
+		t.Fatalf("seed sudoers: %v", err)
+	}
+	s := stepInstallSudoers()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied {
+		t.Fatal("expected existing sudoers to skip")
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("idempotent sudoers should not run visudo, got %v", runner.calls)
+	}
+	info, err := os.Stat(env.sudoersPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != modeSudoers {
+		t.Fatalf("mode: got 0o%03o want 0o%03o", info.Mode().Perm(), modeSudoers)
+	}
+}
+
+func TestStepWriteToolWrappers_WritesAllowListedWrappers(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	writeTestToolsList(t, env, []toolsListEntry{{name: "claude", target: "/usr/local/bin/claude"}, {name: "codex", target: "/usr/local/bin/codex"}})
+	s := stepWriteToolWrappers()
+	if _, err := s.apply(context.Background(), env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	for _, tool := range []string{"plk-claude", "plk-codex"} {
+		if _, err := os.Stat(filepath.Join(env.wrapperDir, tool)); err != nil {
+			t.Errorf("missing wrapper %s: %v", tool, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(env.wrapperDir, "plk-playwright")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("unexpected unresolved wrapper stat err=%v", err)
+	}
+}
+
+func TestStepWriteToolWrappers_BackupsStaleDefaultWrapper(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	writeTestToolsList(t, env, []toolsListEntry{{name: "claude", target: "/usr/local/bin/claude"}})
+	stale := filepath.Join(env.wrapperDir, "plk-codex")
+	if err := os.WriteFile(stale, []byte("old codex wrapper\n"), 0o755); err != nil { //nolint:gosec // executable wrapper fixture
+		t.Fatalf("seed stale wrapper: %v", err)
+	}
+	s := stepWriteToolWrappers()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected stale wrapper backup to apply")
+	}
+	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale wrapper should be moved aside, stat err=%v", err)
+	}
+	if _, err := os.Stat(stale + ".bak"); err != nil {
+		t.Fatalf("stale backup missing: %v", err)
+	}
+	if err := s.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Fatalf("stale wrapper not restored: %v", err)
+	}
+}
+
+func TestStepWriteToolWrappers_UndoRestoresCustomWrapper(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	writeTestToolsList(t, env, []toolsListEntry{{name: "rustup", target: "/usr/local/bin/rustup"}})
+	path := filepath.Join(env.wrapperDir, "plk-rustup")
+	if err := os.WriteFile(path, []byte("old wrapper\n"), 0o755); err != nil { //nolint:gosec // wrapper fixture
+		t.Fatalf("write old wrapper: %v", err)
+	}
+
+	s := stepWriteToolWrappers()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected wrapper rewrite")
+	}
+	if err := s.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // test fixture path is under t.TempDir.
+	if err != nil {
+		t.Fatalf("read restored wrapper: %v", err)
+	}
+	if string(got) != "old wrapper\n" {
+		t.Fatalf("wrapper not restored: %q", got)
+	}
+}
+
+func TestStepWriteWrapperInventory_RoundTrip(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	writeTestToolsList(t, env, []toolsListEntry{{name: "claude", target: "/usr/local/bin/claude"}})
+	s := stepWriteWrapperInventory()
+	if _, err := s.apply(context.Background(), env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	// Idempotency: rerun.
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply 2: %v", err)
+	}
+	if applied {
+		t.Errorf("expected idempotent no-op on second apply")
+	}
+	inv := readWrapperInventory(env)
+	if !stringSlicesEqual(inv, []string{"plk-claude"}) {
+		t.Errorf("inventory: got %v, want [plk-claude]", inv)
+	}
+}
+
+func TestStepWriteWrapperInventory_UsesToolsListEntries(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	writeTestToolsList(t, env, []toolsListEntry{{name: "rustup", target: "/usr/local/bin/rustup"}})
+	if err := os.MkdirAll(filepath.Dir(env.wrapperInvPath), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir: %v", err)
+	}
+	body, err := marshalWrapperInventory(wrapperInventory{
+		Wrappers: []string{"plk-claude", "plk-rustup"},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(env.wrapperInvPath, body, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	s := stepWriteWrapperInventory()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected inventory rewrite to match tools.list")
+	}
+	inv := readWrapperInventory(env)
+	if !stringSlicesEqual(inv, []string{"plk-rustup"}) {
+		t.Fatalf("inventory: %v, want [plk-rustup]", inv)
+	}
+}
+
+func TestStepWriteWrapperInventory_AddsMissingToolsListWrapper(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	writeTestToolsList(t, env, []toolsListEntry{{name: "claude", target: "/usr/local/bin/claude"}, {name: "rustup", target: "/usr/local/bin/rustup"}})
+	if err := os.MkdirAll(filepath.Dir(env.wrapperInvPath), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir: %v", err)
+	}
+	body, err := marshalWrapperInventory(wrapperInventory{Wrappers: []string{"plk-rustup"}})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := os.WriteFile(env.wrapperInvPath, body, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	s := stepWriteWrapperInventory()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected missing defaults to be added")
+	}
+	inv := readWrapperInventory(env)
+	if !stringSlicesEqual(inv, []string{"plk-claude", "plk-rustup"}) {
+		t.Fatalf("inventory: %v, want [plk-claude plk-rustup]", inv)
+	}
+}
+
+func writeTestToolsList(t *testing.T, env *installEnv, entries []toolsListEntry) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(env.toolsListPath), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir tools.list parent: %v", err)
+	}
+	if err := os.WriteFile(env.toolsListPath, []byte(renderToolsList(entries)), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+}
+
+func TestStepInstallNFTRules_SkipsWhenLoaded(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	// Pre-write the file so the body matches.
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	// Make the exact-chain nft query succeed with a healthy live chain.
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), body, 0, nil)
+	runner.on(argvFor(testSystemctl, "is-enabled", filepath.Base(env.nftPersistUnitPath)), "enabled\n", 0, nil)
+	runner.on(argvFor(testSystemctl, "is-enabled", filepath.Base(env.nftExpiryTimerPath)), "enabled\n", 0, nil)
+	runner.on(argvFor(testSystemctl, "is-active", filepath.Base(env.nftExpiryTimerPath)), "active\n", 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied {
+		t.Errorf("expected skip when rules file matches and table is loaded")
+	}
+}
+
+func TestStepInstallNFTRules_SkipsWhenLoadedForRootOperator(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	env.lookupUser = func(name string) (*user.User, error) {
+		switch name {
+		case "pipelock-proxy":
+			return &user.User{Uid: "988", Gid: "988", Username: name, HomeDir: "/var/lib/pipelock-proxy"}, nil
+		case "pipelock-agent":
+			return &user.User{Uid: "987", Gid: "987", Username: name, HomeDir: "/home/pipelock-agent"}, nil
+		case containInstallOperatorUser:
+			return &user.User{Uid: "0", Gid: "0", Username: name, HomeDir: "/root"}, nil
+		default:
+			return nil, user.UnknownUserError(name)
+		}
+	}
+	body := renderNFTRules(0, 988, 987, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), body, 0, nil)
+	runner.on(argvFor(testSystemctl, "is-enabled", filepath.Base(env.nftPersistUnitPath)), "enabled\n", 0, nil)
+	runner.on(argvFor(testSystemctl, "is-enabled", filepath.Base(env.nftExpiryTimerPath)), "enabled\n", 0, nil)
+	runner.on(argvFor(testSystemctl, "is-active", filepath.Base(env.nftExpiryTimerPath)), "active\n", 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if applied {
+		t.Errorf("expected skip when root-operator rules file matches and table is loaded")
+	}
+}
+
+func TestStepInstallNFTRules_ReloadsWhenLoadedTableDrifted(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	drifted := strings.Replace(body, "tcp dport 8888 accept", "tcp dport 8889 accept", 1)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), drifted, 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected live drift repair")
+	}
+
+	assertManagedChainReload(t, runner, env)
+}
+
+func TestStepInstallNFTRulesNewTableFailureNeedsRollback(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	body := renderNFTRules(1000, 988, 987, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), "No such file or directory", 1, nil)
+	runner.on(argvFor("systemctl", "daemon-reload"), "", 1, nil)
+	changed, err := stepInstallNFTRulesApply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("later-step failure = %v, want daemon-reload error", err)
+	}
+	if !changed {
+		t.Fatal("new table was loaded but rollback was not requested")
+	}
+	loaded := false
+	for _, call := range runner.calls {
+		if filepath.Base(call.name) == testNFT && strings.Join(call.args, " ") == "-f "+managedChainReloadPath(env) {
+			loaded = true
+		}
+	}
+	if !loaded {
+		t.Fatal("positive control: new nft table was not loaded")
+	}
+}
+
+func TestStepInstallNFTRules_RefusesUnownedLoopbackMarks(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	live := `table inet pipelock_containment {
+	chain output_filter { type filter hook output priority filter; policy accept;
+	meta skuid 987 oifname "lo" ip daddr 127.0.0.1 socket cgroupv2 level 1 "pipelock_contained.slice" ct state new ct mark set 0x504c4b01 accept # handle 70
+	meta skuid 987 oifname "lo" ip6 daddr ::1 socket cgroupv2 level 1 "pipelock_contained.slice" ct state 0x8 ct mark set 0x504c4b01 accept # handle 71
+	}
+}`
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), live, 0, nil)
+	runner.on(argvFor(testNFT, "-n", "list", "chain", "inet", defaultNFTTable, legacyOwnedLoopbackInputChain), "No such file or directory", 1, nil)
+
+	var reloadScript string
+	writeFile := env.writeFile
+	env.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		if path == managedChainReloadPath(env) {
+			reloadScript = string(data)
+		}
+		return writeFile(path, data, mode)
+	}
+
+	applied, err := stepInstallNFTRules().apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "nft reconciliation conflict") || applied {
+		t.Fatalf("unowned fragment apply=(%v,%v), want untouched conflict", applied, err)
+	}
+	for _, call := range runner.calls {
+		if filepath.Base(call.name) == testNFT && len(call.args) > 0 && call.args[0] == "-f" {
+			t.Fatal("conflict applied nft rules")
+		}
+	}
+	if reloadScript != "" {
+		t.Fatal("conflict wrote transaction")
+	}
+}
+
+func TestStepInstallNFTRules_RefusesUnownedUnhookedLookalike(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+
+	lookalike := `table inet pipelock_containment {
+		chain output_filter {
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+`
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), lookalike, 0, nil)
+
+	applied, err := stepInstallNFTRules().apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "nft reconciliation conflict") || applied {
+		t.Fatalf("unowned fragment apply=(%v,%v), want untouched conflict", applied, err)
+	}
+	for _, call := range runner.calls {
+		if filepath.Base(call.name) == testNFT && len(call.args) > 0 && call.args[0] == "-f" {
+			t.Fatal("conflict applied nft rules")
+		}
+	}
+}
+
+func TestStepInstallNFTRules_RefusesUnattributedLiveChainCollision(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	unrelated := `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			ip daddr 203.0.113.10 accept
+		}
+	}
+`
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), unrelated, 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "nft reconciliation conflict") {
+		t.Fatalf("apply error = %v, want unattributed collision refusal", err)
+	}
+	if applied {
+		t.Fatal("unattributed collision must not report an applied repair")
+	}
+	for _, c := range runner.calls {
+		if filepath.Base(c.name) == testNFT && strings.Join(c.args, " ") == "delete chain inet "+defaultNFTTable+" "+defaultNFTChain {
+			t.Fatalf("unattributed collision deleted nft chain: %v", runner.calls)
+		}
+		if filepath.Base(c.name) == testNFT && len(c.args) == 2 && c.args[0] == "-f" && (c.args[1] == env.nftRulesPath || c.args[1] == managedChainReloadPath(env)) {
+			t.Fatalf("unattributed collision loaded replacement rules: %v", runner.calls)
+		}
+	}
+}
+
+func TestStepInstallNFTRules_RefusesUnattributedLiveChainCollisionOnRerun(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write managed rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	unrelated := `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			ip daddr 203.0.113.10 accept
+		}
+	}
+`
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), unrelated, 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "nft reconciliation conflict") {
+		t.Fatalf("apply error = %v, want unattributed collision refusal", err)
+	}
+	if applied {
+		t.Fatal("unattributed rerun collision must not report an applied repair")
+	}
+	for _, c := range runner.calls {
+		if filepath.Base(c.name) == testNFT && strings.Join(c.args, " ") == "delete chain inet "+defaultNFTTable+" "+defaultNFTChain {
+			t.Fatalf("unattributed rerun collision deleted nft chain: %v", runner.calls)
+		}
+		if filepath.Base(c.name) == testNFT && len(c.args) == 2 && c.args[0] == "-f" && (c.args[1] == env.nftRulesPath || c.args[1] == managedChainReloadPath(env)) {
+			t.Fatalf("unattributed rerun collision loaded replacement rules: %v", runner.calls)
+		}
+	}
+}
+
+func TestStepInstallNFTRules_RefusesUnownedAcceptBeforeDrop(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	failOpen := `table inet pipelock_containment {
+		chain output_filter {
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			ip daddr 10.0.0.10 tcp dport 443 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+`
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), failOpen, 0, nil)
+
+	applied, err := stepInstallNFTRules().apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "nft reconciliation conflict") || applied {
+		t.Fatalf("unowned fragment apply=(%v,%v), want untouched conflict", applied, err)
+	}
+	for _, call := range runner.calls {
+		if filepath.Base(call.name) == testNFT && len(call.args) > 0 && call.args[0] == "-f" {
+			t.Fatal("conflict applied nft rules")
+		}
+	}
+}
+
+func TestStepInstallNFTRules_RefusesUnownedControlFlow(t *testing.T) {
+	tests := []struct {
+		name string
+		rule string
+	}{
+		{
+			name: "return",
+			rule: "meta skuid 987 return",
+		},
+		{
+			name: "jump",
+			rule: "meta skuid 987 jump allow_all",
+		},
+		{
+			name: "goto",
+			rule: "meta skuid 987 goto allow_all",
+		},
+		{
+			name: "queue",
+			rule: "meta skuid 987 queue",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env, runner, _ := newFakeEnv(t)
+			operatorUID, proxyUID, agentUID := 1000, 988, 987
+			body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+			if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+				t.Fatalf("mkdir rules parent: %v", err)
+			}
+			if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+				t.Fatalf("write rules: %v", err)
+			}
+			writeNFTPersistUnitFixture(t, env)
+			failOpen := `table inet pipelock_containment {
+		chain allow_all {
+			accept
+		}
+		chain output_filter {
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			` + tc.rule + `
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+`
+			runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), failOpen, 0, nil)
+
+			applied, err := stepInstallNFTRules().apply(context.Background(), env)
+			if err == nil || !strings.Contains(err.Error(), "nft reconciliation conflict") || applied {
+				t.Fatalf("unowned fragment apply=(%v,%v), want untouched conflict", applied, err)
+			}
+			for _, call := range runner.calls {
+				if filepath.Base(call.name) == testNFT && len(call.args) > 0 && call.args[0] == "-f" {
+					t.Fatal("conflict applied nft rules")
+				}
+			}
+		})
+	}
+}
+
+func TestStepInstallNFTRules_ReloadsWhenLoadedTableHasStaleAgentUID(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	stale := renderNFTRules(operatorUID, proxyUID, 986, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), stale, 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected stale live agent uid to trigger rules reload")
+	}
+
+	assertManagedChainReload(t, runner, env)
+}
+
+func TestStepInstallNFTRules_RepairsMissingPersistenceUnitOnRerun(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), wrapNFTListingForTest(""), 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected rerun to repair missing persistence unit")
+	}
+	unitBody, err := os.ReadFile(env.nftPersistUnitPath)
+	if err != nil {
+		t.Fatalf("read persistence unit: %v", err)
+	}
+	if !strings.Contains(string(unitBody), env.nftRulesPath) {
+		t.Fatalf("persistence unit missing rules path:\n%s", unitBody)
+	}
+}
+
+func TestStepInstallNFTRules_LoadsWhenAbsent(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	// nft validate + load + systemctl enable should all succeed by default.
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), "No such file or directory", 1, nil)
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Errorf("expected apply=true on fresh install")
+	}
+	// Verify the file exists.
+	if _, err := os.Stat(env.nftRulesPath); err != nil {
+		t.Errorf("rules file not written: %v", err)
+	}
+	// Verify the run sequence included validate then load.
+	var sawValidate, sawLoad bool
+	for _, c := range runner.calls {
+		if filepath.Base(c.name) == testNFT && len(c.args) >= 2 && c.args[0] == "-c" && c.args[1] == "-f" {
+			sawValidate = true
+		}
+		if filepath.Base(c.name) == testNFT && len(c.args) >= 1 && c.args[0] == "-f" && (len(c.args) < 2 || c.args[0] != "-c") {
+			sawLoad = true
+		}
+	}
+	if !sawValidate || !sawLoad {
+		t.Errorf("expected validate + load in run sequence, got %v", runner.calls)
+	}
+}
+
+func TestStepInstallNFTRules_ReloadsLoadedChainWithValidatedScript(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte("old broad-loopback rules\n"), 0o600); err != nil {
+		t.Fatalf("write old rules: %v", err)
+	}
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), wrapNFTListingForTest(""), 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected changed rules to apply")
+	}
+
+	assertManagedChainReload(t, runner, env)
+}
+
+func TestStepInstallNFTRules_PersistsViaOwnedSystemdUnitAndRestores(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	original := "[Unit]\nDescription=old unit\n"
+	if err := os.MkdirAll(filepath.Dir(env.nftPersistUnitPath), 0o750); err != nil {
+		t.Fatalf("mkdir unit parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftPersistUnitPath, []byte(original), 0o600); err != nil {
+		t.Fatalf("write unit: %v", err)
+	}
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), "No such file or directory", 1, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected apply=true")
+	}
+
+	unitBody, err := os.ReadFile(env.nftPersistUnitPath)
+	if err != nil {
+		t.Fatalf("read persistence unit: %v", err)
+	}
+	if !strings.Contains(string(unitBody), "ExecStart="+env.pipelockTarget+" contain reload-nft-rules") {
+		t.Fatalf("unit missing ExecStart:\n%s", unitBody)
+	}
+
+	if err := s.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	restored, err := os.ReadFile(env.nftPersistUnitPath)
+	if err != nil {
+		t.Fatalf("read restored unit: %v", err)
+	}
+	if string(restored) != original {
+		t.Fatalf("unit not restored: got %q want %q", restored, original)
+	}
+}
+
+func TestStepInstallNFTRules_UndoRestoresPreviousLiveTableAndServiceState(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	staleRules := renderNFTRules(1000, 988, 986, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.WriteFile(env.nftRulesPath, []byte(staleRules), 0o600); err != nil {
+		t.Fatalf("write stale managed rules: %v", err)
+	}
+	previousTable := renderNFTRules(1000, 988, 987, 8889, defaultNFTTable, defaultNFTChain)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), previousTable, 0, nil)
+	runner.on(argvFor(testNFT, "list", "table", "inet", defaultNFTTable), previousTable, 0, nil)
+	runner.on(argvFor(testSystemctl, "is-enabled", filepath.Base(env.nftPersistUnitPath)), "disabled\n", 1, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected changed nft rules to apply")
+	}
+	if env.prevNFTTableDump != previousTable {
+		t.Fatalf("previous table not captured: %q", env.prevNFTTableDump)
+	}
+	if !env.prevNFTPersistStateKnown || env.prevNFTPersistEnabled {
+		t.Fatalf("previous nft persistence unit state not captured as disabled")
+	}
+
+	if err := s.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	restorePath := env.nftRulesPath + ".restore"
+	if _, err := os.Stat(restorePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("restore file should be removed, stat err=%v", err)
+	}
+	var sawValidateRestore, sawRestore, sawDisable bool
+	for _, c := range runner.calls {
+		if filepath.Base(c.name) == testNFT && len(c.args) == 3 && c.args[0] == "-c" && c.args[1] == "-f" && c.args[2] == restorePath {
+			sawValidateRestore = true
+		}
+		if filepath.Base(c.name) == testNFT && len(c.args) == 2 && c.args[0] == "-f" && c.args[1] == restorePath {
+			sawRestore = true
+		}
+		if c.name == testSystemctl && strings.Join(c.args, " ") == "disable "+filepath.Base(env.nftPersistUnitPath) {
+			sawDisable = true
+		}
+	}
+	if !sawRestore {
+		t.Fatalf("expected nft restore from captured table, got %v", runner.calls)
+	}
+	if !sawValidateRestore {
+		t.Fatalf("expected nft restore validation before applying captured table, got %v", runner.calls)
+	}
+	if !sawDisable {
+		t.Fatalf("expected persistence unit disabled-state restore, got %v", runner.calls)
+	}
+}
+
+func TestStepInstallNFTRules_UndoValidatesCapturedRestoreBeforeDeletingLiveTable(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	env.prevNFTTableStateKnown = true
+	// This attempt loaded rules over the captured table, so undo restores it.
+	env.nftTableMutatedByInstall = true
+	env.prevNFTTableDump = "table inet " + defaultNFTTable + " {\n"
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	restorePath := env.nftRulesPath + ".restore"
+	runner.on(argvFor(testNFT, "-c", "-f", restorePath), "syntax error", 1, nil)
+
+	s := stepInstallNFTRules()
+	err := s.undo(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "validate previous nft table restore") {
+		t.Fatalf("undo error = %v, want restore validation failure", err)
+	}
+	for _, c := range runner.calls {
+		if filepath.Base(c.name) == testNFT && strings.Join(c.args, " ") == "delete table inet "+defaultNFTTable {
+			t.Fatalf("rollback deleted live table before proving captured restore was loadable: %v", runner.calls)
+		}
+		if filepath.Base(c.name) == testNFT && len(c.args) == 2 && c.args[0] == "-f" && c.args[1] == restorePath {
+			t.Fatalf("rollback applied restore after validation failed: %v", runner.calls)
+		}
+	}
+}
+
+func TestStepInstallNFTRules_UndoRejectsWrongCapturedTableBeforeDeletingLiveTable(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	env.prevNFTTableStateKnown = true
+	// This attempt loaded rules over the captured table, so undo restores it.
+	env.nftTableMutatedByInstall = true
+	env.prevNFTTableDump = `table inet other_containment {
+		chain output_filter {
+			meta skuid 987 drop
+		}
+	}
+`
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+
+	s := stepInstallNFTRules()
+	err := s.undo(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "captured nft table dump is not table inet "+defaultNFTTable) {
+		t.Fatalf("undo error = %v, want wrong-table restore rejection", err)
+	}
+	for _, c := range runner.calls {
+		if c.name == testNFT {
+			t.Fatalf("wrong-table captured dump must not execute nft command: %v", runner.calls)
+		}
+	}
+}
+
+func TestStepInstallNFTRules_ReloadDeletesOnlyManagedChain(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	drifted := strings.Replace(body, "tcp dport 8888 accept", "tcp dport 8889 accept", 1)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), drifted, 0, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("expected live drift repair")
+	}
+
+	assertManagedChainReload(t, runner, env)
+}
+
+func TestStepInstallNFTRules_ManagedChainReloadValidationFailureAbortsApply(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	drifted := strings.Replace(body, "tcp dport 8888 accept", "tcp dport 8889 accept", 1)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), drifted, 0, nil)
+	runner.on(argvFor(testNFT, "-c", "-f", managedChainReloadPath(env)), "syntax error", 1, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "validate nft managed chain reload") {
+		t.Fatalf("apply error = %v, want managed-chain reload validation failure", err)
+	}
+	if applied {
+		t.Fatal("failed managed-chain reload validation must not report applied")
+	}
+	for _, c := range runner.calls {
+		if c.name != testNFT {
+			continue
+		}
+		if strings.Join(c.args, " ") == "delete chain inet "+defaultNFTTable+" "+defaultNFTChain {
+			t.Fatalf("validation failure used standalone chain delete: %v", runner.calls)
+		}
+		if len(c.args) == 2 && c.args[0] == "-f" && c.args[1] == managedChainReloadPath(env) {
+			t.Fatalf("reload continued after managed-chain reload validation failed: %v", runner.calls)
+		}
+	}
+}
+
+func TestStepInstallNFTRules_ManagedChainReloadApplyFailureDoesNotDeleteSeparately(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	drifted := strings.Replace(body, "tcp dport 8888 accept", "tcp dport 8889 accept", 1)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), drifted, 0, nil)
+	runner.on(argvFor(testNFT, "-f", managedChainReloadPath(env)), "netlink apply failed", 1, nil)
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "reload nft managed chain") {
+		t.Fatalf("apply error = %v, want managed-chain reload apply failure", err)
+	}
+	if !applied {
+		t.Fatal("attempted reload must report possible kernel mutation")
+	}
+	var sawValidate bool
+	for _, c := range runner.calls {
+		if c.name != testNFT {
+			continue
+		}
+		if len(c.args) == 3 && c.args[0] == "-c" && c.args[1] == "-f" && c.args[2] == managedChainReloadPath(env) {
+			sawValidate = true
+		}
+		if strings.Join(c.args, " ") == "delete chain inet "+defaultNFTTable+" "+defaultNFTChain {
+			t.Fatalf("reload apply failure used standalone chain delete: %v", runner.calls)
+		}
+		if strings.Join(c.args, " ") == "delete table inet "+defaultNFTTable {
+			t.Fatalf("reload apply failure deleted table separately: %v", runner.calls)
+		}
+	}
+	if !sawValidate {
+		t.Fatalf("reload apply failure did not validate combined reload script first: %v", runner.calls)
+	}
+}
+
+func TestStepInstallNFTRules_ManagedChainReloadWriteFailureAbortsBeforeNFT(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	drifted := strings.Replace(body, "tcp dport 8888 accept", "tcp dport 8889 accept", 1)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), drifted, 0, nil)
+	originalWriteFile := env.writeFile
+	env.writeFile = func(path string, contents []byte, mode os.FileMode) error {
+		if path == managedChainReloadPath(env) {
+			return stringError("reload write denied")
+		}
+		return originalWriteFile(path, contents, mode)
+	}
+
+	s := stepInstallNFTRules()
+	applied, err := s.apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "write nft managed chain reload file") {
+		t.Fatalf("apply error = %v, want managed-chain reload write failure", err)
+	}
+	if applied {
+		t.Fatal("failed managed-chain reload write must not report applied")
+	}
+	for _, c := range runner.calls {
+		if c.name != testNFT {
+			continue
+		}
+		if len(c.args) >= 2 && c.args[len(c.args)-1] == managedChainReloadPath(env) {
+			t.Fatalf("reload write failure must not invoke nft on reload script: %v", runner.calls)
+		}
+		if strings.Join(c.args, " ") == "delete chain inet "+defaultNFTTable+" "+defaultNFTChain {
+			t.Fatalf("reload write failure used standalone chain delete: %v", runner.calls)
+		}
+	}
+}
+
+func TestStepInstallNFTRules_UndoRemovesManagedIncludeWhenNoBackup(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.nftMainPath = filepath.Join(t.TempDir(), "nftables.conf")
+	if err := os.MkdirAll(filepath.Dir(env.nftMainPath), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir main config parent: %v", err)
+	}
+	body := "flush ruleset\n\n# Pipelock containment persistence\n" + nftRulesIncludeLine(env.nftRulesPath) + "\n"
+	if err := os.WriteFile(env.nftMainPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write main config: %v", err)
+	}
+
+	if err := restoreOrRemoveNFTMainInclude(env); err != nil {
+		t.Fatalf("restore/remove include: %v", err)
+	}
+	got, err := os.ReadFile(env.nftMainPath)
+	if err != nil {
+		t.Fatalf("read main config: %v", err)
+	}
+	if strings.Contains(string(got), nftRulesIncludeLine(env.nftRulesPath)) {
+		t.Fatalf("include not removed:\n%s", got)
+	}
+	if strings.Contains(string(got), "Pipelock containment persistence") {
+		t.Fatalf("managed comment not removed:\n%s", got)
+	}
+}
+
+func TestStepCreateDirRejectsSymlinkTarget(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	root := t.TempDir()
+	target := filepath.Join(root, "real")
+	if err := os.MkdirAll(target, 0o750); err != nil {
+		t.Fatalf("mkdir target: %v", err)
+	}
+	link := filepath.Join(root, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	s := stepCreateDir("test", func(*installEnv) string { return link }, modeDirPrivate)
+	applied, err := s.apply(context.Background(), env)
+	if err == nil {
+		t.Fatal("expected symlink target rejection")
+	}
+	if applied {
+		t.Fatal("symlink rejection must not report applied")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestStepCreateDirRejectsSymlinkParent(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real-parent")
+	if err := os.MkdirAll(realParent, 0o750); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+	linkParent := filepath.Join(root, "link-parent")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	path := filepath.Join(linkParent, "child")
+	s := stepCreateDir("test", func(*installEnv) string { return path }, modeDirPrivate)
+	applied, err := s.apply(context.Background(), env)
+	if err == nil {
+		t.Fatal("expected symlink parent rejection")
+	}
+	if applied {
+		t.Fatal("symlink parent rejection must not report applied")
+	}
+	if !strings.Contains(err.Error(), "symlink parent") {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestInstallSteps_Count(t *testing.T) {
+	// Sanity: the install flow has 40 steps total after combining the runtime
+	// contract steps, credential guard, operator evidence ACL, browser CA
+	// trust, agent-browser defaults, config-mode repair, published services,
+	// and final readiness gate. Changing this count changes documented dry-run
+	// output.
+	steps := installSteps(installOpts{})
+	if len(steps) != 40 {
+		t.Errorf("installSteps count: got %d, want 40", len(steps))
+	}
+}
+
+func TestInstallCmd_Wiring(t *testing.T) {
+	cmd := installCmd()
+	if cmd.Use != "install" {
+		t.Errorf("cmd.Use: %q", cmd.Use)
+	}
+	if cmd.Flag("dry-run") == nil {
+		t.Errorf("--dry-run flag missing")
+	}
+	if cmd.Flag("pipelock-binary") == nil {
+		t.Errorf("--pipelock-binary flag missing")
+	}
+	if cmd.Flag("config") == nil {
+		t.Errorf("--config flag missing")
+	}
+	if cmd.Flag("proxy-port") == nil {
+		t.Errorf("--proxy-port flag missing")
+	}
+}
+
+func TestInstallCmdRejectsInvalidPortBeforeRootCheck(t *testing.T) {
+	cmd := installCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	cmd.SetArgs([]string{"--dry-run", "--proxy-port", "0", "--operator-user", containInstallOperatorUser})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected invalid port error")
+	}
+	if cliutil.ExitCodeOf(err) != cliutil.ExitConfig {
+		t.Fatalf("exit code: got %d want %d", cliutil.ExitCodeOf(err), cliutil.ExitConfig)
+	}
+	if !strings.Contains(err.Error(), "--port") {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestInstallCmdUnsupportedHostStopsBeforeInstallEnvironment(t *testing.T) {
+	origPrivilege := requireContainInstallPrivilege
+	origHost := requireContainInstallHost
+	origEnv := newContainInstallEnv
+	t.Cleanup(func() {
+		requireContainInstallPrivilege = origPrivilege
+		requireContainInstallHost = origHost
+		newContainInstallEnv = origEnv
+	})
+
+	requireContainInstallPrivilege = func(string) error { return nil }
+	requireContainInstallHost = func() error { return errors.New("unsupported test host") }
+	newContainInstallEnv = func(io.Writer) *installEnv {
+		t.Fatal("unsupported host reached install environment construction")
+		return nil
+	}
+
+	cmd := installCmd()
+	err := cmd.RunE(cmd, nil)
+	if err == nil || cliutil.ExitCodeOf(err) != cliutil.ExitConfig || !strings.Contains(err.Error(), "unsupported test host") {
+		t.Fatalf("error = %v, want unsupported-host precondition failure", err)
+	}
+}
+
+func TestInstallCmdDryRunSkipsHostPreflightAndPrintsPlan(t *testing.T) {
+	origHost := requireContainInstallHost
+	origEnv := newContainInstallEnv
+	t.Cleanup(func() {
+		requireContainInstallHost = origHost
+		newContainInstallEnv = origEnv
+	})
+	requireContainInstallHost = func() error {
+		t.Fatal("dry-run must not run host preflight")
+		return nil
+	}
+	env, _, out := newFakeEnv(t)
+	newContainInstallEnv = func(io.Writer) *installEnv { return env }
+	src := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(src, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cmd := installCmd()
+	cmd.SetArgs([]string{"--dry-run", "--operator-user", containInstallOperatorUser, "--pipelock-binary", env.pipelockBinary, "--config", src})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if !strings.Contains(out.String(), "planned steps") {
+		t.Fatalf("dry-run output = %q, want plan", out.String())
+	}
+}
+
+func TestWalkAndChown_NoOpEnvCallsForEveryFile(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	chownCalls := 0
+	env.chown = func(string, int, int) error {
+		chownCalls++
+		return nil
+	}
+	root := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(root, "sub"), 0o755); err != nil { //nolint:gosec // tmpdir
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "file"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "sub", "file2"), []byte("y"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := walkAndChown(env, root, 988, 988); err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	// root + sub + file + file2 = 4 entries.
+	if chownCalls != 4 {
+		t.Errorf("chown calls: got %d, want 4", chownCalls)
+	}
+}
+
+func TestPathExists(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	if pathExists(env, "/definitely/not/a/real/path/here") {
+		t.Errorf("expected false for missing")
+	}
+	if !pathExists(env, env.pipelockBinary) {
+		t.Errorf("expected true for planted source binary")
+	}
+}
+
+func TestExpectExec_HitsAndMisses(t *testing.T) {
+	// /bin/sh exists everywhere we care about.
+	if err := expectExec("sh"); err != nil {
+		t.Errorf("sh expected to exist: %v", err)
+	}
+	if err := expectExec("nonexistent-binary-pipelock-test-12345"); err == nil {
+		t.Errorf("expected error for missing binary")
+	}
+}
+
+func TestCollapseWS(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"hello\n  world", "hello world"},
+		{"  leading  ", "leading"},
+		{"tabs\tand\tnewlines\n", "tabs and newlines"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := collapseWS(c.in); got != c.want {
+			t.Errorf("collapseWS(%q): got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestTruncateForErr(t *testing.T) {
+	long := strings.Repeat("x", 500)
+	got := truncateForErr(long)
+	// 200 chars + the UTF-8 ellipsis (3 bytes). Use HasSuffix to avoid
+	// hard-coding the rune byte length.
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("truncated string missing ellipsis suffix: %q", got)
+	}
+	if len(strings.TrimSuffix(got, "…")) != 200 {
+		t.Errorf("truncated prefix len: got %d, want 200", len(strings.TrimSuffix(got, "…")))
+	}
+	if got := truncateForErr("short"); got != "short" {
+		t.Errorf("short: %q", got)
+	}
+}
+
+func TestSHA256HexOfFile(t *testing.T) {
+	tmp := filepath.Join(t.TempDir(), "x")
+	if err := os.WriteFile(tmp, []byte("hello"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := sha256HexOfFile(tmp)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	want := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+	if got != want {
+		t.Errorf("hash: got %s, want %s", got, want)
+	}
+}
+
+func TestBackupAndWrite_NewFileNoBak(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "new")
+	if err := backupAndWrite(env, path, []byte("data"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := os.Stat(path + ".bak"); err == nil {
+		t.Errorf("unexpected .bak when path was new")
+	}
+}
+
+func TestWriteFileAtomicWritesContentsAndMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "atomic")
+	if err := writeFileAtomic(path, []byte("one"), 0o600); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	if err := writeFileAtomic(path, []byte("two"), 0o600); err != nil {
+		t.Fatalf("write second: %v", err)
+	}
+	got, err := os.ReadFile(path) //nolint:gosec // tmpdir-scoped test path
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "two" {
+		t.Fatalf("contents: got %q", got)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode: got 0o%03o want 0o600", info.Mode().Perm())
+	}
+}
+
+func TestBackupAndWrite_ExistingPromotesToBak(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := backupAndWrite(env, path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	bak, err := os.ReadFile(path + ".bak") //nolint:gosec // tmpdir-scoped test path
+	if err != nil {
+		t.Fatalf("read bak: %v", err)
+	}
+	if string(bak) != "old" {
+		t.Errorf("bak: %q", bak)
+	}
+	cur, _ := os.ReadFile(path) //nolint:gosec // tmpdir-scoped test path
+	if string(cur) != "new" {
+		t.Errorf("cur: %q", cur)
+	}
+}
+
+func TestBackupAndWriteRotatesExistingBackup(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	if err := backupAndWrite(env, path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got, err := env.readFile(path)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if string(got) != "new" {
+		t.Fatalf("current file: %q", got)
+	}
+	bak, err := env.readFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(bak) != "current" {
+		t.Fatalf("backup: %q", bak)
+	}
+	archives := backupArchives(t, path)
+	if len(archives) != 1 {
+		t.Fatalf("archives: got %d want 1 (%v)", len(archives), archives)
+	}
+	archived, err := env.readFile(archives[0])
+	if err != nil {
+		t.Fatalf("read archive: %v", err)
+	}
+	if string(archived) != "original" {
+		t.Fatalf("archive: %q", archived)
+	}
+}
+
+func TestBackupAndWriteSkipsRotationWhenBackupMatchesCurrent(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	if err := backupAndWrite(env, path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	assertFileContents(t, path, []byte("new"))
+	assertFileContents(t, path+".bak", []byte("current"))
+	if archives := backupArchives(t, path); len(archives) != 0 {
+		t.Fatalf("unexpected archives: %v", archives)
+	}
+}
+
+func TestBackupAndWriteArchiveNameCollisionUsesDistinctNames(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host.conf")
+	now := time.Date(2026, 5, 17, 16, 53, 0, 123, time.UTC)
+	origNow := backupArchiveNow
+	backupArchiveNow = func() time.Time { return now }
+	t.Cleanup(func() { backupArchiveNow = origNow })
+
+	if err := os.WriteFile(path, []byte("current-1"), 0o600); err != nil {
+		t.Fatalf("seed current 1: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original-1"), 0o600); err != nil {
+		t.Fatalf("seed backup 1: %v", err)
+	}
+	if err := backupAndWrite(env, path, []byte("new-1"), 0o600); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	if err := backupAndWrite(env, path, []byte("new-2"), 0o600); err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+
+	archives := backupArchives(t, path)
+	if len(archives) != 2 {
+		t.Fatalf("archives: got %d want 2 (%v)", len(archives), archives)
+	}
+	if archives[0] == archives[1] {
+		t.Fatalf("archive names collided: %v", archives)
+	}
+	assertFileContents(t, archives[0], []byte("original-1"))
+	assertFileContents(t, archives[1], []byte("current-1"))
+	assertFileContents(t, path+".bak", []byte("new-1"))
+	assertFileContents(t, path, []byte("new-2"))
+}
+
+func TestBackupAndWriteRestoresRotatedBackupOnWriteFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	env.writeFile = func(string, []byte, os.FileMode) error {
+		return stringError("disk full")
+	}
+	err := backupAndWrite(env, path, []byte("new"), 0o600)
+	if err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("expected write failure, got %v", err)
+	}
+	assertFileContents(t, path, []byte("current"))
+	assertFileContents(t, path+".bak", []byte("original"))
+	if archives := backupArchives(t, path); len(archives) != 0 {
+		t.Fatalf("archive should be restored after failed write: %v", archives)
+	}
+}
+
+func TestBackupAndWriteRemovesNewFileAfterWriteFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "new-file")
+	env.writeFile = func(path string, contents []byte, mode os.FileMode) error {
+		if err := os.WriteFile(path, contents, mode); err != nil {
+			return err
+		}
+		return stringError("late write failure")
+	}
+	err := backupAndWrite(env, path, []byte("partial"), 0o600)
+	if err == nil || !strings.Contains(err.Error(), "late write failure") {
+		t.Fatalf("expected write failure, got %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed new file should be removed, stat err=%v", err)
+	}
+}
+
+func TestBackupAndWriteReportsRemoveFailureAfterNewFileWriteFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "new-file")
+	env.writeFile = func(string, []byte, os.FileMode) error {
+		return stringError("write denied")
+	}
+	env.removeFile = func(string) error {
+		return stringError("remove denied")
+	}
+	err := backupAndWrite(env, path, []byte("partial"), 0o600)
+	if err == nil || !strings.Contains(err.Error(), "write denied") || !strings.Contains(err.Error(), "remove denied") {
+		t.Fatalf("expected joined write/remove error, got %v", err)
+	}
+}
+
+func TestBackupAndWriteReportsRestoreFailureAfterWriteFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	env.writeFile = func(string, []byte, os.FileMode) error {
+		return stringError("write denied")
+	}
+	origRename := env.rename
+	env.rename = func(oldPath, newPath string) error {
+		if oldPath == path+".bak" && newPath == path {
+			return stringError("restore denied")
+		}
+		return origRename(oldPath, newPath)
+	}
+	err := backupAndWrite(env, path, []byte("new"), 0o600)
+	if err == nil || !strings.Contains(err.Error(), "write denied") || !strings.Contains(err.Error(), "restore denied") {
+		t.Fatalf("expected joined write/restore error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsCurrentStatError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	origLstat := env.lstat
+	var currentStats int
+	env.lstat = func(p string) (os.FileInfo, error) {
+		if p == path {
+			currentStats++
+			if currentStats == 1 {
+				return nil, os.ErrNotExist
+			}
+			return nil, stringError("stat denied")
+		}
+		return origLstat(p)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "stat denied") {
+		t.Fatalf("expected stat error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsCurrentReadError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	env.readFile = func(string) ([]byte, error) {
+		return nil, stringError("read denied")
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "read denied") {
+		t.Fatalf("expected read error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakRejectsCurrentSymlinkAfterPrecheck(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	origLstat := env.lstat
+	var pathStats int
+	env.lstat = func(p string) (os.FileInfo, error) {
+		if p == path {
+			pathStats++
+			if pathStats == 2 {
+				return fakeFileInfo{mode: os.ModeSymlink}, nil
+			}
+		}
+		return origLstat(p)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("expected late symlink rejection, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsBackupStatError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	origLstat := env.lstat
+	env.lstat = func(p string) (os.FileInfo, error) {
+		if p == path+".bak" {
+			return nil, stringError("backup stat denied")
+		}
+		return origLstat(p)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "backup stat denied") {
+		t.Fatalf("expected backup stat error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsBackupReadError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	origReadFile := env.readFile
+	env.readFile = func(p string) ([]byte, error) {
+		if p == path+".bak" {
+			return nil, stringError("backup read denied")
+		}
+		return origReadFile(p)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "backup read denied") {
+		t.Fatalf("expected backup read error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsSecondBackupReadError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	origReadFile := env.readFile
+	var backupReads int
+	env.readFile = func(p string) ([]byte, error) {
+		if p == path+".bak" {
+			backupReads++
+			if backupReads == 2 {
+				return nil, stringError("second backup read denied")
+			}
+		}
+		return origReadFile(p)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "second backup read denied") {
+		t.Fatalf("expected second backup read error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsArchiveStatError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	origLstat := env.lstat
+	env.lstat = func(p string) (os.FileInfo, error) {
+		if strings.Contains(p, ".bak.archived-") {
+			return nil, stringError("archive stat denied")
+		}
+		return origLstat(p)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "archive stat denied") {
+		t.Fatalf("expected archive stat error, got %v", err)
+	}
+}
+
+func TestBackupCurrentToBakReportsArchiveRenameFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	origRename := env.rename
+	env.rename = func(oldPath, newPath string) error {
+		if oldPath == path+".bak" && strings.Contains(newPath, ".bak.archived-") {
+			return stringError("archive rename denied")
+		}
+		return origRename(oldPath, newPath)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "archive rename denied") {
+		t.Fatalf("expected archive rename error, got %v", err)
+	}
+}
+
+func TestNextBackupArchivePathSkipsSymlinkCollision(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	bak := filepath.Join(dir, "host.conf.bak")
+	now := time.Date(2026, 5, 17, 16, 53, 0, 123, time.UTC)
+	first := fmt.Sprintf("%s.archived-%s", bak, now.Format(backupArchiveTimeFormat))
+	if err := os.Symlink(filepath.Join(dir, "elsewhere"), first); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	got, err := nextBackupArchivePath(env, bak, now)
+	if err != nil {
+		t.Fatalf("next archive path: %v", err)
+	}
+	if got != first+".1" {
+		t.Fatalf("archive path = %q, want %q", got, first+".1")
+	}
+}
+
+func TestBackupCurrentToBakRestoresArchiveWhenPromoteFails(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	origRename := env.rename
+	env.rename = func(oldPath, newPath string) error {
+		if oldPath == path && newPath == path+".bak" {
+			return stringError("promote denied")
+		}
+		return origRename(oldPath, newPath)
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "promote denied") {
+		t.Fatalf("expected promote error, got %v", err)
+	}
+	assertFileContents(t, path, []byte("current"))
+	assertFileContents(t, path+".bak", []byte("original"))
+	if len(env.archivedBackups[path+".bak"]) != 0 {
+		t.Fatalf("archive tracking not cleared: %+v", env.archivedBackups)
+	}
+}
+
+func TestBackupCurrentToBakReportsArchiveRestoreFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	origRename := env.rename
+	env.rename = func(oldPath, newPath string) error {
+		switch {
+		case oldPath == path && newPath == path+".bak":
+			return stringError("promote denied")
+		case strings.Contains(oldPath, ".bak.archived-") && newPath == path+".bak":
+			return stringError("archive restore denied")
+		default:
+			return origRename(oldPath, newPath)
+		}
+	}
+	_, err := backupCurrentToBak(env, path)
+	if err == nil || !strings.Contains(err.Error(), "promote denied") || !strings.Contains(err.Error(), "archive restore denied") {
+		t.Fatalf("expected joined promote/archive restore error, got %v", err)
+	}
+}
+
+func TestForgetArchivedBackupHandlesEmptyAndMiddleEntries(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	forgetArchivedBackup(env, "missing.bak", "archive")
+
+	bak := filepath.Join(t.TempDir(), "host.conf.bak")
+	env.archivedBackups = map[string][]string{
+		bak: {"first", "second"},
+	}
+	forgetArchivedBackup(env, bak, "first")
+	if got := env.archivedBackups[bak]; len(got) != 1 || got[0] != "second" {
+		t.Fatalf("archives = %#v, want second retained", got)
+	}
+}
+
+func TestRestoreBackupIfPresentRestoresOnlyWhenBakExists(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "host.conf")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := restoreBackupIfPresent(env, path); err != nil {
+		t.Fatalf("restore without backup: %v", err)
+	}
+	got, err := env.readFile(path)
+	if err != nil {
+		t.Fatalf("read current: %v", err)
+	}
+	if string(got) != "current" {
+		t.Fatalf("file changed without backup: %q", got)
+	}
+	if err := os.WriteFile(path+".bak", []byte("backup"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	if err := restoreBackupIfPresent(env, path); err != nil {
+		t.Fatalf("restore with backup: %v", err)
+	}
+	got, err = env.readFile(path)
+	if err != nil {
+		t.Fatalf("read restored: %v", err)
+	}
+	if string(got) != "backup" {
+		t.Fatalf("restored: got %q want backup", got)
+	}
+}
+
+func TestRestoreLatestArchivedBackupIgnoresMissingArchive(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	bak := filepath.Join(t.TempDir(), "host.conf.bak")
+	archive := bak + ".archived-2026-05-17T16:53:00.000000000Z"
+	env.archivedBackups = map[string][]string{bak: {archive}}
+	if err := restoreLatestArchivedBackup(env, bak); err != nil {
+		t.Fatalf("restore missing archive: %v", err)
+	}
+	if len(env.archivedBackups) != 0 {
+		t.Fatalf("archive tracking not popped: %+v", env.archivedBackups)
+	}
+}
+
+func TestRestoreLatestArchivedBackupReportsStatError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	bak := filepath.Join(t.TempDir(), "host.conf.bak")
+	archive := bak + ".archived-2026-05-17T16:53:00.000000000Z"
+	env.archivedBackups = map[string][]string{bak: {archive}}
+	origLstat := env.lstat
+	env.lstat = func(p string) (os.FileInfo, error) {
+		if p == archive {
+			return nil, stringError("archive stat denied")
+		}
+		return origLstat(p)
+	}
+	err := restoreLatestArchivedBackup(env, bak)
+	if err == nil || !strings.Contains(err.Error(), "archive stat denied") {
+		t.Fatalf("expected archive stat error, got %v", err)
+	}
+}
+
+func TestRestoreLatestArchivedBackupReportsRenameError(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	bak := filepath.Join(t.TempDir(), "host.conf.bak")
+	archive := bak + ".archived-2026-05-17T16:53:00.000000000Z"
+	if err := os.WriteFile(archive, []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed archive: %v", err)
+	}
+	env.archivedBackups = map[string][]string{bak: {archive}}
+	env.rename = func(string, string) error {
+		return stringError("archive restore denied")
+	}
+	err := restoreLatestArchivedBackup(env, bak)
+	if err == nil || !strings.Contains(err.Error(), "archive restore denied") {
+		t.Fatalf("expected archive restore error, got %v", err)
+	}
+}
+
+func TestPopArchivedBackupMissingKey(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.archivedBackups = map[string][]string{"other.bak": {"archive"}}
+	if got := popArchivedBackup(env, "missing.bak"); got != "" {
+		t.Fatalf("pop missing key = %q, want empty", got)
+	}
+}
+
+func TestRestoreBackup_PromotesBak(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	if err := os.WriteFile(path+".bak", []byte("backup"), 0o600); err != nil {
+		t.Fatalf("seed bak: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := restoreBackup(env, path); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, _ := os.ReadFile(path) //nolint:gosec // tmpdir-scoped test path
+	if string(got) != "backup" {
+		t.Errorf("restored: %q", got)
+	}
+}
+
+func TestRestoreBackupRestoresLatestArchivedBackup(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	if err := os.WriteFile(path, []byte("pre-upgrade"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original-backup"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	if err := backupAndWrite(env, path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := restoreBackup(env, path); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	assertFileContents(t, path, []byte("pre-upgrade"))
+	assertFileContents(t, path+".bak", []byte("original-backup"))
+	if archives := backupArchives(t, path); len(archives) != 0 {
+		t.Fatalf("archive should be promoted back to .bak: %v", archives)
+	}
+}
+
+func TestRestoreBackupUsesRunArchiveStackOrder(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	now := time.Date(2026, 5, 17, 16, 53, 0, 123, time.UTC)
+	origNow := backupArchiveNow
+	backupArchiveNow = func() time.Time { return now }
+	t.Cleanup(func() { backupArchiveNow = origNow })
+
+	if err := os.WriteFile(path, []byte("current-0"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("original"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	for i := 1; i <= 12; i++ {
+		if err := backupAndWrite(env, path, []byte(fmt.Sprintf("current-%d", i)), 0o600); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+	if err := restoreBackup(env, path); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	assertFileContents(t, path, []byte("current-11"))
+	assertFileContents(t, path+".bak", []byte("current-10"))
+}
+
+func TestRestoreBackupRejectsArchivedSymlinkBackup(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	if err := os.WriteFile(path, []byte("new"), 0o600); err != nil {
+		t.Fatalf("seed current: %v", err)
+	}
+	if err := os.WriteFile(path+".bak", []byte("pre-upgrade"), 0o600); err != nil {
+		t.Fatalf("seed backup: %v", err)
+	}
+	archive := path + ".bak.archived-2026-05-17T16:53:00.000000000Z"
+	if err := os.Symlink(filepath.Join(dir, "elsewhere"), archive); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	rememberArchivedBackup(env, path+".bak", archive)
+	err := restoreBackup(env, path)
+	if err == nil || !strings.Contains(err.Error(), "archived backup") {
+		t.Fatalf("expected archived symlink rejection, got %v", err)
+	}
+	assertFileContents(t, path, []byte("pre-upgrade"))
+	if _, err := os.Lstat(path + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf(".bak should have been promoted before archive rejection, stat err=%v", err)
+	}
+}
+
+func TestRestoreBackup_RemovesWhenNoBak(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("current"), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := restoreBackup(env, path); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("expected path removed; stat err=%v", err)
+	}
+}
+
+func containsString(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A UID change: the rules file on disk and the live chain were rendered with
+// earlier UIDs. Install must pass the UIDs from that file's header to reload,
+// so the reload script removes every rule of the old managed block.
+func TestStepInstallNFTRules_ReloadRemovesOldBlockAfterUIDChange(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, oldProxyUID, oldAgentUID := 1000, 1038, 1037
+	old := renderNFTRules(operatorUID, oldProxyUID, oldAgentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(old), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	live := nftListingFromRulesBodyForTest(old, 40)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), live, 0, nil)
+	reloadPath := managedChainReloadPath(env)
+	var script string
+	originalWrite := env.writeFile
+	env.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		if path == reloadPath {
+			script = string(data)
+		}
+		return originalWrite(path, data, mode)
+	}
+
+	if _, err := stepInstallNFTRules().apply(context.Background(), env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	assertManagedChainReload(t, runner, env)
+	oldRules := nftRulesWithHandles(live)
+	if len(oldRules) < 5 {
+		t.Fatalf("fixture has too few old rules: %d", len(oldRules))
+	}
+	for _, rule := range oldRules {
+		if !strings.Contains(script, fmt.Sprintf("delete rule inet %s %s handle %d\n", defaultNFTTable, defaultNFTChain, rule.handle)) {
+			t.Fatalf("old-UID rule %q (handle %d) survived the reload:\n%s", rule.line, rule.handle, script)
+		}
+	}
+}

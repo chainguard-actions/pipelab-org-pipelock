@@ -1,0 +1,199 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package license provides Ed25519-signed license tokens for gating
+// premium features (multi-agent profiles). Tokens are self-contained
+// and verified offline; no server infrastructure is required.
+package license
+
+import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// maxTokenBytes caps the decoded token size to prevent memory exhaustion
+// from maliciously large tokens. 64 KiB is generous for any realistic
+// license payload (~200 bytes JSON + 64 bytes signature).
+const maxTokenBytes = 64 * 1024
+
+// tokenPrefix identifies the license token format version.
+const tokenPrefix = "pipelock_lic_" + "v1_" //nolint:gosec // G101: not a credential, license format prefix
+
+var ErrLicenseExpired = errors.New("license expired")
+
+// Feature names for gating.
+const (
+	FeatureAgents = "agents"
+	FeatureAssess = "assess"
+	// FeatureFleet gates Pipelock's fleet control plane (the conductor
+	// subsystem and the standalone audit sink). Conductor coordinates policy
+	// distribution and signed audit ingest across multiple Pipelock instances -
+	// central governance - which is the Enterprise tier per the
+	// "sell coordination, not detection" doctrine.
+	FeatureFleet = "fleet"
+)
+
+// License represents the claims in a signed license token.
+type License struct {
+	ID             string   `json:"id"`
+	Email          string   `json:"sub"`
+	Org            string   `json:"org,omitempty"`
+	IssuedAt       int64    `json:"iat"`
+	ExpiresAt      int64    `json:"exp"`
+	Features       []string `json:"features"`
+	Tier           string   `json:"tier,omitempty"`            // e.g. "pro", "founding_pro"
+	SubscriptionID string   `json:"subscription_id,omitempty"` // external billing reference
+}
+
+// Issue creates a signed license token string from the license data.
+func Issue(l License, privateKey ed25519.PrivateKey) (string, error) {
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return "", errors.New("invalid private key size")
+	}
+	payload, err := json.Marshal(l)
+	if err != nil {
+		return "", fmt.Errorf("marshal license: %w", err)
+	}
+	// Cap payload size to prevent overflow in the allocation below.
+	// License JSON is a small struct; 64KB is generous.
+	const maxPayload = 64 * 1024
+	if len(payload) > maxPayload {
+		return "", fmt.Errorf("license payload too large: %d bytes", len(payload))
+	}
+	sig := ed25519.Sign(privateKey, payload)
+	size := len(payload) + ed25519.SignatureSize
+	if size < len(payload) { // integer overflow guard
+		return "", errors.New("token size overflow")
+	}
+	token := make([]byte, size)
+	copy(token, payload)
+	copy(token[len(payload):], sig)
+	return tokenPrefix + base64.RawURLEncoding.EncodeToString(token), nil
+}
+
+// Verify decodes a license token, checks the Ed25519 signature against
+// the provided public key, and validates expiration against the wall clock.
+// Returns the license data on success. It is the wall-clock convenience
+// wrapper around verifyAt; callers that already carry an injected
+// verification time (the intermediate/CRL chain) use verifyAt so every
+// temporal check in the chain pivots on the same instant.
+func Verify(token string, publicKey ed25519.PublicKey) (License, error) {
+	return verifyAt(token, publicKey, time.Now())
+}
+
+// verifyAt is the clock-aware verification core. now is the verification
+// instant the license expiry is evaluated against, so the chain can share one
+// clock with the intermediate validity window and CRL expiry/freshness checks.
+func verifyAt(token string, publicKey ed25519.PublicKey, now time.Time) (License, error) {
+	if len(publicKey) != ed25519.PublicKeySize {
+		return License{}, errors.New("invalid public key")
+	}
+	payload, sig, err := splitToken(token)
+	if err != nil {
+		return License{}, err
+	}
+
+	// Verify the signature BEFORE parsing: never unmarshal untrusted payload
+	// bytes until the root/intermediate signature over them has checked out.
+	if !ed25519.Verify(publicKey, payload, sig) {
+		return License{}, errors.New("invalid license signature")
+	}
+
+	var l License
+	if err := decodeLicenseJSON(payload, &l); err != nil {
+		return License{}, fmt.Errorf("parse license payload: %w", err)
+	}
+
+	// Validate required claims.
+	if l.ID == "" {
+		return License{}, errors.New("license missing required field: id")
+	}
+	if l.Email == "" {
+		return License{}, errors.New("license missing required field: sub")
+	}
+
+	if l.ExpiresAt > 0 && now.Unix() > l.ExpiresAt {
+		return l, fmt.Errorf("%w on %s", ErrLicenseExpired, time.Unix(l.ExpiresAt, 0).UTC().Format(time.DateOnly))
+	}
+
+	return l, nil
+}
+
+// HasFeature checks whether the license includes a named feature.
+func (l License) HasFeature(feature string) bool {
+	for _, f := range l.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
+// DecodeUnverified extracts the license payload from a token WITHOUT verifying
+// the signature. Use for inspection only, never for authorization decisions —
+// every authorization path uses Verify / VerifyWithCRL / VerifyTokenWithOptions,
+// which return a License only when the signature checks out. The Unverified
+// suffix makes accidental misuse in a trust path obvious at the call site.
+func DecodeUnverified(token string) (License, error) {
+	payload, _, err := splitToken(token)
+	if err != nil {
+		return License{}, err
+	}
+	var l License
+	if err := decodeLicenseJSON(payload, &l); err != nil {
+		return License{}, fmt.Errorf("parse license payload: %w", err)
+	}
+	return l, nil
+}
+
+// splitToken validates the token envelope (prefix, size cap, base64) and splits
+// the decoded bytes into the signed payload and its trailing Ed25519 signature.
+// It does NOT verify the signature or parse the payload, so verifyAt can check
+// the signature BEFORE unmarshalling untrusted JSON while DecodeUnverified can
+// inspect without verifying. Shared by both so the wire format lives in one place.
+func splitToken(token string) (payload, sig []byte, err error) {
+	if !strings.HasPrefix(token, tokenPrefix) {
+		return nil, nil, errors.New("invalid license format: missing prefix")
+	}
+	encoded := strings.TrimPrefix(token, tokenPrefix)
+	// Reject oversized tokens before allocating memory for base64 decode.
+	if len(encoded) > maxTokenBytes {
+		return nil, nil, errors.New("license token exceeds maximum size")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode license: %w", err)
+	}
+	// Minimum: 2 bytes of JSON + 64 bytes of signature.
+	if len(raw) <= ed25519.SignatureSize {
+		return nil, nil, errors.New("license token too short")
+	}
+	return raw[:len(raw)-ed25519.SignatureSize], raw[len(raw)-ed25519.SignatureSize:], nil
+}
+
+// PublicKeyHex is set at build time via ldflags:
+//
+//	-X github.com/luckyPipewrench/pipelock/internal/license.PublicKeyHex=<hex>
+//
+// Official releases embed the production public key. Dev builds leave it
+// empty, which means license verification always fails and agents require
+// a license_public_key_file in the config.
+var PublicKeyHex string
+
+// EmbeddedPublicKey returns the build-time public key, or nil if not set.
+func EmbeddedPublicKey() ed25519.PublicKey {
+	if PublicKeyHex == "" {
+		return nil
+	}
+	key, err := hex.DecodeString(PublicKeyHex)
+	if err != nil || len(key) != ed25519.PublicKeySize {
+		return nil
+	}
+	return ed25519.PublicKey(key)
+}

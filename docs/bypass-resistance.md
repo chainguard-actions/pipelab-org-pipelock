@@ -1,0 +1,241 @@
+# Bypass Resistance
+
+This page documents the evasion techniques pipelock handles and the ones it doesn't. Security reviewers: this is the honest picture.
+
+## How Scanning Works
+
+Pipelock scans mediated URLs, tool arguments, and responses. For URL scanning, DLP runs before DNS resolution so secrets are caught before a DNS query leaves the proxy, and DNS-based SSRF checks validate the resolved addresses. Agent-chosen destinations use the full private-address SSRF policy. Configured MCP upstream dialing is a different surface: local/private servers are allowed, but cloud metadata endpoints remain blocked.
+
+Response scanning uses a 6-pass normalization pipeline. Each pass catches a different evasion class.
+
+## Encoding Evasion
+
+These techniques hide secrets or injection payloads inside encoded data.
+
+| Technique | Example | Status | How |
+|-----------|---------|--------|-----|
+| Base64 (standard + URL-safe) | `c2stYW50LWFwaTA=` | Tested | Tries 4 base64 variants on every segment > 10 chars |
+| Base32 | `ONQW2YLUMVWGY3DP` | Tested | Decoded and re-checked against DLP |
+| Hex encoding | `736b2d616e742d` | Tested | Hex-decoded, case-insensitive |
+| Delimiter-separated hex | `73:6b:2d:61:6e:74` | Tested | Strips 6 delimiter formats (`:`, `-`, ` `, `,`, `\x` prefix, `0x` prefix) before hex decode |
+| URL encoding (multi-layer) | `%25%32%44` (5-10 layers deep) | Tested | `IterativeDecode()` runs up to 500 rounds; a URL component or reconstructed value still changing after 500 rounds is refused |
+| Mixed encoding chains | `base64(hex("secret"))` | Tested | Each layer decoded, re-normalized, re-checked; HTML entities are one of the layers, at any position in the chain |
+| Nested HTML entities | `&amp;amp;#65;` | Tested | Decoded up to 16 passes; an entity chain still changing after 16 passes is refused on outbound surfaces |
+| Field-split encoding | Secret spread across `?a=sk-&b=ant-&c=api03` | Tested | Query subsequence matching (ordered 2-4 param combos; see Query parameter splitting) |
+
+Decoding is bounded so scan cost stays bounded: 500 percent-decoding rounds, 16 HTML entity passes, and 4096 distinct candidates per decode walk. Outbound scans allow the first decode layer under the transport's input-size limit. Further expansion shares an 8 MiB budget, charged by the input bytes of each recursive step that reveals a new candidate. Terminal and duplicate-only steps don't spend that budget. The HTML walk has a separate budget with the same rules. Reaching a depth or work bound with a new view left uninspected is a refusal. Large single-layer content can therefore be inspected without spending the recursive budget on its terminal decoded views; large or branching nested encodings can still be refused.
+
+Outbound URLs use the core floor for work-limit refusals. Existing URL depth limits still apply wherever a URL is scanned, including URL fields that A2A responses carry. Outbound bodies, WebSocket frames, MCP tool arguments, A2A requests and headers carry the `Uninspectable encoded content` finding, which blocks under warn actions, audit mode and suppression like other incomplete inspection. Inbound content retains its previous work accounting and partial-view policy, including URL fields. Text in HTTP and MCP responses, server-to-client frames, A2A responses and Agent Cards isn't refused at a decode bound.
+
+Text DLP also inspects separator-separated RFC 4648 hex, base64, base64url, base32 and base32hex beyond the normalizer's short-token ceiling. Raw literal and shape screens select complete decoded lanes, one per alphabet and phase. Cue admission verifies complete literals, including factored keywords, and can verify a bounded mandatory prefix derived from the pattern grammar. That prefix can come from any required element of the pattern, including one in the middle. Finite shape cues verify a whole class run derived from the pattern's minimum length, including compatible UTF-8 bytes, instead of using isolated case-folded Unicode runes as cues. A finite pattern also has to match somewhere within its maximum length of the cue before the whole lane is decoded. Each admitted pattern searches a lane at most once with the existing validator-aware matcher, including overlapping WIF candidates. An explicit outer hex layer and one HTML or JSON escape transform can expose another encoded lane. This adds bounded coverage; it doesn't reconstruct arbitrary encoding chains.
+
+Built-in patterns run on input, text-preserving transformations and decoder outputs. Configured patterns admitted through a qualifying required literal also run on those views. Configured patterns admitted only through a finite character shape run on input and exact text-preserving views, including percent, HTML and JSON escape decoding. Binary decoder descendants and decoded images don't gain that configured shape-only coverage. Configured patterns with `keywords` use the same keyword rule on decoded lanes: a keyword in the source window outside the encoded value or in the decoded window qualifies, and a lane whose context can't be checked within the keyword budget follows the existing inspection-incomplete policy. Patterns outside the terminal's admitted grammar keep their existing scanner coverage.
+
+The terminal has a separate 8 MiB decoded-byte allowance. It charges distinct byte offsets for each exact source view, alphabet and phase. Reusing a decoded lane doesn't charge its bytes again. A lane must finish decoding before it can match; outbound exhaustion produces the existing inspection refusal. Inbound exhaustion emits `Partial encoded content inspection` as a non-blocking warning, including audit and signed-receipt evidence where that consumer supports them. This warning means some encoded content wasn't inspected. Other findings still enforce normally.
+
+Raw screening and whole-lane matching add work even when no secret is found. Repeated-cue adversarial inputs have linear confirmation work, but measured public calls can take roughly one and a half to two and a half times as long as the scanner with this terminal disabled. This is a measured cost range, not a latency ceiling. Complete-lane decoding can also use the last few allowance bytes where an earlier local rejection would have stopped without charging them.
+
+## Unicode Evasion
+
+These techniques use Unicode characters to break pattern matching.
+
+| Technique | Example | Status | How |
+|-----------|---------|----------|-----|
+| Zero-width characters | `sk\u200b-ant` (ZW space in key) | Tested | 16 Unicode ranges stripped before matching |
+| Unicode Tags | U+E0020–U+E007E | Tested | Printable ASCII tags decoded beside the stripped view; framing tags dropped |
+| NFKC normalization bypass | `ﬁle` (fi ligature) | Tested | NFKC decomposition applied to all scanned text |
+| Homoglyphs (Cyrillic) | `аpi_kеy` (Cyrillic a and e) | Tested | 80+ confusable character mappings |
+| Homoglyphs (Greek/Armenian/Cherokee) | `αpi`, `օverride` | Tested | Extended confusable map covers major scripts |
+| Combining marks | `e\u0306` (e + combining breve) | Tested | NFD decomposition then mark stripping |
+| Control characters | `sk\x00-ant` (null byte) | Tested | C0, C1, DEL all stripped before matching |
+| Leetspeak | `1GN0R3 4LL` | Tested | Digit-to-letter folding (response scanning) |
+| Vowel substitution | `instrocktoons` | Tested | Vowel folding pass in response scanning |
+| Regional indicators / emoji | Boxed letters, flag sequences | Tested | Stripped by zero-width/variation selector removal |
+| Exotic whitespace | `\u00A0`, `\u2000`-`\u200A`, `\u3000`, etc. | Tested | `StripExoticWhitespace` removes 18 Unicode space codepoints before DLP matching |
+| Zalgo text | `t̷̺̀e̸̜̅s̵̲̈́t̵̙̅` (stacked combining marks) | Tested | `StripCombiningMarks` removes all marks; `ZalgoDensity` detects 3+ consecutive marks as suspicious for taint signaling |
+
+Unicode tag decoding follows the [Unicode Standard, Chapter 23, Tags](https://www.unicode.org/versions/latest/core-spec/chapter-23/). DLP scans both stripped and tag-decoded views for URL paths and queries, outbound text, configured environment/file secrets, and canary values. Response injection scanning checks tag-decoded text with the same patterns as other decoded views. Mixed visible text and other invisible characters retain their usual normalization. Decoding shares the existing candidate/work budgets and response recursion limit; outbound inspection that exhausts its decode budget is refused. A tag sequence alone does not trigger a finding. Cross-request fragment matching also retains both views when enabled, with the existing retention limits and source-request attribution.
+
+## DNS-Based Exfiltration
+
+These techniques leak data through DNS queries rather than HTTP bodies.
+
+| Technique | Example | Status | How |
+|-----------|---------|----------|-----|
+| Secret in subdomain | `aGVsbG8.evil.com` | Tested | Subdomain entropy check + DLP on hostname, pre-DNS |
+| Secret split across labels | `sk-ant.AABB.CCDD.evil.com` | Tested | Dots stripped, labels concatenated before DLP |
+| High-entropy subdomains | `jk3n4k5n.evil.com` | Tested | Shannon entropy > 4.0 on labels > 8 chars |
+| Subdomain rotation | `a.evil.com`, `b.evil.com`, `c.evil.com` | Tested | Rate limiting and data budget keyed on the registrable base domain (public-suffix eTLD+1, not just the last two labels) |
+
+URL DLP uses the Public Suffix List to separate the registrable domain from its subdomain prefix. It removes dots from that prefix and passes it through the existing bounded decoders, including hex, base32, base32hex and base64url ([RFC 4648](https://www.rfc-editor.org/rfc/rfc4648)). Both the immutable core floor and configured DLP inspect the decoded views for credential matches. Label boundaries can occur anywhere within the encoding; DNS labels have a 63-octet limit (the size limits section of [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035)). Base32 decoding accepts lowercase DNS spellings; base64url decoding preserves case. This is content detection within one hostname, not reconstruction across requests or arbitrary encoding schemes.
+
+**Key design choice:** DLP and subdomain entropy run before DNS resolution. Credential matches in these views are refused before the proxy resolves the destination. This applies to fetch URLs, forward-proxy URLs and CONNECT hostnames routed through Pipelock; direct DNS requires containment or network policy.
+
+## Slow/Chunked Exfiltration
+
+These techniques exfiltrate data in small pieces over time.
+
+| Technique | Example | Status | How |
+|-----------|---------|----------|-----|
+| Many small requests | 1 byte per request, 1000 requests | Tested | Per-domain rate limiting (default 60/min) |
+| Data budget exhaustion | Stay under rate limit, send lots of data | Tested | Per-domain byte budget (sliding 60-second window) |
+| Subdomain rotation for rate bypass | Different subdomains to reset counters | Tested | Rate limit keyed on base domain, not full hostname |
+| Query parameter splitting | `?a=sk-&b=ant-&c=api03` across params | Tested | Ordered query subsequence matching: combinations of 2-4 values for up to 20 non-empty values; above 20, every combination of 3 (up to 33 values) or 2 (up to 111 values); a URL with more values is refused, never truncated |
+| Path segment splitting | `/sk-/ant-/api03/AAAA/evil.com` | Tested | Noise stripping + ordered concatenation |
+
+## Prompt Injection Evasion
+
+These techniques hide injection payloads in fetched content or MCP tool results.
+
+| Technique | Example | Status | How |
+|-----------|---------|----------|-----|
+| Basic injection | "Ignore all previous instructions" | Tested | 34 built-in patterns; the basic injection pattern is case-insensitive |
+| Zero-width splitting | `ignore\u200ball\u200bprevious` | Tested | Pass 1: strip ZW chars |
+| Word boundary collapse | Words merged after ZW removal | Tested | Pass 2: replace invisible with space, re-scan |
+| Leetspeak substitution | `1GN0R3 4LL PR3V10US` | Tested | Pass 3: digit-to-letter folding |
+| No-space concatenation | `ignoreallpreviousinstructions` | Tested | Pass 4: optional-whitespace pattern variants |
+| Vowel confusion | `instrocktoons` | Tested | Pass 5: vowel folding (a,e,i,o,u mapped to same char) |
+| Encoded injection | `base64("ignore all previous")` | Tested | Pass 6: base64/hex decode, re-normalize, re-scan |
+| Homoglyph injection | `іgnore` (Cyrillic і) | Tested | Confusable mapping in normalization pipeline |
+
+## MCP-Specific Evasion
+
+These techniques target the MCP proxy layer.
+
+| Technique | Example | Status | How |
+|-----------|---------|----------|-----|
+| Tool description poisoning | Injection in tool description text | Tested | Description scanned through response pipeline |
+| Rug-pull (mid-session drift) | Tool description changes after first `tools/list` | Tested | SHA256 hash baseline per session |
+| Cross-tool injection | Tool A result injected into Tool B input | Tested | All text extracted from results and scanned |
+| Encoded payload in tool result | `base64("override system prompt")` in result | Tested | Decoded and re-scanned |
+| Shell obfuscation in args | `r\m -rf`, `${IFS}-rf`, `$'\x6d'` | Tested | Shell escape decoding before policy matching; values that only exist at run time aren't resolved (see [Known Limitations](#architectural-limits)) |
+| Unknown tool execution | Server returns tools not in initial inventory | Tested | Session binding validates against baseline |
+| JSON key exfiltration | Secret encoded as JSON object key | Tested | Both keys and values extracted from JSON |
+| Batch response poisoning | N clean + 1 injected response in batch | Tested | Each batch element scanned individually |
+
+## Request Body and Header Evasion
+
+These techniques try to exfiltrate secrets through request bodies or headers instead of URLs.
+
+| Technique | Example | Status | How |
+|-----------|---------|--------|-----|
+| Secret in POST body (JSON) | `{"key": "sk-ant-..."}` | Tested | Recursive JSON string extraction, DLP scan per field + joined |
+| Secret in JSON object key | `{"AKIA1234...": "value"}` | Tested | Both keys and values extracted from JSON |
+| Secret in form field | `token=sk-ant-...` | Tested | Form-urlencoded parsed, keys + values scanned |
+| Secret in multipart field | File upload form with secret in any part body | Tested | All multipart part bodies are scanned regardless of declared `Content-Type` |
+| Secret in multipart filename | `Content-Disposition: ...; filename="sk-ant-..."` | Tested | Filenames extracted and scanned; oversized filenames blocked |
+| Secret in custom multipart header | `X-Part-Token: sk-ant-...` on a part | Tested | Custom multipart part headers are extracted and scanned |
+| Transfer-encoding bypass | Base64 or quoted-printable secret in a part body | Tested | Multipart `Content-Transfer-Encoding` is decoded before scanning |
+| Content-Type spoofing | JSON body sent as `application/octet-stream` | Tested | Unknown types get fallback raw-text scan (never skipped) |
+| Compressed body bypass | gzip-encoded body to evade regex matching | Tested | Any non-identity Content-Encoding is fail-closed blocked |
+| Split secret across headers | `X-A: sk-ant-` + `X-B: api03-rest` | Tested | Joined scan concatenates all scanned header values |
+| Split secret across name:value | `X-AKIA1234: EXAMPLE` | Tested | Header name + value concatenated and scanned (all mode) |
+| Secret in Authorization header | `Bearer sk-ant-...` to allowlisted host | Tested | Headers scanned regardless of destination (no allowlist skip) |
+| Malformed form body | Invalid urlencoded to trigger raw fallback | Tested | Fail-closed block on parse error (prevents parser differential) |
+| Multipart boundary omission | `multipart/form-data` without boundary | Tested | Fail-closed block (missing boundary) |
+
+**Scope note:** Request body and header scanning applies to forward HTTP proxy (absolute-URI requests), fetch handler headers, and intercepted CONNECT tunnels (when `tls_interception.enabled` is true). Unintercepted CONNECT tunnels carry TLS-encrypted traffic where bodies and headers are not visible.
+
+## Cross-Request Exfiltration
+
+These techniques spread secret data across multiple independent requests to stay below per-request detection thresholds.
+
+| Technique | Variant | Status | How |
+|-----------|---------|--------|-----|
+| Split secret across requests | A: one piece per URL/body/payload, separate requests | Tested | Fragment reassembly buffers outbound payloads (URLs, request bodies, MCP JSON-RPC payloads, WebSocket frames) per session, re-scans concatenated content against DLP |
+| Encode-then-split | B: base64 the secret, split the encoded form | Tested | Fragment buffer decodes reassembled content through the same multi-encoding pipeline as single-request DLP |
+| Low-entropy drip | C1: small pieces that individually look benign | Tested | Entropy budget tracks cumulative Shannon entropy per session across a sliding window. Exceeding the budget triggers the configured action. |
+| Session-key partitioning | D: rotate a self-declared agent id per request so each piece lands in its own bucket | Tested | CEE and adaptive/session-profiling state are keyed to the verified client IP, not the attacker-controlled `X-Pipelock-Agent` header / `?agent=` query. Rotating the agent id no longer splits a session. |
+| Flood-to-evict | E: flood the session cap to LRU-evict a victim's in-progress accumulation | Tested | Eviction is least-progress-biased: fresh, low-progress sessions are evicted before in-progress (near-threshold / multi-fragment) accumulations. |
+| Covert channel exfiltration | C2: timing, header ordering, HTTP/2 frame flags | Not covered | These channels carry bits outside the URL/body content layer. Detecting them requires protocol-level analysis beyond content inspection. Documented gap. |
+
+**Two detection mechanisms:**
+
+- **Entropy budget:** tracks the cumulative information content (Shannon entropy bits) of all outbound payloads (URLs, request bodies, MCP JSON-RPC payloads, WebSocket frames) per session within a sliding time window. When total bits exceed the configured threshold (`bits_per_window`), the request triggers the configured action. This catches slow-drip exfiltration where each individual request looks clean.
+
+- **Fragment reassembly:** buffers outbound payloads (URLs, request bodies, MCP JSON-RPC payloads, WebSocket frames) per session using two independent streams: one for query parameter values, bare tokens, and body content, and another for query parameter names. Both streams are re-scanned against DLP patterns on every request (synchronous, pre-forward). When a concatenated buffer matches a DLP pattern, the completing request triggers the configured CEE action before it leaves. Buffer size is capped per session to prevent memory exhaustion.
+
+**Adaptive enforcement:** Entropy-budget hits remain visible but do not add to the per-session adaptive score or acquire a stronger action. With `action: warn`, an opaque payload that matches no concrete detector can continue to pass; use `action: block` when the budget must stop it. Fragment-reassembly DLP hits add adaptive score when the cross-request action blocks them; a warned fragment hit is recorded without score. A session already at `block_all` because of concrete evidence denies entropy-only traffic too.
+
+**Partition resistance (session keying):** HTTP-family CEE, adaptive-enforcement, airlock, and behavioral-baseline state accumulates per logical session, and the session key is anchored to the transport peer IP from the proxy's `RemoteAddr`; forwarded-address headers are ignored. Behind another proxy or load balancer, that address identifies the intermediary, not the original end client, so callers sharing it also share the fallback bucket unless a stronger bound identity separates them. The self-declared agent identity (`X-Pipelock-Agent` header or `?agent=` query) is attacker-controllable, so it narrows the bucket only when it is *not* attacker-variable: an infrastructure-bound identity (a per-agent listener or a `source_cidrs` match, both graded `bound`) or a single config-default identity. When `bind_default_agent_identity` is off, an `X-Pipelock-Agent` header still takes precedence over the config-default identity for attribution (policy, receipts and logs keep the declared grade), but the stateful controls key such a request as the configured default, so one peer address keeps one bucket (`<default>|<client address>`) whether or not it sends the header; releases before 3.7 split a peer between that bucket and the bare client address, so state recorded under the old client-address key for a header-carrying peer does not carry over, and `session reset` of that old key does not clear the named key (reset the `<default>|<client address>` key that `adaptive whoami` reports). A bound identity (per-agent listener or `source_cidrs`) keeps its own bucket, `?agent=` never split them because the configured default takes precedence over the query, and `bind_default_agent_identity: true` remains the stronger setting because it also ignores the header outright. The per-IP domain tracker is deliberately unchanged: it still sees a header-supplied name as untrusted, since it exists to catch header rotation. An identity selected by `source_cidrs` (grade `bound`) produces a name-keyed session (`<agent>|<client address>`), the same as a per-agent listener. The `matched` grade is different: it means only that a self-declared header or query name happens to equal a profile name, and such a name follows the same state projection as a self-declared one: the configured unbound default when present, otherwise the client address. Ratifying the supplied name addresses no live profile. Without an unbound configured default, header- or query-supplied agent names that do not match a bound identity fold to the transport peer IP, so an attacker cannot rotate the agent identifier per request to split a session. Behavioral-baseline profiles follow that same boundary: name-keyed profiles apply only to bound or config-default identities, while self-declared, matched, and unknown identities without an unbound configured default use a client key in the `ip4-<hex>` or `ip6-<hex>` form. An embedded non-TCP listener encodes its non-IP peer identifier as the reserved `ip-<hex>` form. Ratifying a self-declared name addresses no live profile. This is fail-closed for partitioning: distinct self-declared callers behind one peer IP share state, so one noisy caller can escalate the other. The same HTTP-family key feeds these stateful controls and is shared across fetch, forward proxy, TLS-intercepted CONNECT, WebSocket, and reverse proxy traffic. MCP stdio and non-listener MCP paths use their transport-owned invocation identity.
+
+On the HTTP reverse listener, authenticated stateful MCP controls use an authenticated principal. The configured listener bearer is one shared credential principal; a verifier-backed resolver can subdivide it for OAuth or mTLS deployments. Pipelock derives an opaque, per-listener keyed state identifier and never keys authenticated principal state from `Mcp-Session-Id`, `_meta.clientInfo`, routing headers, forwarded IP headers, or another client-controlled claim. Bearer rotation revokes the prior state epoch. When `mcp_session_binding.listener_require_state_token` is true, a request without a principal or Pipelock-issued session token is refused before upstream rather than running with that control removed. The omitted default is false: unauthenticated traffic uses the isolated `Mcp-Session-Id` compatibility partition and keeps configured scanning.
+
+Protocol revision `2026-07-28` has no initialization exchange or protocol session. Principal-owned state therefore begins on the first authenticated request and needs no Pipelock extension header. The older `Pipelock-Session-Token` remains an isolated compatibility capability for legacy clients only; current requests never receive it. Denial-of-wallet uses the same authenticated principal when available and otherwise follows the configured subject-trust policy; see [subject trust grades](configuration.md#subject-trust-grades).
+
+**Eviction resistance (memory cap):** Both trackers bound memory with a global session cap and evict when full. Eviction is least-progress-biased rather than pure LRU: a fresh, low-progress session (single fragment, or entropy below half the budget) is evicted before an in-progress accumulation (two or more in-window fragments, or near-threshold entropy). This prevents an attacker from flooding the cap with dummy sessions to drop a victim's partially-accumulated secret before the threshold trips. When every session is in-progress, eviction falls back to global LRU so memory stays bounded regardless.
+
+**Session enforcement at capacity:** The shared session store refuses new keys when every retained session carries airlock, adaptive escalation, `block_all`, or policy-relevant taint. Capacity eviction selects an eligible session without discarding those restrictions. Idle expiry remains a session boundary except for airlock; this protection doesn't preserve history across expiry, explicit deletion, or process restart. See [session profiling](configuration.md#session-profiling) for recovery and lifetime rules.
+
+**Coverage gap:** Cross-request detection scans all outbound content visible to the proxy: URLs, request bodies, MCP JSON-RPC payloads, and WebSocket frames. For CONNECT tunnels without TLS interception, only the target hostname is visible (not the request body or path). Enable `tls_interception.enabled: true` to get full cross-request coverage on CONNECT traffic. MCP stdio has no HTTP client-IP surface, so it is not part of HTTP-family cross-transport reassembly; MCP payload accumulation is keyed by MCP session identity. Detection that depends on buffering within a sliding window cannot reassemble fragments dripped slower than `window_minutes`; widen the window (at a memory cost) to catch slower exfiltration.
+
+## Media and SVG Evasion
+
+These techniques use media responses or SVG content to deliver payloads.
+
+| Technique | Example | Status | How |
+|-----------|---------|--------|-----|
+| EXIF metadata exfiltration | Secret in JPEG EXIF comment field | Tested | JPEG APP1/APP2/APP13 segments stripped; PNG tEXt/iTXt/zTXt/eXIf chunks stripped |
+| SVG foreignObject injection | `<foreignObject>` with embedded HTML instructions | Tested | Whole SVG refused (403, `media_policy`); `<foreignObject>` is not on the drawing allowlist |
+| SVG event handler injection | `<rect onload="fetch('evil.com')">` | Tested | Whole SVG refused (403, `media_policy`); any `on*` attribute fails validation |
+| SVG external reference | `<use xlink:href="https://evil.com/x.svg">` | Tested | Whole SVG refused (403, `media_policy`); an external fetching reference fails validation, local `#id` references are accepted |
+| SVG hidden text injection | `<text style="opacity:0">injection payload</text>` | Tested | Hidden text elements with `opacity:0`, `display:none`, or `visibility:hidden` stripped |
+| SVG script injection | `<script>evil()</script>` in SVG | Tested | Whole SVG refused (403, `media_policy`); `<script>` is an active element |
+| SVG animation injection | `<set attributeName="href" to="evil.com">` | Tested | Whole SVG refused (403, `media_policy`); an animation targeting a non-drawing attribute fails validation |
+| Audio/video as injection carrier | Prompt injection via ASR transcription of audio | Mitigated | Audio and video responses stripped by default (`strip_audio: true`, `strip_video: true`) |
+| Decompression bomb | 1KB compressed image expands to 10GB | Tested | `max_image_bytes` enforced before any parsing (default 5 MiB) |
+| SVG as image bypass | Serve SVG as `image/svg+xml` to bypass image-specific scanning | Tested | `image/svg+xml` rejected from `allowed_image_types`; SVG is delivered only after complete Browser Shield validation, and is refused whenever Shield is disabled (the default) |
+
+## Known Limitations
+
+These are things pipelock does not protect against. If your threat model includes these, you need additional controls.
+
+### Out of Scope
+
+| Limitation | Why | Mitigation |
+|------------|-----|------------|
+| **Process-level attacks** | Pipelock is a network proxy, not a sandbox. If the agent can exec arbitrary processes, those processes can bypass the proxy. | Pair with an OS sandbox (Docker, gVisor, Firecracker). See [comparison](comparison.md). |
+| **Non-HTTP exfiltration** | Agent writes to cloud-synced folder, clipboard, stdout, or subprocess that doesn't use the proxy. | Container network isolation (see [deployment recipes](guides/deployment-recipes.md)). |
+| **Model compromise** | If the model itself is fine-tuned to be malicious, pipelock can't distinguish legitimate from malicious intent. | Defense in depth. Pipelock catches the network-visible symptoms. |
+| **Steganography (pixel-level)** | Data hidden in image pixels, timing channels, or LSBs of audio/video. | Beyond content inspection. Requires specialized analysis. Media policy strips EXIF/XMP/IPTC/ICC metadata from JPEG and text/eXIf chunks from PNG (eliminating metadata-based steganography), but pixel-level encoding remains out of scope. |
+
+### Architectural Limits
+
+| Limitation | Detail | Impact |
+|------------|--------|--------|
+| **Regex-based injection detection** | Injection patterns are syntactic, not semantic. An LLM-crafted injection that doesn't match known patterns will pass. | Add custom patterns for your domain. Future: pluggable detector interface. |
+| **CONNECT tunnel body blindness** | Without TLS interception, CONNECT tunnels carry end-to-end TLS where pipelock only sees the hostname. | Enable `tls_interception.enabled: true` to decrypt, scan, and re-encrypt tunnel traffic. Bodies, headers, and responses are fully scanned. Domains that pin certificates can be excluded via `passthrough_domains`. |
+| **DNS rebinding TOCTOU** | Hostname resolves to public IP at scan time, then to internal IP at connect time. Classic time-of-check/time-of-use race. | DNS pinning mitigates most cases. For high-security: use strict mode (allowlist only). |
+| **Very slow exfiltration** | 1 byte per hour over days. Below any practical rate limit or entropy threshold. | Container isolation prevents this entirely. Without isolation, this is the residual risk. |
+| **ReDoS in custom patterns** | User-supplied DLP or response patterns could have catastrophic backtracking. Built-in patterns are tested, but custom ones aren't analyzed for ReDoS. | Test custom patterns before deploying. |
+| **Text-based tool policy** | When enabled, tool policy reads submitted text and resolves simple in-command assignments and `echo`/`printf` substitutions, but not arbitrary run-time values or earlier Git settings. An unresolved scalar program word at the start of a command, after leading assignments, gives `--force`, `--hard` and their long-option prefixes destructive readings. Programs behind wrappers or shell reserved words, short options such as `-f`, refspecs such as `+main` and Git aliases defined earlier can evade this check. | Treat tool policy as an early check, not the only one. Protect important branches where pushes land (branch protection on the Git host), and use sandbox or `pipelock contain` to limit what a process can change. |
+| **HITL approval flooding** | Attacker generates many HITL prompts to overwhelm the human reviewer. | Use `block` action instead of `ask` in unattended environments. |
+
+### Operational Risks
+
+| Risk | Detail | Mitigation |
+|------|--------|------------|
+| **Misconfiguration** | The audit preset sets `enforce: false` and disables adaptive escalation. Ordinary findings warn, while core credentials, SSRF, fail-closed transport checks and explicit tool-policy rules can still block. Setting only `mode: audit` leaves ordinary URL enforcement active. Use a balanced or strict preset for broader enforcement. | Start with balanced mode. Use `pipelock audit .` to generate a config tuned for your project. |
+| **Agent identity spoofing** | Any process that can reach pipelock can claim any agent name via `X-Pipelock-Agent` header or `?agent=` query param. | Use listener binding (dedicated ports per agent) or a `source_cidrs` match on the connection's own source address for network-bound identity; both are graded `bound` and neither authenticates the host or process behind the address. Header/query methods trust the caller. Network isolation adds defense in depth. |
+| **IPv6 bypass** | If `internal` CIDR list doesn't include IPv6 ranges, agents could reach internal services via IPv6. Zone IDs (e.g. `::1%eth0`) could bypass `net.ParseIP` if not stripped. | Default config includes `::1/128`, `fc00::/7`, `fe80::/10`, `224.0.0.0/4` (IPv4 multicast), `ff00::/8` (IPv6 multicast). Zone IDs are stripped before IP parsing. |
+| **MCP confused deputy** | A malicious MCP server sends JSON-RPC responses with IDs the client never used, hijacking the agent's execution flow. | Response ID validation tracks outbound request IDs and rejects unsolicited responses. One-shot consumption prevents replay. |
+
+## Testing Your Setup
+
+Pipelock ships with built-in test vectors. After configuring, verify:
+
+```bash
+# Should be BLOCKED (DLP catches the fake key)
+pipelock check --config pipelock.yaml --url "https://example.com/?key=sk-ant-api03-fake1234567890"
+
+# Should be BLOCKED (domain blocklist)
+pipelock check --config pipelock.yaml --url "https://pastebin.com/raw/abc123"
+
+# Should be ALLOWED (clean URL)
+pipelock check --config pipelock.yaml --url "https://docs.python.org/3/"
+
+# Validate scanning coverage with test vectors
+pipelock test --config pipelock.yaml --fail-on-gap
+```
+
+For production deployments, also test from within your isolation layer (Docker, K8s, iptables) to verify the agent cannot bypass pipelock entirely.

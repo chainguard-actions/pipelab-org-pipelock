@@ -1,0 +1,1436 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package git
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/gitprotect"
+	"github.com/luckyPipewrench/pipelock/internal/sarif"
+)
+
+const cleanDiff = `diff --git a/main.go b/main.go
+--- a/main.go
++++ b/main.go
+@@ -1,2 +1,3 @@
+ package main
++import "fmt"
+
+`
+
+// testRootCmd builds a minimal root command with the git subcommand attached.
+// This replaces rootCmd() from the parent cli package for isolated testing.
+func testRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "pipelock",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+	root.AddCommand(Cmd())
+	return root
+}
+
+// fakeKey builds a test credential at runtime to avoid gitleaks false positives.
+func fakeKey() string {
+	return "AK" + "IA" + "IOSFODNN7" + "EXAMPLE"
+}
+
+func writeInstallTestConfig(t *testing.T) string {
+	t.Helper()
+	cfgPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfgPath
+}
+
+// isolateInstallHooksConfig prevents hook-install tests from embedding an
+// operator's discovered config path. Install hooks intentionally inherit
+// PIPELOCK_CONFIG, so give each test an explicit, test-owned value.
+func isolateInstallHooksConfig(t *testing.T) {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("home", t.TempDir())
+	configHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	hostileConfig := filepath.Join(configHome, "pipelock", "pipelock.yaml")
+	if err := os.MkdirAll(filepath.Dir(hostileConfig), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(hostileConfig, []byte("mode: [\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PIPELOCK_CONFIG", writeInstallTestConfig(t))
+}
+
+func runScanDiffCmd(t *testing.T, diff string) (string, error) {
+	t.Helper()
+	stdin, err := os.CreateTemp(t.TempDir(), "scan-diff-stdin-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.WriteString(diff); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = stdin.Close() })
+
+	oldStdin := os.Stdin
+	os.Stdin = stdin
+	t.Cleanup(func() { os.Stdin = oldStdin })
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err = cmd.Execute()
+	return buf.String(), err
+}
+
+func TestGitCmd_Help(t *testing.T) {
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "--help"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "scan-diff") {
+		t.Error("expected help to list scan-diff command")
+	}
+	if !strings.Contains(output, "install-hooks") {
+		t.Error("expected help to list install-hooks command")
+	}
+}
+
+func TestGitCmd_InRootHelp(t *testing.T) {
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"--help"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "git") {
+		t.Error("expected root help to list 'git' command")
+	}
+}
+
+func TestScanDiffCmd_CleanDiff(t *testing.T) {
+	diff := cleanDiff
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("expected no error for clean diff, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_FindsSecret(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/config.go b/config.go
+--- a/config.go
++++ b/config.go
+@@ -1,2 +1,3 @@
+ package config
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when secrets found")
+	}
+	if !errors.Is(err, ErrSecretsFound) {
+		t.Fatalf("expected ErrSecretsFound, got: %v", err)
+	}
+	if got := cliutil.ExitCodeOf(err); got != cliutil.ExitGeneral {
+		t.Fatalf("secret finding exit code = %d, want %d", got, cliutil.ExitGeneral)
+	}
+}
+
+func TestScanDiffCmd_UnverifiableInputReturnsExitTwoWithoutFinding(t *testing.T) {
+	output, err := runScanDiffCmd(t, "garbage not a diff\n")
+	if err == nil {
+		t.Fatal("expected unverifiable input error")
+	}
+	if !errors.Is(err, ErrScanUnverified) {
+		t.Fatalf("expected ErrScanUnverified, got: %v", err)
+	}
+	if !errors.Is(err, gitprotect.ErrNoDiffHeaders) {
+		t.Fatalf("expected ErrNoDiffHeaders, got: %v", err)
+	}
+	if got := cliutil.ExitCodeOf(err); got != cliutil.ExitConfig {
+		t.Fatalf("unverifiable input exit code = %d, want %d", got, cliutil.ExitConfig)
+	}
+	if !strings.Contains(output, "ERROR: unverifiable input") {
+		t.Fatalf("expected scanner error output, got: %q", output)
+	}
+	if strings.Contains(output, "Secret detected") || strings.Contains(output, ErrSecretsFound.Error()) {
+		t.Fatalf("unverifiable input was reported as a finding: %q", output)
+	}
+}
+
+func TestScanDiffCmd_WholeFileDeletionPassesClean(t *testing.T) {
+	diff := "diff --git a/secrets.txt b/secrets.txt\n" +
+		"deleted file mode 100644\n" +
+		"index abc1234..0000000\n" +
+		"--- a/secrets.txt\n" +
+		"+++ /dev/null\n" +
+		"@@ -1,3 +0,0 @@\n" +
+		"-first line\n" +
+		"-key = \\\"" + fakeKey() + "\\\"\n" +
+		"-third line\n"
+	output, err := runScanDiffCmd(t, diff)
+	if err != nil {
+		t.Fatalf("whole-file deletion should pass clean, got: %v; output: %s", err, output)
+	}
+	if strings.Contains(output, "Secret detected") {
+		t.Fatalf("whole-file deletion was reported as a finding: %q", output)
+	}
+}
+
+func TestScanDiffCmd_FailClosedMalformedInputs(t *testing.T) {
+	key := fakeKey()
+	tests := []struct {
+		name    string
+		diff    string
+		wantErr error
+	}{
+		{
+			name:    "bare added secret no headers",
+			diff:    "+provider_token=" + key + "\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name:    "bogus empty new-file header",
+			diff:    "+++ \n+provider_token=" + key + "\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name:    "dev null new-file header",
+			diff:    "+++ /dev/null\n+provider_token=" + key + "\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name: "partial parse secret before valid section",
+			diff: "+provider_token=" + key + "\n" +
+				"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+safe=true\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name: "bare secret before valid section",
+			diff: "provider_token=" + key + "\n" +
+				"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+safe=true\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name: "core orphan secret retained despite inline marker",
+			diff: "+provider_token=" + key + " // pipelock:ignore\n" +
+				"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+safe=true\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name:    "core bare secret retained despite inline marker",
+			diff:    "+provider_token=" + key + " // pipelock:ignore\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name: "clean orphan line before valid section",
+			diff: "+not_a_secret=true\n" +
+				"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+safe=true\n",
+			wantErr: gitprotect.ErrUnattributedAddedLines,
+		},
+		{
+			name: "clean garbage before valid section",
+			diff: "not a diff\n" +
+				"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+safe=true\n",
+			wantErr: gitprotect.ErrUnattributedAddedLines,
+		},
+		{
+			name:    "whitespace",
+			diff:    " \n\t\n",
+			wantErr: gitprotect.ErrNoDiffHeaders,
+		},
+		{
+			name: "secret in later malformed section",
+			diff: "diff --git a/safe b/safe\n--- a/safe\n+++ b/safe\n@@ -0,0 +1 @@\n+safe=true\n" +
+				"diff --git a/bad b/bad\n--- a/bad\n+++ \n@@ -0,0 +1 @@\n+provider_token=" + key + "\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name: "multi-file some headers missing",
+			diff: "diff --git a/safe b/safe\n--- a/safe\n+++ b/safe\n@@ -0,0 +1 @@\n+safe=true\n" +
+				"diff --git a/noheader b/noheader\n@@ -0,0 +1 @@\n+provider_token=" + key + "\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name:    "crlf line endings",
+			diff:    "diff --git a/x b/x\r\n--- a/x\r\n+++ b/x\r\n@@ -0,0 +1 @@\r\n+provider_token=" + key + "\r\n",
+			wantErr: ErrSecretsFound,
+		},
+		{
+			name:    "clean non-diff garbage",
+			diff:    "not a diff\nstill not a diff\n",
+			wantErr: gitprotect.ErrNoDiffHeaders,
+		},
+		{
+			name:    "binary patch",
+			diff:    "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\nA\n",
+			wantErr: gitprotect.ErrUnsupportedBinaryPatch,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := runScanDiffCmd(t, tc.diff)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("expected %v, got %v\noutput:\n%s", tc.wantErr, err, output)
+			}
+		})
+	}
+}
+
+func TestScanDiffCmd_FailClosedOversizedInput(t *testing.T) {
+	diff := strings.Repeat("A", gitprotect.MaxDiffBytes+1)
+
+	output, err := runScanDiffCmd(t, diff)
+	if !errors.Is(err, gitprotect.ErrDiffTooLarge) {
+		t.Fatalf("expected %v, got %v\noutput:\n%s", gitprotect.ErrDiffTooLarge, err, output)
+	}
+}
+
+func TestScanDiffCmd_CleanMetadataOnlyDiffs(t *testing.T) {
+	tests := []struct {
+		name string
+		diff string
+	}{
+		{
+			name: "mode only",
+			diff: "diff --git a/tool.sh b/tool.sh\nold mode 100644\nnew mode 100755\n",
+		},
+		{
+			name: "rename only",
+			diff: "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n",
+		},
+		{
+			name: "no prefix",
+			diff: "diff --git main.go main.go\n--- main.go\n+++ main.go\n@@ -1,2 +1,3 @@\n package main\n+import \"fmt\"\n",
+		},
+		{
+			name: "clean text with binary summary",
+			diff: "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+const ok = true\n" +
+				"diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n",
+		},
+		{
+			name: "long clean line",
+			diff: "diff --git a/min.js b/min.js\n--- a/min.js\n+++ b/min.js\n@@ -0,0 +1 @@\n+" + strings.Repeat("A", 1100*1024) + "\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := runScanDiffCmd(t, tc.diff)
+			if err != nil {
+				t.Fatalf("expected clean diff to exit 0, got %v\noutput:\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestScanDiffCmd_LongAndBinarySummarySecretsStillBlock(t *testing.T) {
+	key := fakeKey()
+	tests := []struct {
+		name string
+		diff string
+	}{
+		{
+			name: "secret in long line",
+			diff: "diff --git a/min.js b/min.js\n--- a/min.js\n+++ b/min.js\n@@ -0,0 +1 @@\n+" +
+				strings.Repeat("A", 1100*1024) + "provider_token=" + key + "\n",
+		},
+		{
+			name: "secret with binary summary",
+			diff: "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -0,0 +1 @@\n+provider_token=" + key + "\n" +
+				"diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			output, err := runScanDiffCmd(t, tc.diff)
+			if !errors.Is(err, ErrSecretsFound) {
+				t.Fatalf("expected %v, got %v\noutput:\n%s", ErrSecretsFound, err, output)
+			}
+		})
+	}
+}
+
+func TestScanDiffCmd_EmptyStdin(t *testing.T) {
+	r, w, _ := os.Pipe()
+	_ = w.Close() // empty stdin
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("empty stdin should be a no-op, got: %v", err)
+	}
+	if !strings.Contains(buf.String(), "No diff content on stdin.") {
+		t.Fatalf("expected empty-stdin notice, got: %q", buf.String())
+	}
+}
+
+func TestInstallHooksCmd_CreatesHook(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	// Create a fake git repo
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Change to the fake repo dir
+	oldDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(oldDir); err != nil {
+			t.Errorf("restore cwd: %v", err)
+		}
+	})
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	hookPath := filepath.Join(gitDir, "hooks", "pre-push")
+	data, err := os.ReadFile(filepath.Clean(hookPath))
+	if err != nil {
+		t.Fatalf("hook file not created: %v", err)
+	}
+
+	content := string(data)
+	if !strings.HasPrefix(content, "#!/bin/sh") {
+		t.Error("hook should start with shebang")
+	}
+	if !strings.Contains(content, "scan-diff") {
+		t.Error("hook should contain scan-diff command")
+	}
+
+	// Verify file is executable
+	info, _ := os.Stat(hookPath)
+	if info.Mode()&0o111 == 0 {
+		t.Error("hook file should be executable")
+	}
+}
+
+func TestInstallHooksCmd_ExistingHookBlocked(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git", "hooks")
+	if err := os.MkdirAll(gitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Create existing hook
+	hookPath := filepath.Join(gitDir, "pre-push")
+	if err := os.WriteFile(filepath.Clean(hookPath), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil { //nolint:gosec // G302: hooks must be executable
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when hook already exists")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("expected 'already exists' error, got: %v", err)
+	}
+}
+
+func TestInstallHooksCmd_ForceOverwrite(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git", "hooks")
+	if err := os.MkdirAll(gitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	hookPath := filepath.Join(gitDir, "pre-push")
+	if err := os.WriteFile(filepath.Clean(hookPath), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil { //nolint:gosec // G302: hooks must be executable
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks", "--force"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("expected --force to succeed, got: %v", err)
+	}
+
+	data, _ := os.ReadFile(filepath.Clean(hookPath))
+	if !strings.Contains(string(data), "scan-diff") {
+		t.Error("hook should have been overwritten with pipelock content")
+	}
+}
+
+func TestInstallHooksCmd_NoGitDir(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	// A temporary directory can have a real repository in its ancestry. At
+	// the volume root the search has no parent and cannot install a hook in
+	// an unrelated repository above the test fixture.
+	root := filepath.VolumeName(t.TempDir()) + string(filepath.Separator)
+	if _, err := os.Lstat(filepath.Join(root, ".git")); !os.IsNotExist(err) {
+		t.Skipf("volume root cannot provide a no-repository fixture: %v", err)
+	}
+	t.Chdir(root)
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "not a git repository") {
+		t.Fatalf("expected no-repository error, got %v", err)
+	}
+}
+
+func TestInstallHooksCmd_GitFile_Worktree(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	// Simulate a git worktree where .git is a file pointing to the real gitdir
+	dir := t.TempDir()
+	realGitDir := filepath.Join(dir, "real-gitdir")
+	if err := os.MkdirAll(realGitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	worktreeDir := filepath.Join(dir, "worktree")
+	if err := os.MkdirAll(worktreeDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Write .git file that points to the real gitdir
+	gitFile := filepath.Join(worktreeDir, ".git")
+	if err := os.WriteFile(gitFile, []byte("gitdir: "+realGitDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(worktreeDir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error for worktree .git file: %v", err)
+	}
+
+	hookPath := filepath.Join(realGitDir, "hooks", "pre-push")
+	data, err := os.ReadFile(filepath.Clean(hookPath))
+	if err != nil {
+		t.Fatalf("hook file not created in worktree gitdir: %v", err)
+	}
+	if !strings.Contains(string(data), "scan-diff") {
+		t.Error("hook should contain scan-diff command")
+	}
+}
+
+func TestInstallHooksCmd_WithBinary(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks", "--binary", "/usr/local/bin/pipelock"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	hookPath := filepath.Join(gitDir, "hooks", "pre-push")
+	data, _ := os.ReadFile(filepath.Clean(hookPath))
+	if !strings.Contains(string(data), "/usr/local/bin/pipelock") {
+		t.Error("hook should contain the custom binary path")
+	}
+}
+
+func TestResolveGitFile_InvalidContent(t *testing.T) {
+	dir := t.TempDir()
+	gitFilePath := filepath.Join(dir, ".git")
+
+	// Write a .git file without the "gitdir: " prefix.
+	if err := os.WriteFile(gitFilePath, []byte("not a valid git pointer\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := resolveGitFile(gitFilePath, dir)
+	if err == nil {
+		t.Fatal("expected error for invalid .git file content")
+	}
+	if !strings.Contains(err.Error(), "invalid .git file") {
+		t.Errorf("expected 'invalid .git file' error, got: %v", err)
+	}
+}
+
+func TestResolveGitFile_NonexistentGitdir(t *testing.T) {
+	dir := t.TempDir()
+	gitFilePath := filepath.Join(dir, ".git")
+
+	// Write a .git file pointing to a nonexistent directory.
+	if err := os.WriteFile(gitFilePath, []byte("gitdir: /nonexistent/gitdir/path\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := resolveGitFile(gitFilePath, dir)
+	if err == nil {
+		t.Fatal("expected error for nonexistent gitdir path")
+	}
+	if !strings.Contains(err.Error(), "does not exist") {
+		t.Errorf("expected 'does not exist' error, got: %v", err)
+	}
+}
+
+func TestResolveGitFile_RelativePath(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a real gitdir directory at a relative path.
+	realGitDir := filepath.Join(dir, "sub", "real-gitdir")
+	if err := os.MkdirAll(realGitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	gitFilePath := filepath.Join(dir, ".git")
+	// Write a .git file with a relative path.
+	if err := os.WriteFile(gitFilePath, []byte("gitdir: sub/real-gitdir\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := resolveGitFile(gitFilePath, dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != realGitDir {
+		t.Errorf("expected %q, got %q", realGitDir, result)
+	}
+}
+
+func TestResolveGitFile_AbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a real gitdir directory at an absolute path.
+	realGitDir := filepath.Join(dir, "absolute-gitdir")
+	if err := os.MkdirAll(realGitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	gitFilePath := filepath.Join(dir, ".git")
+	// Write a .git file with an absolute path.
+	if err := os.WriteFile(gitFilePath, []byte("gitdir: "+realGitDir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := resolveGitFile(gitFilePath, dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != realGitDir {
+		t.Errorf("expected %q, got %q", realGitDir, result)
+	}
+}
+
+func TestResolveGitFile_PointsToFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a regular file (not a directory) where the gitdir should be.
+	notADir := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("just a file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	gitFilePath := filepath.Join(dir, ".git-pointer")
+	if err := os.WriteFile(gitFilePath, []byte("gitdir: "+notADir+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := resolveGitFile(gitFilePath, dir)
+	if err == nil {
+		t.Fatal("expected error when gitdir points to a file, not a directory")
+	}
+	if !strings.Contains(err.Error(), "not a directory") {
+		t.Errorf("expected 'not a directory' error, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_WithConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+
+	yaml := `
+version: 1
+mode: balanced
+api_allowlist:
+  - "*.anthropic.com"
+fetch_proxy:
+  listen: "127.0.0.1:9999"
+  timeout_seconds: 15
+`
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	diff := cleanDiff
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--config", cfgPath})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("expected no error for clean diff with config, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_InvalidConfig(t *testing.T) {
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString("some diff\n")
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--config", "/nonexistent/config.yaml"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for nonexistent config")
+	}
+}
+
+func TestInstallHooksCmd_WithConfig(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeInstallTestConfig(t)
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks", "--config", cfgPath})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	hookPath := filepath.Join(gitDir, "hooks", "pre-push")
+	data, _ := os.ReadFile(filepath.Clean(hookPath))
+	if !strings.Contains(string(data), cfgPath) {
+		t.Error("hook should contain the config path")
+	}
+}
+
+func TestScanDiffCmd_JSON_CleanDiff(t *testing.T) {
+	diff := cleanDiff
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--json"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	output := strings.TrimSpace(buf.String())
+	if output != "[]" {
+		t.Errorf("expected [], got %q", output)
+	}
+}
+
+func TestScanDiffCmd_JSON_FindsSecret(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/config.go b/config.go
+--- a/config.go
++++ b/config.go
+@@ -1,2 +1,3 @@
+ package config
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--json"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if !errors.Is(err, ErrSecretsFound) {
+		t.Fatalf("expected ErrSecretsFound, got: %v", err)
+	}
+
+	var findings []gitprotect.Finding
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &findings); err != nil {
+		t.Fatalf("invalid JSON output: %v\nraw: %q", err, buf.String())
+	}
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(findings))
+	}
+	if findings[0].File != "config.go" {
+		t.Errorf("expected file config.go, got %q", findings[0].File)
+	}
+	if findings[0].Pattern == "" {
+		t.Error("expected non-empty pattern")
+	}
+}
+
+func TestScanDiffCmd_JSON_EmptyStdin(t *testing.T) {
+	r, w, _ := os.Pipe()
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--json"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("empty JSON stdin should be a no-op, got: %v", err)
+	}
+	if strings.TrimSpace(buf.String()) != "[]" {
+		t.Fatalf("expected empty JSON array, got: %q", buf.String())
+	}
+}
+
+func TestInstallHooksCmd_ReadOnlyGitDir(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	// MkdirAll for hooks dir fails when .git is read-only.
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	if err := os.MkdirAll(gitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	// Make .git dir read-only so MkdirAll("hooks") fails.
+	if err := os.Chmod(gitDir, 0o500); err != nil { //nolint:gosec // intentionally restrictive for test
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitDir, 0o700) }) //nolint:gosec // restore
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for read-only .git dir")
+	}
+	if !strings.Contains(err.Error(), "creating hooks directory") {
+		t.Errorf("expected 'creating hooks directory' error, got: %v", err)
+	}
+}
+
+func TestInstallHooksCmd_ReadOnlyHooksDir(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	// WriteFile fails when hooks dir exists but is read-only.
+	dir := t.TempDir()
+	gitDir := filepath.Join(dir, ".git")
+	hooksDir := filepath.Join(gitDir, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	// Make hooks dir read-only so WriteFile fails.
+	if err := os.Chmod(hooksDir, 0o500); err != nil { //nolint:gosec // intentionally restrictive for test
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hooksDir, 0o700) }) //nolint:gosec // restore
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for read-only hooks dir")
+	}
+	if !strings.Contains(err.Error(), "writing hook") {
+		t.Errorf("expected 'writing hook' error, got: %v", err)
+	}
+}
+
+func TestResolveGitFile_Unreadable(t *testing.T) {
+	dir := t.TempDir()
+	gitFile := filepath.Join(dir, ".git")
+	if err := os.WriteFile(gitFile, []byte("gitdir: ../somewhere"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make .git file unreadable.
+	if err := os.Chmod(gitFile, 0o000); err != nil { //nolint:gosec // intentionally restrictive for test
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitFile, 0o600) }) //nolint:gosec // restore
+
+	_, err := resolveGitFile(gitFile, dir)
+	if err == nil {
+		t.Fatal("expected error for unreadable .git file")
+	}
+	if !strings.Contains(err.Error(), "reading .git file") {
+		t.Errorf("expected 'reading .git file' error, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_ExcludePaths(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/vendor/lib.go b/vendor/lib.go
+--- a/vendor/lib.go
++++ b/vendor/lib.go
+@@ -1,2 +1,3 @@
+ package lib
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--exclude", "vendor/"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	// Should succeed because the finding in vendor/ is excluded
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("expected no error with excluded path, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_ExcludeGlob(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/pkg/gen.pb.go b/pkg/gen.pb.go
+--- a/pkg/gen.pb.go
++++ b/pkg/gen.pb.go
+@@ -1,2 +1,3 @@
+ package pkg
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--json", "--exclude", "*.pb.go"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err != nil {
+		t.Fatalf("expected no error with excluded glob, got: %v", err)
+	}
+
+	output := strings.TrimSpace(buf.String())
+	if output != "[]" {
+		t.Errorf("expected empty findings [], got %q", output)
+	}
+}
+
+func TestScanDiffCmd_ExcludeDoesNotAffectOtherFiles(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/config.go b/config.go
+--- a/config.go
++++ b/config.go
+@@ -1,2 +1,3 @@
+ package config
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--exclude", "vendor/"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	// config.go is NOT excluded, so the secret should still be found
+	err := cmd.Execute()
+	if !errors.Is(err, ErrSecretsFound) {
+		t.Fatalf("expected ErrSecretsFound for non-excluded file, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_SARIF_CleanDiff(t *testing.T) {
+	diff := cleanDiff
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--format", "sarif"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(buf.String()), &parsed); err != nil {
+		t.Fatalf("SARIF output is not valid JSON: %v", err)
+	}
+	if parsed["version"] != "2.1.0" {
+		t.Errorf("version = %v, want 2.1.0", parsed["version"])
+	}
+}
+
+func TestScanDiffCmd_SARIF_FindsSecret(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/config.go b/config.go
+--- a/config.go
++++ b/config.go
+@@ -1,2 +1,3 @@
+ package config
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--format", "sarif"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if !errors.Is(err, ErrSecretsFound) {
+		t.Fatalf("expected ErrSecretsFound, got: %v", err)
+	}
+
+	var parsed struct {
+		Runs []struct {
+			Results []struct {
+				RuleID  string `json:"ruleId"`
+				Level   string `json:"level"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(buf.String()), &parsed); err != nil {
+		t.Fatalf("invalid SARIF JSON: %v\nraw: %q", err, buf.String())
+	}
+	if len(parsed.Runs) != 1 {
+		t.Fatalf("runs = %d, want 1", len(parsed.Runs))
+	}
+	if len(parsed.Runs[0].Results) == 0 {
+		t.Fatal("expected at least 1 SARIF result")
+	}
+	r0 := parsed.Runs[0].Results[0]
+	if r0.Level != sarif.LevelError {
+		t.Errorf("level = %q, want %q", r0.Level, sarif.LevelError)
+	}
+	if !strings.Contains(r0.RuleID, "DLP-") {
+		t.Errorf("ruleId = %q, expected DLP- prefix", r0.RuleID)
+	}
+	// Verify the raw SARIF output does not contain the actual secret value.
+	if strings.Contains(buf.String(), key) {
+		t.Error("SARIF output must not contain the actual secret value")
+	}
+}
+
+func TestScanDiffCmd_SARIF_EmptyStdin(t *testing.T) {
+	r, w, _ := os.Pipe()
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--format", "sarif"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("empty SARIF stdin should be a no-op, got: %v", err)
+	}
+	if !strings.Contains(buf.String(), `"version"`) {
+		t.Fatalf("expected SARIF output for empty stdin, got: %q", buf.String())
+	}
+}
+
+func TestScanDiffCmd_SARIF_ToFile(t *testing.T) {
+	key := fakeKey()
+	diff := fmt.Sprintf(`diff --git a/config.go b/config.go
+--- a/config.go
++++ b/config.go
+@@ -1,2 +1,3 @@
+ package config
++var key = "%s"
+
+`, key)
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	outFile := filepath.Join(t.TempDir(), "results.sarif")
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--format", "sarif", "-o", outFile})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if !errors.Is(err, ErrSecretsFound) {
+		t.Fatalf("expected ErrSecretsFound, got: %v", err)
+	}
+
+	data, readErr := os.ReadFile(filepath.Clean(outFile))
+	if readErr != nil {
+		t.Fatalf("failed to read SARIF file: %v", readErr)
+	}
+	if !strings.Contains(string(data), `"version": "2.1.0"`) {
+		t.Error("expected SARIF version in output file")
+	}
+	if !strings.Contains(buf.String(), "SARIF written to:") {
+		t.Error("expected confirmation message on stderr")
+	}
+}
+
+func TestScanDiffCmd_InvalidFormat(t *testing.T) {
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(cleanDiff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--format", "xml"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for invalid format")
+	}
+	if !strings.Contains(err.Error(), "unsupported format") {
+		t.Errorf("expected 'unsupported format' error, got: %v", err)
+	}
+}
+
+func TestScanDiffCmd_SARIF_HighSeverity(t *testing.T) {
+	// Google API Key has severity "high" - should map to SARIF "error", not "note".
+	diff := "diff --git a/config.go b/config.go\n--- a/config.go\n+++ b/config.go\n@@ -1,2 +1,3 @@\n package config\n+var key = \"" + "AIza" + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" + "A\"\n\n"
+
+	r, w, _ := os.Pipe()
+	_, _ = w.WriteString(diff)
+	_ = w.Close()
+
+	oldStdin := os.Stdin
+	os.Stdin = r
+	defer func() { os.Stdin = oldStdin }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "scan-diff", "--format", "sarif"})
+
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if !errors.Is(err, ErrSecretsFound) {
+		t.Fatalf("expected ErrSecretsFound, got: %v", err)
+	}
+
+	var parsed struct {
+		Runs []struct {
+			Results []struct {
+				RuleID  string `json:"ruleId"`
+				Level   string `json:"level"`
+				Message struct {
+					Text string `json:"text"`
+				} `json:"message"`
+				Locations []struct {
+					PhysicalLocation struct {
+						Region *struct {
+							Snippet *struct {
+								Text string `json:"text"`
+							} `json:"snippet"`
+						} `json:"region"`
+					} `json:"physicalLocation"`
+				} `json:"locations"`
+			} `json:"results"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal([]byte(buf.String()), &parsed); err != nil {
+		t.Fatalf("invalid SARIF JSON: %v\nraw: %q", err, buf.String())
+	}
+	if len(parsed.Runs[0].Results) == 0 {
+		t.Fatal("expected at least 1 SARIF result")
+	}
+	r0 := parsed.Runs[0].Results[0]
+	// High severity should map to "error", not "note".
+	if r0.Level != sarif.LevelError {
+		t.Errorf("level = %q, want %q (high -> error)", r0.Level, sarif.LevelError)
+	}
+	// Verify no snippet (secrets must not leak into SARIF).
+	for _, loc := range r0.Locations {
+		if loc.PhysicalLocation.Region != nil && loc.PhysicalLocation.Region.Snippet != nil {
+			t.Error("snippet should be nil: SARIF must not contain secret content")
+		}
+	}
+}
+
+func TestInstallHooksCmd_BadGitFile(t *testing.T) {
+	isolateInstallHooksConfig(t)
+
+	// .git is a file with invalid content (no "gitdir: " prefix).
+	// This exercises the findGitDir → resolveGitFile error path.
+	dir := t.TempDir()
+	gitFile := filepath.Join(dir, ".git")
+	if err := os.WriteFile(gitFile, []byte("garbage content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oldDir, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer func() { _ = os.Chdir(oldDir) }()
+
+	cmd := testRootCmd()
+	cmd.SetArgs([]string{"git", "install-hooks"})
+	buf := &bytes.Buffer{}
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "invalid .git file") {
+		t.Fatalf("expected invalid .git file error, got %v", err)
+	}
+}

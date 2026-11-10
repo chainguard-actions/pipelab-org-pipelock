@@ -1,0 +1,1296 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+	"gopkg.in/yaml.v3"
+)
+
+const containMetricsListen = "127.0.0.1:9091"
+
+// agentListenerFromConfigBytes reads the managed listener without resolving
+// unrelated runtime files. An invalid declaration must not remove its guard.
+func agentListenerFromConfigBytes(data []byte) (string, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if errors.Is(err, io.EOF) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("parse managed config: %w", err)
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return "", errors.New("managed config must be a YAML mapping")
+	}
+	var fields struct {
+		Containment struct {
+			AgentListener string `yaml:"agent_listener"`
+		} `yaml:"containment"`
+	}
+	if err := mapping.Decode(&fields); err != nil {
+		return "", fmt.Errorf("decode containment.agent_listener: %w", err)
+	}
+	listener := fields.Containment.AgentListener
+	if listener == "" {
+		return "", nil
+	}
+	host, portText, err := net.SplitHostPort(listener)
+	if err != nil {
+		return "", fmt.Errorf("containment.agent_listener: %w", err)
+	}
+	ip := net.ParseIP(host)
+	port, err := strconv.Atoi(portText)
+	if ip == nil || !ip.IsLoopback() || err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("containment.agent_listener %q must be a numeric loopback address with a valid port", listener)
+	}
+	if ip.To4() != nil && strings.Contains(host, ":") {
+		return "", fmt.Errorf("containment.agent_listener %q uses an IPv4-mapped IPv6 address; write it as 127.0.0.1", listener)
+	}
+	return listener, nil
+}
+
+type migratedConfigArtifact struct {
+	path string
+	dir  bool
+}
+
+type configMigrationContext struct {
+	env          *installEnv
+	configDir    string
+	operatorHome string
+	artifacts    []migratedConfigArtifact
+	preview      bool // rewrite writable paths without creating migration artifacts
+}
+
+func migratePipelockConfigForContain(env *installEnv, configSource string, data []byte) ([]byte, []migratedConfigArtifact, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		return nil, nil, err
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, nil, errors.New("pipelock config must be a YAML mapping")
+	}
+
+	ctx := &configMigrationContext{
+		env:       env,
+		configDir: filepath.Dir(configSource),
+	}
+	home, err := operatorHomeDir(env)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve operator home for config migration: %w", err)
+	}
+	ctx.operatorHome = home
+	if err := migrateFileSentryWatchPaths(ctx, mapping); err != nil {
+		return nil, nil, err
+	}
+
+	if err := migrateScalarFile(ctx, mapping, []string{"license_file"}, filepath.Join(env.configDir, "license.token"), modeConfigSecret); err != nil {
+		return nil, nil, err
+	}
+	if err := migrateFlightRecorderSigningKey(ctx, mapping); err != nil {
+		return nil, nil, err
+	}
+	if err := migrateScalarFile(ctx, mapping, []string{"mediation_envelope", "signing_key_path"}, filepath.Join(env.configDir, "keys", "mediation-envelope-signing.key"), modePinSecret); err != nil {
+		return nil, nil, err
+	}
+	if err := migrateScalarFile(ctx, mapping, []string{"mcp_binary_integrity", "manifest_path"}, filepath.Join(env.configDir, "integrity", "manifest.json"), modeConfigSecret); err != nil {
+		return nil, nil, err
+	}
+	if err := migrateScalarFile(ctx, mapping, []string{"learn_lock", "roster_path"}, filepath.Join(env.configDir, "roster.json"), modeConfigSecret); err != nil {
+		return nil, nil, err
+	}
+	if err := migrateSaltSource(ctx, mapping); err != nil {
+		return nil, nil, err
+	}
+	if err := migrateTLSCA(ctx, mapping); err != nil {
+		return nil, nil, err
+	}
+	// The agent can reach the main proxy listener by design. Keeping /metrics
+	// and /stats there gives a contained process an oracle for scanner hits,
+	// blocked destinations, and anomaly categories. Put observability on a
+	// distinct loopback listener; the containment rules allow only the proxy
+	// port and drop agent-owned traffic to other loopback ports.
+	metricsListen := strings.TrimSpace(scalarValue(mappingValue(mapping, "metrics_listen")))
+	proxyPort := effectiveProxyPort(mapping, env.proxyPort)
+	metricsExposure, err := containmentMetricsExposureFromMapping(mapping)
+	if err != nil {
+		return nil, nil, err
+	}
+	if metricsListen == "" {
+		if metricsExposure != nil {
+			return nil, nil, fmt.Errorf("containment.metrics_exposure requires an explicit non-loopback metrics_listen; set metrics_listen or remove the exposure policy")
+		}
+		// The value we are about to write gets the same check as one the
+		// operator wrote. It is a fixed port, so on a host whose proxy already
+		// runs there the default collides, and inserting it unchecked would
+		// have the installer produce a config its own runtime refuses: metrics
+		// come up disabled and the reason points at a line the operator never
+		// typed.
+		if err := config.ValidateContainmentMetricsExposure(containMetricsListen, proxyPort, metricsExposure, time.Now()); err != nil {
+			return nil, nil, fmt.Errorf("cannot migrate %s: the default containment metrics listener %s collides with this host's proxy port %d; "+
+				"set metrics_listen to another loopback port, or move fetch_proxy.listen: %w",
+				"metrics_listen", containMetricsListen, proxyPort, err)
+		}
+		setMappingScalar(mapping, "metrics_listen", containMetricsListen)
+	} else if err := config.ValidateContainmentMetricsExposure(metricsListen, proxyPort, metricsExposure, time.Now()); err != nil {
+		return nil, nil, err
+	}
+	loopbackServices, err := containmentLoopbackServicesFromMapping(mapping)
+	if err != nil {
+		return nil, nil, err
+	}
+	// An expired declaration is a lapsed grant: staging the config must not
+	// refuse because of it, or an operator cannot re-run install to retire it.
+	// Malformed, duplicate, and proxy-port entries still refuse.
+	if _, _, err := config.ResolveContainmentLoopbackServices(loopbackServices, proxyPort, time.Now()); err != nil {
+		return nil, nil, err
+	}
+
+	if err := migrateContainWritablePaths(ctx, mapping); err != nil {
+		return nil, nil, err
+	}
+	migrateRedirectProfiles(ctx, mapping)
+
+	out, err := encodeYAML(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, ctx.artifacts, nil
+}
+
+// previewContainWritablePaths applies the same path rewrites as migration before
+// install can create users, directories, keys, or staging files.
+func previewContainWritablePaths(env *installEnv, source string, data []byte) ([]byte, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		return nil, err
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, errors.New("pipelock config must be a YAML mapping")
+	}
+	home, err := operatorHomeDir(env)
+	if err != nil {
+		return nil, err
+	}
+	ctx := &configMigrationContext{env: env, configDir: filepath.Dir(source), operatorHome: home, preview: true}
+	if err := migrateContainWritablePaths(ctx, mapping); err != nil {
+		return nil, err
+	}
+	return encodeYAML(root)
+}
+
+func migrateContainWritablePaths(ctx *configMigrationContext, mapping *yaml.Node) error {
+	env := ctx.env
+	if err := migrateScalarDir(ctx, mapping, []string{"rules", "rules_dir"}, filepath.Join(env.dataDir, "rules")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"flight_recorder", "dir"}, filepath.Join(env.dataDir, "recorder")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"learn", "capture_dir"}, filepath.Join(env.dataDir, "captures", "local")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"behavioral_baseline", "profile_dir"}, filepath.Join(env.dataDir, "baselines")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"learn_lock", "store_dir"}, filepath.Join(env.dataDir, "contracts", "active")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"mcp_tool_policy", "quarantine_dir"}, filepath.Join(env.dataDir, "quarantine")); err != nil {
+		return err
+	}
+	if err := migrateLoggingFile(ctx, mapping); err != nil {
+		return err
+	}
+	return nil
+}
+
+func migrateFileSentryWatchPaths(ctx *configMigrationContext, root *yaml.Node) error {
+	paths := getMappingPath(root, []string{"file_sentry", "watch_paths"})
+	if paths == nil {
+		return nil
+	}
+	if paths.Kind != yaml.SequenceNode {
+		return nil // the selected binary's config preflight reports the schema error
+	}
+	for i, item := range paths.Content {
+		pathNode := item
+		if item.Kind == yaml.MappingNode {
+			pathNode = mappingValue(item, "path")
+		}
+		if pathNode == nil || pathNode.Kind != yaml.ScalarNode || strings.TrimSpace(pathNode.Value) == "" {
+			continue
+		}
+		path := strings.TrimSpace(pathNode.Value)
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(ctx.configDir, path)
+		}
+		cleaned, err := sanitizeSystemdBindPath(path)
+		if err != nil {
+			return fmt.Errorf("file_sentry.watch_paths[%d] %q: %w", i, path, err)
+		}
+		pathNode.Value = cleaned
+	}
+	return nil
+}
+
+func containServiceReadOnlyPaths(data []byte, proxyPort int) ([]string, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		return nil, err
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, errors.New("pipelock config must be a YAML mapping")
+	}
+	metricsListen := strings.TrimSpace(scalarValue(mappingValue(mapping, "metrics_listen")))
+	if metricsListen == "" {
+		return nil, errors.New("metrics_listen must use a dedicated loopback port; rerun contain install with --config to migrate the managed config safely")
+	}
+	metricsExposure, err := containmentMetricsExposureFromMapping(mapping)
+	if err != nil {
+		return nil, err
+	}
+	if err := config.ValidateContainmentMetricsExposure(metricsListen, effectiveProxyPort(mapping, proxyPort), metricsExposure, time.Now()); err != nil {
+		return nil, err
+	}
+	return containServiceReadOnlyPathsFromMapping(mapping)
+}
+
+// absentContainmentValue recognizes omitted values and parsed YAML nulls,
+// including aliases to null. Other alias targets retain strict type checks.
+func absentContainmentValue(node *yaml.Node) bool {
+	if node == nil {
+		return true
+	}
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!null"
+}
+
+func containmentMetricsExposureFromMapping(root *yaml.Node) (*config.ContainmentMetricsExposure, error) {
+	containment := mappingValue(root, "containment")
+	if absentContainmentValue(containment) {
+		return nil, nil
+	}
+	if containment.Kind != yaml.MappingNode {
+		return nil, errors.New("containment must be a mapping")
+	}
+	exposure := mappingValue(containment, "metrics_exposure")
+	// Match config.Load: a null optional policy grants no metrics exposure.
+	if absentContainmentValue(exposure) {
+		return nil, nil
+	}
+	if exposure.Kind != yaml.MappingNode {
+		return nil, errors.New("containment.metrics_exposure must be a mapping")
+	}
+	data, err := yaml.Marshal(exposure)
+	if err != nil {
+		return nil, fmt.Errorf("encode containment.metrics_exposure: %w", err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	var policy config.ContainmentMetricsExposure
+	if err := decoder.Decode(&policy); err != nil {
+		return nil, fmt.Errorf("parse containment.metrics_exposure: %w", err)
+	}
+	return &policy, nil
+}
+
+// parseContainmentLoopbackServicesFromConfigBytes parses and validates
+// containment.loopback_services out of raw managed-config YAML bytes and
+// returns the EFFECTIVE set: expired entries are dropped, never returned. It
+// is the single source both contain install (declaredContainmentLoopbackServicesWithLapsed,
+// which fails install closed on any error) and the boot/operator nft
+// reconciler (which instead falls back to zero declared services on any
+// error, logging why) call, so both consumers agree on exactly what counts
+// as a usable declared exception. An expired entry is a lapsed grant, not an
+// error; callers that must name it use the WithLapsed form.
+func parseContainmentLoopbackServicesFromConfigBytes(data []byte, proxyPort int, now time.Time) ([]config.ContainmentLoopbackService, error) {
+	active, _, err := parseContainmentLoopbackServicesWithLapsed(data, proxyPort, now)
+	return active, err
+}
+
+// parseContainmentLoopbackServicesWithLapsed is the partitioning form of
+// parseContainmentLoopbackServicesFromConfigBytes: the usable entries, plus
+// the well-formed entries whose expires_at has passed. A malformed,
+// duplicate, or proxy-port entry is still an error, expired or not.
+func parseContainmentLoopbackServicesWithLapsed(data []byte, proxyPort int, now time.Time) ([]config.ContainmentLoopbackService, []config.LapsedContainmentGrant, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		// A document with no YAML content at all -- empty, or only
+		// comments -- declares nothing, exactly like a document carrying no
+		// containment key. Reporting that as an unhonorable declaration is a
+		// much louder claim than the file supports.
+		if errors.Is(err, io.EOF) {
+			return nil, nil, nil
+		}
+		return nil, nil, fmt.Errorf("parse managed config: %w", err)
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, nil, errors.New("managed config must be a YAML mapping")
+	}
+	declared, err := containmentLoopbackServicesFromMapping(mapping)
+	if err != nil {
+		return nil, nil, err
+	}
+	return config.ResolveContainmentLoopbackServices(declared, proxyPort, now)
+}
+
+// containmentLoopbackServicesFromMapping is the outbound-exception sibling of
+// containmentMetricsExposureFromMapping: it decodes containment.loopback_services
+// from the same raw YAML mapping, using the same strict-decode-then-validate
+// shape, so a malformed or unreviewable declared exception is rejected at
+// config load / contain install time rather than silently ignored.
+func containmentLoopbackServicesFromMapping(root *yaml.Node) ([]config.ContainmentLoopbackService, error) {
+	containment := mappingValue(root, "containment")
+	if absentContainmentValue(containment) {
+		return nil, nil
+	}
+	if containment.Kind != yaml.MappingNode {
+		return nil, errors.New("containment must be a mapping")
+	}
+	services := mappingValue(containment, "loopback_services")
+	// An explicit YAML null means the same thing as an absent key: no
+	// declared services. config.Load already decodes it that way into a nil
+	// slice, and refusing it here made the two disagree about one file --
+	// `pipelock check` accepted it while `contain install --config` failed
+	// before staging anything, leaving the operator to discover that only
+	// omitting the key or writing [] would work.
+	if absentContainmentValue(services) {
+		return nil, nil
+	}
+	if services.Kind != yaml.SequenceNode {
+		return nil, errors.New("containment.loopback_services must be a list")
+	}
+	data, err := yaml.Marshal(services)
+	if err != nil {
+		return nil, fmt.Errorf("encode containment.loopback_services: %w", err)
+	}
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	var declared []config.ContainmentLoopbackService
+	if err := decoder.Decode(&declared); err != nil {
+		return nil, fmt.Errorf("parse containment.loopback_services: %w", err)
+	}
+	return declared, nil
+}
+
+// effectiveProxyPort returns the port the contained agent can actually reach.
+//
+// The caller passes the installer's port, which is the default on almost every
+// host and therefore right almost every time. On a host that configures its own
+// fetch_proxy.listen it is wrong, and wrong in the permissive direction: the
+// check would compare the metrics listener against 8888 while the agent reaches
+// the proxy somewhere else, so a metrics_listen equal to the real proxy port
+// passes here and is refused by the runtime. Reading the port out of the same
+// config being validated keeps every caller agreeing with the runtime.
+//
+// The passed port remains the fallback, because a config that omits
+// fetch_proxy.listen genuinely runs on the installer's port.
+func effectiveProxyPort(mapping *yaml.Node, fallback int) int {
+	fetchProxy := getMappingPath(mapping, []string{"fetch_proxy"})
+	if fetchProxy == nil {
+		return fallback
+	}
+	listen := strings.TrimSpace(scalarValue(mappingValue(fetchProxy, "listen")))
+	if listen == "" {
+		return fallback
+	}
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(port)
+	if err != nil || parsed < 1 || parsed > 65535 {
+		return fallback
+	}
+	return parsed
+}
+
+func containServiceReadOnlyPathsFromMapping(root *yaml.Node) ([]string, error) {
+	fileSentry := getMappingPath(root, []string{"file_sentry"})
+	if fileSentry == nil || !yamlBool(mappingValue(fileSentry, "enabled")) {
+		return nil, nil
+	}
+	watchPaths := mappingValue(fileSentry, "watch_paths")
+	if watchPaths == nil || watchPaths.Kind != yaml.SequenceNode {
+		return nil, nil
+	}
+	seen := make(map[string]struct{})
+	for i, item := range watchPaths.Content {
+		pathNode := item
+		if item.Kind == yaml.MappingNode {
+			pathNode = mappingValue(item, "path")
+		}
+		path := scalarValue(pathNode)
+		if path == "" {
+			continue
+		}
+		if !filepath.IsAbs(path) {
+			return nil, fmt.Errorf("file_sentry.watch_paths[%d] %q must be absolute in the managed config", i, path)
+		}
+		cleaned, err := sanitizeSystemdBindPath(path)
+		if err != nil {
+			return nil, fmt.Errorf("file_sentry.watch_paths[%d] %q: %w", i, path, err)
+		}
+		if isServiceSandboxHiddenPath(cleaned) {
+			seen[cleaned] = struct{}{}
+		}
+	}
+	paths := make([]string, 0, len(seen))
+	for path := range seen {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func sanitizeSystemdBindPath(path string) (string, error) {
+	cleaned := filepath.Clean(path)
+	if strings.ContainsAny(cleaned, "\x00\r\n:") {
+		return "", errors.New("cannot be represented safely in a systemd bind path")
+	}
+	return cleaned, nil
+}
+
+func isServiceSandboxHiddenPath(path string) bool {
+	return isProtectedHomePath(path) || path == "/tmp" || strings.HasPrefix(path, "/tmp/") ||
+		path == "/var/tmp" || strings.HasPrefix(path, "/var/tmp/")
+}
+
+func isProtectedHomePath(path string) bool {
+	for _, root := range []string{"/home", "/root", "/run/user"} {
+		if path == root || strings.HasPrefix(path, root+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseSingleYAMLDocument(data []byte) (*yaml.Node, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var root yaml.Node
+	if err := dec.Decode(&root); err != nil {
+		return nil, fmt.Errorf("parse pipelock config: %w", err)
+	}
+	var extra yaml.Node
+	if err := dec.Decode(&extra); err == nil {
+		return nil, errors.New("pipelock config must be a single YAML document")
+	} else if !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("parse pipelock config: %w", err)
+	}
+	return &root, nil
+}
+
+func encodeYAML(root *yaml.Node) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(root); err != nil {
+		_ = enc.Close()
+		return nil, fmt.Errorf("encode migrated pipelock config: %w", err)
+	}
+	if err := enc.Close(); err != nil {
+		return nil, fmt.Errorf("close migrated pipelock config encoder: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+func documentMapping(root *yaml.Node) *yaml.Node {
+	if root.Kind == yaml.DocumentNode && len(root.Content) == 1 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	return root
+}
+
+// applyFreshFilesystemDefault writes containment.filesystem.mode enforce only
+// when the managed config does not exist yet and the candidate never set the
+// key. An explicit off, enforce, null, or blank value is left as written.
+// A stat error other than absence fails closed instead of guessing fresh.
+func applyFreshFilesystemDefault(env *installEnv, data []byte) ([]byte, error) {
+	if env == nil || env.stat == nil {
+		return nil, errors.New("stat managed config: filesystem default requires a stat function")
+	}
+	dst := managedPipelockConfigPath(env)
+	_, err := env.stat(dst)
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat managed config %s: %w", dst, err)
+	}
+	return injectFreshFilesystemMode(data)
+}
+
+func injectFreshFilesystemMode(data []byte) ([]byte, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		return nil, err
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, errors.New("pipelock config must be a YAML mapping")
+	}
+	if getMappingPath(mapping, []string{"containment", "filesystem", "mode"}) != nil {
+		return data, nil
+	}
+	containment, err := ensureYAMLMapping(mapping, "containment")
+	if err != nil {
+		return nil, err
+	}
+	filesystem, err := ensureYAMLMapping(containment, "filesystem")
+	if err != nil {
+		return nil, err
+	}
+	setMappingScalar(filesystem, "mode", config.ContainmentFilesystemModeEnforce)
+	return encodeYAML(root)
+}
+
+func ensureYAMLMapping(parent *yaml.Node, key string) (*yaml.Node, error) {
+	if parent == nil || parent.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("containment config %q must be a mapping to set filesystem.mode", key)
+	}
+	if n := mappingValue(parent, key); n != nil {
+		if n.Kind == yaml.ScalarNode && (n.Tag == "!!null" || strings.TrimSpace(n.Value) == "" || n.Value == "~" || n.Value == "null") {
+			n.Kind = yaml.MappingNode
+			n.Tag = "!!map"
+			n.Value = ""
+			n.Content = nil
+			return n, nil
+		}
+		if n.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("containment config %q must be a mapping to set filesystem.mode", key)
+		}
+		return n, nil
+	}
+	n := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	parent.Content = append(parent.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, n)
+	return n, nil
+}
+
+func operatorHomeDir(env *installEnv) (string, error) {
+	if env.operatorUser == "" {
+		return "", errors.New("operator user not set")
+	}
+	u, err := env.lookupUser(env.operatorUser)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(u.HomeDir), nil
+}
+
+func migrateScalarFile(ctx *configMigrationContext, root *yaml.Node, path []string, dest string, mode os.FileMode) error {
+	n := getMappingPath(root, path)
+	if n == nil || n.Kind != yaml.ScalarNode || strings.TrimSpace(n.Value) == "" {
+		return nil
+	}
+	src, ok := ctx.resolveMigratablePath(n.Value)
+	if !ok {
+		return nil
+	}
+	if err := copyConfigFile(ctx, src, dest, mode); err != nil {
+		return fmt.Errorf("migrate %s: %w", strings.Join(path, "."), err)
+	}
+	n.Value = dest
+	return nil
+}
+
+func migrateFlightRecorderSigningKey(ctx *configMigrationContext, root *yaml.Node) error {
+	const field = "flight_recorder.signing_key_path"
+
+	n := getMappingPath(root, []string{"flight_recorder", "signing_key_path"})
+	if n == nil || n.Kind != yaml.ScalarNode || strings.TrimSpace(n.Value) == "" {
+		return nil
+	}
+	src, ok := ctx.resolveMigratablePath(n.Value)
+	if !ok {
+		return nil
+	}
+	dest := filepath.Join(ctx.env.configDir, "keys", "flight-recorder-signing.key")
+	if err := copyConfigFile(ctx, src, dest, modePinSecret); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("migrate %s: %w", field, err)
+		}
+		// The configured source key was not found at the resolved migratable
+		// path. Do NOT immediately generate a fresh key: regenerating churns
+		// the flight-recorder signing key, which orphans any existing receipt
+		// chain (the prior chain stays sealed under the old key and live
+		// emission opens a new segment). Prefer preserving the operator's
+		// existing key. ensureFlightRecorderSigningKeyWithRecovery reuses a
+		// valid key already at dest (e.g. from a prior install), else recovers
+		// the configured key resolved directly (recoverSrc) when it exists and
+		// is a valid key, and only generates fresh when there is genuinely no
+		// pre-existing key anywhere. recoverSrc is the original configured path
+		// resolved without the migratable-root restriction, so an operator key
+		// that lives outside the migratable root is still recovered rather than
+		// replaced.
+		recoverSrc := ctx.resolveExistingKeyPath(n.Value)
+		if err := ensureFlightRecorderSigningKeyWithRecovery(ctx, dest, recoverSrc); err != nil {
+			return fmt.Errorf("migrate %s: %w", field, err)
+		}
+	} else if _, err := signing.LoadPrivateKeyFile(dest); err != nil {
+		return fmt.Errorf("migrate %s: validate migrated signing key %s: %w", field, dest, err)
+	} else if err := writeFlightRecorderPublicKeyForContain(ctx, dest); err != nil {
+		return fmt.Errorf("migrate %s: %w", field, err)
+	}
+	n.Value = dest
+	return nil
+}
+
+// ensureFlightRecorderSigningKey makes dest hold a usable flight-recorder
+// signing key without needlessly rotating it. Preference order, to preserve any
+// existing receipt chain:
+//
+//  1. A valid key already at dest is reused as-is (re-permed only).
+//  2. recoverSrc, when non-empty and pointing at a valid existing key, is
+//     copied to dest. This recovers the operator's prior key when the migration
+//     source resolved to a different path than where the key actually lives.
+//  3. Only when neither exists is a fresh key generated.
+//
+// Generating a fresh key changes signer_key, which orphans the existing
+// chain; the live v1 emitter then opens a new chain segment rather than
+// resuming. So a fresh key is the last resort, not the default.
+func ensureFlightRecorderSigningKey(ctx *configMigrationContext, dest string) error {
+	return ensureFlightRecorderSigningKeyWithRecovery(ctx, dest, "")
+}
+
+func ensureFlightRecorderSigningKeyWithRecovery(ctx *configMigrationContext, dest, recoverSrc string) error {
+	if info, err := ctx.env.lstat(dest); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("existing target %s is a symlink; refusing to use as signing key", dest)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("existing target %s is not a regular file", dest)
+		}
+		if err := ctx.env.chmod(dest, modePinSecret); err != nil {
+			return fmt.Errorf("chmod %s: %w", dest, err)
+		}
+		if _, err := signing.LoadPrivateKeyFile(dest); err != nil {
+			return fmt.Errorf("validate existing signing key %s: %w", dest, err)
+		}
+		return writeFlightRecorderPublicKeyForContain(ctx, dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat existing target %s: %w", dest, err)
+	}
+
+	// No key at dest. Try to recover the operator's existing key before
+	// generating a new one, so re-running install does not churn the signing
+	// key and orphan the chain.
+	if recoverSrc != "" && recoverSrc != dest {
+		if recovered, err := recoverExistingSigningKey(ctx, recoverSrc, dest); err != nil {
+			return err
+		} else if recovered {
+			return writeFlightRecorderPublicKeyForContain(ctx, dest)
+		}
+	}
+
+	if err := ensureMigratedDir(ctx, filepath.Dir(dest), migrationDirMode(ctx.env, filepath.Dir(dest))); err != nil {
+		return err
+	}
+	_, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		return fmt.Errorf("generate signing key: %w", err)
+	}
+	if wrote, err := backupAndWriteIfChanged(ctx.env, dest, []byte(signing.EncodePrivateKey(priv)), modePinSecret); err != nil {
+		return err
+	} else if wrote {
+		ctx.artifacts = append(ctx.artifacts, migratedConfigArtifact{path: dest})
+	}
+	return writeFlightRecorderPublicKeyForContain(ctx, dest)
+}
+
+func writeFlightRecorderPublicKeyForContain(ctx *configMigrationContext, keyPath string) error {
+	priv, err := signing.LoadPrivateKeyFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("load signing key %s for public export: %w", keyPath, err)
+	}
+	pubHex, err := signing.PublicKeyHexFromPrivateKey(priv)
+	if err != nil {
+		return fmt.Errorf("derive public key for %s: %w", keyPath, err)
+	}
+	pubPath := keyPath + ".pub"
+	if wrote, err := backupAndWriteIfChanged(ctx.env, pubPath, []byte(pubHex+"\n"), modeConfigSecret); err != nil {
+		return fmt.Errorf("write public signing key %s: %w", pubPath, err)
+	} else if wrote {
+		ctx.artifacts = append(ctx.artifacts, migratedConfigArtifact{path: pubPath})
+	}
+	return nil
+}
+
+// recoverExistingSigningKey copies a pre-existing valid signing key from src to
+// dest when src is a regular, non-symlink file holding a parseable key. It
+// reports (true, nil) on a successful recovery, (false, nil) when src is absent
+// or not a usable key (caller falls back to fresh generation), and a non-nil
+// error only for hard failures (bad symlink, write error). Recovering rather
+// than regenerating keeps the receipt chain's signer_key stable.
+func recoverExistingSigningKey(ctx *configMigrationContext, src, dest string) (bool, error) {
+	info, err := ctx.env.lstat(src)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat recovery source %s: %w", src, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("recovery source %s is a symlink; refusing to copy as root", src)
+	}
+	if !info.Mode().IsRegular() {
+		// Not a regular file (directory, device, ...). Not recoverable; let
+		// the caller generate a fresh key.
+		return false, nil
+	}
+	// Validate it is a real signing key before adopting it. A non-key file at
+	// the old path must not be copied in and then fail to load at runtime.
+	if _, err := signing.LoadPrivateKeyFile(src); err != nil {
+		return false, nil
+	}
+	if err := copyConfigFile(ctx, src, dest, modePinSecret); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("recover signing key from %s: %w", src, err)
+	}
+	return true, nil
+}
+
+func migrateScalarDir(ctx *configMigrationContext, root *yaml.Node, path []string, dest string) error {
+	n := getMappingPath(root, path)
+	if n == nil || n.Kind != yaml.ScalarNode || strings.TrimSpace(n.Value) == "" {
+		return nil
+	}
+	src, ok := ctx.resolveMigratablePath(n.Value)
+	if !ok {
+		return nil
+	}
+	if !ctx.preview {
+		if err := copyConfigDir(ctx, src, dest); err != nil {
+			return fmt.Errorf("migrate %s: %w", strings.Join(path, "."), err)
+		}
+	}
+	n.Value = dest
+	return nil
+}
+
+func migrateSaltSource(ctx *configMigrationContext, root *yaml.Node) error {
+	n := getMappingPath(root, []string{"learn", "privacy", "salt_source"})
+	if n == nil || n.Kind != yaml.ScalarNode {
+		return nil
+	}
+	value := strings.TrimSpace(n.Value)
+	if !strings.HasPrefix(value, "file:") {
+		return nil
+	}
+	src, ok := ctx.resolveMigratablePath(strings.TrimPrefix(value, "file:"))
+	if !ok {
+		return nil
+	}
+	dest := filepath.Join(ctx.env.configDir, "learn-privacy-salt")
+	if err := copyConfigFile(ctx, src, dest, modePinSecret); err != nil {
+		return fmt.Errorf("migrate learn.privacy.salt_source: %w", err)
+	}
+	n.Value = "file:" + dest
+	return nil
+}
+
+func migrateTLSCA(ctx *configMigrationContext, root *yaml.Node) error {
+	tlsNode := getMappingPath(root, []string{"tls_interception"})
+	if tlsNode == nil || tlsNode.Kind != yaml.MappingNode {
+		return nil
+	}
+	certNode := getMappingPath(tlsNode, []string{"ca_cert"})
+	keyNode := getMappingPath(tlsNode, []string{"ca_key"})
+
+	certValue := scalarValue(certNode)
+	keyValue := scalarValue(keyNode)
+	if certValue == "" && keyValue == "" && !yamlBool(getMappingPath(tlsNode, []string{"enabled"})) {
+		return nil
+	}
+	// Empty CA fields resolve the way the proxy resolves them: --home or
+	// PIPELOCK_HOME when set, otherwise the operator's ~/.pipelock. Using a
+	// different default here would copy a different CA than the one the
+	// operator's proxy was running with. resolveMigratablePath still refuses
+	// to copy anything outside the operator's home.
+	caDir := filepath.Join(ctx.operatorHome, signing.DefaultPipelockDir)
+	if home := signing.ResolvedHome(); home != "" {
+		caDir = home
+		// Migration copies only from inside the operator home, so a default
+		// under an external pipelock home would be written into the contained
+		// config without its files. Refuse instead of installing a CA path the
+		// contained proxy may be unable to read.
+		if (certValue == "" || keyValue == "") && !pathWithin(ctx.operatorHome, caDir) {
+			return fmt.Errorf("tls_interception: pipelock home %s is outside the operator home %s; set tls_interception.ca_cert and ca_key explicitly", caDir, ctx.operatorHome)
+		}
+	}
+	if certValue == "" {
+		certValue = filepath.Join(caDir, "ca.pem")
+		certNode = setMappingScalar(tlsNode, "ca_cert", certValue)
+	}
+	if keyValue == "" {
+		keyValue = filepath.Join(caDir, "ca-key.pem")
+		keyNode = setMappingScalar(tlsNode, "ca_key", keyValue)
+	}
+	if err := migrateScalarFileValue(ctx, certNode, certValue, filepath.Join(ctx.env.configDir, "tls", "ca.pem"), modeConfigSecret); err != nil {
+		return fmt.Errorf("migrate tls_interception.ca_cert: %w", err)
+	}
+	if err := migrateScalarFileValue(ctx, keyNode, keyValue, filepath.Join(ctx.env.configDir, "tls", "ca-key.pem"), modePinSecret); err != nil {
+		return fmt.Errorf("migrate tls_interception.ca_key: %w", err)
+	}
+	return nil
+}
+
+func migrateScalarFileValue(ctx *configMigrationContext, n *yaml.Node, value, dest string, mode os.FileMode) error {
+	src, ok := ctx.resolveMigratablePath(value)
+	if !ok {
+		return nil
+	}
+	if err := copyConfigFile(ctx, src, dest, mode); err != nil {
+		return err
+	}
+	n.Value = dest
+	return nil
+}
+
+func migrateLoggingFile(ctx *configMigrationContext, root *yaml.Node) error {
+	n := getMappingPath(root, []string{"logging", "file"})
+	if n == nil || n.Kind != yaml.ScalarNode || strings.TrimSpace(n.Value) == "" {
+		return nil
+	}
+	_, ok := ctx.resolveMigratablePath(n.Value)
+	if !ok {
+		return nil
+	}
+	dest := filepath.Join(ctx.env.dataDir, "logs", "audit.log")
+	if !ctx.preview {
+		if err := ensureMigratedDir(ctx, filepath.Dir(dest), migrationDirMode(ctx.env, filepath.Dir(dest))); err != nil {
+			return err
+		}
+	}
+	n.Value = dest
+	return nil
+}
+
+func migrateRedirectProfiles(ctx *configMigrationContext, root *yaml.Node) {
+	profiles := getMappingPath(root, []string{"mcp_tool_policy", "redirect_profiles"})
+	if profiles == nil || profiles.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(profiles.Content); i += 2 {
+		profile := profiles.Content[i+1]
+		execNode := getMappingPath(profile, []string{"exec"})
+		if execNode == nil || execNode.Kind != yaml.SequenceNode || len(execNode.Content) == 0 {
+			continue
+		}
+		first := execNode.Content[0]
+		if first.Kind != yaml.ScalarNode {
+			continue
+		}
+		src, ok := ctx.resolveMigratablePath(first.Value)
+		if !ok {
+			continue
+		}
+		if filepath.Base(src) == "pipelock" {
+			first.Value = ctx.env.pipelockTarget
+		}
+	}
+}
+
+// resolveExistingKeyPath resolves a configured path to a cleaned absolute path
+// for read-only recovery, WITHOUT the migratable-root containment check that
+// resolveMigratablePath enforces. It is used only to locate an operator's
+// pre-existing signing key so it can be copied (preserving signer_key) instead
+// of regenerated. Returns "" when the path cannot be resolved. The caller still
+// validates the file (regular, non-symlink, parseable key) before adopting it.
+func (ctx *configMigrationContext) resolveExistingKeyPath(raw string) string {
+	raw = strings.TrimSpace(strings.Trim(raw, `"`))
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "~") {
+		if ctx.operatorHome == "" {
+			return ""
+		}
+		switch {
+		case raw == "~":
+			raw = ctx.operatorHome
+		case strings.HasPrefix(raw, "~/"):
+			raw = filepath.Join(ctx.operatorHome, strings.TrimPrefix(raw, "~/"))
+		default:
+			return ""
+		}
+	}
+	if !filepath.IsAbs(raw) {
+		raw = filepath.Join(ctx.configDir, raw)
+	}
+	return filepath.Clean(raw)
+}
+
+func (ctx *configMigrationContext) resolveMigratablePath(raw string) (string, bool) {
+	raw = strings.TrimSpace(strings.Trim(raw, `"`))
+	if raw == "" {
+		return "", false
+	}
+	if strings.HasPrefix(raw, "~") {
+		if ctx.operatorHome == "" {
+			return "", false
+		}
+		switch {
+		case raw == "~":
+			raw = ctx.operatorHome
+		case strings.HasPrefix(raw, "~/"):
+			raw = filepath.Join(ctx.operatorHome, strings.TrimPrefix(raw, "~/"))
+		default:
+			return "", false
+		}
+	}
+	if !filepath.IsAbs(raw) {
+		raw = filepath.Join(ctx.configDir, raw)
+	}
+	clean := filepath.Clean(raw)
+	if ctx.operatorHome == "" {
+		return clean, false
+	}
+	rel, err := filepath.Rel(ctx.operatorHome, clean)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return clean, false
+	}
+	return clean, true
+}
+
+func copyConfigFile(ctx *configMigrationContext, src, dest string, mode os.FileMode) error {
+	if err := rejectSymlinkComponents(ctx, src); err != nil {
+		return err
+	}
+	info, err := ctx.env.lstat(src)
+	if err != nil {
+		return fmt.Errorf("stat source %s: %w", src, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("source %s is a symlink; refusing to copy as root", src)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("source %s is not a regular file", src)
+	}
+	data, err := readRegularFileNoFollow(src)
+	if err != nil {
+		return fmt.Errorf("read source %s: %w", src, err)
+	}
+	after, err := ctx.env.lstat(src)
+	if err != nil {
+		return fmt.Errorf("stat source %s after read: %w", src, err)
+	}
+	if !os.SameFile(info, after) || !after.Mode().IsRegular() {
+		return fmt.Errorf("source %s changed during migration; retry after quiescing config writes", src)
+	}
+	if err := ensureMigratedDir(ctx, filepath.Dir(dest), migrationDirMode(ctx.env, filepath.Dir(dest))); err != nil {
+		return err
+	}
+	if wrote, err := backupAndWriteIfChanged(ctx.env, dest, data, mode); err != nil {
+		return err
+	} else if wrote {
+		ctx.artifacts = append(ctx.artifacts, migratedConfigArtifact{path: dest})
+	}
+	return nil
+}
+
+func copyConfigDir(ctx *configMigrationContext, src, dest string) error {
+	info, err := ctx.env.lstat(src)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ensureMigratedDir(ctx, dest, migrationDirMode(ctx.env, dest))
+		}
+		return fmt.Errorf("stat source %s: %w", src, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("source %s is a symlink; refusing to copy as root", src)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("source %s is not a directory", src)
+	}
+	if err := rejectSymlinkComponents(ctx, src); err != nil {
+		return err
+	}
+	if err := ensureMigratedDir(ctx, dest, migrationDirMode(ctx.env, dest)); err != nil {
+		return err
+	}
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dest, rel)
+		if rel == "." {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("source %s is a symlink; refusing to copy as root", path)
+		}
+		if d.IsDir() {
+			return ensureMigratedDir(ctx, target, migrationDirMode(ctx.env, target))
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := readRegularFileNoFollow(path)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", path, err)
+		}
+		after, err := ctx.env.lstat(path)
+		if err != nil {
+			return fmt.Errorf("stat source %s after read: %w", path, err)
+		}
+		if !os.SameFile(info, after) || !after.Mode().IsRegular() {
+			return fmt.Errorf("source %s changed during migration; retry after quiescing config writes", path)
+		}
+		if wrote, err := backupAndWriteIfChanged(ctx.env, target, data, modeConfigSecret); err != nil {
+			return err
+		} else if wrote {
+			ctx.artifacts = append(ctx.artifacts, migratedConfigArtifact{path: target})
+		}
+		return nil
+	})
+}
+
+func cleanupMigratedConfigArtifacts(env *installEnv, artifacts []migratedConfigArtifact) error {
+	var errs []error
+	for i := len(artifacts) - 1; i >= 0; i-- {
+		artifact := artifacts[i]
+		var err error
+		if artifact.dir {
+			err = env.removeFile(artifact.path)
+			if errors.Is(err, os.ErrNotExist) || isDirectoryNotEmpty(err) {
+				err = nil
+			}
+		} else {
+			err = restoreBackup(env, artifact.path)
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func isDirectoryNotEmpty(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "directory not empty") || strings.Contains(msg, "not empty")
+}
+
+func backupAndWriteIfChanged(env *installEnv, path string, contents []byte, mode os.FileMode) (bool, error) {
+	clean := filepath.Clean(path)
+	if info, err := env.lstat(clean); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return false, fmt.Errorf("%s is a symlink; refusing privileged write", clean)
+		}
+		if info.IsDir() {
+			return false, fmt.Errorf("%s is a directory", clean)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat existing %s: %w", clean, err)
+	}
+	if existing, err := env.readFile(clean); err == nil {
+		if bytesEqual(existing, contents) {
+			if err := env.chmod(clean, mode); err != nil {
+				return false, fmt.Errorf("chmod %s: %w", clean, err)
+			}
+			return false, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("read existing %s: %w", clean, err)
+	}
+	if err := backupAndWrite(env, clean, contents, mode); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func ensureMigratedDir(ctx *configMigrationContext, path string, mode os.FileMode) error {
+	if info, err := ctx.env.lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink; refusing to create migrated directory", path)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("%s exists and is not a directory", path)
+		}
+		return ctx.env.chmod(path, mode)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if err := rejectSymlinkParents(ctx.env, path); err != nil {
+		return err
+	}
+	for _, dir := range missingDirs(ctx, path) {
+		ctx.artifacts = append(ctx.artifacts, migratedConfigArtifact{path: dir, dir: true})
+	}
+	if err := ctx.env.mkdirAll(path, mode); err != nil {
+		return fmt.Errorf("mkdir %s: %w", path, err)
+	}
+	if err := ctx.env.chmod(path, mode); err != nil {
+		return fmt.Errorf("chmod %s: %w", path, err)
+	}
+	return nil
+}
+
+func rejectSymlinkParents(env *installEnv, path string) error {
+	clean := filepath.Clean(path)
+	parent := filepath.Dir(clean)
+	for parent != "." && parent != string(os.PathSeparator) {
+		info, err := env.lstat(parent)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("path %s has symlink parent %s; refusing to create as root", clean, parent)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat parent %s: %w", parent, err)
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			break
+		}
+		parent = next
+	}
+	return nil
+}
+
+func migrationDirMode(env *installEnv, path string) os.FileMode {
+	clean := filepath.Clean(path)
+	switch clean {
+	case filepath.Clean(env.configDir), filepath.Join(filepath.Clean(env.configDir), "contain"):
+		return modeDirTraversable
+	default:
+		return modeDirPrivate
+	}
+}
+
+func missingDirs(ctx *configMigrationContext, path string) []string {
+	var base string
+	switch {
+	case pathWithin(ctx.env.configDir, path):
+		base = ctx.env.configDir
+	case pathWithin(ctx.env.dataDir, path):
+		base = ctx.env.dataDir
+	default:
+		return nil
+	}
+	rel, err := filepath.Rel(base, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || rel == ".." {
+		return nil
+	}
+	var out []string
+	cur := base
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		cur = filepath.Join(cur, part)
+		if _, err := ctx.env.stat(cur); errors.Is(err, os.ErrNotExist) {
+			out = append(out, cur)
+		}
+	}
+	return out
+}
+
+func pathWithin(base, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
+func rejectSymlinkComponents(ctx *configMigrationContext, path string) error {
+	if ctx.operatorHome == "" {
+		return nil
+	}
+	rel, err := filepath.Rel(ctx.operatorHome, path)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return nil
+	}
+	cur := ctx.operatorHome
+	if info, err := ctx.env.lstat(cur); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("source %s has symlink component %s; refusing to copy as root", path, cur)
+	}
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		cur = filepath.Join(cur, part)
+		info, err := ctx.env.lstat(cur)
+		if err != nil {
+			return fmt.Errorf("stat source %s: %w", cur, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("source %s has symlink component %s; refusing to copy as root", path, cur)
+		}
+	}
+	return nil
+}
+
+func getMappingPath(root *yaml.Node, path []string) *yaml.Node {
+	cur := root
+	for _, key := range path {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return nil
+		}
+		cur = mappingValue(cur, key)
+	}
+	return cur
+}
+
+func mappingValue(m *yaml.Node, key string) *yaml.Node {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func setMappingScalar(m *yaml.Node, key, value string) *yaml.Node {
+	if n := mappingValue(m, key); n != nil {
+		n.Kind = yaml.ScalarNode
+		n.Tag = "!!str"
+		n.Value = value
+		return n
+	}
+	n := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
+	m.Content = append(m.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, n)
+	return n
+}
+
+func scalarValue(n *yaml.Node) string {
+	if n == nil || n.Kind != yaml.ScalarNode {
+		return ""
+	}
+	return strings.TrimSpace(n.Value)
+}
+
+func yamlBool(n *yaml.Node) bool {
+	if n == nil || n.Kind != yaml.ScalarNode {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(n.Value), "true")
+}

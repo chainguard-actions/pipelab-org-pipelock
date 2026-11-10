@@ -1,0 +1,214 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package assess
+
+import (
+	"bytes"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/report/attestation"
+)
+
+// setupFinalizedRunWithAttestation creates a fully finalized, signed assessment
+// run with attestation and badge artifacts.
+func setupFinalizedRunWithAttestation(t *testing.T) (runDir, keystoreDir, agentName string) {
+	t.Helper()
+
+	runDir = setupCompletedRun(t)
+	keystoreDir, agentName = generateTestKeys(t)
+
+	opts := assessFinalizeOpts{
+		HasAssess:   true,
+		Agent:       agentName,
+		KeystoreDir: keystoreDir,
+		Attestation: true,
+		Badge:       true,
+	}
+	if err := runAssessFinalize(runDir, opts); err != nil {
+		t.Fatalf("runAssessFinalize (attestation): %v", err)
+	}
+
+	return runDir, keystoreDir, agentName
+}
+
+func TestAssessVerifyAttestation_SignedValid(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunWithAttestation(t)
+
+	exitCode, err := runAssessVerifyAttestation(runDir, agentName, keystoreDir)
+	if err != nil {
+		t.Fatalf("runAssessVerifyAttestation: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("exit code = %d, want 0", exitCode)
+	}
+}
+
+func TestAssessVerifyAttestation_MissingAttestation(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunSigned(t)
+
+	exitCode, err := runAssessVerifyAttestation(runDir, agentName, keystoreDir)
+	if err == nil {
+		t.Fatal("expected error for missing attestation, got nil")
+	}
+	if exitCode != verifyExitUnsigned {
+		t.Errorf("exit code = %d, want %d", exitCode, verifyExitUnsigned)
+	}
+	if !strings.Contains(err.Error(), "attestation not present") {
+		t.Errorf("error should mention missing attestation, got: %v", err)
+	}
+}
+
+func TestAssessVerifyAttestationCmd_OutputModes(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunWithAttestation(t)
+
+	t.Run("human verified", func(t *testing.T) {
+		cmd := assessVerifyAttestationCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs([]string{runDir, "--agent", agentName, "--keystore", keystoreDir})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute human verify-attestation: %v\nout:\n%s", err, out.String())
+		}
+		if !strings.Contains(out.String(), "Attestation: verified") {
+			t.Fatalf("human output = %q, want verified status", out.String())
+		}
+	})
+
+	t.Run("json verified", func(t *testing.T) {
+		cmd := assessVerifyAttestationCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs([]string{runDir, "--agent", agentName, "--keystore", keystoreDir, "--json"})
+
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("execute json verify-attestation: %v\nout:\n%s", err, out.String())
+		}
+		var result map[string]interface{}
+		if err := json.Unmarshal(out.Bytes(), &result); err != nil {
+			t.Fatalf("json output: %v\nout:\n%s", err, out.String())
+		}
+		if result["verified"] != true || result["exit_code"] != float64(0) {
+			t.Fatalf("json result = %#v, want verified true exit_code 0", result)
+		}
+	})
+}
+
+func TestAssessVerifyAttestationCmd_JSONMissingAttestationReturnsUnsigned(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunSigned(t)
+	cmd := assessVerifyAttestationCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{runDir, "--agent", agentName, "--keystore", keystoreDir, "--json"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatalf("execute missing attestation succeeded\nout:\n%s", out.String())
+	}
+	if code := cliutil.ExitCodeOf(err); code != verifyExitUnsigned {
+		t.Fatalf("exit code = %d, want %d; err=%v", code, verifyExitUnsigned, err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("json error output = %q, want no partial JSON when verifier fails before rendering", out.String())
+	}
+}
+
+func TestAssessVerifyAttestation_CmdRegistered(t *testing.T) {
+	cmd := Cmd()
+	subCmds := cmd.Commands()
+
+	found := false
+	for _, sub := range subCmds {
+		if sub.Use == "verify-attestation <run-dir>" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("assess verify-attestation command not registered")
+	}
+}
+
+func TestAssessFinalize_AttestationArtifacts(t *testing.T) {
+	runDir, _, _ := setupFinalizedRunWithAttestation(t)
+
+	for _, name := range []string{"attestation.json", "attestation.json.sig", "badge.svg"} {
+		if _, err := os.Stat(filepath.Join(runDir, name)); err != nil {
+			t.Fatalf("%s not found after attestation finalize: %v", name, err)
+		}
+	}
+
+	data, err := os.ReadFile(filepath.Clean(filepath.Join(runDir, "attestation.json")))
+	if err != nil {
+		t.Fatalf("reading attestation.json: %v", err)
+	}
+
+	var att attestation.Attestation
+	if err := json.Unmarshal(data, &att); err != nil {
+		t.Fatalf("parsing attestation.json: %v", err)
+	}
+	if att.PrimaryArtifact != "assessment.json" {
+		t.Errorf("PrimaryArtifact = %q, want assessment.json", att.PrimaryArtifact)
+	}
+	if att.BadgeText != "Pipelock Verified" {
+		t.Errorf("BadgeText = %q, want Pipelock Verified", att.BadgeText)
+	}
+
+	badge, err := os.ReadFile(filepath.Clean(filepath.Join(runDir, "badge.svg")))
+	if err != nil {
+		t.Fatalf("reading badge.svg: %v", err)
+	}
+	if !bytes.Contains(badge, []byte("PIPELOCK")) {
+		t.Error("badge.svg should contain badge text")
+	}
+}
+
+// TestAssessVerifyAttestation_ResolvesRecordedAgent covers the case where the
+// assessment was signed under a custom identity and the verifier names no agent.
+// Falling back to the built-in default here would look for a key that never
+// signed anything and fail on a bundle that is perfectly valid.
+func TestAssessVerifyAttestation_ResolvesRecordedAgent(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunWithAttestation(t)
+	// The empty value is what an operator who passes no --agent has. Pin it
+	// here rather than rely on TestMain, since this variable is the thing under test.
+	t.Setenv("PIPELOCK_AGENT", "")
+	if agentName == assessDefaultSigningAgent {
+		t.Fatalf("fixture agent %q must differ from the default for this test to mean anything", agentName)
+	}
+
+	exitCode, err := runAssessVerifyAttestation(runDir, "", keystoreDir)
+	if err != nil {
+		t.Fatalf("runAssessVerifyAttestation with no agent: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("exit code = %d, want 0", exitCode)
+	}
+}
+
+// The manifest signature path has the same requirement, and had the same bug.
+func TestAssessVerify_ResolvesRecordedAgent(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunWithAttestation(t)
+	// The empty value is what an operator who passes no --agent has. Pin it
+	// here rather than rely on TestMain, since this variable is the thing under test.
+	t.Setenv("PIPELOCK_AGENT", "")
+	if agentName == assessDefaultSigningAgent {
+		t.Fatalf("fixture agent %q must differ from the default", agentName)
+	}
+
+	exitCode, err := runAssessVerify(runDir, "", keystoreDir)
+	if err != nil {
+		t.Fatalf("runAssessVerify with no agent: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("exit code = %d, want 0", exitCode)
+	}
+}

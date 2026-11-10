@@ -1,0 +1,796 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package rules
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Bundle represents a parsed and validated rule bundle.
+type Bundle struct {
+	FormatVersion         int      `yaml:"format_version"`
+	Name                  string   `yaml:"name"`
+	Version               string   `yaml:"version"`
+	Author                string   `yaml:"author"`
+	Description           string   `yaml:"description"`
+	Homepage              string   `yaml:"homepage"`
+	MinPipelock           string   `yaml:"min_pipelock"`
+	TestedThroughPipelock string   `yaml:"tested_through_pipelock"`
+	License               string   `yaml:"license"`
+	Tier                  string   `yaml:"tier"`              // standard, community, pro (v2+)
+	MonotonicVersion      uint64   `yaml:"monotonic_version"` // rollback-prevention counter (v2+)
+	PublishedAt           string   `yaml:"published_at"`      // RFC 3339 timestamp (v2+)
+	ExpiresAt             string   `yaml:"expires_at"`        // RFC 3339 timestamp (v2+)
+	RequiredFeatures      []string `yaml:"required_features"` // engine features needed (v2+, enforced at load time)
+	KeyID                 string   `yaml:"key_id"`            // signing key fingerprint (v2+)
+	Rules                 []Rule   `yaml:"rules"`
+}
+
+// Rule represents a single detection rule within a bundle.
+type Rule struct {
+	ID          string      `yaml:"id"`
+	Type        string      `yaml:"type"`
+	Status      string      `yaml:"status"`
+	Name        string      `yaml:"name"`
+	Description string      `yaml:"description"`
+	Severity    string      `yaml:"severity"`
+	Confidence  string      `yaml:"confidence"`
+	References  []string    `yaml:"references"`
+	Tags        []string    `yaml:"tags"`
+	Pattern     RulePattern `yaml:"pattern"`
+}
+
+// RulePattern holds type-specific detection payload.
+type RulePattern struct {
+	Regex     string `yaml:"regex"`
+	ScanField string `yaml:"scan_field"`
+	Validator string `yaml:"validator,omitempty"`
+	// ExemptDomains is accepted for v1 parse compatibility. External bundle
+	// rules are deny-only, so bundle exemptions are ignored with a load warning
+	// and must be configured in the local pipelock config.
+	ExemptDomains []string `yaml:"exempt_domains"`
+}
+
+// Rule type constants.
+const (
+	RuleTypeDLP        = "dlp"
+	RuleTypeInjection  = "injection"
+	RuleTypeToolPoison = "tool-poison"
+)
+
+// Rule status constants.
+const (
+	StatusExperimental = "experimental"
+	StatusStable       = "stable"
+	StatusDeprecated   = "deprecated"
+)
+
+// Severity constants for rule validation. These are independent of the config
+// package severity constants because rule bundles use a different set (no
+// info/warn, but includes low).
+const (
+	severityCritical = "critical"
+	severityHigh     = "high"
+	severityMedium   = "medium"
+	severityLow      = "low"
+)
+
+// Confidence constants for rule validation.
+const (
+	confidenceHigh   = "high"
+	confidenceMedium = "medium"
+	confidenceLow    = "low"
+)
+
+// Bundle tier constants.
+const (
+	TierStandard  = "standard"
+	TierCommunity = "community"
+	TierPro       = "pro"
+)
+
+// validTiers is the set of allowed tier values for v2+ bundles.
+var validTiers = map[string]bool{
+	TierStandard:  true,
+	TierCommunity: true,
+	TierPro:       true,
+}
+
+// KnownFeatures is the set of engine features that bundles can require.
+// Bundles declaring a required_feature not in this set are rejected at
+// load time, forcing operators to upgrade pipelock before using the bundle.
+var KnownFeatures = map[string]bool{
+	"dlp":            true,
+	"injection":      true,
+	"tool_poison":    true,
+	"chain":          true,
+	"ssrf":           true,
+	"response":       true,
+	"encoding_aware": true, // recursive base64/hex/base32 detection
+	"checksum":       true, // Luhn, mod97, WIF, ABA, DEA, NPI validators
+}
+
+// featureNameRegex validates required_features entries: 1-64 chars,
+// lowercase alphanumeric + underscores.
+var featureNameRegex = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+
+var strictSemverRegex = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
+
+// CheckRequiredFeatures verifies that every feature in required is well-formed
+// and is a known engine feature. Returns an error naming the first invalid or
+// unknown feature.
+func CheckRequiredFeatures(required []string) error {
+	for _, f := range required {
+		if !featureNameRegex.MatchString(f) {
+			return fmt.Errorf("invalid feature name %q (must be 1-64 lowercase alphanumeric chars with underscores)", f)
+		}
+		if !KnownFeatures[f] {
+			return fmt.Errorf("bundle requires unknown feature %q (upgrade pipelock to use this bundle)", f)
+		}
+	}
+	return nil
+}
+
+// Bundle size and count limits.
+const (
+	MaxBundleFileSize = 1 << 20 // 1 MB
+	MaxRuleCount      = 1000
+	MaxRegexLength    = 4096
+	MaxBundleNameLen  = 64
+	MaxRuleIDLen      = 96
+	MinNameLen        = 3
+	MinRuleIDLen      = 3
+	MaxFormatVersion  = 2
+)
+
+// Scan field constants for tool-poison rules.
+const (
+	scanFieldDescription = "description"
+	scanFieldName        = "name"
+)
+
+// Compiled validation patterns for bundle names and rule IDs.
+// Bundle name: 3-64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen.
+var bundleNameRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
+
+// Rule ID: 3-96 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen.
+var ruleIDRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,94}[a-z0-9]$`)
+
+// Valid enum sets for quick membership checks.
+var validStatuses = map[string]bool{
+	StatusExperimental: true,
+	StatusStable:       true,
+	StatusDeprecated:   true,
+}
+
+var validSeverities = map[string]bool{
+	severityCritical: true,
+	severityHigh:     true,
+	severityMedium:   true,
+	severityLow:      true,
+}
+
+var validConfidences = map[string]bool{
+	confidenceHigh:   true,
+	confidenceMedium: true,
+	confidenceLow:    true,
+}
+
+// ParseBundle unmarshals YAML data into a Bundle and validates it.
+// Unknown fields at any nesting level are rejected.
+func ParseBundle(data []byte) (*Bundle, error) {
+	if len(data) > MaxBundleFileSize {
+		return nil, fmt.Errorf("parse bundle: size %d exceeds maximum of %d bytes", len(data), MaxBundleFileSize)
+	}
+
+	var b Bundle
+
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+
+	if err := decoder.Decode(&b); err != nil {
+		return nil, fmt.Errorf("parse bundle: %w", err)
+	}
+
+	if err := b.Validate(); err != nil {
+		return nil, err
+	}
+
+	return &b, nil
+}
+
+// Validate performs comprehensive validation of a Bundle.
+// Accepts format_version 1 (original) and 2 (with tier, freshness, key binding).
+func (b *Bundle) Validate() error {
+	if b.FormatVersion < 1 || b.FormatVersion > MaxFormatVersion {
+		return fmt.Errorf("validate bundle: format_version must be 1-%d, got %d", MaxFormatVersion, b.FormatVersion)
+	}
+
+	if err := ValidateBundleName(b.Name); err != nil {
+		return fmt.Errorf("validate bundle: name: %w", err)
+	}
+
+	if _, err := ParseCalVer(b.Version); err != nil {
+		return fmt.Errorf("validate bundle: version: %w", err)
+	}
+
+	if b.Author == "" {
+		return fmt.Errorf("validate bundle: author must not be empty")
+	}
+
+	if b.Description == "" {
+		return fmt.Errorf("validate bundle: description must not be empty")
+	}
+
+	if b.TestedThroughPipelock != "" {
+		if _, err := parseStrictSemverVersion(b.TestedThroughPipelock); err != nil {
+			return fmt.Errorf("validate bundle: invalid tested_through_pipelock %q: %w", b.TestedThroughPipelock, err)
+		}
+	}
+
+	// V2+ fields are required when format_version >= 2.
+	if b.FormatVersion >= 2 {
+		if err := b.validateV2Fields(); err != nil {
+			return err
+		}
+	}
+
+	if len(b.Rules) > MaxRuleCount {
+		return fmt.Errorf("validate bundle: %d rules exceeds maximum of %d", len(b.Rules), MaxRuleCount)
+	}
+
+	seen := make(map[string]bool, len(b.Rules))
+
+	for i := range b.Rules {
+		if err := validateRule(&b.Rules[i], seen); err != nil {
+			return fmt.Errorf("validate bundle: rule[%d]: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// validateV2Fields validates fields introduced in format_version 2.
+func (b *Bundle) validateV2Fields() error {
+	if !validTiers[b.Tier] {
+		return fmt.Errorf("validate bundle: invalid tier %q (must be standard, community, or pro)", b.Tier)
+	}
+
+	if b.MonotonicVersion == 0 {
+		return fmt.Errorf("validate bundle: monotonic_version must be > 0")
+	}
+
+	if b.PublishedAt == "" {
+		return fmt.Errorf("validate bundle: published_at must not be empty")
+	}
+	if _, err := parseRFC3339(b.PublishedAt); err != nil {
+		return fmt.Errorf("validate bundle: published_at: %w", err)
+	}
+
+	if b.ExpiresAt == "" {
+		return fmt.Errorf("validate bundle: expires_at must not be empty")
+	}
+	if _, err := parseRFC3339(b.ExpiresAt); err != nil {
+		return fmt.Errorf("validate bundle: expires_at: %w", err)
+	}
+
+	if b.KeyID == "" {
+		return fmt.Errorf("validate bundle: key_id must not be empty for v2+ bundles")
+	}
+
+	for _, f := range b.RequiredFeatures {
+		if !featureNameRegex.MatchString(f) {
+			return fmt.Errorf("validate bundle: required_features entry %q must be 1-64 lowercase alphanumeric chars with underscores", f)
+		}
+	}
+
+	return nil
+}
+
+// validateRule validates a single rule and checks for duplicate IDs.
+func validateRule(r *Rule, seen map[string]bool) error {
+	if err := ValidateRuleID(r.ID); err != nil {
+		return fmt.Errorf("id: %w", err)
+	}
+
+	if seen[r.ID] {
+		return fmt.Errorf("duplicate rule id %q", r.ID)
+	}
+	seen[r.ID] = true
+
+	definition, ok := ruleTypeDefinitionFor(r.Type)
+	if !ok {
+		return fmt.Errorf("invalid type %q for rule %q", r.Type, r.ID)
+	}
+
+	if !validStatuses[r.Status] {
+		return fmt.Errorf("invalid status %q for rule %q", r.Status, r.ID)
+	}
+
+	if r.Name == "" {
+		return fmt.Errorf("name must not be empty for rule %q", r.ID)
+	}
+
+	if r.Description == "" {
+		return fmt.Errorf("description must not be empty for rule %q", r.ID)
+	}
+
+	if !validSeverities[r.Severity] {
+		return fmt.Errorf("invalid severity %q for rule %q", r.Severity, r.ID)
+	}
+
+	if !validConfidences[r.Confidence] {
+		return fmt.Errorf("invalid confidence %q for rule %q", r.Confidence, r.ID)
+	}
+
+	if err := validatePattern(&r.Pattern, definition, r.ID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// validatePattern validates a rule's pattern fields based on rule type.
+func validatePattern(p *RulePattern, definition ruleTypeDefinition, ruleID string) error {
+	if p.Regex == "" {
+		return fmt.Errorf("regex must not be empty for rule %q", ruleID)
+	}
+
+	if len(p.Regex) > MaxRegexLength {
+		return fmt.Errorf("regex length %d exceeds maximum of %d for rule %q", len(p.Regex), MaxRegexLength, ruleID)
+	}
+
+	if _, err := regexp.Compile(p.Regex); err != nil {
+		return fmt.Errorf("invalid regex for rule %q: %w", ruleID, err)
+	}
+
+	if p.Validator != "" {
+		if len(definition.ValidatorValues) == 0 {
+			return fmt.Errorf("validator is only valid for %s rules (rule %q)", RuleTypeDLP, ruleID)
+		}
+		if !slices.Contains(definition.ValidatorValues, p.Validator) {
+			return fmt.Errorf("invalid validator %q for rule %q", p.Validator, ruleID)
+		}
+	}
+
+	// scan_field validation for tool-poison rules.
+	if len(definition.ScanFieldValues) > 0 {
+		if p.ScanField == "" {
+			p.ScanField = definition.DefaultScanField
+		} else if !slices.Contains(definition.ScanFieldValues, p.ScanField) {
+			return fmt.Errorf("invalid scan_field %q for rule %q (must be %q or %q)", p.ScanField, ruleID, scanFieldDescription, scanFieldName)
+		}
+	} else if p.ScanField != "" {
+		return fmt.Errorf("scan_field is only valid for %s rules (rule %q)", RuleTypeToolPoison, ruleID)
+	}
+
+	return nil
+}
+
+// ValidateBundleName validates a bundle name against the naming convention:
+// 3-64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen.
+func ValidateBundleName(name string) error {
+	if !bundleNameRegex.MatchString(name) {
+		return fmt.Errorf("bundle name %q must match %s (3-%d lowercase alphanumeric chars and hyphens, no leading/trailing hyphen)",
+			name, bundleNameRegex.String(), MaxBundleNameLen)
+	}
+	return nil
+}
+
+// ValidateRuleID validates a rule ID against the naming convention:
+// 3-96 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphen.
+func ValidateRuleID(id string) error {
+	if !ruleIDRegex.MatchString(id) {
+		return fmt.Errorf("rule id %q must match %s (3-%d lowercase alphanumeric chars and hyphens, no leading/trailing hyphen)",
+			id, ruleIDRegex.String(), MaxRuleIDLen)
+	}
+	return nil
+}
+
+// NamespacedID returns a namespaced rule identifier in "bundleName:ruleID" format.
+func NamespacedID(bundleName, ruleID string) string {
+	return bundleName + ":" + ruleID
+}
+
+// CheckMinPipelock verifies that currentVersion meets the minimum required
+// pipelock version. If minVersion is empty, the check always passes.
+// ErrUnverifiableVersion reports that the running build does not carry a
+// released version, so a bundle's min_pipelock requirement could not be checked
+// either way. It is deliberately distinct from a requirement that was checked
+// and genuinely not met: callers load and warn only for this availability case.
+// A requirement that IS met or genuinely unmet never produces this error.
+var ErrUnverifiableVersion = errors.New("check min pipelock")
+
+// CheckMinPipelock keeps the contract every caller outside the loader relied on before the
+// warn-and-load change: an unprovable running version is ACCEPTED when allowUnversioned is
+// true and REFUSED otherwise. A genuinely unmet or malformed requirement always refuses. The
+// parameter was briefly ignored, which made fleet policy delivery refuse a development
+// follower that used to be accepted; the wrapper restores that behavior exactly.
+func CheckMinPipelock(minVersion, currentVersion string, allowUnversioned bool) error {
+	err := CheckMinPipelockVerdict(minVersion, currentVersion)
+	if err != nil && allowUnversioned && errors.Is(err, ErrUnverifiableVersion) {
+		return nil
+	}
+	return err
+}
+
+// CheckMinPipelockVerdict reports the raw verdict. An unprovable running version returns an
+// error wrapping ErrUnverifiableVersion so the caller can choose between warn-and-load and
+// refusal; the rule-bundle loader is the caller that makes that choice from configuration.
+func CheckMinPipelockVerdict(minVersion, currentVersion string) error {
+	if minVersion == "" {
+		return nil
+	}
+
+	minSemver, err := parseSemverVersion(minVersion)
+	if err != nil {
+		return fmt.Errorf("check min pipelock: invalid min_pipelock %q: %w", minVersion, err)
+	}
+
+	// A git-describe --dirty build appends a dirty marker. Semver orders a
+	// prerelease BELOW its release, so an unstripped "2.3.0-dirty" compares
+	// below 2.3.0 and a build of the required release would refuse its own
+	// bundle. Stripping the marker first also restores git-describe
+	// recognition for "<tag>-<commits>-g<hash>-dirty", whose trailing marker
+	// otherwise hides the commits/hash pair the detector looks for.
+	effectiveVersion := stripDirtyMarker(currentVersion)
+
+	if isDevelopmentCurrentVersion(effectiveVersion) {
+		// A source build carries no release stamp, so the requirement cannot
+		// be verified. Keep the actionable refusal text that predated the
+		// warn-and-load loader path: non-loader callers expose this error to
+		// their operators, while the loader turns this sentinel into a warning
+		// when its setting allows the bundle.
+		return fmt.Errorf(
+			"%w: this build does not report a released version (%q), so the bundle requirement min_pipelock %q cannot be verified; install a released binary, or set rules.allow_unversioned_bundle_load: true to load it unverified",
+			ErrUnverifiableVersion, currentVersion, minVersion)
+	}
+	curSemver, err := parseSemverVersion(effectiveVersion)
+	if err != nil {
+		// Not orderable semver AND not a recognized development build
+		// (isDevelopmentCurrentVersion above already returned true for those:
+		// git-describe strings, `-dev`, `devel`, unset). A version that reaches
+		// here is genuinely malformed, so fail CLOSED (skip the bundle) rather
+		// than treating it as newest — a mis-stamped binary must not silently
+		// load bundles requiring a newer Pipelock. minVersion is parsed strictly
+		// above, so a malformed bundle min_pipelock still errors too.
+		return fmt.Errorf("check min pipelock: unrecognized current version %q (not a release or a known development build)", currentVersion)
+	}
+
+	if compareSemverVersion(curSemver, minSemver) < 0 {
+		return fmt.Errorf("check min pipelock: current version %q is below minimum %q", currentVersion, minVersion)
+	}
+
+	return nil
+}
+
+// TestedThroughPipelockWarning reports when a released Pipelock binary is
+// newer than the bundle's advisory tested ceiling. It never rejects a bundle:
+// min_pipelock remains the fail-closed compatibility requirement.
+func TestedThroughPipelockWarning(testedThrough, currentVersion string) (string, error) {
+	if testedThrough == "" {
+		return "", nil
+	}
+
+	ceiling, err := parseStrictSemverVersion(testedThrough)
+	if err != nil {
+		return "", fmt.Errorf("check tested through pipelock: invalid tested_through_pipelock %q: %w", testedThrough, err)
+	}
+
+	effectiveVersion := stripDirtyMarker(currentVersion)
+	if isDevelopmentCurrentVersion(effectiveVersion) {
+		return "", nil
+	}
+	current, err := parseTestedThroughCurrentVersion(effectiveVersion)
+	if err != nil {
+		return "", nil
+	}
+	if compareStrictSemverVersion(current, ceiling) <= 0 {
+		return "", nil
+	}
+
+	return fmt.Sprintf("bundle tested through Pipelock %q, but running %q; tested_through_pipelock is advisory", testedThrough, currentVersion), nil
+}
+
+type semverVersion struct {
+	major      int
+	minor      int
+	patch      int
+	prerelease string
+}
+
+// parseSemver parses a semver string into major, minor, patch integers.
+// Pre-release/build suffixes (anything after the first "-" or "+") are stripped.
+func parseSemver(s string) (major, minor, patch int, err error) {
+	v, err := parseSemverVersion(s)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return v.major, v.minor, v.patch, nil
+}
+
+func parseSemverVersion(s string) (semverVersion, error) {
+	// Strip "v" prefix (e.g. "v2.1.0" → "2.1.0").
+	s = strings.TrimPrefix(s, "v")
+	prerelease := ""
+	if idx := strings.Index(s, "+"); idx >= 0 {
+		s = s[:idx]
+	}
+	if idx := strings.Index(s, "-"); idx >= 0 {
+		prerelease = s[idx+1:]
+		s = s[:idx]
+	}
+
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return semverVersion{}, fmt.Errorf("expected 3 segments, got %d in %q", len(parts), s)
+	}
+
+	major, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return semverVersion{}, fmt.Errorf("invalid major %q: %w", parts[0], err)
+	}
+
+	minor, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return semverVersion{}, fmt.Errorf("invalid minor %q: %w", parts[1], err)
+	}
+
+	patch, err := strconv.Atoi(parts[2])
+	if err != nil {
+		return semverVersion{}, fmt.Errorf("invalid patch %q: %w", parts[2], err)
+	}
+
+	return semverVersion{major: major, minor: minor, patch: patch, prerelease: prerelease}, nil
+}
+
+func parseStrictSemverVersion(s string) (strictSemverVersion, error) {
+	return parseStrictSemverParts(s)
+}
+
+type strictSemverVersion struct {
+	major      string
+	minor      string
+	patch      string
+	prerelease string
+}
+
+func parseTestedThroughCurrentVersion(s string) (strictSemverVersion, error) {
+	return parseStrictSemverParts(strings.TrimPrefix(s, "v"))
+}
+
+func parseStrictSemverParts(s string) (strictSemverVersion, error) {
+	if !strictSemverRegex.MatchString(s) {
+		return strictSemverVersion{}, fmt.Errorf("must be SemVer 2.0.0")
+	}
+	releaseAndPrerelease := strings.SplitN(strings.SplitN(s, "+", 2)[0], "-", 2)
+	if len(releaseAndPrerelease) == 2 {
+		for _, identifier := range strings.Split(releaseAndPrerelease[1], ".") {
+			if len(identifier) > 1 && identifier[0] == '0' && isDigits(identifier) {
+				return strictSemverVersion{}, fmt.Errorf("numeric prerelease identifier %q must not contain leading zeroes", identifier)
+			}
+		}
+	}
+	release := strings.Split(releaseAndPrerelease[0], ".")
+	prerelease := ""
+	if len(releaseAndPrerelease) == 2 {
+		prerelease = releaseAndPrerelease[1]
+	}
+	return strictSemverVersion{major: release[0], minor: release[1], patch: release[2], prerelease: prerelease}, nil
+}
+
+// stripDirtyMarker removes a trailing git-describe dirty marker so the rest of
+// the version is classified and compared on its own terms.
+func stripDirtyMarker(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if strings.HasSuffix(trimmed, "-dirty") {
+		return strings.TrimSuffix(trimmed, "-dirty")
+	}
+	if strings.HasSuffix(trimmed, ".dirty") {
+		candidate := strings.TrimSuffix(trimmed, ".dirty")
+		if isDevelopmentCurrentVersion(candidate) {
+			return candidate
+		}
+		return trimmed
+	}
+	if strings.HasSuffix(trimmed, "+dirty") {
+		return strings.TrimSuffix(trimmed, "+dirty")
+	}
+	return trimmed
+}
+
+func isDevelopmentCurrentVersion(s string) bool {
+	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
+	if s == "" || s == "devel" || s == "(devel)" {
+		return true
+	}
+	v, err := parseSemverVersion(s)
+	if err == nil && prereleaseHasIdentifier(v.prerelease, "dev") {
+		return true
+	}
+	return isGitDescribeVersion(s) || isBareGitCommitVersion(s)
+}
+
+func prereleaseHasIdentifier(prerelease, ident string) bool {
+	for _, part := range strings.FieldsFunc(prerelease, func(r rune) bool { return r == '.' || r == '-' }) {
+		if strings.EqualFold(part, ident) {
+			return true
+		}
+	}
+	return false
+}
+
+// isGitDescribeVersion recognizes a `git describe --tags` string by its SHAPE:
+// "<tag>-<commits>-g<shorthash>" (e.g. "v3.1.0-146-gabc1234" or "2-147-gf1c242a0")
+// with a bare-number tag). It keys off the trailing "-<digits>-g<hex>" so a
+// source/CI build is recognized regardless of the tag's own format. It does NOT
+// match arbitrary malformed strings ("abc") or Go pseudo-versions (whose short
+// hash carries no "g" prefix); those fall through to strict parsing and fail
+// closed rather than being treated as a dev build.
+func isGitDescribeVersion(s string) bool {
+	parts := strings.Split(s, "-")
+	if len(parts) < 3 {
+		return false
+	}
+	commits := parts[len(parts)-2]
+	shorthash := parts[len(parts)-1]
+	if _, err := strconv.ParseUint(commits, 10, 64); err != nil {
+		return false
+	}
+	if !strings.HasPrefix(shorthash, "g") || len(shorthash) == 1 {
+		return false
+	}
+	return isHexString(shorthash[1:])
+}
+
+func isBareGitCommitVersion(s string) bool {
+	// `git describe --always` emits a bare abbreviated commit id when no matching
+	// tag is reachable, which is still a source build with no orderable release.
+	//
+	// Deliberately accepts an all-DIGIT string, which is why this looks looser
+	// than it needs to be. An abbreviated commit id is hexadecimal, so roughly
+	// one in twenty-seven real short hashes contains no a-f letter at all;
+	// requiring a letter would misclassify those legitimate source builds as
+	// malformed and refuse them outright. The accepted cost is that an all-digit
+	// version scheme this project does not use (a CalVer stamp such as 20260731)
+	// is read as a commit id, which downgrades it from a hard refusal to the
+	// unverifiable-source-build path. Do not "tighten" this to require a hex
+	// letter without first weighing that availability regression.
+	const minShortHashLen = 7
+	return len(s) >= minShortHashLen && isHexString(s)
+}
+
+func isHexString(s string) bool {
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func compareSemverVersion(a, b semverVersion) int {
+	if cmp := compareSemver(a.major, a.minor, a.patch, b.major, b.minor, b.patch); cmp != 0 {
+		return cmp
+	}
+	if a.prerelease == b.prerelease {
+		return 0
+	}
+	if a.prerelease == "" {
+		return 1
+	}
+	if b.prerelease == "" {
+		return -1
+	}
+	return comparePrerelease(a.prerelease, b.prerelease)
+}
+
+func comparePrerelease(a, b string) int {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	for i := 0; i < len(aParts) && i < len(bParts); i++ {
+		if aParts[i] == bParts[i] {
+			continue
+		}
+		aNum, aErr := strconv.ParseUint(aParts[i], 10, 64)
+		bNum, bErr := strconv.ParseUint(bParts[i], 10, 64)
+		switch {
+		case aErr == nil && bErr == nil:
+			if aNum < bNum {
+				return -1
+			}
+			if aNum == bNum {
+				continue
+			}
+			return 1
+		case aErr == nil:
+			return -1
+		case bErr == nil:
+			return 1
+		default:
+			return strings.Compare(aParts[i], bParts[i])
+		}
+	}
+	return cmpInt(len(aParts), len(bParts))
+}
+
+func compareStrictSemverVersion(a, b strictSemverVersion) int {
+	for _, versions := range [][2]string{{a.major, b.major}, {a.minor, b.minor}, {a.patch, b.patch}} {
+		if cmp := compareDecimalStrings(versions[0], versions[1]); cmp != 0 {
+			return cmp
+		}
+	}
+	if a.prerelease == b.prerelease {
+		return 0
+	}
+	if a.prerelease == "" {
+		return 1
+	}
+	if b.prerelease == "" {
+		return -1
+	}
+	return compareStrictPrerelease(a.prerelease, b.prerelease)
+}
+
+func compareStrictPrerelease(a, b string) int {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	for i := 0; i < len(aParts) && i < len(bParts); i++ {
+		if aParts[i] == bParts[i] {
+			continue
+		}
+		aNumeric := isDigits(aParts[i])
+		bNumeric := isDigits(bParts[i])
+		switch {
+		case aNumeric && bNumeric:
+			return compareDecimalStrings(aParts[i], bParts[i])
+		case aNumeric:
+			return -1
+		case bNumeric:
+			return 1
+		default:
+			return strings.Compare(aParts[i], bParts[i])
+		}
+	}
+	return cmpInt(len(aParts), len(bParts))
+}
+
+func compareDecimalStrings(a, b string) int {
+	if len(a) != len(b) {
+		return cmpInt(len(a), len(b))
+	}
+	return strings.Compare(a, b)
+}
+
+// compareSemver returns -1 if a < b, 0 if equal, 1 if a > b.
+func compareSemver(aMajor, aMinor, aPatch, bMajor, bMinor, bPatch int) int {
+	if aMajor != bMajor {
+		return cmpInt(aMajor, bMajor)
+	}
+
+	if aMinor != bMinor {
+		return cmpInt(aMinor, bMinor)
+	}
+
+	return cmpInt(aPatch, bPatch)
+}
+
+// parseRFC3339 parses an RFC 3339 timestamp string into a time.Time.
+func parseRFC3339(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid RFC 3339 timestamp %q: %w", s, err)
+	}
+	return t, nil
+}

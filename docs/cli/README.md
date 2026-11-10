@@ -1,0 +1,31 @@
+# CLI Reference
+
+This index covers the commands with a dedicated page. Run `pipelock --help` for
+the full command tree and `pipelock <command> --help` for any command's flags.
+
+| Command | Purpose |
+|---|---|
+| [`pipelock check`](check.md) | Validate config, test a URL, or check config using the local service's configuration environment. |
+| [`pipelock verify-receipt`](verify-receipt.md) | Verify signatures, chain integrity, and the declared evidence endpoint. |
+| [`pipelock exec`](exec.md) | Check a running proxy and launch a cooperative client with proxy and CA settings. |
+| [`pipelock guard`](guard.md) | Run one Linux command with filesystem and HTTP/HTTPS egress enforcement, or inspect its declarations. |
+| [`pipelock baseline`](baseline.md) | Inspect, ratify, and relearn behavioral-baseline profiles through the admin API. |
+| [`pipelock demo`](demo.md) | Run self-contained attack scenarios that show what Pipelock catches. |
+| [`pipelock status`](operator.md) | Read-only operator setup and local inspection commands. |
+| [`pipelock reload`](reload.md) | Synchronous daemon reload verdict, active identity, and pending restart fields. |
+| [`pipelock git scan-diff`](git.md) | Scan a unified diff on stdin for credentials before it is committed or merged. |
+| [`pipelock scan`](scan.md) | Scan files for invisible-Unicode and bidi-control injection. |
+| [`pipelock skill-scan`](skill-scan.md) | Inventory skill files, compare lock drift, and flag conservative source-to-sink combinations. |
+| [`pipelock discover`](discover.md) | Inventory MCP configurations, apply checked project overrides, and report unconfirmed launch coverage. |
+| [`pipelock doctor`](doctor.md) | Audit whether configured protections are actually enforceable in the current topology. |
+| [`pipelock explain`](explain.md) | Explain a URL verdict and the exact, per-scanner remediation knob for a block. |
+| [`pipelock verify-install`](verify-install.md) | Deterministic smoke checks that scanning is wired plus direct-egress probes with explicit exposed or inconclusive outcomes. |
+| [`pipelock adaptive`](adaptive.md) | Operator CLI for adaptive-enforcement state and overrides. |
+| [`pipelock session`](session.md) | Operator CLI for airlock session recovery. |
+| [`pipelock keys status`](keys.md) | Unified view of every signing-key purpose: source, presence, readability, and validity. |
+| [`pipelock commitment-key`](commitment-key.md) | Initialize, inspect, rotate, retire, back up, restore, and test private evidence commitment keys. |
+| [`pipelock mcp integrity manifest`](mcp-integrity.md) | Generate and verify MCP server binary-integrity manifests. |
+| [`pipelock init sidecar`](init-sidecar.md) | Generate an enforced Pipelock companion proxy for a Kubernetes workload. |
+| [`pipelock license`](license.md) | Install, inspect, and check the license that unlocks paid features. |
+| [`pipelock dashboard serve`](dashboard.md) | Serve the read-only Evidence dashboard over a flight-recorder directory (Pro/Enterprise). |
+| [`pipelock update`](update.md) | Check for, verify, and install a newer Pipelock release; roll back to the previous binary. |

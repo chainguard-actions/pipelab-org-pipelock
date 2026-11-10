@@ -1,0 +1,178 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package metrics
+
+import (
+	"encoding/json"
+	"net/http"
+	"sort"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+const maxTopEntries = 100
+
+// PrometheusHandler returns an HTTP handler that serves /metrics in Prometheus text format.
+func (m *Metrics) PrometheusHandler() http.Handler {
+	handler := promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		ceeFunc := m.CEEStatsFunc
+		m.mu.Unlock()
+		// Match /stats: read the current proxy state outside the metrics lock.
+		// A zero snapshot also clears bytes retained before reset or reload.
+		if ceeFunc != nil {
+			m.SetCrossRequestFragmentBytes(float64(ceeFunc().FragmentBufferBytes))
+		}
+		handler.ServeHTTP(w, r)
+	})
+}
+
+// StatsHandler returns an HTTP handler that serves a JSON stats summary.
+func (m *Metrics) StatsHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		m.mu.Lock()
+		total := m.allowedCount + m.blockedCount
+		stats := statsResponse{
+			UptimeSeconds: time.Since(m.startTime).Seconds(),
+			Requests: requestStats{
+				Total:   total,
+				Allowed: m.allowedCount,
+				Blocked: m.blockedCount,
+			},
+			Tunnels:           m.tunnelCount,
+			WebSockets:        m.wsConnectionCount,
+			TopBlockedDomains: topN(m.topBlockedDomains),
+			TopScanners:       topN(m.topScannerHits),
+			Sessions: sessionStats{
+				Active:       m.sessionActiveCount,
+				Anomalies:    m.sessionAnomalyCount,
+				Escalations:  m.sessionEscalationCount,
+				TopAnomalies: topN(m.topAnomalyTypes),
+			},
+			Receipts: receiptStats{
+				EmitFailures:   topN(m.receiptEmitFailureCounts),
+				RequiredBlocks: topRequiredReceiptBlocks(m.requiredReceiptBlocks),
+			},
+			RuleBundles: RuleBundleStats{
+				DegradedCount: len(m.degradedRuleBundles),
+				DegradedNames: append([]string(nil), m.degradedRuleBundles...),
+			},
+		}
+		ceeFunc := m.CEEStatsFunc
+		if total > 0 {
+			stats.Requests.BlockRate = float64(m.blockedCount) / float64(total)
+		}
+		if len(m.agentStats) > 0 {
+			stats.Agents = make(map[string]agentStatsOut, len(m.agentStats))
+			for name, ac := range m.agentStats {
+				stats.Agents[name] = agentStatsOut{
+					Allowed: ac.Allowed,
+					Blocked: ac.Blocked,
+					Tunnels: ac.Tunnels,
+				}
+			}
+		}
+		m.mu.Unlock()
+
+		// Call CEE stats func outside the lock (it accesses proxy atomic pointers).
+		if ceeFunc != nil {
+			stats.CEE = ceeFunc()
+		}
+		if evidence, ok := m.EvidenceHealthStatsSnapshot(); ok {
+			stats.EvidenceHealth = &evidence
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(stats)
+	}
+}
+
+type statsResponse struct {
+	UptimeSeconds     float64                  `json:"uptime_seconds"`
+	Requests          requestStats             `json:"requests"`
+	Tunnels           int64                    `json:"tunnels"`
+	WebSockets        int64                    `json:"websockets"`
+	TopBlockedDomains []rankedEntry            `json:"top_blocked_domains"`
+	TopScanners       []rankedEntry            `json:"top_scanners"`
+	Sessions          sessionStats             `json:"sessions"`
+	Receipts          receiptStats             `json:"receipts"`
+	RuleBundles       RuleBundleStats          `json:"rule_bundles"`
+	CEE               CEEStats                 `json:"cross_request_detection"`
+	EvidenceHealth    *EvidenceHealthStats     `json:"evidence_health"`
+	Agents            map[string]agentStatsOut `json:"agents,omitempty"`
+}
+
+type receiptStats struct {
+	EmitFailures   []rankedEntry                 `json:"emit_failures"`
+	RequiredBlocks []requiredReceiptBlockSummary `json:"required_blocks"`
+}
+
+type requiredReceiptBlockSummary struct {
+	Reason    string `json:"reason"`
+	Transport string `json:"transport"`
+	Count     int64  `json:"count"`
+}
+
+type agentStatsOut struct {
+	Allowed int64 `json:"allowed"`
+	Blocked int64 `json:"blocked"`
+	Tunnels int64 `json:"tunnels"`
+}
+
+type sessionStats struct {
+	Active       int64         `json:"active"`
+	Anomalies    int64         `json:"anomalies"`
+	Escalations  int64         `json:"escalations"`
+	TopAnomalies []rankedEntry `json:"top_anomalies"`
+}
+
+type requestStats struct {
+	Total     int64   `json:"total"`
+	Allowed   int64   `json:"allowed"`
+	Blocked   int64   `json:"blocked"`
+	BlockRate float64 `json:"block_rate"`
+}
+
+type rankedEntry struct {
+	Name  string `json:"name"`
+	Count int64  `json:"count"`
+}
+
+func topN(m map[string]int64) []rankedEntry {
+	entries := make([]rankedEntry, 0, len(m))
+	for name, count := range m {
+		entries = append(entries, rankedEntry{Name: name, Count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Count > entries[j].Count
+	})
+	return entries
+}
+
+func topRequiredReceiptBlocks(m map[string]int64) []requiredReceiptBlockSummary {
+	entries := make([]requiredReceiptBlockSummary, 0, len(m))
+	for key, count := range m {
+		reason, transport := splitRequiredReceiptBlockKey(key)
+		entries = append(entries, requiredReceiptBlockSummary{
+			Reason:    reason,
+			Transport: transport,
+			Count:     count,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Count != entries[j].Count {
+			return entries[i].Count > entries[j].Count
+		}
+		if entries[i].Reason != entries[j].Reason {
+			return entries[i].Reason < entries[j].Reason
+		}
+		return entries[i].Transport < entries[j].Transport
+	})
+	if len(entries) > maxTopEntries {
+		entries = entries[:maxTopEntries]
+	}
+	return entries
+}

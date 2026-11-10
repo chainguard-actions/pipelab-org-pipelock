@@ -1,0 +1,367 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package git
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/gitprotect"
+	"github.com/luckyPipewrench/pipelock/internal/sarif"
+)
+
+var (
+	// ErrSecretsFound is returned when pipelock git scan-diff detects secrets.
+	ErrSecretsFound = errors.New("secrets found in diff")
+	// ErrScanUnverified is returned when pipelock git scan-diff produced no
+	// trustworthy result. That covers input it could not read or parse, and also
+	// a configuration, encoding, or report-writing failure that prevents the
+	// scan from being run or its result from being delivered. It deliberately
+	// does NOT mean the diff was clean, and it never overlaps ErrSecretsFound.
+	ErrScanUnverified = errors.New("scan produced no verified result")
+)
+
+// Output format constants.
+const (
+	formatJSON  = "json"
+	formatText  = "text"
+	formatSARIF = "sarif"
+)
+
+// binaryName is the default binary name for generated hooks.
+const binaryName = "pipelock"
+
+// Cmd returns the top-level "git" cobra command.
+func Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "git",
+		Short: "Git-aware security commands",
+		Long: `Git integration for pre-push secret scanning and hook management.
+
+Examples:
+  git diff HEAD~1 | pipelock git scan-diff
+  pipelock git install-hooks`,
+	}
+
+	cmd.AddCommand(scanDiffCmd())
+	cmd.AddCommand(installHooksCmd())
+	return cmd
+}
+
+func scanDiffCmd() *cobra.Command {
+	var configFile string
+	var jsonOutput bool
+	var format string
+	var outputFile string
+	var excludePaths []string
+	var verbose bool
+
+	cmd := &cobra.Command{
+		Use:   "scan-diff",
+		Short: "Scan a unified diff for secrets",
+		Long: `Reads a unified diff from stdin and scans added lines for DLP pattern matches.
+
+Designed for use in git hooks or CI pipelines. Exit code 0 means the diff was
+scanned and is clean, 1 means secrets were found, and 2 means no verified result
+was produced: input that could not be read or parsed, or a configuration,
+encoding, or report-writing failure. A caller that treats any non-zero status as
+"secrets found" reports leaks that were never detected.
+
+Results are written to stdout unless --output directs a SARIF result to a file.
+Diagnostics, including errors and verbose suppression notes, are written to stderr.
+
+Examples:
+  git diff HEAD~1 | pipelock git scan-diff
+  git diff --cached | pipelock git scan-diff --config pipelock.yaml
+  git diff HEAD~1 | pipelock git scan-diff --json
+  git diff HEAD~1 | pipelock git scan-diff --format sarif -o results.sarif
+  git diff HEAD~1 | pipelock git scan-diff --exclude vendor/ --exclude "*.generated.go"`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Resolve format: --json is shorthand for --format json
+			effectiveFormat := format
+			if jsonOutput && effectiveFormat == "" {
+				effectiveFormat = formatJSON
+			}
+			if effectiveFormat == "" {
+				effectiveFormat = formatText
+			}
+			switch effectiveFormat {
+			case formatText, formatJSON, formatSARIF:
+			default:
+				return cliutil.ExitCodeError(cliutil.ExitConfig,
+					fmt.Errorf("%w: unsupported format %q (valid: text, json, sarif)", ErrScanUnverified, effectiveFormat))
+			}
+
+			cfg, err := cliutil.LoadConfigOrDefault(configFile)
+			if err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("%w: %w", ErrScanUnverified, err))
+			}
+
+			diffData, err := io.ReadAll(io.LimitReader(os.Stdin, gitprotect.MaxDiffBytes+1))
+			if err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig,
+					fmt.Errorf("%w: reading diff from stdin: %w", ErrScanUnverified, err))
+			}
+			if len(diffData) > gitprotect.MaxDiffBytes {
+				return cliutil.ExitCodeError(cliutil.ExitConfig,
+					fmt.Errorf("%w: %w of %d bytes", ErrScanUnverified, gitprotect.ErrDiffTooLarge, gitprotect.MaxDiffBytes))
+			}
+
+			if len(diffData) == 0 {
+				if effectiveFormat == formatJSON {
+					return writeScanResult(cmd.OutOrStdout(), "[]\n")
+				}
+				if effectiveFormat == formatSARIF {
+					if sarifErr := writeGitSARIF(cmd, nil, outputFile); sarifErr != nil {
+						return cliutil.ExitCodeError(cliutil.ExitConfig,
+							fmt.Errorf("%w: %w", ErrScanUnverified, sarifErr))
+					}
+					return nil
+				}
+				// For empty input this line is the whole result, not a diagnostic
+				// alongside one, so a failed write leaves the caller with nothing
+				// and must not report clean. The JSON branch above already fails
+				// closed on the same condition.
+				return writeScanResult(cmd.OutOrStdout(), "No diff content on stdin.\n")
+			}
+
+			patterns := gitprotect.CompileDLPPatterns(config.WithCoreDLPFloor(cfg.DLP.Patterns))
+			result, scanErr := gitprotect.ScanDiff(string(diffData), patterns)
+			if scanErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "ERROR: %v\n", scanErr)
+				return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("%w: %w", ErrScanUnverified, scanErr))
+			}
+
+			// ScanDiff handles inline pipelock:ignore from the diff content
+			// (more reliable than disk reads which fail on CWD/path mismatch).
+			// Config-based suppression still runs here for suppress_findings entries.
+			findings := result.Findings
+			if verbose && len(result.Suppressed) > 0 {
+				for _, f := range result.Suppressed {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "SUPPRESSED: %s:%d  %s (inline)\n", f.File, f.Line, f.Pattern)
+				}
+			}
+			if verbose {
+				for _, f := range findings {
+					if gitprotect.IsCoreFloorPattern(f.Pattern) && cliutil.SuppressRe.MatchString(f.Content) {
+						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "KEPT: %s:%d  %s (core floor patterns cannot be suppressed)\n", f.File, f.Line, f.Pattern)
+					}
+				}
+			}
+
+			// Config-based suppression (suppress_findings entries)
+			findings, suppressed, reasons := cliutil.SuppressGitFindings(findings, cfg.Suppress)
+			if verbose && len(suppressed) > 0 {
+				cliutil.PrintSuppressedGit(cmd.ErrOrStderr(), suppressed, reasons)
+			}
+
+			// Filter excluded paths from findings
+			if len(excludePaths) > 0 {
+				filtered := findings[:0:0]
+				for _, f := range findings {
+					if f.File != "" && cliutil.ShouldExclude(f.File, excludePaths) {
+						continue
+					}
+					filtered = append(filtered, f)
+				}
+				findings = filtered
+			}
+
+			switch effectiveFormat {
+			case formatJSON:
+				data, jsonErr := gitprotect.FindingsJSON(findings)
+				if jsonErr != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig,
+						fmt.Errorf("%w: encoding findings: %w", ErrScanUnverified, jsonErr))
+				}
+				if writeErr := writeScanResult(cmd.OutOrStdout(), string(data)+"\n"); writeErr != nil {
+					return writeErr
+				}
+			case formatSARIF:
+				if sarifErr := writeGitSARIF(cmd, findings, outputFile); sarifErr != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig,
+						fmt.Errorf("%w: %w", ErrScanUnverified, sarifErr))
+				}
+			default:
+				if writeErr := writeScanResult(cmd.OutOrStdout(), gitprotect.FormatFindings(findings)); writeErr != nil {
+					return writeErr
+				}
+			}
+
+			if len(findings) > 0 {
+				return ErrSecretsFound
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output findings as JSON (shorthand for --format json)")
+	cmd.Flags().StringVar(&format, "format", "", "output format: text, json, or sarif")
+	cmd.Flags().StringVarP(&outputFile, "output", "o", "", "write SARIF output to file")
+	cmd.Flags().StringArrayVar(&excludePaths, "exclude", nil, "exclude paths from findings (glob or directory prefix, repeatable)")
+	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "print suppressed findings to stderr")
+	cmd.MarkFlagsMutuallyExclusive("json", "format")
+	return cmd
+}
+
+func installHooksCmd() *cobra.Command {
+	var configFile string
+	var binary string
+	var force bool
+	var quiet bool
+
+	cmd := &cobra.Command{
+		Use:   "install-hooks",
+		Short: "Install git pre-push hook for secret scanning",
+		Long: `Writes a pre-push hook to .git/hooks/pre-push that runs pipelock git scan-diff
+before each push. The hook blocks pushes if secrets are detected (fail-closed).
+
+If .git/hooks/pre-push already exists, use --force to overwrite it.
+
+Examples:
+  pipelock git install-hooks
+  pipelock git install-hooks --config /etc/pipelock/pipelock.yaml
+  pipelock git install-hooks --force`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			gitDir, err := findGitDir()
+			if err != nil {
+				return err
+			}
+
+			hookPath := filepath.Join(gitDir, "hooks", "pre-push")
+
+			if !force {
+				if _, err := os.Stat(hookPath); err == nil {
+					return fmt.Errorf("hook already exists at %s (use --force to overwrite)", hookPath)
+				}
+			}
+
+			if binary == "" {
+				binary = binaryName
+			}
+
+			resolvedConfig, err := cliutil.ResolveConfigForInstall(configFile)
+			if err != nil {
+				return err
+			}
+			cliutil.WriteInstallConfigProvenance(cmd.ErrOrStderr(), "git install-hooks", resolvedConfig, quiet)
+
+			hookContent := gitprotect.GeneratePrePushHook(binary, resolvedConfig.Path)
+
+			hooksDir := filepath.Join(gitDir, "hooks")
+			if err := os.MkdirAll(hooksDir, 0o750); err != nil {
+				return fmt.Errorf("creating hooks directory: %w", err)
+			}
+
+			if err := os.WriteFile(hookPath, []byte(hookContent), 0o755); err != nil { //nolint:gosec // hooks must be executable
+				return fmt.Errorf("writing hook: %w", err)
+			}
+
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Installed pre-push hook at %s\n", hookPath)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path for the hook to use")
+	cmd.Flags().StringVar(&binary, "binary", "", "path to pipelock binary (default: "+binaryName+" in PATH)")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite existing hook")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress config provenance output")
+	return cmd
+}
+
+// writeScanResult delivers a scan result and treats a failed write as no
+// verified result.
+//
+// A discarded write error lets a scan that found nothing exit 0 while its output
+// never reached the caller, which is indistinguishable from a clean, delivered
+// scan. Diagnostics on stderr stay best-effort; only the result itself is gated
+// here.
+func writeScanResult(w io.Writer, text string) error {
+	if _, err := fmt.Fprint(w, text); err != nil { //nolint:gosec // G705: CLI output, not web
+		return cliutil.ExitCodeError(cliutil.ExitConfig,
+			fmt.Errorf("%w: delivering scan result: %w", ErrScanUnverified, err))
+	}
+	return nil
+}
+
+func writeGitSARIF(cmd *cobra.Command, findings []gitprotect.Finding, outputPath string) error {
+	log := sarif.New("pipelock git scan-diff", cliutil.Version)
+
+	for _, f := range findings {
+		ruleID := "DLP-" + strings.ReplaceAll(f.Pattern, " ", "-")
+		idx := log.AddRule(ruleID, f.Pattern)
+		// Do not include f.Content in snippet: it contains the matched
+		// secret and would be leaked into SARIF artifacts / upload-sarif.
+		log.AddResult(
+			ruleID, idx,
+			sarif.SeverityToLevel(f.Severity),
+			fmt.Sprintf("Secret detected: %s", f.Pattern),
+			f.File, f.Line, "",
+		)
+	}
+
+	return log.WriteToTarget(cmd.OutOrStdout(), cmd.ErrOrStderr(), outputPath)
+}
+
+func findGitDir() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getting working directory: %w", err)
+	}
+
+	for {
+		gitPath := filepath.Join(dir, ".git")
+		info, err := os.Stat(gitPath)
+		if err == nil {
+			if info.IsDir() {
+				return gitPath, nil
+			}
+			// .git is a file (worktree/submodule): parse "gitdir: <path>"
+			resolved, err := resolveGitFile(gitPath, dir)
+			if err != nil {
+				return "", err
+			}
+			return resolved, nil
+		}
+
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("not a git repository (no .git directory found)")
+		}
+		dir = parent
+	}
+}
+
+// resolveGitFile reads a .git file (used by worktrees/submodules) and
+// returns the absolute path to the actual git directory.
+func resolveGitFile(gitFilePath, baseDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Clean(gitFilePath))
+	if err != nil {
+		return "", fmt.Errorf("reading .git file: %w", err)
+	}
+	content := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(content, "gitdir: ") {
+		return "", fmt.Errorf("invalid .git file: expected 'gitdir: <path>', got %q", content)
+	}
+	gitdir := strings.TrimPrefix(content, "gitdir: ")
+	if !filepath.IsAbs(gitdir) {
+		gitdir = filepath.Join(baseDir, gitdir)
+	}
+	gitdir = filepath.Clean(gitdir)
+	if info, err := os.Stat(gitdir); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("gitdir path %q does not exist or is not a directory", gitdir)
+	}
+	return gitdir, nil
+}

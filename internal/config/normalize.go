@@ -1,0 +1,1129 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"gopkg.in/yaml.v3"
+)
+
+// normalizeLearn trims surrounding whitespace from Learn.CaptureDir and,
+// conditionally, from Learn.Privacy.SaltSource. Literal salt sources are
+// preserved byte-for-byte: trimming `" secret "` to `"secret"` would
+// silently change the HMAC and break continuity across reloads, so only
+// `file:` paths and `${VAR}` env references (where surrounding whitespace
+// is meaningless and likely YAML indentation drift) get trimmed. An
+// all-whitespace literal collapses to "" and is treated as unset by the
+// downstream resolver.
+func normalizeLearn(l *Learn) {
+	l.CaptureDir = strings.TrimSpace(l.CaptureDir)
+	src := l.Privacy.SaltSource
+	trimmed := strings.TrimSpace(src)
+	if trimmed == "" {
+		l.Privacy.SaltSource = ""
+		return
+	}
+	if strings.HasPrefix(trimmed, "file:") ||
+		(strings.HasPrefix(trimmed, "${") && strings.HasSuffix(trimmed, "}")) {
+		l.Privacy.SaltSource = trimmed
+	}
+}
+
+func normalizeConductor(c *Conductor) {
+	if c.AuditSigningKeyID == "" && c.InstanceID != "" {
+		c.AuditSigningKeyID = c.InstanceID
+	}
+	if c.RecorderKeyID == "" && c.InstanceID != "" {
+		c.RecorderKeyID = c.InstanceID
+	}
+	if c.PollInterval == "" {
+		c.PollInterval = "30s"
+	}
+	if c.CreatedSkewSeconds == 0 {
+		c.CreatedSkewSeconds = 60
+	}
+	if c.MaxMinVersionMinorSkew == 0 {
+		c.MaxMinVersionMinorSkew = 1
+	}
+	if c.MaxCapabilityThreshold == 0 {
+		c.MaxCapabilityThreshold = 7
+	}
+	if c.EmergencyStream == nil {
+		c.EmergencyStream = ptrBool(true)
+	}
+	if c.StalePolicy.GraceMultiplier == 0 {
+		c.StalePolicy.GraceMultiplier = 1
+	}
+	if c.StalePolicy.AfterGrace == "" {
+		c.StalePolicy.AfterGrace = ConductorStaleStrictDenyAll
+	}
+}
+
+// applySecurityDefaults sets security-sensitive booleans to true when they are
+// omitted or null in the config YAML. YAML unmarshal into a plain bool cannot
+// distinguish "field omitted" (should default to true, fail-closed) from "field
+// explicitly set to false" (user intent). We unmarshal into a raw map to detect
+// which fields are actually present with a non-nil value, then default the rest.
+// It also records ambiguous legacy MCP settings without changing their defaults.
+func applySecurityDefaults(rawYAML []byte, cfg *Config) {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(rawYAML, &raw); err != nil {
+		// Primary unmarshal already succeeded; treat parse errors as "all
+		// omitted" so we fail closed with every security default enabled. A nil
+		// map makes every section lookup below nil, and setBoolDefault turns a
+		// nil section into true, so this path and the normal path share one list
+		// and cannot drift apart.
+		raw = nil
+	}
+
+	setBoolDefault := func(section map[string]interface{}, key string, target *bool) {
+		if section == nil {
+			*target = true
+			return
+		}
+		val, present := section[key]
+		if !present || val == nil { // omitted or YAML null/blank: fail closed
+			*target = true
+		}
+	}
+
+	// False plus an empty action is the historical unset representation,
+	// including in generated YAML. Preserve its runtime defaults and warn
+	// rather than silently interpreting existing files as disables.
+	warnAmbiguousMCPDisable := func(name string, enabled bool, action string, configured bool) {
+		section, _ := raw[name].(map[string]interface{})
+		if value, present := section["enabled"]; present && value != nil && !enabled && action == "" && !configured {
+			cfg.mcpCompatibilityWarnings = append(cfg.mcpCompatibilityWarnings, Warning{
+				Field:   name,
+				Message: fmt.Sprintf("%s: enabled: false with an empty action is ambiguous; retaining runtime defaults in MCP modes. To disable this section intentionally, set \"action: warn\" under %s, replacing any existing action line (a second action key is a duplicate-key error), aligned with enabled (or inside the same inline mapping), and restart. Remove enabled: false to keep defaults without this warning.", name, name),
+			})
+		}
+	}
+	warnAmbiguousMCPDisable("mcp_input_scanning", cfg.MCPInputScanning.Enabled, cfg.MCPInputScanning.Action, false)
+	warnAmbiguousMCPDisable("mcp_tool_scanning", cfg.MCPToolScanning.Enabled, cfg.MCPToolScanning.Action, false)
+	warnAmbiguousMCPDisable("mcp_tool_policy", cfg.MCPToolPolicy.Enabled, cfg.MCPToolPolicy.Action, len(cfg.MCPToolPolicy.Rules) != 0)
+
+	dlp, _ := raw["dlp"].(map[string]interface{})
+	setBoolDefault(dlp, "scan_env", &cfg.DLP.ScanEnv)
+
+	resp, _ := raw["response_scanning"].(map[string]interface{})
+	setBoolDefault(resp, "enabled", &cfg.ResponseScanning.Enabled)
+
+	reqBody, _ := raw["request_body_scanning"].(map[string]interface{})
+	setBoolDefault(reqBody, "enabled", &cfg.RequestBodyScanning.Enabled)
+	setBoolDefault(reqBody, "scan_headers", &cfg.RequestBodyScanning.ScanHeaders)
+	setBoolDefault(reqBody, "content_entropy_enabled", &cfg.RequestBodyScanning.ContentEntropyEnabled)
+	// Issuer-bound session cookies default on (Defaults() and the configuration
+	// guide both say true). Without this line any config file loaded false, so
+	// the feature only existed on the no-config path.
+	setBoolDefault(reqBody, "issuer_bound_session_cookies", &cfg.RequestBodyScanning.IssuerBoundSessionCookies)
+
+	git, _ := raw["git_protection"].(map[string]interface{})
+	setBoolDefault(git, "pre_push_scan", &cfg.GitProtection.PrePushScan)
+
+	logging, _ := raw["logging"].(map[string]interface{})
+	setBoolDefault(logging, "include_allowed", &cfg.Logging.IncludeAllowed)
+	setBoolDefault(logging, "include_blocked", &cfg.Logging.IncludeBlocked)
+
+	// Scan API kind enable flags default to true (all kinds enabled).
+	scanAPI, _ := raw["scan_api"].(map[string]interface{})
+	var kinds map[string]interface{}
+	if scanAPI != nil {
+		kinds, _ = scanAPI["kinds"].(map[string]interface{})
+	}
+	setBoolDefault(kinds, "url", &cfg.ScanAPI.Kinds.URL)
+	setBoolDefault(kinds, "dlp", &cfg.ScanAPI.Kinds.DLP)
+	setBoolDefault(kinds, "prompt_injection", &cfg.ScanAPI.Kinds.PromptInjection)
+	setBoolDefault(kinds, "tool_call", &cfg.ScanAPI.Kinds.ToolCall)
+
+	rules, _ := raw["rules"].(map[string]interface{})
+	setBoolDefault(rules, "trust_embedded_keys", &cfg.Rules.TrustEmbeddedKeys)
+	setBoolDefault(rules, "allow_unversioned_bundle_load", &cfg.Rules.AllowUnversionedBundleLoad)
+
+	// A2A scanning: detection booleans default to true (full scanning when enabled).
+	a2a, _ := raw["a2a_scanning"].(map[string]interface{})
+	setBoolDefault(a2a, "scan_agent_cards", &cfg.A2AScanning.ScanAgentCards)
+	setBoolDefault(a2a, "detect_card_drift", &cfg.A2AScanning.DetectCardDrift)
+	setBoolDefault(a2a, "session_smuggling_detection", &cfg.A2AScanning.SessionSmugglingDetection)
+	setBoolDefault(a2a, "scan_raw_parts", &cfg.A2AScanning.ScanRawParts)
+
+	// Generic SSE streaming: enabled defaults to true so LLM SSE traffic is
+	// scanned out of the box. Operators must explicitly set enabled: false to
+	// opt out, in which case the disabled-mode path still streams with
+	// flushing rather than silently buffering.
+	rs, _ := raw["response_scanning"].(map[string]interface{})
+	var sse map[string]interface{}
+	if rs != nil {
+		sse, _ = rs["sse_streaming"].(map[string]interface{})
+	}
+	setBoolDefault(sse, "enabled", &cfg.ResponseScanning.SSEStreaming.Enabled)
+
+	// Flight recorder: enabled, redact, and sign default to true. enabled is
+	// default-on so receipts are available out of the box (omitting the section
+	// must produce enabled=true, per the security-default invariant); redact and
+	// sign default true for fail-closed forensics. enabled=true with no dir is
+	// inert (no recorder is built), so the default cannot break configs that omit
+	// a recorder dir - validateFlightRecorder treats that case as a no-op.
+	fr, _ := raw["flight_recorder"].(map[string]interface{})
+	setBoolDefault(fr, "enabled", &cfg.FlightRecorder.Enabled)
+	setBoolDefault(fr, "redact", &cfg.FlightRecorder.Redact)
+	setBoolDefault(fr, "sign_checkpoints", &cfg.FlightRecorder.SignCheckpoints)
+
+	// MCP tool provenance: offline_only defaults to true (no network calls).
+	prov, _ := raw["mcp_tool_provenance"].(map[string]interface{})
+	setBoolDefault(prov, "offline_only", &cfg.MCPToolProvenance.OfflineOnly)
+
+	// Adaptive cooperative-tool burst downweighting defaults on. Operators can
+	// explicitly set false if they want every burst anomaly scored at full weight.
+	adaptive, _ := raw["adaptive_enforcement"].(map[string]interface{})
+	setBoolDefault(adaptive, "cooperative_tool_downweight", &cfg.AdaptiveEnforcement.CooperativeToolDownweight)
+
+	// Behavioral baseline: poison_resistance defaults to true (trimmed-mean scoring).
+	bb, _ := raw["behavioral_baseline"].(map[string]interface{})
+	setBoolDefault(bb, "poison_resistance", &cfg.BehavioralBaseline.PoisonResistance)
+
+	// Browser Shield rewrite passes default on. An operator who enables the
+	// shield in a config file without naming these got a shield that stripped
+	// no hidden prompt traps, extension probes or tracking pixels.
+	shield, _ := raw["browser_shield"].(map[string]interface{})
+	setBoolDefault(shield, "strip_extension_probing", &cfg.BrowserShield.StripExtensionProbing)
+	setBoolDefault(shield, "strip_hidden_traps", &cfg.BrowserShield.StripHiddenTraps)
+	setBoolDefault(shield, "strip_tracking_pixels", &cfg.BrowserShield.StripTrackingPixels)
+
+	// Taint defaults to enabled when omitted, matching Defaults().
+	taint, _ := raw["taint"].(map[string]interface{})
+	setBoolDefault(taint, "enabled", &cfg.Taint.Enabled)
+
+	deferSection, _ := raw["defer"].(map[string]interface{})
+	setBoolDefault(deferSection, "enabled", &cfg.Defer.Enabled)
+
+	// Learn privacy: preserve the reserved public_allowlist_default wire shape
+	// and its historical default. The runtime does not consume this field yet.
+	learn, _ := raw["learn"].(map[string]interface{})
+	var privacy map[string]interface{}
+	if learn != nil {
+		privacy, _ = learn["privacy"].(map[string]interface{})
+	}
+	setBoolDefault(privacy, "public_allowlist_default", &cfg.Learn.Privacy.PublicAllowlistDefault)
+
+	// Health watchdog: enabled defaults to true so wedge detection runs out of
+	// the box. An operator who omits health_watchdog (or sets it to ~) still
+	// gets the watchdog; explicit `enabled: false` is required to opt out.
+	hw, _ := raw["health_watchdog"].(map[string]interface{})
+	setBoolDefault(hw, "enabled", &cfg.HealthWatchdog.Enabled)
+
+	conductor, _ := raw["conductor"].(map[string]interface{})
+	setBoolDefault(conductor, "honor_remote_kill_switch", &cfg.Conductor.HonorRemoteKillSwitch)
+}
+
+// validateExplicitEntropyThreshold rejects a configured non-positive path
+// entropy threshold before ApplyDefaults can replace it with the default. An
+// omitted or null field still defaults to 4.5; only an explicit numeric value
+// is an operator choice that must fail loud rather than silently change.
+func validateExplicitEntropyThreshold(rawYAML []byte, cfg *Config) error {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(rawYAML, &raw); err != nil {
+		return fmt.Errorf("parsing config for entropy threshold validation: %w", err)
+	}
+	fetchProxy, _ := raw["fetch_proxy"].(map[string]interface{})
+	monitoring, _ := fetchProxy["monitoring"].(map[string]interface{})
+	value, configured := monitoring["entropy_threshold"]
+	if !configured || value == nil || cfg.FetchProxy.Monitoring.EntropyThreshold > 0 {
+		return nil
+	}
+	return fmt.Errorf("fetch_proxy.monitoring.entropy_threshold must be greater than 0 when configured; omit it to use the default (4.5)")
+}
+
+// reconcileNewToolAdmissionAlias canonicalizes the deprecated
+// mcp_tool_scanning.new_tool_action key (warn|block) into
+// mcp_tool_scanning.new_tool_admission (admit|withhold) so both spellings
+// produce an identical effective policy and, downstream, an identical
+// CanonicalPolicyHash. Must run after strict YAML decode and before
+// ApplyDefaults fills NewToolAdmission with its default, and before any
+// hash is computed. Returns an error if both keys are explicitly set;
+// otherwise records a one-time deprecation notice on cfg when the old key
+// was used, surfaced later by validateMCPToolScanning.
+func reconcileNewToolAdmissionAlias(rawYAML []byte, cfg *Config) error {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(rawYAML, &raw); err != nil {
+		return fmt.Errorf("parsing config for new_tool_admission alias reconciliation: %w", err)
+	}
+	toolScanning, _ := raw["mcp_tool_scanning"].(map[string]interface{})
+	admissionVal, admissionPresent := toolScanning["new_tool_admission"]
+	actionVal, actionPresent := toolScanning["new_tool_action"]
+	// An explicitly empty canonical value is equivalent to omission, matching
+	// the deprecated alias below. It must not conflict with a non-empty alias
+	// that supplies the effective admission policy.
+	admissionSet := admissionPresent && admissionVal != nil && cfg.MCPToolScanning.NewToolAdmission != ""
+	// An explicitly empty deprecated value was accepted before this alias was
+	// introduced. Treat it like an omitted key so it neither conflicts with the
+	// canonical spelling nor bypasses ApplyDefaults.
+	actionSet := actionPresent && actionVal != nil && cfg.MCPToolScanning.NewToolAction != ""
+
+	if admissionSet && actionSet {
+		return errors.New("mcp_tool_scanning: set only one of new_tool_admission or the deprecated new_tool_action alias, not both")
+	}
+	if !actionSet {
+		// Nothing to reconcile; clear any stray parsed value defensively
+		// (yaml null decodes to "" already, this just documents the intent).
+		cfg.MCPToolScanning.NewToolAction = ""
+		return nil
+	}
+	switch cfg.MCPToolScanning.NewToolAction {
+	case ActionWarn:
+		cfg.MCPToolScanning.NewToolAdmission = NewToolAdmit
+	case ActionBlock:
+		cfg.MCPToolScanning.NewToolAdmission = NewToolWithhold
+	default:
+		return fmt.Errorf("invalid mcp_tool_scanning new_tool_action %q: must be warn or block", cfg.MCPToolScanning.NewToolAction)
+	}
+	cfg.NewToolActionAliasWarning = "mcp_tool_scanning.new_tool_action is deprecated; use new_tool_admission: admit|withhold instead"
+	cfg.MCPToolScanning.NewToolAction = ""
+	return nil
+}
+
+// ApplyDefaults fills in zero-value fields with sensible defaults.
+func (c *Config) ApplyDefaults() {
+	normalizeLearn(&c.Learn)
+	normalizeConductor(&c.Conductor)
+	if c.Version == 0 {
+		c.Version = 1
+	}
+	if c.Mode == "" {
+		c.Mode = ModeBalanced
+	}
+	if c.FetchProxy.Listen == "" {
+		c.FetchProxy.Listen = DefaultListen
+	}
+	if c.FetchProxy.TimeoutSeconds <= 0 {
+		c.FetchProxy.TimeoutSeconds = 30
+	}
+	if c.FetchProxy.MaxResponseMB <= 0 {
+		c.FetchProxy.MaxResponseMB = 10
+	}
+	if c.FetchProxy.UserAgent == "" {
+		c.FetchProxy.UserAgent = "Pipelock Fetch/1.0"
+	}
+	if c.FetchProxy.Monitoring.MaxURLLength <= 0 {
+		c.FetchProxy.Monitoring.MaxURLLength = DefaultMaxURLLength
+	}
+	if c.FetchProxy.Monitoring.EntropyThreshold <= 0 {
+		c.FetchProxy.Monitoring.EntropyThreshold = 4.5
+	}
+	if c.FetchProxy.Monitoring.SubdomainEntropyThreshold <= 0 {
+		c.FetchProxy.Monitoring.SubdomainEntropyThreshold = 4.0
+	}
+	if c.FetchProxy.Monitoring.SubdomainEntropyExclusions == nil {
+		c.FetchProxy.Monitoring.SubdomainEntropyExclusions = append([]string(nil), Defaults().FetchProxy.Monitoring.SubdomainEntropyExclusions...)
+	}
+	// The shipped document-sharing routes must reach a YAML-backed deployment,
+	// which is every real operator: Load() decodes into an EMPTY config and then
+	// calls this, so a default that is only present in Defaults() covers the
+	// no-config CLI path and nothing else. nil means the operator omitted the
+	// field and gets the shipped set; an explicitly empty list is a deliberate
+	// opt-out and is preserved, matching the sibling above.
+	if c.FetchProxy.Monitoring.PathEntropyExclusions == nil {
+		c.FetchProxy.Monitoring.PathEntropyExclusions = append([]PathEntropyExclusion(nil), Defaults().FetchProxy.Monitoring.PathEntropyExclusions...)
+	}
+	// Same rule for the exfiltration blocklist, where losing it is worse: it is
+	// a deny list, so a config file that omitted the key ran with no blocklist
+	// at all while validation reported OK. nil gets the shipped set; an
+	// explicit [] stays an opt-out.
+	if c.FetchProxy.Monitoring.Blocklist == nil {
+		c.FetchProxy.Monitoring.Blocklist = append([]string(nil), Defaults().FetchProxy.Monitoring.Blocklist...)
+	}
+	if c.FetchProxy.Monitoring.MaxReqPerMinute <= 0 {
+		c.FetchProxy.Monitoring.MaxReqPerMinute = 60
+	}
+	if c.Logging.Format == "" {
+		c.Logging.Format = DefaultLogFormat
+	}
+	if c.Logging.Output == "" {
+		c.Logging.Output = DefaultLogOutput
+	}
+	if c.ResponseScanning.Enabled && c.ResponseScanning.Action == "" {
+		c.ResponseScanning.Action = ActionWarn
+	}
+	if c.ResponseScanning.SizeExemptScanMaxBytes <= 0 {
+		c.ResponseScanning.SizeExemptScanMaxBytes = DefaultSizeExemptScanMaxBytes
+	}
+	if c.ResponseScanning.SizeExemptScanMaxInflightBytes <= 0 {
+		c.ResponseScanning.SizeExemptScanMaxInflightBytes = DefaultSizeExemptScanMaxInflightBytes
+	}
+	if c.ResponseScanning.Action == ActionAsk && c.ResponseScanning.AskTimeoutSeconds <= 0 {
+		c.ResponseScanning.AskTimeoutSeconds = 30
+	}
+	for i := range c.ResponseScanning.MCPServers {
+		c.ResponseScanning.MCPServers[i].Server = strings.TrimSpace(c.ResponseScanning.MCPServers[i].Server)
+		c.ResponseScanning.MCPServers[i].Trust = strings.ToLower(strings.TrimSpace(c.ResponseScanning.MCPServers[i].Trust))
+	}
+	for i := range c.Taint.TrustedMCPServers {
+		c.Taint.TrustedMCPServers[i] = strings.TrimSpace(c.Taint.TrustedMCPServers[i])
+	}
+	// Merge default response scanning patterns with user patterns.
+	// include_defaults (nil/true): defaults load first, user patterns override by name.
+	// include_defaults (false): only user patterns are used (full override).
+	if c.ResponseScanning.Enabled {
+		c.ResponseScanning.Patterns = mergeResponsePatterns(
+			c.ResponseScanning.IncludeDefaults,
+			c.ResponseScanning.Patterns,
+			Defaults().ResponseScanning.Patterns,
+		)
+	}
+	// Merge default DLP patterns with user patterns.
+	// include_defaults (nil/true): defaults load first, user patterns override by name.
+	// include_defaults (false): only user patterns are used (full override).
+	c.DLP.Patterns = mergeDLPPatterns(
+		c.DLP.IncludeDefaults,
+		c.DLP.Patterns,
+		Defaults().DLP.Patterns,
+	)
+	markBuiltInCredentialURLWhitespaceGrammar(c.DLP.Patterns)
+	markBuiltInCredentialAudienceHosts(c.DLP.Patterns)
+	// Always default OnParseError (fail-closed) regardless of enabled state,
+	// since validation checks it unconditionally.
+	if c.MCPInputScanning.OnParseError == "" {
+		c.MCPInputScanning.OnParseError = ActionBlock
+	}
+	if c.MCPInputScanning.Enabled && c.MCPInputScanning.Action == "" {
+		c.MCPInputScanning.Action = ActionWarn
+	}
+	if c.MCPToolScanning.Enabled && c.MCPToolScanning.Action == "" {
+		c.MCPToolScanning.Action = ActionWarn
+	}
+	if c.MCPToolScanning.Enabled && c.MCPToolScanning.NewToolAdmission == "" {
+		c.MCPToolScanning.NewToolAdmission = NewToolAdmit
+	}
+	if c.MCPDataClassLabels.UnknownClass == "" {
+		c.MCPDataClassLabels.UnknownClass = Defaults().MCPDataClassLabels.UnknownClass
+	}
+	if c.MCPToolPolicy.Enabled && c.MCPToolPolicy.Action == "" {
+		c.MCPToolPolicy.Action = ActionWarn
+	}
+	if c.Defer.TimeoutSeconds <= 0 {
+		c.Defer.TimeoutSeconds = 2
+	}
+	if c.Defer.MaxPending <= 0 {
+		c.Defer.MaxPending = 64
+	}
+	if c.Defer.MaxPendingPerSession <= 0 {
+		c.Defer.MaxPendingPerSession = 8
+	}
+	if c.Defer.MaxPendingBytes <= 0 {
+		c.Defer.MaxPendingBytes = 1024 * 1024
+	}
+	if c.Defer.MaxCascadeDepth == 0 {
+		c.Defer.MaxCascadeDepth = 8
+	}
+	if c.RequestPolicy.OnParseError == "" {
+		c.RequestPolicy.OnParseError = ActionBlock
+	}
+	if c.RequestPolicy.OnOpaqueOperation == "" {
+		c.RequestPolicy.OnOpaqueOperation = ActionBlock
+	}
+	for i := range c.RequestPolicy.Batch {
+		b := &c.RequestPolicy.Batch[i]
+		if b.RequestsField == "" {
+			b.RequestsField = "requests"
+		}
+		if b.MethodField == "" {
+			b.MethodField = "method"
+		}
+		if b.URLField == "" {
+			b.URLField = "url"
+		}
+		if b.BodyField == "" {
+			b.BodyField = "body"
+		}
+		if b.MaxSubRequests <= 0 {
+			b.MaxSubRequests = 64
+		}
+	}
+	if c.ForwardProxy.MaxTunnelSeconds <= 0 {
+		c.ForwardProxy.MaxTunnelSeconds = 300
+	}
+	if c.ForwardProxy.IdleTimeoutSeconds <= 0 {
+		c.ForwardProxy.IdleTimeoutSeconds = 120
+	}
+	if c.WebSocketProxy.MaxMessageBytes <= 0 {
+		c.WebSocketProxy.MaxMessageBytes = 1048576 // 1MB
+	}
+	if c.WebSocketProxy.MaxConcurrentConnections <= 0 {
+		c.WebSocketProxy.MaxConcurrentConnections = 128
+	}
+	if c.WebSocketProxy.ScanTextFrames == nil {
+		t := true
+		c.WebSocketProxy.ScanTextFrames = &t
+	}
+	if c.WebSocketProxy.StripCompression == nil {
+		t := true
+		c.WebSocketProxy.StripCompression = &t
+	}
+	if c.WebSocketProxy.MaxConnectionSeconds <= 0 {
+		c.WebSocketProxy.MaxConnectionSeconds = 3600
+	}
+	if c.WebSocketProxy.IdleTimeoutSeconds <= 0 {
+		c.WebSocketProxy.IdleTimeoutSeconds = 300
+	}
+	if c.WebSocketProxy.OriginPolicy == "" {
+		c.WebSocketProxy.OriginPolicy = OriginPolicyRewrite
+	}
+	if c.GitProtection.Enabled && len(c.GitProtection.AllowedBranches) == 0 {
+		c.GitProtection.AllowedBranches = []string{"feature/*", "fix/*", "main", "master"}
+	}
+	if c.Internal == nil {
+		c.Internal = []string{
+			"0.0.0.0/8",        // "this" network - services listening on all interfaces
+			"127.0.0.0/8",      // loopback
+			"10.0.0.0/8",       // RFC 1918 private
+			"172.16.0.0/12",    // RFC 1918 private
+			"192.168.0.0/16",   // RFC 1918 private
+			"169.254.0.0/16",   // link-local
+			"168.63.129.16/32", // Azure WireServer metadata
+			"100.64.0.0/10",    // CGN / shared address space (Tailscale, CGNAT)
+			"224.0.0.0/4",      // IPv4 multicast
+			"::/128",           // IPv6 unspecified
+			"::1/128",          // IPv6 loopback
+			"fc00::/7",         // IPv6 unique local
+			"fe80::/10",        // IPv6 link-local
+			"ff00::/8",         // IPv6 multicast
+		}
+	}
+
+	// Session profiling defaults
+	if c.SessionProfiling.Enabled {
+		if c.SessionProfiling.AnomalyAction == "" {
+			c.SessionProfiling.AnomalyAction = ActionWarn
+		}
+		if c.SessionProfiling.DomainBurst <= 0 {
+			c.SessionProfiling.DomainBurst = 5
+		}
+		if c.SessionProfiling.WindowMinutes <= 0 {
+			c.SessionProfiling.WindowMinutes = 5
+		}
+	}
+	if c.SessionProfiling.MaxSessions <= 0 {
+		c.SessionProfiling.MaxSessions = 1000
+	}
+	if c.SessionProfiling.SessionTTLMinutes <= 0 {
+		c.SessionProfiling.SessionTTLMinutes = 30
+	}
+	if c.SessionProfiling.CleanupIntervalSeconds <= 0 {
+		c.SessionProfiling.CleanupIntervalSeconds = 60
+	}
+
+	// Adaptive enforcement defaults
+	if c.AdaptiveEnforcement.Enabled {
+		if c.AdaptiveEnforcement.EscalationThreshold <= 0 {
+			c.AdaptiveEnforcement.EscalationThreshold = 5.0
+		}
+		if c.AdaptiveEnforcement.DecayPerCleanRequest <= 0 {
+			c.AdaptiveEnforcement.DecayPerCleanRequest = 0.5
+		}
+		if c.AdaptiveEnforcement.LevelDurationSeconds <= 0 {
+			c.AdaptiveEnforcement.LevelDurationSeconds = 300
+		}
+		if c.AdaptiveEnforcement.DeescalationCheckSeconds <= 0 {
+			c.AdaptiveEnforcement.DeescalationCheckSeconds = 30
+		}
+
+		// Level defaults: only fill nil fields (explicit values including "" and false are operator intent).
+		// Elevated: warn actions upgrade to block.
+		if c.AdaptiveEnforcement.Levels.Elevated.UpgradeWarn == nil {
+			c.AdaptiveEnforcement.Levels.Elevated.UpgradeWarn = ptrStr(ActionBlock)
+		}
+		// High: both warn and ask upgrade to block.
+		if c.AdaptiveEnforcement.Levels.High.UpgradeWarn == nil {
+			c.AdaptiveEnforcement.Levels.High.UpgradeWarn = ptrStr(ActionBlock)
+		}
+		if c.AdaptiveEnforcement.Levels.High.UpgradeAsk == nil {
+			c.AdaptiveEnforcement.Levels.High.UpgradeAsk = ptrStr(ActionBlock)
+		}
+		// Critical: all upgrades to block + session deny.
+		if c.AdaptiveEnforcement.Levels.Critical.UpgradeWarn == nil {
+			c.AdaptiveEnforcement.Levels.Critical.UpgradeWarn = ptrStr(ActionBlock)
+		}
+		if c.AdaptiveEnforcement.Levels.Critical.UpgradeAsk == nil {
+			c.AdaptiveEnforcement.Levels.Critical.UpgradeAsk = ptrStr(ActionBlock)
+		}
+		if c.AdaptiveEnforcement.Levels.Critical.BlockAll == nil {
+			c.AdaptiveEnforcement.Levels.Critical.BlockAll = ptrBool(true)
+		}
+	}
+
+	if c.TLSInterception.PassthroughDomains == nil {
+		c.TLSInterception.PassthroughDomains = append([]string(nil), Defaults().TLSInterception.PassthroughDomains...)
+	}
+
+	// Kill switch defaults
+	if c.KillSwitch.Message == "" {
+		c.KillSwitch.Message = "Emergency deny-all active"
+	}
+	if c.KillSwitch.HealthExempt == nil {
+		c.KillSwitch.HealthExempt = ptrBool(true)
+	}
+	if c.KillSwitch.MetricsExempt == nil {
+		c.KillSwitch.MetricsExempt = ptrBool(true)
+	}
+	if c.KillSwitch.APIExempt == nil {
+		c.KillSwitch.APIExempt = ptrBool(true)
+	}
+
+	// Emit defaults
+	c.normalizeEmitCorrelationHeader()
+	if c.Emit.Webhook.TimeoutSecs <= 0 {
+		c.Emit.Webhook.TimeoutSecs = 5
+	}
+	if c.Emit.Webhook.QueueSize <= 0 {
+		c.Emit.Webhook.QueueSize = 64
+	}
+	if c.Emit.Webhook.MinSeverity == "" {
+		c.Emit.Webhook.MinSeverity = SeverityWarn
+	}
+	if c.Emit.Webhook.Format == "" {
+		c.Emit.Webhook.Format = EmitFormatJSON
+	}
+	if c.Emit.Syslog.MinSeverity == "" {
+		c.Emit.Syslog.MinSeverity = SeverityWarn
+	}
+	if c.Emit.Syslog.Format == "" {
+		c.Emit.Syslog.Format = EmitFormatJSON
+	}
+	if c.Emit.OTLP.MinSeverity == "" {
+		c.Emit.OTLP.MinSeverity = SeverityWarn
+	}
+	if c.Emit.OTLP.TimeoutSeconds <= 0 {
+		c.Emit.OTLP.TimeoutSeconds = 10
+	}
+	if c.Emit.OTLP.QueueSize <= 0 {
+		c.Emit.OTLP.QueueSize = 256
+	}
+	if c.Emit.Forwarder.MinSeverity == "" {
+		c.Emit.Forwarder.MinSeverity = SeverityWarn
+	}
+	if c.Emit.Forwarder.TimeoutSeconds <= 0 {
+		c.Emit.Forwarder.TimeoutSeconds = 5
+	}
+	if c.Emit.Forwarder.QueueSize <= 0 {
+		c.Emit.Forwarder.QueueSize = 256
+	}
+	if c.Emit.Forwarder.MaxSpoolBytes <= 0 {
+		c.Emit.Forwarder.MaxSpoolBytes = defaultForwarderMaxSpoolBytes
+	}
+	if c.Emit.Syslog.Facility == "" {
+		c.Emit.Syslog.Facility = "local0"
+	}
+	if c.Emit.Syslog.Tag == "" {
+		c.Emit.Syslog.Tag = DefaultSyslogTag
+	}
+
+	// Sentry defaults (nil sample_rate = 1.0, handled by EffectiveSampleRate())
+	if c.Sentry.Environment == "" {
+		c.Sentry.Environment = "production"
+	}
+
+	// Tool chain detection defaults
+	if c.ToolChainDetection.Enabled && c.ToolChainDetection.Action == "" {
+		c.ToolChainDetection.Action = ActionWarn
+	}
+	if c.ToolChainDetection.WindowSize <= 0 {
+		c.ToolChainDetection.WindowSize = 20
+	}
+	if c.ToolChainDetection.WindowSeconds <= 0 {
+		c.ToolChainDetection.WindowSeconds = 60
+	}
+	if c.ToolChainDetection.MaxGap == nil {
+		d := DefaultMaxGap
+		c.ToolChainDetection.MaxGap = &d
+	}
+
+	// TLS interception defaults
+	if c.TLSInterception.CertTTL == "" {
+		c.TLSInterception.CertTTL = DefaultCertTTL
+	}
+	if c.TLSInterception.CertCacheSize <= 0 {
+		c.TLSInterception.CertCacheSize = 10000
+	}
+	if c.TLSInterception.MaxResponseBytes <= 0 {
+		c.TLSInterception.MaxResponseBytes = 5 * 1024 * 1024 // 5MB
+	}
+
+	// Browser Shield defaults are applied even when disabled so enabling
+	// browser_shield with only `enabled: true` yields production-safe knobs.
+	if c.BrowserShield.Strictness == "" {
+		c.BrowserShield.Strictness = ShieldStrictnessStandard
+	}
+	if c.BrowserShield.MaxShieldBytes <= 0 {
+		c.BrowserShield.MaxShieldBytes = 5 * 1024 * 1024 // 5MB
+	}
+	if c.BrowserShield.OversizeAction == "" {
+		c.BrowserShield.OversizeAction = ShieldOversizeScanHead
+	}
+	if c.BrowserShield.ExemptDomains == nil {
+		c.BrowserShield.ExemptDomains = append([]string(nil), Defaults().BrowserShield.ExemptDomains...)
+	}
+
+	// MCP WS listener defaults
+	if c.MCPWSListener.MaxConnections <= 0 {
+		c.MCPWSListener.MaxConnections = 100
+	}
+
+	// MCP session binding defaults
+	if c.MCPSessionBinding.Enabled {
+		if c.MCPSessionBinding.UnknownToolAction == "" {
+			c.MCPSessionBinding.UnknownToolAction = ActionWarn
+		}
+		if c.MCPSessionBinding.NoBaselineAction == "" {
+			c.MCPSessionBinding.NoBaselineAction = ActionWarn
+		}
+	}
+
+	// Request body scanning defaults
+	if c.RequestBodyScanning.MaxBodyBytes == 0 {
+		c.RequestBodyScanning.MaxBodyBytes = 5 * 1024 * 1024 // 5MB default
+	}
+	if c.ReverseProxy.MaxInflightScanBytes == 0 {
+		c.ReverseProxy.MaxInflightScanBytes = DefaultReverseProxyMaxInflightScanBytes
+	}
+	if c.RequestBodyScanning.Enabled || c.RequestBodyScanning.ContentEntropyEnabled {
+		if c.RequestBodyScanning.ContentEntropyAction == "" {
+			c.RequestBodyScanning.ContentEntropyAction = ActionWarn
+		}
+		if c.RequestBodyScanning.ContentEntropyThreshold <= 0 {
+			c.RequestBodyScanning.ContentEntropyThreshold = 4.5
+		}
+		if c.RequestBodyScanning.ContentEntropyMinLength <= 0 {
+			c.RequestBodyScanning.ContentEntropyMinLength = 32
+		}
+	}
+	if c.RequestBodyScanning.Enabled {
+		if c.RequestBodyScanning.Action == "" {
+			c.RequestBodyScanning.Action = ActionWarn
+		}
+		// ScanHeaders defaults to true when omitted or null in YAML; the
+		// bool-to-true coercion happens in applySecurityDefaults via
+		// setBoolDefault(reqBody, "scan_headers", ...). Explicit
+		// scan_headers: false still disables header scanning.
+		if c.RequestBodyScanning.HeaderMode == "" {
+			c.RequestBodyScanning.HeaderMode = HeaderModeSensitive
+		}
+		if len(c.RequestBodyScanning.SensitiveHeaders) == 0 {
+			c.RequestBodyScanning.SensitiveHeaders = defaultSensitiveHeaders()
+		}
+		if len(c.RequestBodyScanning.IgnoreHeaders) == 0 {
+			c.RequestBodyScanning.IgnoreHeaders = []string{
+				"Connection", "Keep-Alive", "Proxy-Authenticate",
+				"Te", "Trailer", "Transfer-Encoding", "Upgrade",
+				"Host", "Content-Length", "Content-Type",
+				"Accept", "Accept-Encoding", "User-Agent",
+			}
+		}
+	}
+
+	// Scan API defaults (applied regardless of Listen, so a partial config gets sane values)
+	if c.ScanAPI.RateLimit.RequestsPerMinute <= 0 {
+		c.ScanAPI.RateLimit.RequestsPerMinute = 600
+	}
+	if c.ScanAPI.RateLimit.Burst <= 0 {
+		c.ScanAPI.RateLimit.Burst = 50
+	}
+	if c.ScanAPI.MaxBodyBytes == 0 {
+		c.ScanAPI.MaxBodyBytes = 1 << 20 // 1MB
+	}
+	if c.ScanAPI.FieldLimits.URL <= 0 {
+		c.ScanAPI.FieldLimits.URL = 8192
+	}
+	if c.ScanAPI.FieldLimits.Text <= 0 {
+		c.ScanAPI.FieldLimits.Text = 512 * 1024 // 512KB
+	}
+	if c.ScanAPI.FieldLimits.Content <= 0 {
+		c.ScanAPI.FieldLimits.Content = 512 * 1024 // 512KB
+	}
+	if c.ScanAPI.FieldLimits.Arguments <= 0 {
+		c.ScanAPI.FieldLimits.Arguments = 512 * 1024 // 512KB
+	}
+	if c.ScanAPI.Timeouts.Read == "" {
+		c.ScanAPI.Timeouts.Read = "2s"
+	}
+	if c.ScanAPI.Timeouts.Write == "" {
+		c.ScanAPI.Timeouts.Write = "2s"
+	}
+	if c.ScanAPI.Timeouts.Scan == "" {
+		c.ScanAPI.Timeouts.Scan = "5s"
+	}
+	if c.ScanAPI.ConnectionLimit == 0 {
+		c.ScanAPI.ConnectionLimit = 100
+	}
+
+	// Cross-request detection defaults
+	if c.CrossRequestDetection.Enabled {
+		if c.CrossRequestDetection.Action == "" {
+			c.CrossRequestDetection.Action = ActionBlock
+		}
+		if c.CrossRequestDetection.EntropyBudget.Enabled {
+			if c.CrossRequestDetection.EntropyBudget.BitsPerWindow <= 0 {
+				c.CrossRequestDetection.EntropyBudget.BitsPerWindow = 4096 // generous for legitimate traffic
+			}
+			if c.CrossRequestDetection.EntropyBudget.WindowMinutes <= 0 {
+				c.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+			}
+			if c.CrossRequestDetection.EntropyBudget.Action == "" {
+				c.CrossRequestDetection.EntropyBudget.Action = ActionWarn
+			}
+		}
+		if c.CrossRequestDetection.FragmentReassembly.Enabled {
+			if c.CrossRequestDetection.FragmentReassembly.MaxBufferBytes <= 0 {
+				c.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 65536
+			}
+			// Deliberately NOT defaulted here. Coercing a non-positive value
+			// would hide an operator's explicit mistake behind the default and
+			// make the validation rule unreachable; nil means omitted and
+			// ResolvedMaxSessions supplies the default at the point of use.
+			if c.CrossRequestDetection.FragmentReassembly.WindowMinutes <= 0 {
+				c.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+			}
+		}
+	}
+
+	// Address protection defaults
+	if c.AddressProtection.Enabled {
+		if c.AddressProtection.Action == "" {
+			c.AddressProtection.Action = ActionBlock
+		}
+		if c.AddressProtection.UnknownAction == "" {
+			c.AddressProtection.UnknownAction = ActionAllow
+		}
+		if c.AddressProtection.Similarity.PrefixLength <= 0 {
+			c.AddressProtection.Similarity.PrefixLength = 4
+		}
+		if c.AddressProtection.Similarity.SuffixLength <= 0 {
+			c.AddressProtection.Similarity.SuffixLength = 4
+		}
+	}
+
+	// Community rules defaults
+	if c.Rules.MinConfidence == "" {
+		c.Rules.MinConfidence = ConfidenceMedium
+	}
+
+	// File sentry defaults
+	if c.FileSentry.ScanContent == nil {
+		c.FileSentry.ScanContent = ptrBool(true)
+	}
+	if c.FileSentry.Action == "" {
+		c.FileSentry.Action = ActionWarn
+	}
+
+	// A2A scanning defaults
+	if c.A2AScanning.Enabled {
+		if c.A2AScanning.Action == "" {
+			c.A2AScanning.Action = ActionWarn
+		}
+		if c.A2AScanning.MaxContextMessages <= 0 {
+			c.A2AScanning.MaxContextMessages = 100
+		}
+		if c.A2AScanning.MaxContexts <= 0 {
+			c.A2AScanning.MaxContexts = 1000
+		}
+		if c.A2AScanning.MaxRawSize <= 0 {
+			c.A2AScanning.MaxRawSize = 1 << 20 // 1MB encoded
+		}
+	}
+
+	// Taint policy defaults
+	if c.Taint.Policy == "" {
+		c.Taint.Policy = ModeBalanced
+	}
+	if c.Taint.RecentSources < 0 {
+		c.Taint.RecentSources = 10
+	}
+	if c.Taint.AllowlistedDomains == nil {
+		c.Taint.AllowlistedDomains = append([]string(nil), Defaults().Taint.AllowlistedDomains...)
+	}
+	if c.Taint.ProtectedPaths == nil {
+		c.Taint.ProtectedPaths = append([]string(nil), Defaults().Taint.ProtectedPaths...)
+	}
+	if c.Taint.ElevatedPaths == nil {
+		c.Taint.ElevatedPaths = append([]string(nil), Defaults().Taint.ElevatedPaths...)
+	}
+
+	// MCP binary integrity defaults
+	if c.MCPBinaryIntegrity.Enabled {
+		if c.MCPBinaryIntegrity.Action == "" {
+			c.MCPBinaryIntegrity.Action = ActionBlock
+		}
+	}
+
+	// Flight recorder defaults - applied when section is present.
+	// Redact and SignCheckpoints default to true via applySecurityDefaults.
+	if c.FlightRecorder.CheckpointInterval <= 0 {
+		c.FlightRecorder.CheckpointInterval = 1000 // entries between signed checkpoints
+	}
+	if c.FlightRecorder.MaxEntriesPerFile <= 0 {
+		c.FlightRecorder.MaxEntriesPerFile = 10000 // rotate files at this count
+	}
+	if c.FlightRecorder.Completeness.HeartbeatInterval == "" {
+		c.FlightRecorder.Completeness.HeartbeatInterval = "60s"
+	}
+	if c.FlightRecorder.EvidenceHealth.Enabled == nil {
+		c.FlightRecorder.EvidenceHealth.Enabled = ptrBool(c.FlightRecorder.Enabled)
+	}
+	if c.FlightRecorder.EvidenceHealth.SelfAuditInterval == "" {
+		c.FlightRecorder.EvidenceHealth.SelfAuditInterval = "30s"
+	}
+	if c.FlightRecorder.EvidenceHealth.MaxAnchorLag == "" {
+		c.FlightRecorder.EvidenceHealth.MaxAnchorLag = "24h"
+	}
+	if c.FlightRecorder.Anchor.Interval == "" {
+		c.FlightRecorder.Anchor.Interval = DefaultFlightRecorderAnchorInterval.String()
+	}
+	if c.FlightRecorder.Anchor.ReceiptThreshold == nil {
+		c.FlightRecorder.Anchor.ReceiptThreshold = ptrUint64(DefaultFlightRecorderAnchorThreshold)
+	}
+	if c.DashboardSnapshot.Interval == "" {
+		c.DashboardSnapshot.Interval = DefaultDashboardSnapshotInterval.String()
+	}
+
+	// MCP tool provenance defaults
+	if c.MCPToolProvenance.Enabled {
+		if c.MCPToolProvenance.Action == "" {
+			c.MCPToolProvenance.Action = ActionWarn
+		}
+		if c.MCPToolProvenance.Mode == "" {
+			c.MCPToolProvenance.Mode = ProvenanceModePipelock
+		}
+	}
+	// OfflineOnly defaults to true via applySecurityDefaults.
+
+	// Behavioral baseline defaults
+	if c.BehavioralBaseline.Enabled {
+		if c.BehavioralBaseline.DeviationAction == "" {
+			c.BehavioralBaseline.DeviationAction = ActionWarn
+		}
+		if c.BehavioralBaseline.LearningWindow <= 0 {
+			c.BehavioralBaseline.LearningWindow = 10 // sessions to observe before enforcement
+		}
+		if c.BehavioralBaseline.SensitivitySigma <= 0 {
+			c.BehavioralBaseline.SensitivitySigma = 2.0 // stddev multiplier for deviation threshold
+		}
+		if c.BehavioralBaseline.SeasonalityMode == "" {
+			c.BehavioralBaseline.SeasonalityMode = SeasonalityModeNone
+		}
+	}
+	// PoisonResistance defaults to true via applySecurityDefaults.
+
+	// Health watchdog: interval defaults to 2s when omitted or non-positive.
+	// Enabled is handled by applySecurityDefaults (defaults to true).
+	if c.HealthWatchdog.IntervalSeconds <= 0 {
+		c.HealthWatchdog.IntervalSeconds = 2
+	}
+}
+
+func ptrUint64(v uint64) *uint64 {
+	return &v
+}
+
+// mergeDLPPatterns merges default DLP patterns with user-defined patterns.
+// When includeDefaults is nil or true, defaults are loaded first and user
+// patterns override by name (matching Name field). New defaults that don't
+// exist in the user config are automatically added.
+// When includeDefaults is false, only user patterns are used.
+func mergeDLPPatterns(includeDefaults *bool, user, defaults []DLPPattern) []DLPPattern {
+	if includeDefaults != nil && !*includeDefaults {
+		// Explicit opt-out: user patterns only (old behavior).
+		return user
+	}
+	if len(user) == 0 {
+		return defaults
+	}
+	// Build lookup of user pattern names.
+	userNames := make(map[string]struct{}, len(user))
+	for _, p := range user {
+		userNames[p.Name] = struct{}{}
+	}
+	// Start with defaults not overridden by user, then append all user patterns.
+	merged := make([]DLPPattern, 0, len(defaults)+len(user))
+	for _, d := range defaults {
+		if _, overridden := userNames[d.Name]; !overridden {
+			merged = append(merged, d)
+		}
+	}
+	merged = append(merged, user...)
+	return merged
+}
+
+// markBuiltInCredentialURLWhitespaceGrammar restores built-in runtime
+// provenance for shipped preset YAML, which serializes DLPPattern without its
+// runtime-only marker. Only an exact copy of the canonical built-in definition
+// receives the marker; operators cannot configure it through YAML.
+func markBuiltInCredentialURLWhitespaceGrammar(patterns []DLPPattern) {
+	for _, pattern := range defaultDLPPatternSet {
+		if !pattern.CredentialURLWhitespaceGrammar {
+			continue
+		}
+		for i := range patterns {
+			candidate := &patterns[i]
+			candidate.CredentialURLWhitespaceGrammar = candidate.Bundle == "" &&
+				candidate.Name == pattern.Name &&
+				candidate.Regex == pattern.Regex &&
+				candidate.Severity == pattern.Severity &&
+				candidate.Validator == pattern.Validator && len(candidate.Keywords) == 0 && candidate.KeywordWindow == nil &&
+				sameStrings(candidate.ExemptDomains, pattern.ExemptDomains)
+		}
+		return
+	}
+}
+
+// markBuiltInCredentialAudienceHosts restores the immutable audience property
+// for generated preset YAML. The field is excluded from YAML, so only a copy
+// of a shipped pattern receives it after default merging. A changed regex,
+// severity, validator or action stays a normal blocking pattern, and validation
+// warns that the compiled audience no longer applies. An operator
+// exempt_domains list is not part of the identity: it never changes what the
+// pattern matches, so it cannot cost the pattern its audience. Validation
+// warns about an entry the audience already covers (ignored) and about one
+// outside it (honored by the scanner, and a widening the operator chose).
+func markBuiltInCredentialAudienceHosts(patterns []DLPPattern) {
+	// Clear every candidate ONCE, before matching. A clone carries the audience
+	// field, so a pattern whose regex, severity, validator or action was
+	// customized would otherwise keep the built-in audience and earn an allow it
+	// no longer qualifies for. Fail closed: only a candidate that passes the
+	// identity checks below gets an audience back.
+	//
+	// The ACTION belongs in that list even though it softens rather than widens
+	// enforcement. The scanner sets its warn flag as "action is warn AND no
+	// audience", so handing an audience back to a pattern the operator marked
+	// warn does not just add metadata: it clears the warn flag and sends every
+	// non-audience match to the blocking branch, which is the operator's stated
+	// intent reversed.
+	//
+	// This cannot move inside the loop over built-ins: that runs once per
+	// built-in pattern, so a later iteration would wipe the audience an earlier
+	// one had just assigned and every pattern but the last would lose it.
+	for i := range patterns {
+		patterns[i].CredentialAudienceHosts = nil
+		patterns[i].CredentialAudienceAuthorizationOnly = false
+		patterns[i].CredentialAudienceCarrierMask = 0
+		patterns[i].CredentialAudienceGitHosts = nil
+		patterns[i].CredentialAudienceRegistryHosts = nil
+	}
+	for _, builtIn := range defaultDLPPatternSet {
+		if len(builtIn.CredentialAudienceHosts) == 0 {
+			continue
+		}
+		for i := range patterns {
+			candidate := &patterns[i]
+			if candidate.Bundle != "" || candidate.Name != builtIn.Name ||
+				candidate.Regex != builtIn.Regex || candidate.Severity != builtIn.Severity ||
+				candidate.Validator != builtIn.Validator || candidate.Action != builtIn.Action || len(candidate.Keywords) > 0 || candidate.KeywordWindow != nil {
+				continue
+			}
+			candidate.CredentialAudienceHosts = append([]string(nil), builtIn.CredentialAudienceHosts...)
+			candidate.CredentialAudienceAuthorizationOnly = builtIn.CredentialAudienceAuthorizationOnly
+			candidate.CredentialAudienceCarrierMask = builtIn.CredentialAudienceCarrierMask
+			candidate.CredentialAudienceGitHosts = append([]string(nil), builtIn.CredentialAudienceGitHosts...)
+			candidate.CredentialAudienceRegistryHosts = append([]string(nil), builtIn.CredentialAudienceRegistryHosts...)
+		}
+	}
+}
+
+// RestoreBuiltInCredentialAudienceHosts re-derives immutable runtime audience
+// metadata after a trusted config transformation, such as an Enterprise agent
+// profile merge. Serialized profile patterns cannot carry this yaml-excluded
+// field, so callers must restore it from exact shipped pattern identity before
+// constructing a scanner.
+func RestoreBuiltInCredentialAudienceHosts(patterns []DLPPattern) {
+	markBuiltInCredentialAudienceHosts(patterns)
+}
+
+// mergeResponsePatterns merges default response scanning patterns with user-defined patterns.
+// Same semantics as mergeDLPPatterns: nil/true merges by name, false uses user only.
+func mergeResponsePatterns(includeDefaults *bool, user, defaults []ResponseScanPattern) []ResponseScanPattern {
+	if includeDefaults != nil && !*includeDefaults {
+		return user
+	}
+	if len(user) == 0 {
+		return defaults
+	}
+	userNames := make(map[string]struct{}, len(user))
+	for _, p := range user {
+		userNames[p.Name] = struct{}{}
+	}
+	merged := make([]ResponseScanPattern, 0, len(defaults)+len(user))
+	for _, d := range defaults {
+		if _, overridden := userNames[d.Name]; !overridden {
+			merged = append(merged, d)
+		}
+	}
+	merged = append(merged, user...)
+	return merged
+}
+
+// normalizeMediationEnvelope applies defaults and canonicalises
+// signing-related fields regardless of whether Sign is currently on.
+// Returns an error for any field whose raw value is syntactically
+// invalid (negative lengths, malformed component names).
+//
+// Keeping this separate from the sign-gated keyfile load means two
+// configs with identical effective policy but different histories
+// (one that was always sign=false, one that cycled through sign=true)
+// compare identically under ValidateReload.
+func normalizeMediationEnvelope(me *MediationEnvelope) error {
+	me.ActorFormat = strings.TrimSpace(me.ActorFormat)
+	if me.ActorFormat == "" {
+		me.ActorFormat = DefaultEnvelopeActorFormat
+	}
+	me.ActorFormat = strings.ToLower(me.ActorFormat)
+	switch me.ActorFormat {
+	case envelope.ActorFormatLegacy:
+	case envelope.ActorFormatSPIFFE:
+		me.TrustDomain = strings.TrimSpace(me.TrustDomain)
+		if me.TrustDomain == "" {
+			me.TrustDomain = DefaultEnvelopeTrustDomain
+		}
+		me.TrustDomain = strings.ToLower(me.TrustDomain)
+		if !envelope.IsValidTrustDomain(me.TrustDomain) {
+			return fmt.Errorf("mediation_envelope.trust_domain %q must be a DNS-shaped label with no scheme, slashes, userinfo, or port", me.TrustDomain)
+		}
+	default:
+		return fmt.Errorf("mediation_envelope.actor_format must be %q or %q", envelope.ActorFormatLegacy, envelope.ActorFormatSPIFFE)
+	}
+	me.SignatureExpires = strings.TrimSpace(me.SignatureExpires)
+	me.VerifyInbound.ReplayCache.Window = strings.TrimSpace(me.VerifyInbound.ReplayCache.Window)
+	if me.KeyID == "" {
+		me.KeyID = DefaultEnvelopeSignKeyID
+	}
+	if me.CreatedSkewSeconds == 0 {
+		me.CreatedSkewSeconds = DefaultEnvelopeSignCreatedSkewSecs
+	}
+	if me.CreatedSkewSeconds < 0 {
+		return fmt.Errorf("mediation_envelope.created_skew_seconds must be >= 0, got %d", me.CreatedSkewSeconds)
+	}
+	if me.MaxBodyBytes == 0 {
+		me.MaxBodyBytes = DefaultEnvelopeSignMaxBodyBytes
+	}
+	if me.MaxBodyBytes < 0 {
+		return fmt.Errorf("mediation_envelope.max_body_bytes must be >= 0, got %d", me.MaxBodyBytes)
+	}
+	if len(me.SignedComponents) == 0 {
+		me.SignedComponents = DefaultEnvelopeSignedComponents()
+	} else {
+		normalized, err := envelope.NormalizeSignedComponents(me.SignedComponents)
+		if err != nil {
+			return errors.New("mediation_envelope." + err.Error())
+		}
+		me.SignedComponents = normalized
+	}
+	if me.VerifyInbound.ReplayCache.Window == "" {
+		me.VerifyInbound.ReplayCache.Window = DefaultEnvelopeReplayWindow.String()
+	}
+	if me.VerifyInbound.ReplayCache.MaxEntries == 0 {
+		me.VerifyInbound.ReplayCache.MaxEntries = DefaultEnvelopeReplayMaxEntries
+	}
+	return nil
+}

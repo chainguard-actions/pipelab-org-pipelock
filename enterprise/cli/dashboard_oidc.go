@@ -1,0 +1,1082 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package entcli
+
+import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/enterprise/dashboard"
+)
+
+const (
+	dashboardOIDCAlgorithm       = "RS256"
+	dashboardOIDCClockLeeway     = 30 * time.Second
+	dashboardOIDCDefaultCacheTTL = 5 * time.Minute
+	dashboardOIDCHTTPTimeout     = 5 * time.Second
+	dashboardOIDCMaxDocumentSize = 1 << 20
+	dashboardOIDCMaxTokenSize    = 16 << 10
+	dashboardOIDCMaxRoleValues   = 64
+	dashboardOIDCMaxRoleLength   = 256
+	dashboardOIDCMaxJSONDepth    = 64
+	dashboardOIDCMinKeyRefresh   = 30 * time.Second
+	dashboardOIDCRSAMaxBits      = 8192
+)
+
+type dashboardOIDCOptions struct {
+	Issuer       string
+	Audience     string
+	RoleClaim    string
+	RoleMapJSON  string
+	HTTPClient   *http.Client
+	Now          func() time.Time
+	JWKSCacheTTL time.Duration
+}
+
+func validateDashboardAuthenticatorConfig(opts dashboardServeOptions) error {
+	issuerConfigured := strings.TrimSpace(opts.oidcIssuer) != ""
+	anyOIDCOption := issuerConfigured || strings.TrimSpace(opts.oidcAudience) != "" ||
+		strings.TrimSpace(opts.oidcClientID) != "" || strings.TrimSpace(opts.oidcRoleClaim) != "" ||
+		strings.TrimSpace(opts.oidcRoleMap) != ""
+	if anyOIDCOption && !issuerConfigured {
+		return errors.New("--oidc-issuer is required when any OIDC option is set")
+	}
+	// A verified mTLS client certificate is a first-class sole authenticator:
+	// with --require-client-cert the mapped certificate role supplies both route
+	// and raw-view permissions and takes precedence over any token/OIDC principal
+	// (dashboardClientCertAuthorizers), and an absent, wrong-CA, or unmapped
+	// certificate is denied by the TLS layer and the fingerprint role map. So
+	// --require-client-cert alone is a complete, fail-closed authenticator.
+	if strings.TrimSpace(opts.authTokenFile) == "" && !issuerConfigured && !opts.requireClientCert {
+		return errors.New("one authenticator is required: set --auth-token-file, --oidc-issuer, or --require-client-cert")
+	}
+	if strings.TrimSpace(opts.rawTokenFile) != "" && strings.TrimSpace(opts.authTokenFile) == "" {
+		return errors.New("--raw-token-file requires --auth-token-file")
+	}
+	if !issuerConfigured {
+		return nil
+	}
+	if strings.TrimSpace(opts.oidcAudience) == "" && strings.TrimSpace(opts.oidcClientID) == "" {
+		return errors.New("--oidc-audience or --oidc-client-id is required with --oidc-issuer")
+	}
+	if strings.TrimSpace(opts.oidcAudience) != "" && strings.TrimSpace(opts.oidcClientID) != "" &&
+		strings.TrimSpace(opts.oidcAudience) != strings.TrimSpace(opts.oidcClientID) {
+		return errors.New("--oidc-audience and --oidc-client-id must match when both are set")
+	}
+	if strings.TrimSpace(opts.oidcRoleClaim) == "" {
+		return errors.New("--oidc-role-claim is required with --oidc-issuer")
+	}
+	if strings.TrimSpace(opts.oidcRoleMap) == "" {
+		return errors.New("--oidc-role-map must not be empty when OIDC is enabled")
+	}
+	return nil
+}
+
+func dashboardOIDCAudience(opts dashboardServeOptions) string {
+	if strings.TrimSpace(opts.oidcAudience) != "" {
+		return strings.TrimSpace(opts.oidcAudience)
+	}
+	return strings.TrimSpace(opts.oidcClientID)
+}
+
+type dashboardOIDCAuthenticator struct {
+	issuer    string
+	audience  string
+	roleClaim string
+	roleMap   dashboardOIDCRoleMap
+	keys      *dashboardJWKSCache
+	now       func() time.Time
+}
+
+type dashboardOIDCPrincipal struct {
+	Subject     string
+	Roles       []string
+	permissions map[dashboard.Permission]struct{}
+}
+
+func (p *dashboardOIDCPrincipal) hasPermission(permission dashboard.Permission) bool {
+	if p == nil {
+		return false
+	}
+	_, ok := p.permissions[permission]
+	return ok
+}
+
+type dashboardOIDCRoleMap struct {
+	claimValues map[string]string
+	roles       map[string]map[dashboard.Permission]struct{}
+}
+
+type dashboardOIDCRoleMapDocument struct {
+	ClaimValues map[string]string   `json:"claim_values"`
+	Roles       map[string][]string `json:"roles"`
+}
+
+func parseDashboardOIDCRoleMap(value string) (dashboardOIDCRoleMap, error) {
+	if strings.TrimSpace(value) == "" {
+		return dashboardOIDCRoleMap{}, errors.New("--oidc-role-map must contain a JSON role map")
+	}
+	if len(value) > dashboardOIDCMaxDocumentSize {
+		return dashboardOIDCRoleMap{}, errors.New("--oidc-role-map exceeds the 1 MiB limit")
+	}
+	if err := rejectDashboardDuplicateJSONMembers([]byte(value)); err != nil {
+		return dashboardOIDCRoleMap{}, fmt.Errorf("parse --oidc-role-map: %w", err)
+	}
+	var document dashboardOIDCRoleMapDocument
+	decoder := json.NewDecoder(strings.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&document); err != nil {
+		return dashboardOIDCRoleMap{}, fmt.Errorf("parse --oidc-role-map: %w", err)
+	}
+	if err := requireJSONEOF(decoder); err != nil {
+		return dashboardOIDCRoleMap{}, fmt.Errorf("parse --oidc-role-map: %w", err)
+	}
+	if len(document.ClaimValues) == 0 {
+		return dashboardOIDCRoleMap{}, errors.New("--oidc-role-map claim_values must not be empty")
+	}
+	if len(document.Roles) == 0 {
+		return dashboardOIDCRoleMap{}, errors.New("--oidc-role-map roles must not be empty")
+	}
+
+	knownPermissions := make(map[dashboard.Permission]struct{})
+	for _, permission := range dashboard.AllPermissions() {
+		knownPermissions[permission] = struct{}{}
+	}
+	roles := make(map[string]map[dashboard.Permission]struct{}, len(document.Roles))
+	for role, configuredPermissions := range document.Roles {
+		if strings.TrimSpace(role) == "" || len(role) > dashboardOIDCMaxRoleLength {
+			return dashboardOIDCRoleMap{}, errors.New("--oidc-role-map contains an empty or overlong role name")
+		}
+		if len(configuredPermissions) == 0 {
+			return dashboardOIDCRoleMap{}, fmt.Errorf("--oidc-role-map role %q must grant at least one permission", role)
+		}
+		permissions := make(map[dashboard.Permission]struct{}, len(configuredPermissions))
+		for _, configured := range configuredPermissions {
+			permission := dashboard.Permission(configured)
+			if _, ok := knownPermissions[permission]; !ok {
+				return dashboardOIDCRoleMap{}, fmt.Errorf("--oidc-role-map role %q has unknown permission %q", role, configured)
+			}
+			permissions[permission] = struct{}{}
+		}
+		roles[role] = permissions
+	}
+	for claimValue, role := range document.ClaimValues {
+		if strings.TrimSpace(claimValue) == "" || len(claimValue) > dashboardOIDCMaxRoleLength {
+			return dashboardOIDCRoleMap{}, errors.New("--oidc-role-map contains an empty or overlong claim value")
+		}
+		if _, ok := roles[role]; !ok {
+			return dashboardOIDCRoleMap{}, fmt.Errorf("--oidc-role-map claim value %q references unknown role %q", claimValue, role)
+		}
+	}
+	return dashboardOIDCRoleMap{claimValues: document.ClaimValues, roles: roles}, nil
+}
+
+type dashboardOIDCDiscovery struct {
+	Issuer  string `json:"issuer"`
+	JWKSURI string `json:"jwks_uri"`
+}
+
+func newDashboardOIDCAuthenticator(ctx context.Context, opts dashboardOIDCOptions) (*dashboardOIDCAuthenticator, error) {
+	issuer := strings.TrimSpace(opts.Issuer)
+	if err := validateDashboardOIDCURL("--oidc-issuer", issuer); err != nil {
+		return nil, err
+	}
+	audience := strings.TrimSpace(opts.Audience)
+	if audience == "" {
+		return nil, errors.New("--oidc-audience or --oidc-client-id is required with --oidc-issuer")
+	}
+	roleClaim := strings.TrimSpace(opts.RoleClaim)
+	if roleClaim == "" || len(roleClaim) > dashboardOIDCMaxRoleLength {
+		return nil, errors.New("--oidc-role-claim must be non-empty and at most 256 bytes")
+	}
+	roleMap, err := parseDashboardOIDCRoleMap(opts.RoleMapJSON)
+	if err != nil {
+		return nil, err
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	cacheTTL := opts.JWKSCacheTTL
+	if cacheTTL <= 0 {
+		cacheTTL = dashboardOIDCDefaultCacheTTL
+	}
+	client := &http.Client{Timeout: dashboardOIDCHTTPTimeout}
+	if opts.HTTPClient != nil {
+		client = new(http.Client)
+		*client = *opts.HTTPClient
+	}
+	// Discovery and JWKS endpoints are fixed trust anchors. Following even a
+	// same-origin redirect makes their effective destination mutable and can
+	// turn provider metadata into an SSRF or downgrade hop. Clone injected
+	// clients above so this policy cannot be weakened by their redirect hook.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	discoveryURL := strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration"
+	var discovery dashboardOIDCDiscovery
+	if err := fetchDashboardOIDCJSON(ctx, client, discoveryURL, &discovery); err != nil {
+		return nil, fmt.Errorf("OIDC discovery: %w", err)
+	}
+	if discovery.Issuer != issuer {
+		return nil, fmt.Errorf("OIDC discovery issuer %q does not match configured issuer %q", discovery.Issuer, issuer)
+	}
+	if err := validateDashboardOIDCURL("OIDC jwks_uri", discovery.JWKSURI); err != nil {
+		return nil, err
+	}
+	if err := validateDashboardOIDCJWKSOrigin(issuer, discovery.JWKSURI); err != nil {
+		return nil, err
+	}
+	keys := &dashboardJWKSCache{
+		uri:    discovery.JWKSURI,
+		client: client,
+		now:    now,
+		ttl:    cacheTTL,
+	}
+	if err := keys.refresh(ctx); err != nil {
+		return nil, fmt.Errorf("load OIDC JWKS: %w", err)
+	}
+	return &dashboardOIDCAuthenticator{
+		issuer: issuer, audience: audience, roleClaim: roleClaim,
+		roleMap: roleMap, keys: keys, now: now,
+	}, nil
+}
+
+func validateDashboardOIDCURL(label, value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if parsed.User != nil || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s must be an absolute URL without credentials, query, or fragment", label)
+	}
+	if parsed.Scheme == "https" {
+		return nil
+	}
+	if parsed.Scheme == "http" {
+		host := parsed.Hostname()
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s must use HTTPS (HTTP is allowed only for a loopback test issuer)", label)
+}
+
+func validateDashboardOIDCJWKSOrigin(issuer, jwksURI string) error {
+	issuerURL, err := url.Parse(issuer)
+	if err != nil {
+		return fmt.Errorf("--oidc-issuer: %w", err)
+	}
+	jwksURL, err := url.Parse(jwksURI)
+	if err != nil {
+		return fmt.Errorf("OIDC jwks_uri: %w", err)
+	}
+	if !sameDashboardOIDCOrigin(issuerURL, jwksURL) {
+		return fmt.Errorf("OIDC jwks_uri origin %q does not match configured issuer origin %q", jwksURL.Scheme+"://"+jwksURL.Host, issuerURL.Scheme+"://"+issuerURL.Host)
+	}
+	return nil
+}
+
+func sameDashboardOIDCOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		dashboardOIDCPort(a) == dashboardOIDCPort(b)
+}
+
+func dashboardOIDCPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
+}
+
+func fetchDashboardOIDCJSON(ctx context.Context, client *http.Client, endpoint string, dst any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s returned HTTP %d", endpoint, resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, dashboardOIDCMaxDocumentSize+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > dashboardOIDCMaxDocumentSize {
+		return fmt.Errorf("%s response exceeds the 1 MiB limit", endpoint)
+	}
+	if err := rejectDashboardDuplicateJSONMembers(data); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func requireJSONEOF(decoder *json.Decoder) error {
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+type dashboardJWKSCache struct {
+	mu        sync.Mutex
+	uri       string
+	client    *http.Client
+	now       func() time.Time
+	ttl       time.Duration
+	keys      map[string]*rsa.PublicKey
+	expiresAt time.Time
+	lastMiss  time.Time
+	inflight  *dashboardJWKSRefresh
+	// generation counts successful refreshes. A caller records it when it
+	// decides to refresh, so a refresh that completed after that decision
+	// satisfies the caller instead of admitting another fetch.
+	generation uint64
+	// joinedHook, when set by a test, runs after a caller commits to waiting
+	// on an in-flight refresh. It is nil in production.
+	joinedHook func()
+}
+
+// dashboardJWKSRefresh carries one fetch's outcome to every caller that joined
+// it. Keeping the error on the refresh, not on the cache, stops a later
+// refresh from overwriting the result before an earlier waiter reads it.
+type dashboardJWKSRefresh struct {
+	done chan struct{}
+	err  error
+}
+
+type dashboardJWKS struct {
+	Keys []dashboardJWK `json:"keys"`
+}
+
+type dashboardJWK struct {
+	KeyType string   `json:"kty"`
+	KeyID   string   `json:"kid"`
+	Use     string   `json:"use"`
+	Alg     string   `json:"alg"`
+	KeyOps  []string `json:"key_ops"`
+	N       string   `json:"n"`
+	E       string   `json:"e"`
+}
+
+func (c *dashboardJWKSCache) key(ctx context.Context, keyID string) (*rsa.PublicKey, error) {
+	c.mu.Lock()
+	now := c.now()
+	if key := c.keys[keyID]; key != nil && now.Before(c.expiresAt) {
+		c.mu.Unlock()
+		return key, nil
+	}
+	cacheExpired := c.keys == nil || !now.Before(c.expiresAt)
+	keyUnknown := c.keys != nil && c.keys[keyID] == nil
+	recentMiss := !c.lastMiss.IsZero() && now.Before(c.lastMiss.Add(dashboardOIDCMinKeyRefresh))
+	missSinceExpiry := !c.lastMiss.IsZero() && !c.lastMiss.Before(c.expiresAt)
+	if keyUnknown && recentMiss && (!cacheExpired || missSinceExpiry) {
+		c.mu.Unlock()
+		return nil, dashboardOIDCSigningKeyNotFound(keyID)
+	}
+	observed := c.generation
+	if cacheExpired {
+		c.mu.Unlock()
+		if err := c.refreshSince(ctx, observed); err != nil {
+			if keyUnknown {
+				c.recordMiss()
+			}
+			return nil, err
+		}
+		c.mu.Lock()
+		if !c.freshLocked() {
+			c.mu.Unlock()
+			return nil, errDashboardOIDCKeysExpired
+		}
+		if key := c.keys[keyID]; key != nil {
+			c.mu.Unlock()
+			return key, nil
+		}
+		c.lastMiss = c.now()
+		c.mu.Unlock()
+		return nil, dashboardOIDCSigningKeyNotFound(keyID)
+	}
+	if key := c.keys[keyID]; key != nil {
+		c.mu.Unlock()
+		return key, nil
+	}
+	// An unknown kid commonly means the provider rotated keys before this cache
+	// entry expired. Refresh at a bounded rate; attacker-chosen kids must not
+	// turn the dashboard into a JWKS request amplifier. Stale caches refresh
+	// before this gate so normal TTL expiry cannot skip the authorization check
+	// path that would learn a legitimate rotated key.
+	c.lastMiss = now
+	c.mu.Unlock()
+	if err := c.refreshSince(ctx, observed); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	fresh := c.freshLocked()
+	key := c.keys[keyID]
+	c.mu.Unlock()
+	if !fresh {
+		return nil, errDashboardOIDCKeysExpired
+	}
+	if key == nil {
+		return nil, dashboardOIDCSigningKeyNotFound(keyID)
+	}
+	return key, nil
+}
+
+// freshLocked reports whether the cached keys are still within their
+// lifetime. Callers hold c.mu. A caller that resumes after the refresh it
+// waited on has already expired must not use those keys; it fails closed and
+// the next request refreshes.
+func (c *dashboardJWKSCache) freshLocked() bool {
+	return c.keys != nil && c.now().Before(c.expiresAt)
+}
+
+var errDashboardOIDCKeysExpired = errors.New("OIDC signing keys expired before they could be used")
+
+func (c *dashboardJWKSCache) recordMiss() {
+	c.mu.Lock()
+	c.lastMiss = c.now()
+	c.mu.Unlock()
+}
+
+func dashboardOIDCSigningKeyNotFound(keyID string) error {
+	return fmt.Errorf("%w: OIDC signing key %q not found", errDashboardOIDCSigningKeyNotFound, keyID)
+}
+
+var errDashboardOIDCSigningKeyNotFound = errors.New("OIDC signing key not found")
+
+// refresh fetches the JWKS unconditionally, joining a fetch already in flight.
+func (c *dashboardJWKSCache) refresh(ctx context.Context) error {
+	return c.admitRefresh(ctx, 0, false)
+}
+
+// refreshSince fetches the JWKS unless a refresh has succeeded since the
+// caller observed generation, or joins one already in flight. Admission is
+// decided under the same lock that records completion, so a caller delayed
+// between deciding to refresh and getting here cannot start a duplicate fetch.
+// A failed refresh does not advance the generation: the caller then fetches
+// itself rather than proceeding on keys that are still expired.
+func (c *dashboardJWKSCache) refreshSince(ctx context.Context, observed uint64) error {
+	return c.admitRefresh(ctx, observed, true)
+}
+
+// admitRefresh joins an in-flight fetch or starts one. A conditional caller is
+// satisfied without fetching only when a refresh succeeded after it observed
+// the cache and that refresh's keys have not expired since; a caller delayed
+// past that lifetime fetches again rather than reuse expired keys.
+func (c *dashboardJWKSCache) admitRefresh(ctx context.Context, observed uint64, conditional bool) error {
+	c.mu.Lock()
+	if r := c.inflight; r != nil {
+		joined := c.joinedHook
+		c.mu.Unlock()
+		if joined != nil {
+			joined()
+		}
+		select {
+		case <-r.done:
+			return r.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if conditional && c.generation != observed && c.now().Before(c.expiresAt) {
+		c.mu.Unlock()
+		return nil
+	}
+	r := &dashboardJWKSRefresh{done: make(chan struct{})}
+	c.inflight = r
+	c.mu.Unlock()
+
+	err := c.fetchAndStore(ctx)
+
+	c.mu.Lock()
+	r.err = err
+	if err == nil {
+		c.generation++
+	}
+	c.inflight = nil
+	close(r.done)
+	c.mu.Unlock()
+	return err
+}
+
+func (c *dashboardJWKSCache) fetchAndStore(ctx context.Context) error {
+	var set dashboardJWKS
+	if err := fetchDashboardOIDCJSON(ctx, c.client, c.uri, &set); err != nil {
+		return err
+	}
+	keys := make(map[string]*rsa.PublicKey)
+	for _, jwk := range set.Keys {
+		key, include, err := parseDashboardRSAJWK(jwk)
+		if err != nil {
+			return err
+		}
+		if !include {
+			continue
+		}
+		if _, duplicate := keys[jwk.KeyID]; duplicate {
+			return fmt.Errorf("OIDC JWKS contains duplicate kid %q", jwk.KeyID)
+		}
+		keys[jwk.KeyID] = key
+	}
+	if len(keys) == 0 {
+		return errors.New("OIDC JWKS contains no usable RS256 signing keys")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.keys = keys
+	c.expiresAt = c.now().Add(c.ttl)
+	return nil
+}
+
+func parseDashboardRSAJWK(jwk dashboardJWK) (*rsa.PublicKey, bool, error) {
+	if jwk.KeyType != "RSA" || (jwk.Use != "" && jwk.Use != "sig") || (jwk.Alg != "" && jwk.Alg != dashboardOIDCAlgorithm) {
+		return nil, false, nil
+	}
+	if jwk.KeyID == "" || len(jwk.KeyID) > dashboardOIDCMaxRoleLength {
+		return nil, false, errors.New("OIDC JWKS has a usable RSA key with an empty or overlong kid")
+	}
+	if len(jwk.KeyOps) > 0 && !containsString(jwk.KeyOps, "verify") {
+		return nil, false, nil
+	}
+	nBytes, err := base64.RawURLEncoding.Strict().DecodeString(jwk.N)
+	if err != nil {
+		return nil, false, fmt.Errorf("decode OIDC JWK %q modulus: %w", jwk.KeyID, err)
+	}
+	eBytes, err := base64.RawURLEncoding.Strict().DecodeString(jwk.E)
+	if err != nil {
+		return nil, false, fmt.Errorf("decode OIDC JWK %q exponent: %w", jwk.KeyID, err)
+	}
+	n := new(big.Int).SetBytes(nBytes)
+	eBig := new(big.Int).SetBytes(eBytes)
+	if err := validateRSAModulusBits(n, dashboardTrustedRSAMinBits, dashboardOIDCRSAMaxBits); err != nil {
+		return nil, false, fmt.Errorf("OIDC JWK %q RSA modulus: %w", jwk.KeyID, err)
+	}
+	if !eBig.IsInt64() {
+		return nil, false, fmt.Errorf("OIDC JWK %q exponent is out of range", jwk.KeyID)
+	}
+	e := eBig.Int64()
+	if e < 3 || e > int64(^uint(0)>>1) || e%2 == 0 {
+		return nil, false, fmt.Errorf("OIDC JWK %q exponent is invalid", jwk.KeyID)
+	}
+	return &rsa.PublicKey{N: n, E: int(e)}, true, nil
+}
+
+type dashboardJWTHeader struct {
+	Algorithm string   `json:"alg"`
+	KeyID     string   `json:"kid"`
+	Critical  []string `json:"crit"`
+}
+
+func (a *dashboardOIDCAuthenticator) authenticate(r *http.Request) (*dashboardOIDCPrincipal, error) {
+	token, err := dashboardBearerToken(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(token) > dashboardOIDCMaxTokenSize {
+		return nil, errors.New("OIDC bearer token is too large")
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		return nil, errors.New("OIDC bearer token must be a signed compact JWT")
+	}
+	headerBytes, err := base64.RawURLEncoding.Strict().DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("decode OIDC JWT header: %w", err)
+	}
+	var header dashboardJWTHeader
+	if err := decodeDashboardJWTJSON(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("decode OIDC JWT header: %w", err)
+	}
+	if header.Algorithm != dashboardOIDCAlgorithm {
+		return nil, fmt.Errorf("OIDC JWT algorithm %q is not allowed; expected RS256", header.Algorithm)
+	}
+	if header.KeyID == "" || len(header.KeyID) > dashboardOIDCMaxRoleLength {
+		return nil, errors.New("OIDC JWT kid is empty or overlong")
+	}
+	if len(header.Critical) != 0 {
+		return nil, errors.New("OIDC JWT uses unsupported critical headers")
+	}
+	signature, err := base64.RawURLEncoding.Strict().DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("decode OIDC JWT signature: %w", err)
+	}
+	key, err := a.keys.key(r.Context(), header.KeyID)
+	if err != nil {
+		return nil, err
+	}
+	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], signature); err != nil {
+		return nil, errors.New("OIDC JWT signature verification failed")
+	}
+
+	// Claims are decoded only after the signature succeeds; no identity or
+	// authorization decision is ever made from an unverified payload.
+	claimsBytes, err := base64.RawURLEncoding.Strict().DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("decode verified OIDC claims: %w", err)
+	}
+	var claims map[string]json.RawMessage
+	if err := decodeDashboardJWTJSON(claimsBytes, &claims); err != nil {
+		return nil, fmt.Errorf("decode verified OIDC claims: %w", err)
+	}
+	return a.principalFromClaims(claims)
+}
+
+func decodeDashboardJWTJSON(data []byte, dst any) error {
+	if err := rejectDashboardDuplicateJSONMembers(data); err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	return requireJSONEOF(decoder)
+}
+
+func rejectDashboardDuplicateJSONMembers(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := walkDashboardJSONValue(decoder, 0); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func walkDashboardJSONValue(decoder *json.Decoder, depth int) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delim, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	if depth >= dashboardOIDCMaxJSONDepth {
+		return fmt.Errorf("JSON nesting exceeds maximum depth %d", dashboardOIDCMaxJSONDepth)
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			member, memberErr := decoder.Token()
+			if memberErr != nil {
+				return memberErr
+			}
+			name, ok := member.(string)
+			if !ok {
+				return errors.New("JSON object member name is not a string")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return fmt.Errorf("duplicate JSON member %q", name)
+			}
+			seen[name] = struct{}{}
+			if err := walkDashboardJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		if closing != json.Delim('}') {
+			return errors.New("malformed JSON object")
+		}
+	case '[':
+		for decoder.More() {
+			if err := walkDashboardJSONValue(decoder, depth+1); err != nil {
+				return err
+			}
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		if closing != json.Delim(']') {
+			return errors.New("malformed JSON array")
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+	return nil
+}
+
+func dashboardBearerToken(r *http.Request) (string, error) {
+	authorization, ok := dashboardAuthorizationHeader(r)
+	if !ok {
+		return "", errors.New("OIDC bearer token is missing")
+	}
+	parts := strings.Fields(authorization)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
+		return "", errors.New("OIDC bearer token is missing")
+	}
+	return parts[1], nil
+}
+
+func (a *dashboardOIDCAuthenticator) principalFromClaims(claims map[string]json.RawMessage) (*dashboardOIDCPrincipal, error) {
+	issuer, err := requiredStringClaim(claims, "iss")
+	if err != nil || issuer != a.issuer {
+		return nil, errors.New("OIDC issuer claim is missing or does not match")
+	}
+	subject, err := requiredStringClaim(claims, "sub")
+	if err != nil {
+		return nil, errors.New("OIDC subject claim is missing or invalid")
+	}
+	audiences, err := audienceClaim(claims["aud"])
+	if err != nil || !containsString(audiences, a.audience) {
+		return nil, errors.New("OIDC audience claim is missing or does not match")
+	}
+	if rawAZP, present := claims["azp"]; present {
+		var azp string
+		if err := json.Unmarshal(rawAZP, &azp); err != nil || azp != a.audience {
+			return nil, errors.New("OIDC authorized-party claim does not match the expected audience")
+		}
+	} else if len(audiences) > 1 {
+		return nil, errors.New("OIDC token with multiple audiences is missing azp")
+	}
+
+	now := a.now()
+	expiresAt, err := numericDateClaim(claims, "exp", true)
+	if err != nil || !now.Before(expiresAt.Add(dashboardOIDCClockLeeway)) {
+		return nil, errors.New("OIDC token is expired or has an invalid exp claim")
+	}
+	if notBefore, err := numericDateClaim(claims, "nbf", false); err != nil {
+		return nil, errors.New("OIDC token has an invalid nbf claim")
+	} else if !notBefore.IsZero() && now.Add(dashboardOIDCClockLeeway).Before(notBefore) {
+		return nil, errors.New("OIDC token is not yet valid")
+	}
+
+	claimValues, err := roleClaimValues(claims[a.roleClaim])
+	if err != nil {
+		return nil, err
+	}
+	principal := &dashboardOIDCPrincipal{
+		Subject: subject, permissions: make(map[dashboard.Permission]struct{}),
+	}
+	seenRoles := make(map[string]struct{})
+	for _, claimValue := range claimValues {
+		role, mapped := a.roleMap.claimValues[claimValue]
+		if !mapped {
+			continue
+		}
+		if _, seen := seenRoles[role]; seen {
+			continue
+		}
+		seenRoles[role] = struct{}{}
+		principal.Roles = append(principal.Roles, role)
+		for permission := range a.roleMap.roles[role] {
+			principal.permissions[permission] = struct{}{}
+		}
+	}
+	if len(principal.Roles) == 0 {
+		return nil, errors.New("OIDC role claim has no mapped value")
+	}
+	return principal, nil
+}
+
+func requiredStringClaim(claims map[string]json.RawMessage, name string) (string, error) {
+	raw, ok := claims[name]
+	if !ok {
+		return "", errors.New("claim missing")
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil || strings.TrimSpace(value) == "" || len(value) > dashboardOIDCMaxTokenSize {
+		return "", errors.New("claim invalid")
+	}
+	return value, nil
+}
+
+func audienceClaim(raw json.RawMessage) ([]string, error) {
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		if single == "" {
+			return nil, errors.New("audience is empty")
+		}
+		return []string{single}, nil
+	}
+	var multiple []string
+	if err := json.Unmarshal(raw, &multiple); err != nil || len(multiple) == 0 || len(multiple) > dashboardOIDCMaxRoleValues {
+		return nil, errors.New("audience is invalid")
+	}
+	for _, audience := range multiple {
+		if audience == "" || len(audience) > dashboardOIDCMaxRoleLength {
+			return nil, errors.New("audience is invalid")
+		}
+	}
+	return multiple, nil
+}
+
+func numericDateClaim(claims map[string]json.RawMessage, name string, required bool) (time.Time, error) {
+	raw, ok := claims[name]
+	if !ok {
+		if required {
+			return time.Time{}, errors.New("claim missing")
+		}
+		return time.Time{}, nil
+	}
+	text := strings.TrimSpace(string(raw))
+	if text == "" || text[0] == '"' {
+		return time.Time{}, errors.New("numeric date must be a JSON number")
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return time.Time{}, err
+	}
+	seconds, err := strconv.ParseInt(number.String(), 10, 64)
+	if err != nil || seconds < 0 {
+		return time.Time{}, errors.New("numeric date is invalid")
+	}
+	return time.Unix(seconds, 0), nil
+}
+
+func roleClaimValues(raw json.RawMessage) ([]string, error) {
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		if single == "" || len(single) > dashboardOIDCMaxRoleLength {
+			return nil, errors.New("OIDC role claim is empty or overlong")
+		}
+		return []string{single}, nil
+	}
+	var multiple []string
+	if err := json.Unmarshal(raw, &multiple); err != nil || len(multiple) == 0 || len(multiple) > dashboardOIDCMaxRoleValues {
+		return nil, errors.New("OIDC role claim must be a string or a bounded string array")
+	}
+	for _, value := range multiple {
+		if value == "" || len(value) > dashboardOIDCMaxRoleLength {
+			return nil, errors.New("OIDC role claim contains an empty or overlong value")
+		}
+	}
+	return multiple, nil
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+type dashboardOIDCPrincipalContextKey struct{}
+
+type dashboardOIDCFailureContextKey struct{}
+
+func dashboardOIDCPrincipalFromRequest(r *http.Request) *dashboardOIDCPrincipal {
+	principal, _ := r.Context().Value(dashboardOIDCPrincipalContextKey{}).(*dashboardOIDCPrincipal)
+	return principal
+}
+
+func dashboardOIDCFailureReasonFromRequest(r *http.Request) string {
+	reason, _ := r.Context().Value(dashboardOIDCFailureContextKey{}).(string)
+	return reason
+}
+
+func (a *dashboardOIDCAuthenticator) middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, err := a.authenticate(r)
+		if err == nil {
+			ctx := context.WithValue(r.Context(), dashboardOIDCPrincipalContextKey{}, principal)
+			r = r.WithContext(ctx)
+		} else if dashboardBearerAttempted(r) {
+			ctx := context.WithValue(r.Context(), dashboardOIDCFailureContextKey{}, dashboardOIDCFailureCategory(err))
+			r = r.WithContext(ctx)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func dashboardBearerAttempted(r *http.Request) bool {
+	authorization, ok := dashboardAuthorizationHeader(r)
+	if !ok {
+		return false
+	}
+	parts := strings.Fields(authorization)
+	return len(parts) > 0 && strings.EqualFold(parts[0], "Bearer")
+}
+
+func dashboardOIDCFailureCategory(err error) string {
+	if err == nil {
+		return "-"
+	}
+	msg := err.Error()
+	switch {
+	case errors.Is(err, errDashboardOIDCSigningKeyNotFound):
+		return "unknown_principal"
+	case strings.Contains(msg, "bearer token is missing"):
+		return "missing_token"
+	case strings.Contains(msg, "signature"):
+		return "invalid_signature"
+	case strings.Contains(msg, "expired"):
+		return "expired"
+	case strings.Contains(msg, "role claim has no mapped value"):
+		return "permission_denied"
+	default:
+		return "invalid_token"
+	}
+}
+
+type dashboardRequestAuthorization struct {
+	metadataToken string
+	rawToken      string
+	oidc          *dashboardOIDCAuthenticator
+	legacy        func(*http.Request, dashboard.Permission) error
+}
+
+func newDashboardRequestAuthorization(metadataToken, rawToken string, oidc *dashboardOIDCAuthenticator) *dashboardRequestAuthorization {
+	return &dashboardRequestAuthorization{
+		metadataToken: metadataToken,
+		rawToken:      rawToken,
+		oidc:          oidc,
+		legacy: dashboardAuthorizePermissionFunc(
+			func(req *http.Request) bool {
+				return dashboardConfiguredTokenMatches(req, metadataToken) || dashboardConfiguredTokenMatches(req, rawToken)
+			},
+			func(req *http.Request) bool { return dashboardConfiguredTokenMatches(req, rawToken) },
+		),
+	}
+}
+
+func dashboardConfiguredTokenMatches(r *http.Request, token string) bool {
+	return token != "" && dashboardTokenMatches(r, token)
+}
+
+func (a *dashboardRequestAuthorization) metaAuthorized(r *http.Request) bool {
+	return dashboardConfiguredTokenMatches(r, a.metadataToken) ||
+		dashboardConfiguredTokenMatches(r, a.rawToken) ||
+		dashboardOIDCPrincipalFromRequest(r) != nil
+}
+
+// authenticated is the global gate: any operator/OIDC identity.
+func (a *dashboardRequestAuthorization) authenticated(r *http.Request) bool {
+	return a.metaAuthorized(r)
+}
+
+func (a *dashboardRequestAuthorization) rawAuthorized(r *http.Request) bool {
+	return dashboardConfiguredTokenMatches(r, a.rawToken) ||
+		dashboardOIDCPrincipalFromRequest(r).hasPermission(dashboard.PermissionRawRead)
+}
+
+func (a *dashboardRequestAuthorization) authorizePermission(r *http.Request, permission dashboard.Permission) error {
+	if dashboardOIDCPrincipalFromRequest(r).hasPermission(permission) {
+		return nil
+	}
+	if err := a.legacy(r, permission); err == nil {
+		return nil
+	}
+	return fmt.Errorf("dashboard permission %q denied", permission)
+}
+
+func (a *dashboardRequestAuthorization) authAuditInfo(r *http.Request) dashboard.AuthAuditInfo {
+	if principal := dashboardOIDCPrincipalFromRequest(r); principal != nil {
+		return dashboard.AuthAuditInfo{Method: "oidc", Subject: principal.Subject, Roles: principal.Roles}
+	}
+	switch {
+	case dashboardConfiguredTokenMatches(r, a.rawToken):
+		return dashboard.AuthAuditInfo{Method: "raw-access-token", Roles: []string{"raw"}}
+	case dashboardConfiguredTokenMatches(r, a.metadataToken):
+		return dashboard.AuthAuditInfo{Method: "token", Roles: []string{"metadata"}}
+	case dashboardAuthorizationHeaderCount(r) > 1:
+		return dashboard.AuthAuditInfo{Method: "none", FailureReason: "malformed"}
+	case dashboardOIDCFailureReasonFromRequest(r) != "":
+		return dashboard.AuthAuditInfo{Method: "oidc", FailureReason: dashboardOIDCFailureReasonFromRequest(r)}
+	case dashboardCredentialAttempted(r):
+		return dashboard.AuthAuditInfo{Method: "token", FailureReason: "unknown_principal"}
+	default:
+		return dashboard.AuthAuditInfo{Method: "none", FailureReason: "missing_token"}
+	}
+}
+
+// failedAuthMode attributes a rejected request from server-recorded OIDC
+// failure state. An HTTP client cannot set that context value. OIDC takes
+// precedence because both authenticators use the Bearer scheme.
+func (a *dashboardRequestAuthorization) failedAuthMode(r *http.Request) string {
+	if dashboardAuthorizationHeaderCount(r) > 1 {
+		return "none"
+	}
+	if dashboardOIDCFailureReasonFromRequest(r) != "" {
+		return "oidc"
+	}
+	if dashboardCredentialAttempted(r) {
+		return "operator_token"
+	}
+	return "none"
+}
+
+func dashboardCredentialAttempted(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if authorization, ok := dashboardAuthorizationHeader(r); ok && strings.TrimSpace(authorization) != "" {
+		return true
+	}
+	if dashboardAuthorizationHeaderCount(r) > 1 {
+		return true
+	}
+	_, _, ok := r.BasicAuth()
+	return ok
+}
+
+func (a *dashboardRequestAuthorization) wrap(next http.Handler, auditWriter io.Writer) http.Handler {
+	handler := dashboardAuthHandler(a.authenticated, a.authAuditInfo, auditWriter, nil, a.failedAuthMode, next)
+	if a.oidc != nil {
+		return a.oidc.middleware(handler)
+	}
+	return handler
+}

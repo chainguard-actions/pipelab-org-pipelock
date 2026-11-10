@@ -1,0 +1,3390 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package rules
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	domrules "github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// Test-scoped constants for repeated string literals.
+const (
+	testBundlePath    = "/test-bundle/bundle.yaml"
+	testBundleSigPath = "/test-bundle/bundle.yaml.sig"
+	testBundleName    = "test-bundle"
+	testBundleVersion = "2026.03.1"
+)
+
+func TestMain(m *testing.M) {
+	discoverRulesConfigPath = func() (string, error) {
+		return "", nil
+	}
+	dir, err := os.MkdirTemp("", "pipelock-rules-test-home-*")
+	if err != nil {
+		panic(err)
+	}
+	_ = os.Setenv("PIPELOCK_CONFIG", "")
+	_ = os.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	_ = os.Setenv("HOME", filepath.Join(dir, "home"))
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+func withRulesConfigDiscovery(t *testing.T, fn func() (string, error)) {
+	t.Helper()
+	old := discoverRulesConfigPath
+	discoverRulesConfigPath = fn
+	t.Cleanup(func() {
+		discoverRulesConfigPath = old
+	})
+}
+
+// validBundleYAML is minimal valid bundle YAML for testing.
+const validBundleYAML = `format_version: 1
+name: test-bundle
+version: "2026.03.1"
+author: Test Author
+description: A test bundle
+license: Apache-2.0
+min_pipelock: "0.1.0"
+rules:
+  - id: test-rule-one
+    type: dlp
+    status: stable
+    name: Test Rule
+    description: Detects test patterns
+    severity: high
+    confidence: high
+    pattern:
+      regex: "test-secret-[a-z]+"
+`
+
+// secondVersionBundleYAML is a newer version of the test bundle.
+const secondVersionBundleYAML = `format_version: 1
+name: test-bundle
+version: "2026.04.1"
+author: Test Author
+description: A test bundle
+license: Apache-2.0
+min_pipelock: "0.1.0"
+rules:
+  - id: test-rule-one
+    type: dlp
+    status: stable
+    name: Test Rule
+    description: Detects test patterns
+    severity: high
+    confidence: high
+    pattern:
+      regex: "test-secret-[a-z]+"
+  - id: test-rule-two
+    type: dlp
+    status: stable
+    name: Another Test Rule
+    description: Detects more patterns
+    severity: medium
+    confidence: medium
+    pattern:
+      regex: "another-pattern-[0-9]+"
+`
+
+// testRootCmd builds a minimal root command containing the rules subcommand.
+// This replaces rootCmd() from the parent cli package in tests.
+func testRootCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use: "pipelock",
+	}
+	cmd.AddCommand(Cmd())
+	return cmd
+}
+
+// setupUnsignedBundle creates a bundle directory with an unsigned bundle.yaml
+// and bundle.lock.
+func setupUnsignedBundle(t *testing.T, rulesDir, bundleName string, bundleData []byte) {
+	t.Helper()
+
+	bundleDir := filepath.Join(rulesDir, bundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+
+	bundlePath := filepath.Join(bundleDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(bundleData)
+	digest := hex.EncodeToString(hash[:])
+
+	lf := &domrules.LockFile{
+		InstalledVersion: "2026.03.1",
+		InstalledAt:      "2026-03-15T10:00:00Z",
+		Source:           "local:/tmp/my-rules",
+		LastCheck:        "2026-03-15T10:00:00Z",
+		BundleSHA256:     digest,
+		Unsigned:         true,
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+}
+
+// setupSignedBundle creates a bundle.yaml, detached signature, and lock file.
+func setupSignedBundle(t *testing.T, rulesDir, bundleName string, bundleData []byte, pub ed25519.PublicKey, priv ed25519.PrivateKey) {
+	t.Helper()
+
+	bundleDir := filepath.Join(rulesDir, bundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+
+	bundlePath := filepath.Join(bundleDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	sig := ed25519.Sign(priv, bundleData)
+	if err := os.WriteFile(bundlePath+".sig", []byte(base64.StdEncoding.EncodeToString(sig)+"\n"), 0o600); err != nil {
+		t.Fatalf("writing signature: %v", err)
+	}
+
+	hash := sha256.Sum256(bundleData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  testBundleVersion,
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            "https://rules.example/test-bundle/bundle.yaml",
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+}
+
+// Tests in this file that call testRootCmd() are intentionally NOT parallel
+// because cobra commands share global state during execution.
+// Tests that mutate domrules keyring globals or httpsOnlyClient are also
+// sequential to avoid data races.
+
+func setRulesKeyringHexForTest(t *testing.T, keyringHex string) {
+	t.Helper()
+
+	origDefault := domrules.DefaultKeyringHex
+	origKeyring := domrules.KeyringHex
+	domrules.DefaultKeyringHex = ""
+	domrules.KeyringHex = keyringHex
+	t.Cleanup(func() {
+		domrules.DefaultKeyringHex = origDefault
+		domrules.KeyringHex = origKeyring
+	})
+}
+
+// ---------- rules list tests ----------
+
+func TestRulesList_Empty(t *testing.T) {
+	rulesDir := t.TempDir()
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "No bundles installed.") {
+		t.Errorf("expected 'No bundles installed.', got %q", buf.String())
+	}
+}
+
+func TestRulesList_NonExistentDir(t *testing.T) {
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", "/tmp/nonexistent-rules-dir-" + t.Name()})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "No bundles installed.") {
+		t.Errorf("expected 'No bundles installed.', got %q", buf.String())
+	}
+}
+
+func TestRulesList_WithBundle(t *testing.T) {
+	rulesDir := t.TempDir()
+	setupUnsignedBundle(t, rulesDir, testBundleName, []byte(validBundleYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, testBundleName) {
+		t.Errorf("expected bundle name in output, got %q", output)
+	}
+	if !strings.Contains(output, "2026.03.1") {
+		t.Errorf("expected version in output, got %q", output)
+	}
+	if !strings.Contains(output, "unsigned") {
+		t.Errorf("expected 'unsigned' in output, got %q", output)
+	}
+}
+
+func TestRulesList_JSON(t *testing.T) {
+	rulesDir := t.TempDir()
+	bundleYAML := strings.Replace(validBundleYAML, "min_pipelock: \"0.1.0\"", "min_pipelock: \"0.1.0\"\ntested_through_pipelock: \"1.2.0\"", 1)
+	setupUnsignedBundle(t, rulesDir, testBundleName, []byte(bundleYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir, "--json"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var entries []bundleListEntry
+	if err := json.Unmarshal([]byte(buf.String()), &entries); err != nil {
+		t.Fatalf("invalid JSON output: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+
+	if entries[0].Name != testBundleName {
+		t.Errorf("Name = %q, want %q", entries[0].Name, testBundleName)
+	}
+	if entries[0].Signed {
+		t.Error("expected Signed = false for unsigned bundle")
+	}
+	if entries[0].TestedThroughPipelock != "1.2.0" {
+		t.Errorf("TestedThroughPipelock = %q, want 1.2.0", entries[0].TestedThroughPipelock)
+	}
+	if entries[0].CompatibilityStatus != "verified" {
+		t.Errorf("CompatibilityStatus = %q, want verified", entries[0].CompatibilityStatus)
+	}
+}
+
+func TestWarnTestedThroughPipelock(t *testing.T) {
+	var out strings.Builder
+	if err := warnTestedThroughPipelock(&out, "1.2.0", "1.3.0"); err != nil {
+		t.Fatalf("warnTestedThroughPipelock() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "warning:") || !strings.Contains(out.String(), "tested_through_pipelock is advisory") {
+		t.Fatalf("warnTestedThroughPipelock() output = %q, want advisory warning", out.String())
+	}
+}
+
+func TestWarnTestedThroughPipelockMalformedCeiling(t *testing.T) {
+	var out strings.Builder
+	err := warnTestedThroughPipelock(&out, "1.2", "1.3.0")
+	if err == nil || !strings.Contains(err.Error(), "tested_through_pipelock") {
+		t.Fatalf("warnTestedThroughPipelock() error = %v, want malformed ceiling error", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("warnTestedThroughPipelock() wrote %q before returning an error", out.String())
+	}
+}
+
+func TestRulesList_TextShowsTestedThroughWarning(t *testing.T) {
+	originalVersion := cliutil.Version
+	cliutil.Version = "1.3.0"
+	t.Cleanup(func() { cliutil.Version = originalVersion })
+
+	rulesDir := t.TempDir()
+	bundleYAML := strings.Replace(validBundleYAML, "min_pipelock: \"0.1.0\"", "min_pipelock: \"0.1.0\"\ntested_through_pipelock: \"1.2.0\"", 1)
+	setupUnsignedBundle(t, rulesDir, testBundleName, []byte(bundleYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("rules list: %v", err)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "compatibility metadata: verified") || !strings.Contains(output, "tested through Pipelock: 1.2.0") || !strings.Contains(output, "warning: bundle tested through") {
+		t.Fatalf("rules list output = %q, want tested-through ceiling and warning", output)
+	}
+}
+
+func TestRulesList_DoesNotReportCompatibilityFromTamperedBundle(t *testing.T) {
+	originalVersion := cliutil.Version
+	cliutil.Version = "10.0.0"
+	t.Cleanup(func() { cliutil.Version = originalVersion })
+
+	rulesDir := t.TempDir()
+	bundleData := []byte(strings.Replace(validBundleYAML, "min_pipelock: \"0.1.0\"", "min_pipelock: \"0.1.0\"\ntested_through_pipelock: \"1.2.0\"", 1))
+	setupUnsignedBundle(t, rulesDir, testBundleName, bundleData)
+
+	tamperedData := []byte(strings.Replace(string(bundleData), "1.2.0", "9.9.9", 1))
+	bundlePath := filepath.Join(rulesDir, testBundleName, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, tamperedData, 0o600); err != nil {
+		t.Fatalf("tampering bundle: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("rules list must remain available when a bundle fails verification: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "compatibility metadata: unverified: integrity check: SHA-256 mismatch") {
+		t.Fatalf("rules list output = %q, want unverified compatibility status", output)
+	}
+	if strings.Contains(output, "9.9.9") || strings.Contains(output, "tested through Pipelock:") || strings.Contains(output, "warning: bundle tested through") {
+		t.Fatalf("rules list output = %q, must not report tampered compatibility metadata", output)
+	}
+}
+
+func TestRulesList_UnavailableTrustPolicySuppressesCompatibility(t *testing.T) {
+	rulesDir := t.TempDir()
+	bundleData := []byte(strings.Replace(validBundleYAML, "min_pipelock: \"0.1.0\"", "min_pipelock: \"0.1.0\"\ntested_through_pipelock: \"1.2.0\"", 1))
+	setupUnsignedBundle(t, rulesDir, testBundleName, bundleData)
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir, "--config", filepath.Join(t.TempDir(), "missing.yaml")})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("rules list must remain available when the trust policy cannot load: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "compatibility metadata: unverified: loading trust policy:") {
+		t.Fatalf("rules list output = %q, want unverified compatibility status", output)
+	}
+	if strings.Contains(output, "tested through Pipelock:") || strings.Contains(output, "warning: bundle tested through") {
+		t.Fatalf("rules list output = %q, must not report compatibility metadata without a trust policy", output)
+	}
+}
+
+func TestRulesList_UsesConfiguredTrustPolicyForCompatibility(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating signing key: %v", err)
+	}
+	setRulesKeyringHexForTest(t, "")
+
+	rulesDir := t.TempDir()
+	bundleData := []byte(strings.Replace(validBundleYAML, "min_pipelock: \"0.1.0\"", "min_pipelock: \"0.1.0\"\ntested_through_pipelock: \"1.2.0\"", 1))
+	setupSignedBundle(t, rulesDir, testBundleName, bundleData, pub, priv)
+
+	configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+	configData := []byte("rules:\n  trust_embedded_keys: false\n  trusted_keys:\n    - name: test-signer\n      public_key: " + hex.EncodeToString(pub) + "\n")
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "list", "--rules-dir", rulesDir, "--config", configPath})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("rules list: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "compatibility metadata: verified") || !strings.Contains(output, "tested through Pipelock: 1.2.0") {
+		t.Fatalf("rules list output = %q, want compatibility metadata verified under configured trust policy", output)
+	}
+}
+
+// ---------- rules install tests ----------
+
+func TestRulesInstall_LocalUnsigned(t *testing.T) {
+	rulesDir := t.TempDir()
+
+	// Create a local bundle source directory.
+	srcDir := filepath.Join(t.TempDir(), "my-rules")
+	if err := os.MkdirAll(srcDir, 0o750); err != nil {
+		t.Fatalf("creating source dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "bundle.yaml"), []byte(validBundleYAML), 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "--path", srcDir, "--allow-unsigned", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Installed test-bundle") {
+		t.Errorf("expected install confirmation, got %q", output)
+	}
+	if !strings.Contains(output, "unsigned") {
+		t.Errorf("expected 'unsigned' in output, got %q", output)
+	}
+
+	// Verify bundle.lock was written.
+	lockPath := filepath.Join(rulesDir, testBundleName, "bundle.lock")
+	lf, err := domrules.ReadLockFile(lockPath)
+	if err != nil {
+		t.Fatalf("reading lock file: %v", err)
+	}
+	if !lf.Unsigned {
+		t.Error("expected lock file to be unsigned")
+	}
+	if lf.InstalledVersion != "2026.03.1" {
+		t.Errorf("InstalledVersion = %q, want %q", lf.InstalledVersion, "2026.03.1")
+	}
+}
+
+func TestRulesInstall_LocalWithoutFlag(t *testing.T) {
+	rulesDir := t.TempDir()
+	srcDir := filepath.Join(t.TempDir(), "my-rules")
+	if err := os.MkdirAll(srcDir, 0o750); err != nil {
+		t.Fatalf("creating source dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "bundle.yaml"), []byte(validBundleYAML), 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "--path", srcDir, "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for --path without --allow-unsigned")
+	}
+	if !strings.Contains(err.Error(), "allow-unsigned") {
+		t.Errorf("error should mention --allow-unsigned, got: %v", err)
+	}
+}
+
+func TestRulesInstall_PipelockPrefix_NonOfficial(t *testing.T) {
+	rulesDir := t.TempDir()
+
+	// Bundle YAML with pipelock- prefix.
+	pipelockPrefixYAML := strings.Replace(validBundleYAML, "name: test-bundle", "name: pipelock-community", 1)
+
+	srcDir := filepath.Join(t.TempDir(), "my-rules")
+	if err := os.MkdirAll(srcDir, 0o750); err != nil {
+		t.Fatalf("creating source dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "bundle.yaml"), []byte(pipelockPrefixYAML), 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "--path", srcDir, "--allow-unsigned", "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for pipelock- prefix in unsigned bundle")
+	}
+	if !strings.Contains(err.Error(), "reserved prefix") {
+		t.Errorf("error should mention reserved prefix, got: %v", err)
+	}
+}
+
+func TestRulesInstall_AlreadyInstalled(t *testing.T) {
+	rulesDir := t.TempDir()
+
+	// Create a local bundle source directory.
+	srcDir := filepath.Join(t.TempDir(), "my-rules")
+	if err := os.MkdirAll(srcDir, 0o750); err != nil {
+		t.Fatalf("creating source dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "bundle.yaml"), []byte(validBundleYAML), 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	// Install first time.
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "--path", srcDir, "--allow-unsigned", "--rules-dir", rulesDir})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("first install error: %v", err)
+	}
+
+	// Install again (same version, same content).
+	cmd2 := testRootCmd()
+	buf2 := &strings.Builder{}
+	cmd2.SetOut(buf2)
+	cmd2.SetArgs([]string{"rules", "install", "--path", srcDir, "--allow-unsigned", "--rules-dir", rulesDir})
+	err := cmd2.Execute()
+	if err == nil {
+		t.Fatal("expected error for duplicate install")
+	}
+	if !strings.Contains(err.Error(), "already installed") {
+		t.Errorf("error should mention already installed, got: %v", err)
+	}
+}
+
+func TestRulesInstall_RemoteSigned(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte(validBundleYAML)
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	// Set up embedded keyring.
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	// HTTP test server serving bundle.yaml and bundle.yaml.sig.
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case testBundlePath:
+			_, _ = w.Write(bundleData)
+		case testBundleSigPath:
+			_, _ = w.Write([]byte(sigEncoded))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	// Override http.DefaultClient for TLS test server.
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "--source", ts.URL + testBundlePath, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Installed test-bundle") {
+		t.Errorf("expected install confirmation, got %q", output)
+	}
+	if !strings.Contains(output, "official") {
+		t.Errorf("expected 'official' tier in output, got %q", output)
+	}
+}
+
+func TestFetchOfficialRegistryBundle_RejectsOffOriginRedirect(t *testing.T) {
+	// NOT parallel: mutates officialRegistryClient.
+	originalClient := officialRegistryClient
+	offOrigin := "https://rules-attacker.example/bundle.yaml"
+	officialRegistryClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Host {
+			case "pipelab.org":
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{offOrigin}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			case "rules-attacker.example":
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("redirected response")),
+				}, nil
+			default:
+				return nil, fmt.Errorf("unexpected request %s", req.URL)
+			}
+		}),
+		CheckRedirect: originalClient.CheckRedirect,
+	}
+	t.Cleanup(func() { officialRegistryClient = originalClient })
+
+	_, _, err := fetchOfficialRegistryBundle(t.Context(), officialRegistryURL+testBundlePath)
+	if !errors.Is(err, errOfficialRegistryRedirect) {
+		t.Fatalf("error = %v, want typed official registry redirect refusal", err)
+	}
+	if !strings.Contains(err.Error(), "redirects must stay on "+officialRegistryURL) {
+		t.Fatalf("error = %v, want operator-legible registry redirect error", err)
+	}
+}
+
+func TestFetchOfficialRegistryBundle_RejectsNonRegistryOrigin(t *testing.T) {
+	// NOT parallel: mutates officialRegistryClient.
+	originalClient := officialRegistryClient
+	officialRegistryClient = &http.Client{
+		Transport: rulesRoundTripper(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("bundle")),
+			}, nil
+		}),
+		CheckRedirect: originalClient.CheckRedirect,
+	}
+	t.Cleanup(func() { officialRegistryClient = originalClient })
+
+	_, _, err := fetchOfficialRegistryBundle(t.Context(), "https://source.example/bundle.yaml")
+	if !errors.Is(err, errOfficialRegistryOrigin) {
+		t.Fatalf("error = %v, want typed official registry origin refusal", err)
+	}
+}
+
+func TestRulesInstall_SourceOfficialURLAllowsHTTPSRedirect(t *testing.T) {
+	// NOT parallel: mutates the HTTP clients and the keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	bundleData := []byte(validBundleYAML)
+	sigData := []byte(base64.StdEncoding.EncodeToString(ed25519.Sign(priv, bundleData)) + "\n")
+	originalHTTPSClient := httpsOnlyClient
+	httpsOnlyClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Host {
+			case "pipelab.org":
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://source.example" + req.URL.Path}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			case "source.example":
+				body := bundleData
+				if strings.HasSuffix(req.URL.Path, signing.SigExtension) {
+					body = sigData
+				}
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(string(body))),
+				}, nil
+			default:
+				return nil, fmt.Errorf("unexpected source request %s", req.URL)
+			}
+		}),
+		CheckRedirect: originalHTTPSClient.CheckRedirect,
+	}
+	t.Cleanup(func() { httpsOnlyClient = originalHTTPSClient })
+
+	originalOfficialClient := officialRegistryClient
+	officialRegistryClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("official registry client must not fetch --source URL %s", req.URL)
+		}),
+		CheckRedirect: originalOfficialClient.CheckRedirect,
+	}
+	t.Cleanup(func() { officialRegistryClient = originalOfficialClient })
+
+	cmd := testRootCmd()
+	cmd.SetOut(io.Discard)
+	cmd.SetArgs([]string{"rules", "install", "--source", officialRegistryURL + testBundlePath, "--rules-dir", t.TempDir()})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("--source using the official URL should retain generic HTTPS redirect behavior: %v", err)
+	}
+}
+
+func TestRulesInstall_NoArgs(t *testing.T) {
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for no args")
+	}
+}
+
+// ---------- rules remove tests ----------
+
+func TestRulesRemove_Exists(t *testing.T) {
+	rulesDir := t.TempDir()
+	setupUnsignedBundle(t, rulesDir, testBundleName, []byte(validBundleYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "remove", testBundleName, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "Removed test-bundle") {
+		t.Errorf("expected removal confirmation, got %q", buf.String())
+	}
+
+	// Verify directory was removed.
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if _, err := os.Stat(bundleDir); !os.IsNotExist(err) {
+		t.Error("expected bundle directory to be removed")
+	}
+}
+
+func TestRulesRemove_NotInstalled(t *testing.T) {
+	rulesDir := t.TempDir()
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "remove", "nonexistent", "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for non-existent bundle")
+	}
+	if !strings.Contains(err.Error(), "not installed") {
+		t.Errorf("error should mention 'not installed', got: %v", err)
+	}
+}
+
+// ---------- rules verify tests ----------
+
+func TestRulesVerify_Valid(t *testing.T) {
+	rulesDir := t.TempDir()
+	bundleData := []byte(validBundleYAML)
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	// Set embedded keyring.
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+
+	bundlePath := filepath.Join(bundleDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+	sigPath := filepath.Join(bundleDir, "bundle.yaml.sig")
+	if err := os.WriteFile(sigPath, []byte(sigEncoded), 0o600); err != nil {
+		t.Fatalf("writing sig: %v", err)
+	}
+
+	fingerprint := hex.EncodeToString(pub)
+	hash := sha256.Sum256(bundleData)
+	digest := hex.EncodeToString(hash[:])
+
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            "https://rules.pipelock.dev/test-bundle/bundle.yaml",
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      digest,
+		SignerFingerprint: fingerprint,
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "verify", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "OK") {
+		t.Errorf("expected 'OK' in output, got %q", output)
+	}
+	if !strings.Contains(output, "signature OK") {
+		t.Errorf("expected 'signature OK' in output, got %q", output)
+	}
+}
+
+func TestRulesVerify_Tampered(t *testing.T) {
+	rulesDir := t.TempDir()
+	bundleData := []byte(validBundleYAML)
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	// Set embedded keyring.
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+
+	bundlePath := filepath.Join(bundleDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+	sigPath := filepath.Join(bundleDir, "bundle.yaml.sig")
+	if err := os.WriteFile(sigPath, []byte(sigEncoded), 0o600); err != nil {
+		t.Fatalf("writing sig: %v", err)
+	}
+
+	fingerprint := hex.EncodeToString(pub)
+	hash := sha256.Sum256(bundleData)
+	digest := hex.EncodeToString(hash[:])
+
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            "https://rules.pipelock.dev/test-bundle/bundle.yaml",
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      digest,
+		SignerFingerprint: fingerprint,
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+
+	// Tamper with bundle after writing lock.
+	tamperedData := []byte(strings.Replace(validBundleYAML, "Test Rule", "TAMPERED", 1))
+	if err := os.WriteFile(bundlePath, tamperedData, 0o600); err != nil {
+		t.Fatalf("writing tampered bundle: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "verify", "--rules-dir", rulesDir})
+
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for tampered bundle")
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "FAIL") {
+		t.Errorf("expected 'FAIL' in output, got %q", output)
+	}
+}
+
+func TestRulesVerify_UnsignedValid(t *testing.T) {
+	rulesDir := t.TempDir()
+	setupUnsignedBundle(t, rulesDir, testBundleName, []byte(validBundleYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "verify", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "OK") {
+		t.Errorf("expected 'OK' in output, got %q", output)
+	}
+	if !strings.Contains(output, "SHA-256 OK") {
+		t.Errorf("expected 'SHA-256 OK' in output, got %q", output)
+	}
+}
+
+// ---------- rules update tests ----------
+
+func TestRulesUpdate_LocalPathSkipped(t *testing.T) {
+	rulesDir := t.TempDir()
+	setupUnsignedBundle(t, rulesDir, testBundleName, []byte(validBundleYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", testBundleName, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "skipping test-bundle") {
+		t.Errorf("expected skip message, got %q", output)
+	}
+	if !strings.Contains(output, "local path") {
+		t.Errorf("expected 'local path' in skip message, got %q", output)
+	}
+}
+
+func TestRulesUpdate_NotInstalled(t *testing.T) {
+	rulesDir := t.TempDir()
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", "nonexistent", "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for non-existent bundle")
+	}
+	if !strings.Contains(err.Error(), "not installed") {
+		t.Errorf("error should mention 'not installed', got: %v", err)
+	}
+}
+
+func TestRulesUpdate_RemoteUpToDate(t *testing.T) {
+	originalVersion := cliutil.Version
+	cliutil.Version = "1.3.0"
+	t.Cleanup(func() { cliutil.Version = originalVersion })
+
+	bundleYAML := strings.Replace(validBundleYAML, "min_pipelock: \"0.1.0\"", "min_pipelock: \"0.1.0\"\ntested_through_pipelock: \"1.2.0\"", 1)
+	bundleData := []byte(bundleYAML)
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case testBundlePath:
+			_, _ = w.Write(bundleData)
+		case testBundleSigPath:
+			_, _ = w.Write([]byte(sigEncoded))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	// Set up installed bundle with matching version and digest.
+	rulesDir := t.TempDir()
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+	bundlePath := filepath.Join(bundleDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+	sigPath := filepath.Join(bundleDir, "bundle.yaml.sig")
+	if err := os.WriteFile(sigPath, []byte(sigEncoded), 0o600); err != nil {
+		t.Fatalf("writing sig: %v", err)
+	}
+
+	fingerprint := hex.EncodeToString(pub)
+	hash := sha256.Sum256(bundleData)
+	digest := hex.EncodeToString(hash[:])
+
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      digest,
+		SignerFingerprint: fingerprint,
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", testBundleName, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "already up to date") {
+		t.Errorf("expected 'already up to date', got %q", output)
+	}
+	if !strings.Contains(output, "tested through Pipelock") {
+		t.Errorf("expected tested-through warning, got %q", output)
+	}
+
+	// Verify last_check was updated.
+	updatedLF, err := domrules.ReadLockFile(lockPath)
+	if err != nil {
+		t.Fatalf("reading lock file: %v", err)
+	}
+	if updatedLF.LastCheck == lf.LastCheck {
+		t.Error("expected last_check to be updated")
+	}
+}
+
+func TestRulesUpdate_NewerVersion(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	oldData := []byte(validBundleYAML)
+	newData := []byte(secondVersionBundleYAML)
+	newSig := ed25519.Sign(priv, newData)
+	newSigEncoded := base64.StdEncoding.EncodeToString(newSig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case testBundlePath:
+			_, _ = w.Write(newData)
+		case testBundleSigPath:
+			_, _ = w.Write([]byte(newSigEncoded))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	// Set up installed bundle with old version.
+	rulesDir := t.TempDir()
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+	bundlePath := filepath.Join(bundleDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	// Sign old data too for the initial install.
+	oldSig := ed25519.Sign(priv, oldData)
+	oldSigEncoded := base64.StdEncoding.EncodeToString(oldSig) + "\n"
+	sigPath := filepath.Join(bundleDir, "bundle.yaml.sig")
+	if err := os.WriteFile(sigPath, []byte(oldSigEncoded), 0o600); err != nil {
+		t.Fatalf("writing sig: %v", err)
+	}
+
+	fingerprint := hex.EncodeToString(pub)
+	oldHash := sha256.Sum256(oldData)
+	oldDigest := hex.EncodeToString(oldHash[:])
+
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      oldDigest,
+		SignerFingerprint: fingerprint,
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", testBundleName, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Updated test-bundle") {
+		t.Errorf("expected update confirmation, got %q", output)
+	}
+	if !strings.Contains(output, "2026.04.1") {
+		t.Errorf("expected new version in output, got %q", output)
+	}
+
+	// Verify lock file was updated.
+	updatedLF, err := domrules.ReadLockFile(lockPath)
+	if err != nil {
+		t.Fatalf("reading lock file: %v", err)
+	}
+	if updatedLF.InstalledVersion != "2026.04.1" {
+		t.Errorf("InstalledVersion = %q, want %q", updatedLF.InstalledVersion, "2026.04.1")
+	}
+}
+
+// ---------- rules diff tests ----------
+
+func TestRulesDiff_NoDifferences(t *testing.T) {
+	bundleData := []byte(validBundleYAML)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == testBundlePath {
+			_, _ = w.Write(bundleData)
+			return
+		}
+		// Diff also fetches the sig file as part of fetchRemoteBundle.
+		if r.URL.Path == testBundleSigPath {
+			_, _ = w.Write([]byte("placeholder"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(bundleData)
+	lf := &domrules.LockFile{
+		InstalledVersion: "2026.03.1",
+		InstalledAt:      "2026-03-15T10:00:00Z",
+		Source:           ts.URL + testBundlePath,
+		LastCheck:        "2026-03-15T10:00:00Z",
+		BundleSHA256:     hex.EncodeToString(hash[:]),
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "diff", testBundleName, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "No differences found") {
+		t.Errorf("expected 'No differences found', got %q", buf.String())
+	}
+}
+
+func TestRulesDiff_WithChanges(t *testing.T) {
+	oldData := []byte(validBundleYAML)
+	newData := []byte(secondVersionBundleYAML)
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == testBundlePath {
+			_, _ = w.Write(newData)
+			return
+		}
+		if r.URL.Path == testBundleSigPath {
+			_, _ = w.Write([]byte("placeholder"))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating bundle dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion: "2026.03.1",
+		InstalledAt:      "2026-03-15T10:00:00Z",
+		Source:           ts.URL + testBundlePath,
+		LastCheck:        "2026-03-15T10:00:00Z",
+		BundleSHA256:     hex.EncodeToString(hash[:]),
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		t.Fatalf("writing lock file: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "diff", testBundleName, "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	// New version adds test-rule-two.
+	if !strings.Contains(output, "+ test-bundle:test-rule-two") {
+		t.Errorf("expected added rule in output, got %q", output)
+	}
+	if !strings.Contains(output, "1 added") {
+		t.Errorf("expected '1 added' in summary, got %q", output)
+	}
+}
+
+func TestRulesDiff_LocalBundle(t *testing.T) {
+	rulesDir := t.TempDir()
+	localBundleName := "local-only-bundle"
+	// Use a different bundle name (with matching YAML) to exercise the bundleName parameter.
+	localYAML := strings.Replace(validBundleYAML, "name: test-bundle", "name: "+localBundleName, 1)
+	setupUnsignedBundle(t, rulesDir, localBundleName, []byte(localYAML))
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "diff", localBundleName, "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for local bundle diff")
+	}
+	if !strings.Contains(err.Error(), "cannot diff local bundles") {
+		t.Errorf("error should mention local bundles, got: %v", err)
+	}
+}
+
+// ---------- helper tests (no globals, safe for parallel) ----------
+
+func TestDecodeSignatureBytes_Valid(t *testing.T) {
+	t.Parallel()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	data := []byte("test data")
+	sig := ed25519.Sign(priv, data)
+	encoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	decoded, err := decodeSignatureBytes([]byte(encoded))
+	if err != nil {
+		t.Fatalf("decodeSignatureBytes() error: %v", err)
+	}
+
+	if len(decoded) != ed25519.SignatureSize {
+		t.Errorf("signature length = %d, want %d", len(decoded), ed25519.SignatureSize)
+	}
+}
+
+func TestDecodeSignatureBytes_Invalid(t *testing.T) {
+	t.Parallel()
+
+	_, err := decodeSignatureBytes([]byte("not-valid-base64!!!"))
+	if err == nil {
+		t.Fatal("expected error for invalid base64")
+	}
+}
+
+// ---------- loadRulesConfig tests ----------
+
+func TestLoadRulesConfig_ExplicitPathError(t *testing.T) {
+	// Explicit --config with nonexistent file must return error.
+	_, err := loadRulesConfig("/nonexistent/pipelock.yaml")
+	if err == nil {
+		t.Error("expected error for nonexistent explicit config path")
+	}
+}
+
+func TestRulesAllowUnversionedLoadReadsCompatibilitySetting(t *testing.T) {
+	t.Setenv("PIPELOCK_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+
+	if rulesAllowUnversionedLoad("/nonexistent/pipelock.yaml", io.Discard) {
+		t.Fatal("unreadable explicit config must preserve the false compatibility value")
+	}
+	// No configuration at all applies the shipped default, exactly as the
+	// runtime loader does, so install and update stage what the runtime loads.
+	if got, want := rulesAllowUnversionedLoad("", io.Discard), config.Defaults().Rules.AllowUnversionedBundleLoad; got != want {
+		t.Fatalf("missing config = %v, want the shipped default %v", got, want)
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("rules:\n  allow_unversioned_bundle_load: true\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	strictPath := filepath.Join(dir, "strict.yaml")
+	if err := os.WriteFile(strictPath, []byte("rules:\n  allow_unversioned_bundle_load: false\n"), 0o600); err != nil {
+		t.Fatalf("writing strict config: %v", err)
+	}
+	if rulesAllowUnversionedLoad(strictPath, io.Discard) {
+		t.Fatal("explicit false config must keep the strict refusal after defaults and normalization")
+	}
+	if !rulesAllowUnversionedLoad(cfgPath, io.Discard) {
+		t.Fatal("explicit true config should preserve the accepted compatibility value")
+	}
+}
+
+func TestLoadRulesConfig_EmptyFallback(t *testing.T) {
+	// Empty configFile + no env + no discovered config -> nil, nil (not an error).
+	t.Setenv("PIPELOCK_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	var stderr strings.Builder
+	cfg, err := loadRulesConfig("", &stderr)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if cfg != nil {
+		t.Fatal("expected nil config when no explicit, env, or discovered config is present")
+	}
+	if !strings.Contains(stderr.String(), "using built-in defaults") {
+		t.Fatalf("expected defaults provenance, got %q", stderr.String())
+	}
+}
+
+func TestLoadRulesConfig_HostileCWDConfigIgnored(t *testing.T) {
+	t.Setenv("PIPELOCK_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(filepath.Join(dir, "pipelock.yaml"), []byte("mode: balanced\nrules_dir: /hostile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stderr strings.Builder
+	cfg, err := loadRulesConfig("", &stderr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg != nil {
+		t.Fatal("cwd pipelock.yaml must be ignored")
+	}
+	if !strings.Contains(stderr.String(), "using built-in defaults") {
+		t.Fatalf("expected defaults provenance, got %q", stderr.String())
+	}
+}
+
+func TestLoadRulesConfig_EnvVarHonoredWithProvenance(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "env-pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("PIPELOCK_CONFIG", cfgPath)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", t.TempDir())
+
+	var stderr strings.Builder
+	cfg, err := loadRulesConfig("", &stderr)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected env config")
+	}
+	if !strings.Contains(stderr.String(), cfgPath) {
+		t.Fatalf("expected config provenance to include env path, got %q", stderr.String())
+	}
+}
+
+func TestLoadRulesConfig_IgnoresRuntimeLicenseFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\nlicense_file: missing-license.token\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	var stderr strings.Builder
+	cfg, err := loadRulesConfig(cfgPath, &stderr)
+	if err != nil {
+		t.Fatalf("rules config load should not require runtime license_file: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected config")
+	}
+	if cfg.LicenseFile != "" || cfg.LicenseKey != "" {
+		t.Fatalf("rules config loader should scrub runtime license fields, got license_file=%q license_key=%q", cfg.LicenseFile, cfg.LicenseKey)
+	}
+}
+
+func TestLoadRulesConfig_IgnoresRuntimeOnlyFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+	cfgYAML := `mode: balanced
+dlp:
+  secrets_file: /root/not-readable/pipelock-secrets.env
+tls_interception:
+  enabled: true
+  ca_cert: /root/not-readable/ca.pem
+  ca_key: /root/not-readable/ca-key.pem
+`
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cfg, err := loadRulesConfig(cfgPath, io.Discard)
+	if err != nil {
+		t.Fatalf("rules config load should not require runtime-only files: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected config")
+	}
+}
+
+func TestLoadRulesConfig_InvalidRulesFacingConfigFatal(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+	cfgYAML := `mode: balanced
+dlp:
+  patterns:
+    - name: bad-regex
+      regex: "["
+`
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cfg, err := loadRulesConfig(cfgPath, io.Discard)
+	if err == nil {
+		t.Fatal("expected invalid rules-facing DLP pattern to be fatal")
+	}
+	if cfg != nil {
+		t.Fatalf("expected nil config on invalid rules-facing config, got %+v", cfg)
+	}
+	if !strings.Contains(err.Error(), "invalid rules config") || !strings.Contains(err.Error(), "bad-regex") {
+		t.Fatalf("expected invalid DLP pattern error, got %v", err)
+	}
+}
+
+func TestLoadRulesConfig_MalformedDiscoveredConfigFatal(t *testing.T) {
+	xdg := t.TempDir()
+	cfgDir := filepath.Join(xdg, "pipelock")
+	if err := os.MkdirAll(cfgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(cfgDir, "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: [broken\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("PIPELOCK_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("HOME", t.TempDir())
+	withRulesConfigDiscovery(t, cliutil.DiscoverConfigPathStrict)
+
+	var stderr strings.Builder
+	cfg, err := loadRulesConfig("", &stderr)
+	if err == nil {
+		t.Fatal("expected malformed discovered config to be fatal")
+	}
+	if cfg != nil {
+		t.Fatalf("expected nil config on malformed discovered config, got %+v", cfg)
+	}
+	if !strings.Contains(err.Error(), "loading discovered config") {
+		t.Fatalf("expected discovered config load error, got %v", err)
+	}
+}
+
+func TestLoadRulesConfig_UnsafeDiscoveredConfigFatal(t *testing.T) {
+	xdg := t.TempDir()
+	cfgDir := filepath.Join(xdg, "pipelock")
+	if err := os.MkdirAll(cfgDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(cfgDir, "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+	unsafeMode := os.FileMode(0o600 | 0o020)
+	if err := os.Chmod(cfgPath, unsafeMode); err != nil {
+		t.Fatalf("chmod config: %v", err)
+	}
+
+	t.Setenv("PIPELOCK_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	t.Setenv("HOME", t.TempDir())
+	withRulesConfigDiscovery(t, cliutil.DiscoverConfigPathStrict)
+
+	var stderr strings.Builder
+	cfg, err := loadRulesConfig("", &stderr)
+	if err == nil {
+		t.Fatal("expected unsafe discovered config to be fatal")
+	}
+	if cfg != nil {
+		t.Fatalf("expected nil config on unsafe discovered config, got %+v", cfg)
+	}
+	if !strings.Contains(err.Error(), "discovering config") || !strings.Contains(err.Error(), "writable by group or other") {
+		t.Fatalf("expected unsafe discovery error, got %v", err)
+	}
+	if strings.Contains(stderr.String(), "using built-in defaults") {
+		t.Fatalf("unsafe discovered config must not fall back to defaults; stderr=%q", stderr.String())
+	}
+}
+
+// ---------- helper tests (no globals, safe for parallel) ----------
+
+func TestRuleChanged(t *testing.T) {
+	t.Parallel()
+
+	a := &domrules.Rule{
+		ID:          "test-rule",
+		Type:        "dlp",
+		Status:      "stable",
+		Severity:    "high",
+		Description: "desc",
+		Pattern:     domrules.RulePattern{Regex: "abc"},
+	}
+	b := &domrules.Rule{
+		ID:          "test-rule",
+		Type:        "dlp",
+		Status:      "stable",
+		Severity:    "high",
+		Description: "desc",
+		Pattern:     domrules.RulePattern{Regex: "abc"},
+	}
+
+	if ruleChanged(a, b) {
+		t.Error("identical rules should not be marked as changed")
+	}
+
+	b.Pattern.Regex = "xyz"
+	if !ruleChanged(a, b) {
+		t.Error("rules with different regex should be marked as changed")
+	}
+}
+
+// ---------- coverage gap tests ----------
+
+func TestVerifyRemoteSignature_TrustedKey(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte("test bundle data")
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	// Not in embedded keyring -- use trusted keys instead.
+	trustedKeys := []config.TrustedKey{
+		{Name: "test-signer", PublicKey: hex.EncodeToString(pub)},
+	}
+
+	result, err := verifyRemoteSignature(bundleData, []byte(sigEncoded), domrules.DefaultTrustPolicy(trustedKeys))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Tier != domrules.TrustTierThirdParty {
+		t.Errorf("Tier = %q, want %q", result.Tier, domrules.TrustTierThirdParty)
+	}
+	if result.SignerFingerprint == "" {
+		t.Error("expected non-empty signer fingerprint")
+	}
+}
+
+func TestVerifyRemoteSignature_NoMatchingSigner(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte("test bundle data")
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	// Empty embedded keyring, no trusted keys.
+	setRulesKeyringHexForTest(t, "")
+
+	_, err = verifyRemoteSignature(bundleData, []byte(sigEncoded), domrules.DefaultTrustPolicy(nil))
+	if err == nil {
+		t.Fatal("expected error for no matching signer")
+	}
+	if !strings.Contains(err.Error(), "no matching signer") {
+		t.Errorf("error should mention no matching signer, got: %v", err)
+	}
+}
+
+func TestVerifyRemoteSignature_TrustedKeyBadHex(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte("test bundle data")
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, "")
+
+	// Invalid hex and wrong-size key -- both should be skipped, not panic.
+	trustedKeys := []config.TrustedKey{
+		{Name: "bad-hex", PublicKey: "not-hex!!!"},
+		{Name: "wrong-size", PublicKey: "aabbccdd"},
+	}
+
+	_, err = verifyRemoteSignature(bundleData, []byte(sigEncoded), domrules.DefaultTrustPolicy(trustedKeys))
+	if err == nil {
+		t.Fatal("expected error for no matching signer")
+	}
+}
+
+func TestRuleChanged_AllFields(t *testing.T) {
+	t.Parallel()
+
+	base := domrules.Rule{
+		ID: "r1", Type: "dlp", Status: "stable",
+		Severity: "high", Description: "desc",
+		Pattern: domrules.RulePattern{Regex: "abc"},
+	}
+
+	tests := []struct {
+		name   string
+		modify func(r *domrules.Rule)
+	}{
+		{"type differs", func(r *domrules.Rule) { r.Type = "response" }},
+		{"status differs", func(r *domrules.Rule) { r.Status = "experimental" }},
+		{"severity differs", func(r *domrules.Rule) { r.Severity = "critical" }},
+		{"description differs", func(r *domrules.Rule) { r.Description = "different" }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			a := base
+			b := base
+			tt.modify(&b)
+			if !ruleChanged(&a, &b) {
+				t.Errorf("expected rules to differ when %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestLoadRulesConfig_ExplicitPathSuccess(t *testing.T) {
+	// Create a minimal valid config file.
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "test-pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	cfg, err := loadRulesConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+}
+
+func TestLoadRulesConfig_EnvVarFallback(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "env-pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	t.Setenv("PIPELOCK_CONFIG", cfgPath)
+
+	cfg, err := loadRulesConfig("")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config from env var fallback")
+	}
+}
+
+func TestFetchRemoteBundle_NonHTTPS(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := fetchRemoteBundle(t.Context(), "http://evil.com/bundle.yaml")
+	if err == nil {
+		t.Fatal("expected error for non-HTTPS URL")
+	}
+	if !strings.Contains(err.Error(), "HTTPS") {
+		t.Errorf("error should mention HTTPS, got: %v", err)
+	}
+}
+
+func TestHttpGet_Non200(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	_, err := httpGet(t.Context(), ts.URL+"/missing")
+	if err == nil {
+		t.Fatal("expected error for 404 response")
+	}
+	if !strings.Contains(err.Error(), "status 404") {
+		t.Errorf("error should mention status 404, got: %v", err)
+	}
+}
+
+func TestHttpGet_ServerError(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	_, err := httpGet(t.Context(), ts.URL+"/fail")
+	if err == nil {
+		t.Fatal("expected error for 500 response")
+	}
+	if !strings.Contains(err.Error(), "status 500") {
+		t.Errorf("error should mention status 500, got: %v", err)
+	}
+}
+
+func TestDecodeSignatureBytes_WrongLength(t *testing.T) {
+	t.Parallel()
+
+	// Valid base64 but decodes to wrong length (not 64 bytes).
+	shortSig := base64.StdEncoding.EncodeToString([]byte("too-short"))
+	_, err := decodeSignatureBytes([]byte(shortSig))
+	if err == nil {
+		t.Fatal("expected error for wrong signature length")
+	}
+	if !strings.Contains(err.Error(), "invalid signature length") {
+		t.Errorf("error should mention invalid signature length, got: %v", err)
+	}
+}
+
+func TestCheckExistingInstall_DifferentDigest(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+
+	lf := &domrules.LockFile{
+		InstalledVersion: "2026.03.1",
+		InstalledAt:      "2026-03-15T10:00:00Z",
+		Source:           "https://example.com/bundle.yaml",
+		BundleSHA256:     "aaaa",
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	err := checkExistingInstall(bundleDir, "2026.03.1", "bbbb")
+	if err == nil {
+		t.Fatal("expected error for same version different digest")
+	}
+	if !strings.Contains(err.Error(), "republish") {
+		t.Errorf("error should mention republish, got: %v", err)
+	}
+}
+
+func TestCheckExistingInstall_NotInstalled(t *testing.T) {
+	t.Parallel()
+
+	err := checkExistingInstall(filepath.Join(t.TempDir(), "nonexistent"), "2026.03.1", "abc")
+	if err != nil {
+		t.Errorf("expected nil error for not-installed bundle, got: %v", err)
+	}
+}
+
+func TestCheckExistingInstall_MalformedLockBlocksReplacement(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "bundle")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		t.Fatalf("create bundle dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "bundle.lock"), []byte("installed_version: ["), 0o600); err != nil {
+		t.Fatalf("write malformed lock: %v", err)
+	}
+	err := checkExistingInstall(dir, "2026.09.0", "digest")
+	if err == nil || !strings.Contains(err.Error(), "reading installed bundle lock") {
+		t.Fatalf("checkExistingInstall error = %v, want malformed lock rejection", err)
+	}
+}
+
+func TestCheckExistingInstallRejectsMalformedVersions(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		candidateVersion string
+		installedVersion string
+		want             string
+	}{
+		{
+			name:             "candidate",
+			candidateVersion: "not-a-calver",
+			installedVersion: "2026.08.0",
+			want:             "parsing candidate version",
+		},
+		{
+			name:             "installed",
+			candidateVersion: "2026.09.0",
+			installedVersion: "not-a-calver",
+			want:             "parsing installed version",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "bundle")
+			if err := os.MkdirAll(dir, 0o750); err != nil {
+				t.Fatalf("create bundle dir: %v", err)
+			}
+			if err := domrules.WriteLockFile(filepath.Join(dir, "bundle.lock"), &domrules.LockFile{InstalledVersion: tc.installedVersion}); err != nil {
+				t.Fatalf("write lock: %v", err)
+			}
+			err := checkExistingInstall(dir, tc.candidateVersion, "digest")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("checkExistingInstall error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRulesVerify_NoBundles(t *testing.T) {
+	rulesDir := t.TempDir()
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "verify", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "No bundles installed") {
+		t.Errorf("expected 'No bundles installed', got %q", buf.String())
+	}
+}
+
+func TestRulesVerify_MissingLockFile(t *testing.T) {
+	rulesDir := t.TempDir()
+	// Create a bundle dir without a lock file.
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), []byte(validBundleYAML), 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "verify", "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for failed verification")
+	}
+	if !strings.Contains(buf.String(), "FAIL") {
+		t.Errorf("expected FAIL in output, got %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "missing lock file") {
+		t.Errorf("expected 'missing lock file' in output, got %q", buf.String())
+	}
+}
+
+func TestRulesUpdate_UpdateAll(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	newData := []byte(secondVersionBundleYAML)
+	sig := ed25519.Sign(priv, newData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+
+	// Set up an installed signed bundle.
+	oldData := []byte(validBundleYAML)
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	// Run update with no name arg (update all).
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Updated test-bundle") {
+		t.Errorf("expected update confirmation, got %q", output)
+	}
+}
+
+func TestRulesUpdate_RepublishAttack(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	// Same version but modified content (different digest).
+	modifiedYAML := strings.Replace(validBundleYAML, "Detects test patterns", "Modified description", 1)
+	newData := []byte(modifiedYAML)
+	sig := ed25519.Sign(priv, newData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	oldData := []byte(validBundleYAML)
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", testBundleName, "--rules-dir", rulesDir})
+
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for republish attack")
+	}
+	if !strings.Contains(err.Error(), "republish") {
+		t.Errorf("error should mention republish, got: %v", err)
+	}
+}
+
+func TestRulesUpdate_DowngradeRejected(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	// Serve an OLDER version than what's installed.
+	olderYAML := strings.Replace(validBundleYAML, `version: "2026.03.1"`, `version: "2025.12.1"`, 1)
+	newData := []byte(olderYAML)
+	sig := ed25519.Sign(priv, newData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	oldData := []byte(validBundleYAML)
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", testBundleName, "--rules-dir", rulesDir})
+
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for downgrade")
+	}
+	if !strings.Contains(err.Error(), "older") {
+		t.Errorf("error should mention older version, got: %v", err)
+	}
+}
+
+func TestRulesInstall_RemoteNameMismatch(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte(validBundleYAML) // name: test-bundle
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(bundleData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	buf := &strings.Builder{}
+
+	// Call installRemote directly with an expectedName that doesn't match the bundle.
+	err = installRemote(installRemoteOptions{
+		out:          buf,
+		stderr:       io.Discard,
+		rulesDir:     rulesDir,
+		bundleURL:    ts.URL + testBundlePath,
+		expectedName: "wrong-name",
+	})
+	if err == nil {
+		t.Fatal("expected error for name mismatch")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("error should mention name mismatch, got: %v", err)
+	}
+}
+
+func TestInstallRemote_LoadsConfigBeforeFetch(t *testing.T) {
+	var requests atomic.Int32
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(validBundleYAML))
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	err := installRemote(installRemoteOptions{
+		out:        io.Discard,
+		stderr:     io.Discard,
+		rulesDir:   t.TempDir(),
+		bundleURL:  ts.URL + testBundlePath,
+		configFile: filepath.Join(t.TempDir(), "missing-pipelock.yaml"),
+	})
+	if err == nil {
+		t.Fatal("expected config load error")
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("remote bundle was fetched before config validation; requests=%d", requests.Load())
+	}
+}
+
+// ---------- validateBundlePath coverage tests ----------
+
+func TestValidateBundlePath_SymlinkEscape(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+	externalDir := t.TempDir()
+
+	// Create a symlink inside rulesDir that points outside.
+	symlinkPath := filepath.Join(rulesDir, "escape-link")
+	if err := os.Symlink(externalDir, symlinkPath); err != nil {
+		t.Fatalf("creating symlink: %v", err)
+	}
+
+	_, err := validateBundlePath(rulesDir, "escape-link")
+	if err == nil {
+		t.Fatal("expected error for symlink escaping rules directory")
+	}
+	if !strings.Contains(err.Error(), "escapes rules directory") {
+		t.Errorf("error should mention escape, got: %v", err)
+	}
+}
+
+func TestValidateBundlePath_NonExistentOK(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+
+	// Non-existent directory should succeed (install path).
+	got, err := validateBundlePath(rulesDir, "new-bundle")
+	if err != nil {
+		t.Fatalf("unexpected error for non-existent dir: %v", err)
+	}
+	want := filepath.Join(rulesDir, "new-bundle")
+	if got != want {
+		t.Errorf("path = %q, want %q", got, want)
+	}
+}
+
+func TestValidateBundlePath_PathSeparatorRejected(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+
+	_, err := validateBundlePath(rulesDir, "sub/dir")
+	if err == nil {
+		t.Fatal("expected error for name with path separator")
+	}
+	if !strings.Contains(err.Error(), "plain directory name") {
+		t.Errorf("error should mention plain directory name, got: %v", err)
+	}
+}
+
+// ---------- stageBundle chmod coverage test ----------
+
+func TestStageBundle_ChmodPath(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+	bundleData := []byte("test-content")
+	sigData := []byte("sig-data")
+
+	lf := &domrules.LockFile{
+		InstalledVersion: "2026.03.1",
+		Source:           "test",
+		BundleSHA256:     "abc123",
+		Unsigned:         true,
+	}
+
+	err := stageBundle(rulesDir, "chmod-test", bundleData, sigData, lf)
+	if err != nil {
+		t.Fatalf("stageBundle() error: %v", err)
+	}
+
+	// Verify the bundle directory was created with correct permissions.
+	destDir := filepath.Join(rulesDir, "chmod-test")
+	info, err := os.Stat(destDir)
+	if err != nil {
+		t.Fatalf("stat dest dir: %v", err)
+	}
+	if !info.IsDir() {
+		t.Error("expected destination to be a directory")
+	}
+
+	// Verify contents were written.
+	bundlePath := filepath.Clean(filepath.Join(destDir, "bundle.yaml"))
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatalf("reading bundle.yaml: %v", err)
+	}
+	if string(data) != "test-content" {
+		t.Errorf("bundle.yaml content = %q, want %q", string(data), "test-content")
+	}
+
+	sigPath := filepath.Clean(filepath.Join(destDir, "bundle.yaml.sig"))
+	sigOnDisk, err := os.ReadFile(sigPath)
+	if err != nil {
+		t.Fatalf("reading bundle.yaml.sig: %v", err)
+	}
+	if string(sigOnDisk) != "sig-data" {
+		t.Errorf("sig content = %q, want %q", string(sigOnDisk), "sig-data")
+	}
+
+	// Verify lock file was written.
+	lockLF, err := domrules.ReadLockFile(filepath.Join(destDir, "bundle.lock"))
+	if err != nil {
+		t.Fatalf("reading lock file: %v", err)
+	}
+	if lockLF.InstalledVersion != "2026.03.1" {
+		t.Errorf("lock version = %q, want %q", lockLF.InstalledVersion, "2026.03.1")
+	}
+}
+
+func TestStageBundle_NilSignature(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+	bundleData := []byte("bundle-without-sig")
+
+	lf := &domrules.LockFile{
+		InstalledVersion: testBundleVersion,
+		Source:           "test",
+		BundleSHA256:     "def456",
+		Unsigned:         true,
+	}
+
+	// nil sigData means no signature file should be written.
+	err := stageBundle(rulesDir, "no-sig-test", bundleData, nil, lf)
+	if err != nil {
+		t.Fatalf("stageBundle() error: %v", err)
+	}
+
+	destDir := filepath.Join(rulesDir, "no-sig-test")
+
+	// Verify bundle.yaml was written.
+	data, err := os.ReadFile(filepath.Clean(filepath.Join(destDir, "bundle.yaml")))
+	if err != nil {
+		t.Fatalf("reading bundle.yaml: %v", err)
+	}
+	if string(data) != "bundle-without-sig" {
+		t.Errorf("bundle content = %q, want %q", string(data), "bundle-without-sig")
+	}
+
+	// Verify no signature file.
+	sigPath := filepath.Join(destDir, "bundle.yaml.sig")
+	if _, err := os.Stat(sigPath); !os.IsNotExist(err) {
+		t.Error("expected no signature file when sigData is nil")
+	}
+
+	// Verify lock file was written.
+	lockLF, err := domrules.ReadLockFile(filepath.Join(destDir, "bundle.lock"))
+	if err != nil {
+		t.Fatalf("reading lock file: %v", err)
+	}
+	if lockLF.InstalledVersion != testBundleVersion {
+		t.Errorf("lock version = %q, want %q", lockLF.InstalledVersion, testBundleVersion)
+	}
+}
+
+// ---------- updateBundle coverage tests ----------
+
+func TestUpdateBundle_NameChangeRejected(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	// Remote serves a bundle whose manifest name differs from the installed directory name.
+	renamedYAML := strings.Replace(validBundleYAML, "name: test-bundle", "name: renamed-bundle", 1)
+	newData := []byte(renamedYAML)
+	newSig := ed25519.Sign(priv, newData)
+	newSigEncoded := base64.StdEncoding.EncodeToString(newSig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(newSigEncoded))
+			return
+		}
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	oldData := []byte(validBundleYAML)
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	buf := &strings.Builder{}
+	err = updateBundle(updateBundleOpts{
+		Out:      buf,
+		RulesDir: rulesDir,
+		Name:     testBundleName,
+		Policy:   domrules.DefaultTrustPolicy(nil),
+	})
+	if err == nil {
+		t.Fatal("expected error for name change during update")
+	}
+	if !strings.Contains(err.Error(), "name changed") {
+		t.Errorf("error should mention name change, got: %v", err)
+	}
+}
+
+func TestUpdateBundle_ReservedPrefixRecheckOnUpdate(t *testing.T) {
+	// A third-party signer cannot update a bundle with pipelock- prefix.
+	thirdPub, thirdPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating third-party key: %v", err)
+	}
+
+	// Official key for keyring (different from signer).
+	officialPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating official key: %v", err)
+	}
+	setRulesKeyringHexForTest(t, hex.EncodeToString(officialPub))
+
+	// Remote bundle has pipelock-community name, signed by third-party.
+	pipelockYAML := strings.Replace(secondVersionBundleYAML, "name: test-bundle", "name: pipelock-community", 1)
+	newData := []byte(pipelockYAML)
+	newSig := ed25519.Sign(thirdPriv, newData)
+	newSigEncoded := base64.StdEncoding.EncodeToString(newSig) + "\n"
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(newSigEncoded))
+			return
+		}
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	// Set up installed bundle named pipelock-community with matching source URL.
+	rulesDir := t.TempDir()
+	installedName := "pipelock-community"
+	oldYAML := strings.Replace(validBundleYAML, "name: test-bundle", "name: pipelock-community", 1)
+	oldData := []byte(oldYAML)
+	bundleDir := filepath.Join(rulesDir, installedName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + "/pipelock-community/bundle.yaml",
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(thirdPub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	trustedKeys := []config.TrustedKey{
+		{Name: "third-party", PublicKey: hex.EncodeToString(thirdPub)},
+	}
+
+	buf := &strings.Builder{}
+	err = updateBundle(updateBundleOpts{
+		Out:              buf,
+		RulesDir:         rulesDir,
+		Name:             installedName,
+		Policy:           domrules.DefaultTrustPolicy(trustedKeys),
+		AllowKeyRotation: true,
+	})
+	if err == nil {
+		t.Fatal("expected error for reserved prefix with non-official signer on update")
+	}
+	if !strings.Contains(err.Error(), "reserved prefix") {
+		t.Errorf("error should mention reserved prefix, got: %v", err)
+	}
+}
+
+// ---------- coverage boost tests ----------
+
+func TestHttpGet_SizeLimitExceeded(t *testing.T) {
+	// NOT parallel: mutates httpsOnlyClient.
+
+	// Return a body larger than MaxBundleFileSize.
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Write MaxBundleFileSize + 2 bytes to exceed the limit reader.
+		data := make([]byte, domrules.MaxBundleFileSize+2)
+		_, _ = w.Write(data)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	_, err := httpGet(t.Context(), ts.URL+"/large")
+	if err == nil {
+		t.Fatal("expected error for oversized response")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum bundle size") {
+		t.Errorf("error should mention exceeds maximum bundle size, got: %v", err)
+	}
+}
+
+func TestHttpGet_RedirectToHTTPRejected(t *testing.T) {
+	// NOT parallel: mutates httpsOnlyClient.
+
+	// Start an HTTP server (not HTTPS) to be the redirect target.
+	httpTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("should not reach here"))
+	}))
+	defer httpTarget.Close()
+
+	// Start a TLS server that redirects to the plain HTTP target.
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, httpTarget.URL+"/target", http.StatusFound)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	// Install the HTTPS-only redirect check on the test client.
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	_, err := httpGet(t.Context(), ts.URL+"/redirect")
+	if err == nil {
+		t.Fatal("expected error for redirect to non-HTTPS URL")
+	}
+	if !strings.Contains(err.Error(), "non-HTTPS") {
+		t.Errorf("error should mention non-HTTPS redirect, got: %v", err)
+	}
+}
+
+func TestStageBundle_BackupAndRestore(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+	bundleName := "backup-test"
+	destDir := filepath.Join(rulesDir, bundleName)
+
+	// Create an existing bundle directory to trigger the backup path.
+	if err := os.MkdirAll(destDir, 0o750); err != nil {
+		t.Fatalf("creating existing dir: %v", err)
+	}
+	oldContent := []byte("old-bundle-content")
+	if err := os.WriteFile(filepath.Join(destDir, "bundle.yaml"), oldContent, 0o600); err != nil {
+		t.Fatalf("writing old bundle: %v", err)
+	}
+
+	newContent := []byte("new-bundle-content")
+	lf := &domrules.LockFile{
+		InstalledVersion: "2026.04.1",
+		Source:           "test",
+		BundleSHA256:     "abc123",
+		Unsigned:         true,
+	}
+
+	// stageBundle should back up existing, rename new, then remove backup.
+	err := stageBundle(rulesDir, bundleName, newContent, nil, lf)
+	if err != nil {
+		t.Fatalf("stageBundle() error: %v", err)
+	}
+
+	// Verify new content is in place.
+	data, err := os.ReadFile(filepath.Clean(filepath.Join(destDir, "bundle.yaml")))
+	if err != nil {
+		t.Fatalf("reading new bundle: %v", err)
+	}
+	if string(data) != "new-bundle-content" {
+		t.Errorf("bundle content = %q, want %q", string(data), "new-bundle-content")
+	}
+
+	// Verify backup was cleaned up.
+	backupDir := destDir + ".bak"
+	if _, err := os.Stat(backupDir); !os.IsNotExist(err) {
+		t.Error("expected backup directory to be removed after successful stage")
+	}
+}
+
+func TestRulesUpdate_AllWithFailures(t *testing.T) {
+	// NOT parallel: mutates httpsOnlyClient and domrules keyring globals.
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	newData := []byte(secondVersionBundleYAML)
+	sig := ed25519.Sign(priv, newData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+	recoveredData := []byte(strings.Replace(secondVersionBundleYAML, "name: test-bundle", "name: other-bundle", 1))
+	recoveredSig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, recoveredData)) + "\n"
+	var recovered atomic.Bool
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The second source recovers after the first mixed update.
+		if strings.Contains(r.URL.Path, "other-bundle") {
+			if !recovered.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			if strings.HasSuffix(r.URL.Path, ".sig") {
+				_, _ = w.Write([]byte(recoveredSig))
+				return
+			}
+			_, _ = w.Write(recoveredData)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(newData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+
+	// Set up a valid signed bundle (will update successfully).
+	oldData := []byte(validBundleYAML)
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), oldData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+	hash := sha256.Sum256(oldData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	// Set up a second signed bundle whose source will 404 (will fail).
+	otherName := "other-bundle"
+	otherYAML := strings.Replace(validBundleYAML, "name: test-bundle", "name: "+otherName, 1)
+	otherData := []byte(otherYAML)
+	otherDir := filepath.Join(rulesDir, otherName)
+	if err := os.MkdirAll(otherDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(otherDir, "bundle.yaml"), otherData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+	otherHash := sha256.Sum256(otherData)
+	otherLF := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + "/other-bundle/bundle.yaml",
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(otherHash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(otherDir, "bundle.lock"), otherLF); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+	failedBundleBefore, err := os.ReadFile(filepath.Clean(filepath.Join(otherDir, "bundle.yaml")))
+	if err != nil {
+		t.Fatalf("reading failed bundle before update: %v", err)
+	}
+	failedLockBefore, err := os.ReadFile(filepath.Clean(filepath.Join(otherDir, "bundle.lock")))
+	if err != nil {
+		t.Fatalf("reading failed lock before update: %v", err)
+	}
+
+	// A local bundle is intentionally skipped even when another update fails.
+	localName := "local-bundle"
+	localDir := filepath.Join(rulesDir, localName)
+	if err := os.MkdirAll(localDir, 0o750); err != nil {
+		t.Fatalf("creating local bundle directory: %v", err)
+	}
+	localData := []byte(strings.Replace(validBundleYAML, "name: test-bundle", "name: "+localName, 1))
+	if err := os.WriteFile(filepath.Join(localDir, "bundle.yaml"), localData, 0o600); err != nil {
+		t.Fatalf("writing local bundle: %v", err)
+	}
+	localLF := &domrules.LockFile{InstalledVersion: "2026.03.1", Source: "/local/bundle.yaml", Unsigned: true}
+	if err := domrules.WriteLockFile(filepath.Join(localDir, "bundle.lock"), localLF); err != nil {
+		t.Fatalf("writing local lock: %v", err)
+	}
+	localLockBefore, err := os.ReadFile(filepath.Clean(filepath.Join(localDir, "bundle.lock")))
+	if err != nil {
+		t.Fatalf("reading local lock before update: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	errBuf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetErr(errBuf)
+	cmd.SetArgs([]string{"rules", "update", "--rules-dir", rulesDir})
+
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when some bundles fail to update")
+	}
+	if !strings.Contains(err.Error(), "failed to update") {
+		t.Errorf("error should mention failed to update, got: %v", err)
+	}
+	// The error output should mention the failing bundle.
+	if !strings.Contains(errBuf.String(), otherName) {
+		t.Errorf("expected failing bundle name in stderr, got: %q", errBuf.String())
+	}
+	if !strings.Contains(buf.String(), "Updated "+testBundleName+": v2026.03.1 -> v2026.04.1") {
+		t.Errorf("successful update missing from stdout: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "skipping "+localName+": installed from local path") {
+		t.Errorf("local skip missing from stdout: %q", buf.String())
+	}
+	if strings.Contains(buf.String(), "Updated "+otherName) {
+		t.Errorf("failed bundle reported updated: %q", buf.String())
+	}
+
+	updatedData, err := os.ReadFile(filepath.Clean(filepath.Join(bundleDir, "bundle.yaml")))
+	if err != nil || !bytes.Equal(updatedData, newData) {
+		t.Fatalf("successful bundle was not installed: data=%q err=%v", updatedData, err)
+	}
+	updatedSig, err := os.ReadFile(filepath.Clean(filepath.Join(bundleDir, "bundle.yaml.sig")))
+	if err != nil || string(updatedSig) != sigEncoded {
+		t.Fatalf("successful signature was not installed: sig=%q err=%v", updatedSig, err)
+	}
+	updatedLF, err := domrules.ReadLockFile(filepath.Join(bundleDir, "bundle.lock"))
+	if err != nil {
+		t.Fatalf("reading updated lock: %v", err)
+	}
+	if updatedLF.InstalledVersion != "2026.04.1" || updatedLF.BundleSHA256 != sha256Hex(newData) || updatedLF.SignerFingerprint != hex.EncodeToString(pub) {
+		t.Fatalf("updated lock does not identify the installed signed bundle: %+v", updatedLF)
+	}
+	for _, unchanged := range []struct {
+		name string
+		path string
+		want []byte
+	}{
+		{"failed bundle", filepath.Join(otherDir, "bundle.yaml"), failedBundleBefore},
+		{"failed lock", filepath.Join(otherDir, "bundle.lock"), failedLockBefore},
+		{"local bundle", filepath.Join(localDir, "bundle.yaml"), localData},
+		{"local lock", filepath.Join(localDir, "bundle.lock"), localLockBefore},
+	} {
+		got, readErr := os.ReadFile(filepath.Clean(unchanged.path))
+		if readErr != nil || !bytes.Equal(got, unchanged.want) {
+			t.Errorf("%s changed during mixed update: got=%q err=%v", unchanged.name, got, readErr)
+		}
+	}
+	// Neither the committed nor the failed update may leave recovery artifacts.
+	for _, name := range []string{testBundleName, otherName, localName} {
+		if _, statErr := os.Stat(filepath.Join(rulesDir, name+".bak")); !os.IsNotExist(statErr) {
+			t.Errorf("%s backup left after mixed update: %v", name, statErr)
+		}
+	}
+	if pending, _ := filepath.Glob(filepath.Join(rulesDir, ".pipelock-state", "rules-transactions", "*")); len(pending) != 0 {
+		t.Errorf("transaction records left after mixed update: %v", pending)
+	}
+
+	recovered.Store(true)
+	retryCmd := testRootCmd()
+	retryOut := &strings.Builder{}
+	retryErr := &strings.Builder{}
+	retryCmd.SetOut(retryOut)
+	retryCmd.SetErr(retryErr)
+	retryCmd.SetArgs([]string{"rules", "update", "--rules-dir", rulesDir})
+	if err := retryCmd.Execute(); err != nil {
+		t.Fatalf("retry after source recovery failed: %v; stderr=%q", err, retryErr.String())
+	}
+	if strings.Contains(retryErr.String(), "error updating") {
+		t.Errorf("retry reported a bundle failure: %q", retryErr.String())
+	}
+	for _, want := range []string{
+		"Updated " + otherName + ": v2026.03.1 -> v2026.04.1",
+		testBundleName + " v2026.04.1: already up to date",
+		"skipping " + localName + ": installed from local path",
+	} {
+		if !strings.Contains(retryOut.String(), want) {
+			t.Errorf("retry output missing %q: %q", want, retryOut.String())
+		}
+	}
+	recoveredBundle, err := os.ReadFile(filepath.Clean(filepath.Join(otherDir, "bundle.yaml")))
+	if err != nil || !bytes.Equal(recoveredBundle, recoveredData) {
+		t.Fatalf("recovered bundle was not installed: data=%q err=%v", recoveredBundle, err)
+	}
+	recoveredSignature, err := os.ReadFile(filepath.Clean(filepath.Join(otherDir, "bundle.yaml.sig")))
+	if err != nil || string(recoveredSignature) != recoveredSig {
+		t.Fatalf("recovered signature was not installed: sig=%q err=%v", recoveredSignature, err)
+	}
+	recoveredLF, err := domrules.ReadLockFile(filepath.Join(otherDir, "bundle.lock"))
+	if err != nil {
+		t.Fatalf("reading recovered lock: %v", err)
+	}
+	if recoveredLF.InstalledVersion != "2026.04.1" || recoveredLF.BundleSHA256 != sha256Hex(recoveredData) || recoveredLF.SignerFingerprint != hex.EncodeToString(pub) {
+		t.Fatalf("recovered lock does not identify its signed bundle: %+v", recoveredLF)
+	}
+	for _, unchanged := range []struct {
+		name string
+		path string
+		want []byte
+	}{
+		{"previously updated bundle", filepath.Join(bundleDir, "bundle.yaml"), newData},
+		{"previously updated signature", filepath.Join(bundleDir, "bundle.yaml.sig"), []byte(sigEncoded)},
+		{"local bundle", filepath.Join(localDir, "bundle.yaml"), localData},
+		{"local lock", filepath.Join(localDir, "bundle.lock"), localLockBefore},
+	} {
+		got, readErr := os.ReadFile(filepath.Clean(unchanged.path))
+		if readErr != nil || !bytes.Equal(got, unchanged.want) {
+			t.Errorf("%s changed during retry: got=%q err=%v", unchanged.name, got, readErr)
+		}
+	}
+	retriedLF, err := domrules.ReadLockFile(filepath.Join(bundleDir, "bundle.lock"))
+	if err != nil {
+		t.Fatalf("reading already updated lock after retry: %v", err)
+	}
+	if retriedLF.InstalledVersion != updatedLF.InstalledVersion || retriedLF.BundleSHA256 != updatedLF.BundleSHA256 || retriedLF.SignerFingerprint != updatedLF.SignerFingerprint {
+		t.Fatalf("retry changed prior installed identity: before=%+v after=%+v", updatedLF, retriedLF)
+	}
+}
+
+func TestInstallRemote_PipelockPrefixNonOfficial(t *testing.T) {
+	// NOT parallel: mutates httpsOnlyClient and domrules keyring globals.
+
+	// Third-party key signs a bundle with pipelock- prefix.
+	thirdPub, thirdPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating third-party key: %v", err)
+	}
+
+	// Put a different key in the keyring.
+	officialPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating official key: %v", err)
+	}
+	setRulesKeyringHexForTest(t, hex.EncodeToString(officialPub))
+
+	pipelockYAML := strings.Replace(validBundleYAML, "name: test-bundle", "name: pipelock-evil", 1)
+	bundleData := []byte(pipelockYAML)
+	sig := ed25519.Sign(thirdPriv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(bundleData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	trustedKeys := []config.TrustedKey{
+		{Name: "third-party", PublicKey: hex.EncodeToString(thirdPub)},
+	}
+
+	// Write a temp config with the trusted key.
+	cfgDir := t.TempDir()
+	cfgContent := "mode: balanced\nrules:\n  trusted_keys:\n    - name: third-party\n      public_key: " + hex.EncodeToString(thirdPub) + "\n"
+	cfgPath := filepath.Join(cfgDir, "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte(cfgContent), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	_ = trustedKeys // used through config file
+	buf := &strings.Builder{}
+	err = installRemote(installRemoteOptions{
+		out:        buf,
+		stderr:     io.Discard,
+		rulesDir:   rulesDir,
+		bundleURL:  ts.URL + "/pipelock-evil/bundle.yaml",
+		configFile: cfgPath,
+	})
+	if err == nil {
+		t.Fatal("expected error for pipelock- prefix with non-official signer")
+	}
+	if !strings.Contains(err.Error(), "reserved prefix") {
+		t.Errorf("error should mention reserved prefix, got: %v", err)
+	}
+}
+
+func TestAcquireRulesLock_AlreadyHeld(t *testing.T) {
+	t.Parallel()
+
+	rulesDir := t.TempDir()
+
+	// Acquire the lock first.
+	unlock, err := acquireRulesLock(rulesDir)
+	if err != nil {
+		t.Fatalf("first acquireRulesLock() error: %v", err)
+	}
+	defer unlock()
+
+	// Try to acquire again -- should fail with LOCK_NB.
+	_, err = acquireRulesLock(rulesDir)
+	if err == nil {
+		t.Fatal("expected error for already-held lock")
+	}
+	if !strings.Contains(err.Error(), "another rules command") {
+		t.Errorf("error should mention another rules command, got: %v", err)
+	}
+}
+
+func TestRulesUpdate_AllNoBundles(t *testing.T) {
+	// Runs update-all on a directory with only non-bundle entries
+	// (hidden files, .bak dirs). Covers the "No bundles updated" path.
+	rulesDir := t.TempDir()
+
+	// Create entries that get skipped: a hidden dir and a .bak dir.
+	if err := os.MkdirAll(filepath.Join(rulesDir, ".hidden-dir"), 0o750); err != nil {
+		t.Fatalf("creating hidden dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(rulesDir, "stale.bak"), 0o750); err != nil {
+		t.Fatalf("creating bak dir: %v", err)
+	}
+	// Also create a regular file (not a directory) -- should be skipped.
+	if err := os.WriteFile(filepath.Join(rulesDir, "not-a-dir.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatalf("creating file: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", "--rules-dir", rulesDir})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "No bundles updated") {
+		t.Errorf("expected 'No bundles updated', got %q", buf.String())
+	}
+}
+
+func TestRulesUpdate_WithConfigFile(t *testing.T) {
+	// Tests the config loading path in rulesUpdateCmd.
+	// NOT parallel: mutates httpsOnlyClient and domrules keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte(validBundleYAML)
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	setRulesKeyringHexForTest(t, hex.EncodeToString(pub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(bundleData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	// Write a valid config file with trusted keys.
+	cfgDir := t.TempDir()
+	cfgPath := filepath.Join(cfgDir, "pipelock.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"), 0o600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	// Set up installed bundle.
+	rulesDir := t.TempDir()
+	bundleDir := filepath.Join(rulesDir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("creating dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "bundle.yaml"), bundleData, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+
+	hash := sha256.Sum256(bundleData)
+	lf := &domrules.LockFile{
+		InstalledVersion:  "2026.03.1",
+		InstalledAt:       "2026-03-15T10:00:00Z",
+		Source:            ts.URL + testBundlePath,
+		LastCheck:         "2026-03-15T10:00:00Z",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: hex.EncodeToString(pub),
+	}
+	if err := domrules.WriteLockFile(filepath.Join(bundleDir, "bundle.lock"), lf); err != nil {
+		t.Fatalf("writing lock: %v", err)
+	}
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", testBundleName, "--rules-dir", rulesDir, "--config", cfgPath})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(buf.String(), "already up to date") {
+		t.Errorf("expected 'already up to date', got %q", buf.String())
+	}
+}
+
+func TestRulesInstall_ByName(t *testing.T) {
+	// Tests the len(args)==1 branch in rulesInstallCmd.
+	// The official registry URL will fail to connect, which is fine --
+	// we just need to cover the branch, not succeed.
+	// NOT parallel: uses testRootCmd.
+
+	rulesDir := t.TempDir()
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "some-bundle", "--rules-dir", rulesDir})
+
+	err := cmd.Execute()
+	// This will fail because the official registry is unreachable (no mock),
+	// but we exercise the branch.
+	if err == nil {
+		t.Fatal("expected error for unreachable official registry")
+	}
+}
+
+func TestRulesUpdate_BadConfigFile(t *testing.T) {
+	// Tests the config load error path in rulesUpdateCmd.
+	rulesDir := t.TempDir()
+
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "update", "--rules-dir", rulesDir, "--config", "/nonexistent/pipelock.yaml"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for bad config file")
+	}
+	if !strings.Contains(err.Error(), "loading config") {
+		t.Errorf("error should mention loading config, got: %v", err)
+	}
+}
+
+func TestRulesInstall_RemoteSignatureFailure(t *testing.T) {
+	// Bundle signed with key A, but only key B in keyring -> signature verification fails.
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+
+	bundleData := []byte(validBundleYAML)
+	sig := ed25519.Sign(priv, bundleData)
+	sigEncoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+
+	// Generate a DIFFERENT key for the keyring (won't match).
+	otherPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating other key: %v", err)
+	}
+	setRulesKeyringHexForTest(t, hex.EncodeToString(otherPub))
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".sig") {
+			_, _ = w.Write([]byte(sigEncoded))
+			return
+		}
+		_, _ = w.Write(bundleData)
+	}))
+	defer ts.Close()
+
+	origClient := httpsOnlyClient
+	testClient := ts.Client()
+	testClient.CheckRedirect = httpsOnlyClient.CheckRedirect
+	httpsOnlyClient = testClient
+	t.Cleanup(func() { httpsOnlyClient = origClient })
+
+	rulesDir := t.TempDir()
+	cmd := testRootCmd()
+	buf := &strings.Builder{}
+	cmd.SetOut(buf)
+	cmd.SetArgs([]string{"rules", "install", "--source", ts.URL + testBundlePath, "--rules-dir", rulesDir})
+
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error for signature verification failure")
+	}
+	if !strings.Contains(err.Error(), "signature verification") {
+		t.Errorf("error should mention signature verification, got: %v", err)
+	}
+}
+
+// ---------- rules status ----------
+
+type statusCmdOutput struct {
+	stdout string
+	stderr string
+}
+
+// runStatusCmd sets up a cobra root with the rules command, writes cfgYAML to
+// a temp config file, and executes "rules status" with the given extra args.
+func runStatusCmd(t *testing.T, cfgYAML string, extraArgs ...string) statusCmdOutput {
+	t.Helper()
+	t.Setenv("PIPELOCK_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+
+	root := &cobra.Command{Use: "pipelock"}
+	root.AddCommand(Cmd())
+
+	dir := t.TempDir()
+	cfgFile := filepath.Join(dir, "pipelock.yaml")
+	rulesDir := filepath.Join(dir, "rules")
+	full := "rules:\n  rules_dir: " + rulesDir + "\n" + cfgYAML
+	if err := os.WriteFile(cfgFile, []byte(full), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout strings.Builder
+	var stderr strings.Builder
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	args := append([]string{"rules", "status", "--config", cfgFile}, extraArgs...)
+	root.SetArgs(args)
+
+	if err := root.Execute(); err != nil {
+		t.Fatalf("rules status failed: %v", err)
+	}
+	return statusCmdOutput{stdout: stdout.String(), stderr: stderr.String()}
+}
+
+func TestRulesStatus_DefaultConfig(t *testing.T) {
+	output := runStatusCmd(t, "")
+	out := output.stdout
+	if !strings.Contains(out, "Core:") {
+		t.Error("expected Core: line in status output")
+	}
+	if !strings.Contains(out, "compiled fallback") {
+		t.Error("expected 'compiled fallback' when no standard bundle installed")
+	}
+	if !strings.Contains(output.stderr, "pipelock rules: using config ") {
+		t.Fatalf("expected config provenance on stderr, got %q", output.stderr)
+	}
+}
+
+func TestRulesStatus_JSON(t *testing.T) {
+	output := runStatusCmd(t, "", "--json")
+	out := output.stdout
+
+	var status statusReport
+	if err := json.Unmarshal([]byte(out), &status); err != nil {
+		t.Fatalf("invalid JSON output: %v\nstdout=%q\nstderr=%q", err, out, output.stderr)
+	}
+	if status.Core.DLP != scanner.CoreDLPCount() {
+		t.Errorf("expected %d core DLP, got %d", scanner.CoreDLPCount(), status.Core.DLP)
+	}
+	if status.Core.Response != scanner.CoreResponseCount() {
+		t.Errorf("expected %d core response, got %d", scanner.CoreResponseCount(), status.Core.Response)
+	}
+	if status.StandardDLPSource != "compiled" {
+		t.Errorf("expected standard DLP source 'compiled', got %q", status.StandardDLPSource)
+	}
+	if !strings.Contains(output.stderr, "pipelock rules: using config ") {
+		t.Fatalf("expected config provenance on stderr, got %q", output.stderr)
+	}
+}
+
+func TestRulesStatus_IncludeDefaultsFalse(t *testing.T) {
+	output := runStatusCmd(t, "dlp:\n  include_defaults: false\nresponse_scanning:\n  include_defaults: false\n")
+	out := output.stdout
+	if !strings.Contains(out, "disabled") {
+		t.Error("expected 'disabled' when include_defaults: false")
+	}
+}
+
+// TestFetchBundleForRecordedSource_PinsOfficialSource proves the routing that
+// update and diff depend on. A bundle installed by official name records the
+// official registry URL as its source, so re-fetching that recorded source must
+// use the pinned client. Before this routing existed the pin covered only the
+// one-time install, leaving update and diff, the commands an operator runs
+// repeatedly, on the client that accepts a redirect to any HTTPS host.
+func TestFetchBundleForRecordedSource_PinsOfficialSource(t *testing.T) {
+	// NOT parallel: mutates the shared clients.
+	originalOfficial := officialRegistryClient
+	originalHTTPS := httpsOnlyClient
+	t.Cleanup(func() {
+		officialRegistryClient = originalOfficial
+		httpsOnlyClient = originalHTTPS
+	})
+
+	// The general client must never be reached for a recorded official source.
+	httpsOnlyClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("recorded official source was fetched with the unpinned client: %s", req.URL)
+		}),
+		CheckRedirect: originalHTTPS.CheckRedirect,
+	}
+	officialRegistryClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Host {
+			case "pipelab.org":
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://rules-attacker.example/bundle.yaml"}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			default:
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("redirected response")),
+				}, nil
+			}
+		}),
+		CheckRedirect: originalOfficial.CheckRedirect,
+	}
+
+	_, _, err := fetchBundleForRecordedSource(t.Context(), officialRegistryURL+testBundlePath)
+	if !errors.Is(err, errOfficialRegistryRedirect) {
+		t.Fatalf("error = %v, want the recorded official source to be fetched under the pinned redirect policy", err)
+	}
+}
+
+// TestFetchBundleForRecordedSource_LeavesThirdPartySourceUnpinned is the other
+// direction: a recorded third-party source must stay on the general client, so
+// the pin does not quietly become a global redirect policy.
+func TestFetchBundleForRecordedSource_LeavesThirdPartySourceUnpinned(t *testing.T) {
+	// NOT parallel: mutates the shared clients.
+	originalOfficial := officialRegistryClient
+	originalHTTPS := httpsOnlyClient
+	t.Cleanup(func() {
+		officialRegistryClient = originalOfficial
+		httpsOnlyClient = originalHTTPS
+	})
+
+	officialRegistryClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("third-party source was fetched with the pinned client: %s", req.URL)
+		}),
+		CheckRedirect: originalOfficial.CheckRedirect,
+	}
+	reached := false
+	httpsOnlyClient = &http.Client{
+		Transport: rulesRoundTripper(func(*http.Request) (*http.Response, error) {
+			reached = true
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}),
+		CheckRedirect: originalHTTPS.CheckRedirect,
+	}
+
+	_, _, _ = fetchBundleForRecordedSource(t.Context(), "https://source.example/bundle.yaml")
+	if !reached {
+		t.Fatal("third-party recorded source did not use the general client")
+	}
+}
+
+// TestFetchOfficialRegistryBundle_AllowsSameOriginRedirect covers the
+// AVAILABILITY half of the design. Same-origin redirects are permitted on
+// purpose so a future registry path move does not break the documented install
+// command. Without this test, a later tightening that refused every redirect
+// would keep all the refusal tests green while breaking that command in
+// production.
+func TestFetchOfficialRegistryBundle_AllowsSameOriginRedirect(t *testing.T) {
+	// NOT parallel: mutates officialRegistryClient.
+	originalClient := officialRegistryClient
+	moved := "/rules-moved/community-rules/bundle.yaml"
+	officialRegistryClient = &http.Client{
+		Transport: rulesRoundTripper(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host != "pipelab.org" {
+				return nil, fmt.Errorf("left the official origin: %s", req.URL)
+			}
+			if !strings.HasPrefix(req.URL.Path, "/rules-moved/") {
+				target := moved
+				if strings.HasSuffix(req.URL.Path, signing.SigExtension) {
+					target += signing.SigExtension
+				}
+				return &http.Response{
+					StatusCode: http.StatusFound,
+					Header:     http.Header{"Location": []string{"https://pipelab.org" + target}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}
+			body := "moved-bundle"
+			if strings.HasSuffix(req.URL.Path, signing.SigExtension) {
+				body = "moved-signature"
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		}),
+		CheckRedirect: originalClient.CheckRedirect,
+	}
+	t.Cleanup(func() { officialRegistryClient = originalClient })
+
+	bundleData, sigData, err := fetchOfficialRegistryBundle(t.Context(), officialRegistryURL+testBundlePath)
+	if err != nil {
+		t.Fatalf("same-origin redirect refused: %v; a registry path move must not break the documented install", err)
+	}
+	if string(bundleData) != "moved-bundle" || string(sigData) != "moved-signature" {
+		t.Fatalf("bundle=%q sig=%q, want the redirected artifacts", bundleData, sigData)
+	}
+}

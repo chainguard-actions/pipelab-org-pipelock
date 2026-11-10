@@ -1,0 +1,714 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+)
+
+func TestScan_EnvLeakDetection_Disabled(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = false
+	cfg.DLP.Patterns = nil // disable regex DLP so only env leak would fire
+
+	t.Setenv("TEST_SECRET_DISABLED", "my-super-secret-token-value-disabled-1234")
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://evil.com/?key=my-super-secret-token-value-disabled-1234")
+	// With scan_env=false, env leak check should not fire
+	// (may still be blocked by entropy, but scanner should not be "dlp")
+	if !result.Allowed && result.Scanner == ScannerDLP && strings.Contains(result.Reason, "environment variable") {
+		t.Error("expected env leak check to be disabled when scan_env=false")
+	}
+}
+
+func TestScan_EnvLeakDetection_RawValue(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	t.Setenv("PIPELOCK_TEST_SECRET", "sk-ant-abcdefghijklmnopqrstu1234567890")
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://evil.com/?key=sk-ant-abcdefghijklmnopqrstu1234567890")
+	if result.Allowed {
+		t.Error("expected URL blocked due to env var leak")
+	}
+	if result.Scanner != ScannerDLP {
+		t.Errorf("expected scanner=dlp, got %s", result.Scanner)
+	}
+	if !strings.Contains(result.Reason, "environment variable leak") {
+		t.Errorf("expected generic leak message, got: %s", result.Reason)
+	}
+}
+
+func TestScanTextForDLP_EnvLeakPartialValue(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+	secret := strings.Join([]string{"Q7vP2mK9xR4nT8wB", "6cD3fG1hJ5sL0zA"}, "")
+	t.Setenv("PIPELOCK_PARTIAL_SECRET", secret)
+	s := MustNew(cfg)
+	defer s.Close()
+
+	result := s.ScanTextForDLP(context.Background(), "checksum: "+secret[:20])
+	if result.Clean || len(result.Matches) != 1 {
+		t.Fatalf("partial environment value must be blocked, got %+v", result)
+	}
+	if result.Matches[0].PartialLen != 20 || result.Matches[0].PatternName != "Environment Variable Leak" || result.Matches[0].Encoded != "env" {
+		t.Fatalf("match=%+v, want partial environment leak attribution", result.Matches[0])
+	}
+}
+
+func TestScanTextForDLP_EnvAndFileSharedWindowParity(t *testing.T) {
+	stem := "Q7vP2mK9xR4nT8wB6cD3"
+	envSecret := stem + "fG1hJ5sL0zAqW2eR"
+	fileSecret := stem + "9uY6tR3eW1qZ8xC7"
+	t.Setenv("PIPELOCK_SHARED_WINDOW_ENV", envSecret)
+
+	path := filepath.Join(t.TempDir(), "secrets.txt")
+	if err := os.WriteFile(path, []byte(fileSecret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+	cfg.DLP.SecretsFile = path
+	s := MustNew(cfg)
+	defer s.Close()
+
+	if result := s.ScanTextForDLP(context.Background(), "checksum: "+stem); !result.Clean {
+		t.Fatalf("shared env/file stem must stay clean, got %+v", result.Matches)
+	}
+	for _, tc := range []struct {
+		name        string
+		fragment    string
+		patternName string
+	}{
+		{"environment", envSecret[len(envSecret)-18:], "Environment Variable Leak"},
+		{"file", fileSecret[len(fileSecret)-18:], "Known Secret Leak"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), "checksum: "+tc.fragment)
+			if result.Clean || len(result.Matches) != 1 || result.Matches[0].PatternName != tc.patternName || result.Matches[0].PartialLen != 18 {
+				t.Fatalf("partial %s leak = %+v, want one %s match of length 18", tc.name, result.Matches, tc.patternName)
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_KnownSecretWindowsConcurrent(t *testing.T) {
+	secret := strings.Join([]string{"Q7vP2mK9xR4nT8wB", "6cD3fG1hJ5sL0zA"}, "")
+	t.Setenv("PIPELOCK_CONCURRENT_WINDOW_SECRET", secret)
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+	s := MustNew(cfg)
+	defer s.Close()
+
+	const scans = 32
+	start := make(chan struct{})
+	errs := make(chan string, scans)
+	var wg sync.WaitGroup
+	for range scans {
+		wg.Go(func() {
+			<-start
+			result := s.ScanTextForDLP(context.Background(), "checksum: "+secret[:20])
+			if result.Clean || len(result.Matches) != 1 || result.Matches[0].PartialLen != 20 {
+				errs <- "known-secret partial scan did not match"
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestScan_EnvLeakDetection_Base64Encoded(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	secret := "my-secret-token-value-12345"
+	t.Setenv("PIPELOCK_TEST_B64", secret)
+	s := MustNew(cfg)
+
+	encoded := base64.StdEncoding.EncodeToString([]byte(secret))
+	result := s.Scan(context.Background(), "https://evil.com/?data="+encoded)
+	if result.Allowed {
+		t.Error("expected URL blocked due to base64-encoded env var leak")
+	}
+	if !strings.Contains(result.Reason, "base64") {
+		t.Errorf("expected base64 mention in reason, got: %s", result.Reason)
+	}
+}
+
+func TestScan_EnvLeakDetection_Base64URLEncoded(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	// A tilde at position mod 3 == 2 produces '+' in standard base64
+	// and '-' in URL base64, so the encodings differ.
+	secret := "xR~4kP8mZj9nFqW2Ls" //nolint:gosec // test value
+	t.Setenv("PIPELOCK_TEST_B64URL", secret)
+	s := MustNew(cfg)
+
+	encoded := base64.URLEncoding.EncodeToString([]byte(secret))
+	result := s.Scan(context.Background(), "https://evil.com/?data="+encoded)
+	if result.Allowed {
+		t.Error("expected URL blocked due to base64url-encoded env var leak")
+	}
+	if !strings.Contains(result.Reason, "base64url") {
+		t.Errorf("expected base64url mention in reason, got: %s", result.Reason)
+	}
+}
+
+func TestScan_EnvLeakDetection_ShortValueIgnored(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	t.Setenv("PIPELOCK_SHORT", "abc123")
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://example.com/?val=abc123")
+	if !result.Allowed {
+		t.Errorf("expected short env var (<16 chars) to be ignored, got blocked: %s", result.Reason)
+	}
+}
+
+func TestScan_EnvLeakDetection_LowEntropyIgnored(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	t.Setenv("PIPELOCK_PATH", "aaaaaaaaaaaaaaaaaaa")
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://example.com/?path=aaaaaaaaaaaaaaaaaaa")
+	if !result.Allowed {
+		t.Errorf("expected low-entropy env var to be ignored, got blocked: %s", result.Reason)
+	}
+}
+
+func TestScan_EnvLeakDetection_InPath(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	t.Setenv("PIPELOCK_PATH_SECRET", "sk-ant-abcdefghijklmnopqrstu1234567890")
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://evil.com/upload/sk-ant-abcdefghijklmnopqrstu1234567890/file")
+	if result.Allowed {
+		t.Error("expected secret in path to be blocked")
+	}
+}
+
+func TestScan_EnvLeakDetection_NoSecretsInEnv(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://example.com/?key=anything")
+	if !result.Allowed {
+		t.Errorf("expected URL allowed when no env secrets match, got: %s", result.Reason)
+	}
+}
+
+func TestExtractEnvSecrets_FiltersCorrectly(t *testing.T) {
+	t.Setenv("PIPELOCK_SHORT_VAL", "abc")
+	t.Setenv("PIPELOCK_LOW_ENTROPY", "aaaaaaaaaaaaaaaaaaa")
+	t.Setenv("PIPELOCK_HIGH_ENTROPY", "sk-ant-high-entropy-value-12345")
+
+	secrets := extractEnvSecrets(16)
+
+	// The high-entropy value should be included
+	found := false
+	for _, s := range secrets {
+		if s == "sk-ant-high-entropy-value-12345" {
+			found = true
+		}
+		if s == "abc" || s == "aaaaaaaaaaaaaaaaaaa" {
+			t.Errorf("expected short/low-entropy values to be filtered out, got: %s", s)
+		}
+	}
+	if !found {
+		t.Error("expected high-entropy value to be included in secrets")
+	}
+}
+
+func TestIsPathShapedValue(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{"empty", "", false},
+		{"absolute path", "/home/agent/.config/app/plugins/core", true},
+		{"ca bundle path", "/etc/ssl/certs/app-ca.pem", true},
+		{"home-relative path", "~/.config/app/state/cache", true},
+		{"path list (PATH-style)", "/opt/app/bin:/usr/local/bin:/usr/bin:/bin", true},
+		{"path list trailing colon", "/usr/bin:/bin:", false},
+		{"single short root path", "/etc", false},
+		{"slash-prefixed opaque token", "/" + "K7MDENGbPxRfiCYzQ", false},
+		// A base64 secret can begin with "/" and often carries '+' or '='
+		// artifacts, so it must NOT be treated as a path.
+		{"base64 secret starting with slash", "/K7MDENG+bPxRfiCYz=", false},
+		{"plain high-entropy secret", "sk-ant-abcdefghijklmnopqrstu1234567890", false},
+		{"token with slash mid-string", "AKIA" + "IOSFODNN7" + "/EXAMPLEKEY", false},
+		{"colon list with non-path segment", "host:sk-ant-abcdefghij12345", false},
+		{"leading colon (degenerate)", ":/usr/bin", false},
+		// PATH wrapper smuggling a slash-prefixed opaque token must NOT be
+		// treated as path-shaped, or the token escapes the env-leak matcher
+		// set (the single-value branch keeps "/<token>" scannable).
+		{"path list smuggling slash-prefixed token", "/usr/bin:/" + "K7MDENGbPxRfiCYzQ", false},
+		// Real PATH lists, including short single-component dirs, stay skipped.
+		{"path list short single-component dirs", "/bin:/sbin:/usr/bin", true},
+		{"path list multi-component only", "/usr/bin:/usr/local/bin", true},
+		// Windows drive and UNC paths in a conservative subset.
+		{"windows drive path", `C:\Users\sample\tools\dummy.exe`, true},
+		{"windows drive path lowercase letter with spaces", `d:\Program Files\App Name\bin`, true},
+		{"windows drive path non-ascii", `C:\Users\Zoë\AppData\Local`, true},
+		{"windows unc path", `\\fileserver\share\team\app.exe`, true},
+		{"windows shallow drive path", `C:\K7MDENGbPxRfiCYzQ`, false},
+		{"windows shallow unc share", `\\server\share`, false},
+		{"windows unc one component", `\\server\share\K7MDENGbPxRfiCYzQ`, false},
+		{"windows drive-relative", `C:dir\sub\file`, false},
+		{"windows root-relative", `\dir\sub\file`, false},
+		{"windows extended prefix", `\\?\C:\Users\sample\x`, false},
+		{"windows device prefix", `\\.\pipe\name\x`, false},
+		{"windows dot-dot component", `C:\Users\..\Windows\x`, false},
+		{"windows mixed separators", `C:\Users\sample/tools\x`, false},
+		{"windows extra colon", `C:\a\b:stream`, false},
+		{"windows semicolon list", `C:\a\b;C:\c\d`, false},
+		{"windows query-bearing", `C:\a\b?token=abc`, false},
+		{"windows percent-encoded", `C:\a\b%41c`, false},
+		{"windows ampersand", `C:\a\b&c`, false},
+		{"windows hash", `C:\a\b#c`, false},
+		{"windows control char", "C:\\a\\b\x01c", false},
+		{"windows leading tab", "\tC:\\Users\\sample\\tools", false},
+		{"windows trailing newline", "C:\\Users\\sample\\tools\n", false},
+		{"windows unc trailing carriage return", "\\\\server\\share\\team\\app.exe\r", false},
+		{"windows empty component", `C:\a\\b`, false},
+		{"windows trailing separator", `C:\a\b\`, false},
+		{"windows invalid utf8", "C:\\a\\\xffb", false},
+		{"non-letter drive", `1:\a\b`, false},
+		// Surrounding controls are rejected before trimming in every branch.
+		{"unix path trailing newline", "/opt/tools\n", false},
+		{"unix path leading tab", "\t/opt/tools", false},
+		{"unix path with DEL", "/opt/tools\x7f/bin", false},
+		{"path list trailing carriage return", "/usr/bin:/bin\r", false},
+		{"unix path surrounding spaces", "  /opt/tools  ", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isPathShapedValue(tt.value); got != tt.want {
+				t.Errorf("isPathShapedValue(%q) = %v, want %v", tt.value, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExtractEnvSecrets_SkipsPathShapedValues(t *testing.T) {
+	// Path-valued variables the name skip-list misses (HERMES_HOME, CA bundle
+	// vars, ...). Their deep-path values clear the length+entropy filters but
+	// are not secrets, so they must be excluded by value shape. Names use a
+	// non-skipped prefix (PIPELOCK_TEST is collected elsewhere) so the only
+	// thing keeping them out is isPathShapedValue.
+	appHome := "/home/agent/.config/app/plugins/core/x9k2qz"
+	caBundle := "/etc/ssl/certs/app-ca.pem"
+	pathList := "/opt/app/bin:/usr/local/bin:/usr/bin"
+	t.Setenv("PIPELOCK_TEST_APP_HOME", appHome)
+	t.Setenv("PIPELOCK_TEST_CA_BUNDLE", caBundle)
+	t.Setenv("PIPELOCK_TEST_PATHLIST", pathList)
+
+	// A genuine secret value must still be collected.
+	realSecret := "sk-" + "ant-realkey-abcdefghij12345"
+	t.Setenv("PIPELOCK_TEST_REAL", realSecret)
+	slashPrefixedSecret := "/" + "K7MDENGbPxRfiCYzQ"
+	t.Setenv("PIPELOCK_TEST_SLASH_SECRET", slashPrefixedSecret)
+
+	// A PATH-like wrapper smuggling a slash-prefixed opaque token must NOT be
+	// skipped as path-shaped; the whole value stays in the matcher set so the
+	// wrapper can't be used to evade env-leak detection.
+	pathWrappedSecret := "/usr/bin:/" + "K7MDENGbPxRfiCYzQ"
+	t.Setenv("PIPELOCK_TEST_PATH_WRAPPED_SECRET", pathWrappedSecret)
+
+	secrets := extractEnvSecrets(16)
+
+	pathShaped := map[string]string{
+		appHome:  "PIPELOCK_TEST_APP_HOME",
+		caBundle: "PIPELOCK_TEST_CA_BUNDLE",
+		pathList: "PIPELOCK_TEST_PATHLIST",
+	}
+	foundReal := false
+	foundSlashPrefixedSecret := false
+	foundPathWrappedSecret := false
+	for _, s := range secrets {
+		if name, ok := pathShaped[s]; ok {
+			t.Errorf("%s value %q should be skipped (path-shaped, not a secret)", name, s)
+		}
+		if s == realSecret {
+			foundReal = true
+		}
+		if s == slashPrefixedSecret {
+			foundSlashPrefixedSecret = true
+		}
+		if s == pathWrappedSecret {
+			foundPathWrappedSecret = true
+		}
+	}
+	if !foundReal {
+		t.Error("expected genuine secret value to still be collected after path-skip")
+	}
+	if !foundSlashPrefixedSecret {
+		t.Error("expected slash-prefixed opaque secret value to still be collected after path-skip")
+	}
+	if !foundPathWrappedSecret {
+		t.Error("expected PATH-wrapped opaque token to still be collected (no path-wrapper exfil bypass)")
+	}
+}
+
+func TestExtractEnvSecrets_SkipsNonSecretNames(t *testing.T) {
+	// Set well-known non-secret vars with values that would otherwise
+	// pass length and entropy filters.
+	highEntropyPath := "/home/testuser/dev/pipelock-project"
+	testPathVal := "/usr/local/bin:/usr/bin:/home/testuser/.local/bin:/opt/go/bin"
+	testLSColors := "rs=0:di=01;34:ln=01;36:mh=00:pi=40;33"
+	testXDGData := "/home/testuser/.local/share/data"
+	testLCAll := "en_US.UTF-8-something-long-enough"
+	t.Setenv("PWD", highEntropyPath)
+	t.Setenv("HOME", "/home/testuser/complex-dirname")
+	t.Setenv("PATH", testPathVal)
+	t.Setenv("LS_COLORS", testLSColors)
+	t.Setenv("XDG_DATA_HOME", testXDGData)
+	t.Setenv("LC_ALL", testLCAll)
+	t.Setenv("GITHUB_API_URL", "https://api.github.com")
+	t.Setenv("GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
+	t.Setenv("GITHUB_SERVER_URL", "https://github.com")
+
+	// Also set a real secret to confirm those still get collected.
+	// Split at regex boundary to avoid self-scan false positive.
+	realSecret := "sk-" + "ant-realkey-abcdefghij12345"
+	t.Setenv("PIPELOCK_REAL_SECRET", realSecret)
+
+	secrets := extractEnvSecrets(16)
+
+	// Check exact values, not substrings. Other real env vars on the
+	// system may contain similar substrings without being skipped.
+	skipped := map[string]string{
+		highEntropyPath:                  "PWD",
+		"/home/testuser/complex-dirname": "HOME",
+		testPathVal:                      "PATH",
+		testLSColors:                     "LS_COLORS",
+		testXDGData:                      "XDG_DATA_HOME",
+		testLCAll:                        "LC_ALL",
+		"https://api.github.com":         "GITHUB_API_URL",
+		"https://api.github.com/graphql": "GITHUB_GRAPHQL_URL",
+		"https://github.com":             "GITHUB_SERVER_URL",
+	}
+	for _, s := range secrets {
+		if name, ok := skipped[s]; ok {
+			t.Errorf("%s value should be skipped (non-secret env var name)", name)
+		}
+	}
+
+	// The real secret must still be collected.
+	found := false
+	for _, s := range secrets {
+		if s == realSecret {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("real secret should still be collected after skipping non-secret names")
+	}
+}
+
+func TestIsNonSecretEnvName(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"PWD", true},
+		{"HOME", true},
+		{"PATH", true},
+		// POSIX last-command variable: bash sets $_ to the full path of
+		// the previous command. Leaks high-entropy binary paths into
+		// env-secret collection when the shell ran anything under
+		// /usr/local/bin or /opt. Never a secret.
+		{"_", true},
+		{"LS_COLORS", true},
+		{"SHELL", true},
+		{"USER", true},
+		{"DISPLAY", true},
+		{"GOPATH", true},
+		{"EDITOR", true},
+		{"GITHUB_API_URL", true},
+		{"GITHUB_GRAPHQL_URL", true},
+		{"GITHUB_SERVER_URL", true},
+		// Prefix matches
+		{"LC_ALL", true},
+		{"LC_CTYPE", true},
+		{"XDG_DATA_HOME", true},
+		{"XDG_RUNTIME_DIR", true},
+		// Mixed-case variants (Windows-style)
+		{"Path", true},
+		{"UserProfile", true},
+		{"Pwd", true},
+		{"Home", true},
+		{"Shell", true},
+		{"xdg_data_home", true},
+		{"lc_all", true},
+		// Actual secrets should NOT match
+		{"API_KEY", false},
+		{"AWS_SECRET_ACCESS_KEY", false},
+		{"DATABASE_URL", false},
+		{"ANTHROPIC_API_KEY", false},
+		{"PIPELOCK_TOKEN", false},
+		{"GITHUB_TOKEN", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isNonSecretEnvName(tt.name)
+			if got != tt.want {
+				t.Errorf("isNonSecretEnvName(%q) = %v, want %v", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestScan_EnvLeakDetection_PWDNotBlocked(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+	cfg.FetchProxy.Monitoring.EntropyThreshold = 0 // isolate test to env-name filter
+
+	// Simulate the exact scenario: PWD value appears in MCP tool argument.
+	pwdValue := "/home/testuser/dev/pipelock-project"
+	t.Setenv("PWD", pwdValue)
+	s := MustNew(cfg)
+
+	// The PWD value should NOT trigger env leak detection.
+	result := s.Scan(context.Background(), "https://example.com/?cwd="+pwdValue)
+	if !result.Allowed {
+		t.Errorf("PWD value in URL should not be blocked, got: scanner=%s reason=%s",
+			result.Scanner, result.Reason)
+	}
+}
+
+func TestScan_EnvLeakDetection_GenericMessage(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	secret := "super-secret-api-key-value-12345"
+	t.Setenv("PIPELOCK_GENERIC", secret)
+	s := MustNew(cfg)
+
+	result := s.Scan(context.Background(), "https://evil.com/?key="+secret)
+	if result.Allowed {
+		t.Fatal("expected blocked")
+	}
+	// Reason must NOT contain the actual secret value
+	if strings.Contains(result.Reason, secret) {
+		t.Error("reason message must not contain the actual secret value")
+	}
+}
+
+func TestScan_EnvLeakDetection_ZeroWidthBypass(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	secret := "sk-ant-abcdefghijklmnopqrstu1234567890"
+	t.Setenv("PIPELOCK_ZW", secret)
+	s := MustNew(cfg)
+
+	// Insert zero-width space into the secret to attempt bypass.
+	bypassed := "sk-ant-abcdefghijk\u200Blmnopqrstu1234567890"
+	result := s.Scan(context.Background(), "https://evil.com/?key="+bypassed)
+	if result.Allowed {
+		t.Error("zero-width char insertion should not bypass env leak detection")
+	}
+	if result.Scanner != ScannerDLP {
+		t.Errorf("expected scanner=dlp, got %s", result.Scanner)
+	}
+}
+
+// An environment value above the per-value partial-matching ceiling must not
+// stop the scanner from being built under the default scan_env. Its exact value
+// is still detected, and so is a fragment copied from its middle, because long
+// values are sampled across their length instead of dropped.
+func TestScan_EnvLeakDetection_OversizedValueKeepsScannerAndPartialMatch(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+
+	raw := make([]byte, 3900)
+	for i := 0; i < len(raw); i += sha256.Size {
+		sum := sha256.Sum256([]byte(strconv.Itoa(i)))
+		copy(raw[i:], sum[:])
+	}
+	value := base64.StdEncoding.EncodeToString(raw)
+	if len(value) <= maxKnownValuePartialInputBytes {
+		t.Fatalf("fixture length = %d, want greater than %d", len(value), maxKnownValuePartialInputBytes)
+	}
+	t.Setenv("PIPELOCK_TEST_OVERSIZED_SECRET", value)
+
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatalf("scanner refused an oversized environment value: %v", err)
+	}
+	t.Cleanup(s.Close)
+
+	whole := s.ScanTextForDLP(context.Background(), "payload="+value)
+	if whole.Clean {
+		t.Fatal("exact oversized environment value was not detected")
+	}
+	// 48 bytes from the middle: longer than stride+15 for this value, so the
+	// fragment must contain a sampled anchor.
+	mid := len(value) / 2
+	part := s.ScanTextForDLP(context.Background(), "payload="+value[mid:mid+48])
+	if part.Clean {
+		t.Fatal("a 48-byte fragment from the middle of an oversized environment value was not detected")
+	}
+	// Positive control: text that shares no fragment with the value stays clean.
+	if clean := s.ScanTextForDLP(context.Background(), "payload=nothing secret here at all, only prose"); !clean.Clean {
+		t.Fatalf("unrelated text flagged: %+v", clean.Matches)
+	}
+}
+
+func TestExtractEnvSecrets_SkipsWindowsPathValues(t *testing.T) {
+	drivePath := `C:\Users\sample\tools\dummy.exe`
+	uncPath := `\\fileserver\share\team\app.exe`
+	t.Setenv("PIPELOCK_TEST_WIN_BINARY", drivePath)
+	t.Setenv("PIPELOCK_TEST_WIN_UNC", uncPath)
+
+	// Positive controls: a genuine secret, a secret in a variable named like a
+	// path, and a shallow drive-shaped token all stay in the matcher set.
+	realSecret := "sk-" + "ant-realkey-abcdefghij12345"
+	t.Setenv("PIPELOCK_TEST_REAL", realSecret)
+	pathNamedSecret := syntheticEnvSecret()
+	t.Setenv("PIPELOCK_TEST_SECRET_PATH", pathNamedSecret)
+	shallowToken := `C:\` + "K7MDENGbPxRfiCYzQ"
+	t.Setenv("PIPELOCK_TEST_WIN_SHALLOW", shallowToken)
+
+	got := map[string]bool{}
+	for _, s := range extractEnvSecrets(16) {
+		got[s] = true
+	}
+	for _, skipped := range []string{drivePath, uncPath} {
+		if got[skipped] {
+			t.Errorf("Windows path %q should be skipped (path-shaped, not a secret)", skipped)
+		}
+	}
+	for _, kept := range []string{realSecret, pathNamedSecret, shallowToken} {
+		if !got[kept] {
+			t.Errorf("value %q must stay in the env-leak matcher set", kept)
+		}
+	}
+}
+
+// The MCP input path scans tool arguments with ScanTextForDLP. A Windows path
+// held in the environment must not turn a mention of it into a leak finding,
+// while a genuine environment secret in the same text still does.
+func TestScanTextForDLP_WindowsPathEnvValueNotALeak(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = true
+	cfg.DLP.Patterns = nil
+	t.Setenv("PIPELOCK_TEST_WIN_BINARY", `C:\Users\sample\tools\dummy.exe`)
+	secret := syntheticEnvSecret()
+	t.Setenv("PIPELOCK_TEST_SECRET", secret)
+	s := MustNew(cfg)
+	defer s.Close()
+
+	if result := s.ScanTextForDLP(context.Background(), `see Users\sample\tools\dummy.exe please`); !result.Clean {
+		t.Fatalf("mention of a Windows path env value must not be a leak, got %+v", result.Matches)
+	}
+	if result := s.ScanTextForDLP(context.Background(), "leak "+secret); result.Clean {
+		t.Fatal("genuine environment secret must still be detected")
+	}
+}
+
+func TestScanTextForDLP_WindowsPathWithControlStaysScanned(t *testing.T) {
+	for _, tt := range []struct {
+		name, value string
+	}{
+		{name: "drive leading tab", value: "\t" + `C:\Users\sample\tools\dummy.exe`},
+		{name: "drive trailing newline", value: `C:\Users\sample\tools\dummy.exe` + "\n"},
+		{name: "unc trailing carriage return", value: `\\fileserver\share\team\app.exe` + "\r"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("PIPELOCK_TEST_CONTROL_VALUE", tt.value)
+			cfg := testConfig()
+			cfg.DLP.ScanEnv = true
+			cfg.DLP.Patterns = nil
+			s := MustNew(cfg)
+			defer s.Close()
+			if result := s.ScanTextForDLP(context.Background(), "disclose "+tt.value); result.Clean {
+				t.Fatal("control-bearing value must stay in the env matcher")
+			}
+			if result := s.ScanTextForDLP(context.Background(), "ordinary unrelated text"); !result.Clean {
+				t.Fatalf("unrelated text blocked: %+v", result.Matches)
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_PathShapedEnvSecretExplicitFileOverride(t *testing.T) {
+	secret := `C:\folder\` + syntheticEnvSecret()
+	t.Setenv("PIPELOCK_TEST_PATH_SHAPED_SECRET", secret)
+	path := filepath.Join(t.TempDir(), "secrets.txt")
+	if err := os.WriteFile(path, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, explicit := range []bool{false, true} {
+		name := "environment only"
+		if explicit {
+			name = "explicit secrets file"
+		}
+		t.Run(name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.DLP.ScanEnv = true
+			cfg.DLP.Patterns = nil
+			if explicit {
+				cfg.DLP.SecretsFile = path
+			}
+			s := MustNew(cfg)
+			defer s.Close()
+			result := s.ScanTextForDLP(context.Background(), "disclose "+secret)
+			if result.Clean == explicit {
+				t.Fatalf("clean=%v with explicit file=%v, matches=%+v", result.Clean, explicit, result.Matches)
+			}
+		})
+	}
+}
+
+// syntheticEnvSecret returns a fake high-entropy value generated at runtime,
+// so no credential-shaped literal appears in the source for secret scanners.
+// A stride coprime to the alphabet length yields 31 distinct characters.
+func syntheticEnvSecret() string {
+	const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 31)
+	for i := range b {
+		b[i] = alphabet[(i*17+5)%len(alphabet)]
+	}
+	return string(b)
+}

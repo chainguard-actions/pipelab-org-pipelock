@@ -1,0 +1,1385 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package receipt
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+)
+
+// GenesisHash is the chain_prev_hash of the first receipt in a session.
+const GenesisHash = "genesis"
+
+// ErrUnexpectedRecorderEntryType is returned when a recorder evidence file
+// contains an entry whose Type is outside the known recorder taxonomy. Both
+// extraction modes fail closed on it rather than silently skipping it, so an
+// unknown record type cannot ride inside a file that otherwise verifies.
+var ErrUnexpectedRecorderEntryType = errors.New("unexpected recorder entry type")
+
+// TranscriptRoot summarizes a receipt chain for a session.
+type TranscriptRoot struct {
+	SessionID    string    `json:"session_id"`
+	FinalSeq     uint64    `json:"final_seq"`
+	RootHash     string    `json:"root_hash"`
+	ReceiptCount uint64    `json:"receipt_count"`
+	StartTime    time.Time `json:"start_time"`
+	EndTime      time.Time `json:"end_time"`
+}
+
+// ReceiptHash computes the SHA-256 hex digest of a receipt's canonical JSON.
+func ReceiptHash(r Receipt) (string, error) {
+	data, err := Marshal(r)
+	if err != nil {
+		return "", fmt.Errorf("marshal receipt: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ChainResult describes the outcome of chain verification.
+type ChainResult struct {
+	Valid bool
+	// IntegrityVerified means receipt signatures, trusted signer keys, sequence
+	// numbers, and hash links verified without applying session lifecycle
+	// rules. It can be true when Valid is false for a lifecycle-only failure.
+	IntegrityVerified bool
+	ReceiptCount      uint64
+	FinalSeq          uint64
+	RootHash          string
+	StartTime         time.Time
+	EndTime           time.Time
+	Error             string // empty if valid
+	FailureKind       ChainFailureKind
+	BrokenAtSeq       uint64 // set when chain breaks
+	BrokenAtIndex     int    // zero-based receipt index where chain verification failed
+
+	// SignerKeys is the ordered, de-duplicated set of signer public keys
+	// (hex) observed across the chain's segments, in segment order. A
+	// single-key chain has one entry. A rotated chain has one entry per
+	// segment. Always populated, even on failure, so the operator can see
+	// which keys appeared.
+	SignerKeys []string
+	// Segments describes each contiguous single-key run in the chain.
+	Segments []ChainSegment
+	// UntrustedSignerKey is set (and Valid=false) when a segment is signed by
+	// a key that is not in the supplied trusted set (trust-on-first-use mode:
+	// not equal to the genesis key). It names the offending key so the
+	// operator can decide whether it is a legitimate rotation to add to the
+	// trusted set or an attacker-introduced key to investigate.
+	UntrustedSignerKey string
+	// TrustBasis records how each segment key was trusted: "root" for an
+	// operator-pinned key and "endorsed" for a successor authorized by the
+	// immediately preceding trusted key.
+	TrustBasis []string
+	// EndorsementGaps identifies rotation segment keys that lacked a valid,
+	// boundary-matching authorization from the retiring key.
+	EndorsementGaps []string
+}
+
+// ChainFailureKind classifies why chain verification failed.
+type ChainFailureKind string
+
+const (
+	ChainFailureIntegrity     ChainFailureKind = "integrity"
+	ChainFailureTrust         ChainFailureKind = "trust"
+	ChainFailureLifecycle     ChainFailureKind = "lifecycle"
+	ChainFailureLifecycleOpen ChainFailureKind = "lifecycle_missing_open"
+)
+
+// ChainSegment summarizes one single-key run within a (possibly rotated) chain.
+type ChainSegment struct {
+	SignerKey string
+	FirstSeq  uint64
+	FinalSeq  uint64
+	Count     uint64
+	// Boundary is true when this segment began at a KeyTransition (i.e. it is
+	// not the genesis segment). The genesis segment has Boundary=false.
+	Boundary bool
+}
+
+// VerifyChain verifies hash-chain integrity of a sequence of receipts, with
+// support for signing-key rotation boundaries. expectedKeyHex is the single
+// trusted signer key; pass "" for trust-on-first-use (the genesis segment's
+// key becomes the sole trusted key). It is a thin wrapper over
+// VerifyChainTrusted; see that function for the full trust model.
+func VerifyChain(receipts []Receipt, expectedKeyHex string) ChainResult {
+	if expectedKeyHex == "" {
+		return VerifyChainTrusted(receipts, nil)
+	}
+	return VerifyChainTrusted(receipts, []string{expectedKeyHex})
+}
+
+// VerifyChainIntegrity verifies signatures, trusted signer keys, sequence
+// numbers, and hash links while ignoring session-control lifecycle rules.
+func VerifyChainIntegrity(receipts []Receipt, expectedKeyHex string) ChainResult {
+	if expectedKeyHex == "" {
+		return VerifyChainIntegrityTrusted(receipts, nil)
+	}
+	return VerifyChainIntegrityTrusted(receipts, []string{expectedKeyHex})
+}
+
+// VerifyChainTrusted verifies hash-chain integrity across signing-key rotation
+// boundaries against an explicit set of trusted signer keys (hex).
+//
+// Receipts must be in chain order. Within a segment: signatures verify under
+// that segment's key, chain_seq increments by 1 from the segment's baseline,
+// and chain_prev_hash matches the previous receipt's hash.
+//
+// TRUST MODEL (the crux). A signing-key rotation opens a new chain segment
+// whose genesis receipt carries a KeyTransition marker (prior key + seq + tail
+// hash) and whose chain_prev_hash equals the prior tail hash. The marker is
+// signed by the NEW key, so it proves continuity (the boundary references the
+// real prior tail and is internally consistent) but it does NOT prove the
+// holder of the OLD key authorized the rotation - an attacker with write access
+// to the evidence file can read the real prior tail and fabricate a consistent
+// marker, then sign a new segment with their own key. Therefore the marker is
+// continuity/audit metadata, NOT trust delegation. Trust comes ONLY from the
+// caller-supplied trusted key set:
+//
+//   - trustedKeys non-empty: EVERY segment must be signed by a key in the set.
+//     A segment signed by any other key fails (UntrustedSignerKey is set),
+//     regardless of how well-formed its KeyTransition marker is. This is how a
+//     forged attacker-key segment is rejected: the attacker key is not in the
+//     operator's trusted set.
+//   - trustedKeys empty (trust-on-first-use): the genesis segment's key becomes
+//     the sole trusted key. Any rotation to a DIFFERENT key fails with
+//     UntrustedSignerKey set - the operator must re-run with the new key in the
+//     trusted set to confirm it is theirs. A single-key chain still verifies.
+//
+// Structural rules (independent of trust), all fail-closed:
+//
+//   - The genesis (first) receipt must have chain_prev_hash == genesis with no
+//     KeyTransition marker. A rotated segment cannot be verified as a complete
+//     chain in isolation because its embedded marker is not the actual prior tail.
+//   - A new segment mid-chain is introduced ONLY by a seq-0 receipt carrying a
+//     marker whose PriorChainHash equals both this receipt's chain_prev_hash and
+//     the actual prior tail hash, whose PriorSignerKey equals the prior
+//     segment's key, and whose PriorChainSeq equals the prior segment's final
+//     seq. A tampered prior tail breaks this (hash mismatch).
+//   - A KeyTransition marker on a non-seq-0 receipt, or an ordinary seq-0
+//     receipt mid-chain (no marker, prev_hash != genesis), is rejected. This
+//     preserves the genesis check for ordinary receipts (no weakening).
+func VerifyChainTrusted(receipts []Receipt, trustedKeys []string) ChainResult {
+	res := verifyChainTrusted(receipts, trustedKeys, false)
+	if res.FailureKind != ChainFailureLifecycleOpen {
+		return res
+	}
+	integrity := verifyChainTrusted(receipts, trustedKeys, true)
+	if !integrity.Valid {
+		return integrity
+	}
+	res.IntegrityVerified = true
+	res.ReceiptCount = integrity.ReceiptCount
+	res.FinalSeq = integrity.FinalSeq
+	res.RootHash = integrity.RootHash
+	res.StartTime = integrity.StartTime
+	res.EndTime = integrity.EndTime
+	res.SignerKeys = integrity.SignerKeys
+	res.Segments = integrity.Segments
+	return res
+}
+
+// VerifyChainIntegrityTrusted is VerifyChainIntegrity with an explicit trusted
+// signer key set.
+func VerifyChainIntegrityTrusted(receipts []Receipt, trustedKeys []string) ChainResult {
+	return verifyChainTrusted(receipts, trustedKeys, true)
+}
+
+// VerifyChainWithEndorsements verifies a rotated receipt chain while allowing
+// an old-key-signed endorsement to authorize each successor key. Root keys are
+// still supplied out of band. An absent, invalid, duplicate, replayed, or
+// boundary-mismatched endorsement fails closed for every successor. The root
+// set authenticates the genesis signer; it does not bypass transition proof.
+func VerifyChainWithEndorsements(sessionID string, receipts []Receipt, endorsements []RotationEndorsement, rootTrustedKeys []string) ChainResult {
+	if strings.TrimSpace(sessionID) == "" {
+		return ChainResult{Error: "rotation endorsement verification requires a recorder session ID", FailureKind: ChainFailureTrust}
+	}
+	if len(receipts) == 0 {
+		if len(endorsements) != 0 {
+			return ChainResult{Error: "rotation endorsements supplied for an empty receipt chain", FailureKind: ChainFailureTrust}
+		}
+		return ChainResult{Valid: true, IntegrityVerified: true}
+	}
+
+	allKeys := make([]string, 0, len(receipts))
+	seenKeys := make(map[string]struct{})
+	for _, receipt := range receipts {
+		if _, ok := seenKeys[receipt.SignerKey]; !ok {
+			seenKeys[receipt.SignerKey] = struct{}{}
+			allKeys = append(allKeys, receipt.SignerKey)
+		}
+	}
+	base := VerifyChainTrusted(receipts, allKeys)
+	if !base.Valid {
+		return base
+	}
+	roots, err := normalizeTrustedKeys(rootTrustedKeys)
+	if err != nil {
+		base.Valid = false
+		base.FailureKind = ChainFailureTrust
+		base.Error = fmt.Sprintf("trusted key set: %v", err)
+		return base
+	}
+	rootSet := make(map[string]struct{}, len(roots))
+	for _, key := range roots {
+		rootSet[key] = struct{}{}
+	}
+	if len(rootSet) == 0 {
+		return endorsementFailure(base, receipts[0].SignerKey, errors.New("rotation endorsement verification requires at least one trusted root key"))
+	}
+	if _, trusted := rootSet[receipts[0].SignerKey]; !trusted {
+		return endorsementFailure(base, receipts[0].SignerKey, errors.New("genesis signer key is not in the trusted root set"))
+	}
+	if err := verifySignedRecorderSession(sessionID, receipts); err != nil {
+		return endorsementFailure(base, "", err)
+	}
+
+	for _, endorsement := range endorsements {
+		if err := VerifyRotationEndorsement(endorsement); err != nil {
+			return endorsementFailure(base, endorsement.NewSignerKey, err)
+		}
+	}
+
+	base.TrustBasis = make([]string, 0, len(base.Segments))
+	base.TrustBasis = append(base.TrustBasis, "root")
+	used := make(map[int]struct{}, len(endorsements))
+	priorTailIndex := -1
+	for segmentIndex := 1; segmentIndex < len(base.Segments); segmentIndex++ {
+		segment := base.Segments[segmentIndex]
+		var found bool
+		priorTailIndex, found = findRotationPriorTail(receipts, priorTailIndex+1, segment.SignerKey)
+		if !found {
+			return endorsementFailure(base, segment.SignerKey, errors.New("cannot locate rotation boundary"))
+		}
+		prior := receipts[priorTailIndex]
+		priorHash, hashErr := ReceiptHash(prior)
+		if hashErr != nil {
+			return endorsementFailure(base, segment.SignerKey, hashErr)
+		}
+		boundary := receipts[priorTailIndex+1]
+		match := -1
+		for endorsementIndex, endorsement := range endorsements {
+			if _, alreadyUsed := used[endorsementIndex]; alreadyUsed {
+				continue
+			}
+			if endorsement.SessionID != sessionID ||
+				endorsement.PriorSignerKey != prior.SignerKey ||
+				endorsement.PriorFinalSeq != prior.ActionRecord.ChainSeq ||
+				endorsement.PriorTailHash != priorHash ||
+				endorsement.NewSignerKey != boundary.SignerKey {
+				continue
+			}
+			if match >= 0 {
+				return endorsementFailure(base, segment.SignerKey, errors.New("multiple rotation endorsements match one receipt boundary"))
+			}
+			match = endorsementIndex
+		}
+		if match < 0 {
+			return endorsementFailure(base, segment.SignerKey, errors.New("rotation endorsement does not match receipt boundary"))
+		}
+		used[match] = struct{}{}
+		base.TrustBasis = append(base.TrustBasis, "endorsed")
+	}
+	if len(used) != len(endorsements) {
+		return endorsementFailure(base, "", errors.New("unused rotation endorsement does not match a required boundary"))
+	}
+	return base
+}
+
+func findRotationPriorTail(receipts []Receipt, start int, signerKey string) (int, bool) {
+	for i := start; i < len(receipts); i++ {
+		if receipts[i].SignerKey == signerKey {
+			return i - 1, true
+		}
+	}
+	return 0, false
+}
+
+func verifySignedRecorderSession(expected string, receipts []Receipt) error {
+	firstBoundary := len(receipts)
+	for i := 1; i < len(receipts); i++ {
+		if receipts[i].ActionRecord.KeyTransition != nil {
+			firstBoundary = i
+			break
+		}
+	}
+	rootOpenFound := false
+	for i, receipt := range receipts {
+		if open := sessionOpen(receipt.ActionRecord.SessionControl); open != nil {
+			if open.RecorderSession != expected {
+				return fmt.Errorf("signed recorder session %q does not match endorsement session %q", open.RecorderSession, expected)
+			}
+			if i < firstBoundary {
+				rootOpenFound = true
+			}
+		}
+	}
+	if rootOpenFound {
+		return nil
+	}
+	return errors.New("root receipt segment has no signed session_open recorder binding")
+}
+
+func endorsementFailure(base ChainResult, key string, err error) ChainResult {
+	base.Valid = false
+	base.FailureKind = ChainFailureTrust
+	base.UntrustedSignerKey = key
+	base.Error = err.Error()
+	if key != "" {
+		base.EndorsementGaps = []string{key}
+	}
+	return base
+}
+
+func verifyChainTrusted(receipts []Receipt, trustedKeys []string, integrityOnly bool) ChainResult {
+	if len(receipts) == 0 {
+		return ChainResult{Valid: true, IntegrityVerified: true}
+	}
+
+	normalizedKeys, err := normalizeTrustedKeys(trustedKeys)
+	if err != nil {
+		return ChainResult{
+			Valid:         false,
+			BrokenAtSeq:   receipts[0].ActionRecord.ChainSeq,
+			BrokenAtIndex: 0,
+			Error:         fmt.Sprintf("seq %d: trusted key set: %v", receipts[0].ActionRecord.ChainSeq, err),
+			FailureKind:   ChainFailureTrust,
+		}
+	}
+
+	trusted := make(map[string]struct{}, len(normalizedKeys))
+	for _, k := range normalizedKeys {
+		trusted[k] = struct{}{}
+	}
+	v := &chainVerifier{
+		trusted:       trusted,
+		runNonces:     make(map[string]string),
+		closedRuns:    make(map[string]bool),
+		integrityOnly: integrityOnly,
+	}
+	return v.run(receipts)
+}
+
+func normalizeTrustedKeys(trustedKeys []string) ([]string, error) {
+	if len(trustedKeys) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(trustedKeys))
+	for _, key := range trustedKeys {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("trusted signer key cannot be empty")
+		}
+		out = append(out, key)
+	}
+	return out, nil
+}
+
+// chainVerifier carries the walking state for VerifyChain.
+type chainVerifier struct {
+	// trusted is the set of trusted signer keys. Empty means trust-on-first-
+	// use: the genesis key is adopted as the sole trusted key.
+	trusted map[string]struct{}
+
+	curKey     string // expected signer key for the current segment
+	segBaseSeq uint64 // chain_seq of the current segment's first receipt
+	prevHash   string // expected chain_prev_hash for the next receipt
+
+	signerKeys   []string
+	signerKeySet map[string]struct{}
+	segments     []ChainSegment
+	curSeg       *ChainSegment
+	index        int
+	runNonces    map[string]string
+	closedRuns   map[string]bool
+	activeRun    string
+	activeOpen   string
+	runStore     *boundedRunStore
+	compact      bool
+	segmentStart uint64
+
+	integrityOnly bool
+	// trustChainKeys trusts exactly the set VerifyChainTrusted builds from
+	// every signer key in the chain, without first collecting that set.
+	trustChainKeys bool
+}
+
+// StreamingVerifier verifies a v1 receipt chain one receipt at a time.  It is
+// intended for offline maintenance that cannot retain an entire recorder in
+// memory.  It preserves the same lifecycle, rotation, and trusted-key rules as
+// VerifyChain; Finish returns the same ChainResult shape.
+type StreamingVerifier struct {
+	v         *chainVerifier
+	integrity *chainVerifier
+	count     uint64
+	first     *Receipt
+	last      *Receipt
+	fail      *ChainResult
+	lifecycle *ChainResult
+}
+
+// NewStreamingVerifier starts a chain anchored at expectedKeyHex.
+func NewStreamingVerifier(expectedKeyHex string) (*StreamingVerifier, error) {
+	keys, err := normalizeTrustedKeys([]string{expectedKeyHex})
+	if err != nil {
+		return nil, err
+	}
+	newVerifier := func(integrityOnly bool) *chainVerifier {
+		trusted := make(map[string]struct{}, len(keys))
+		for _, key := range keys {
+			trusted[key] = struct{}{}
+		}
+		return &chainVerifier{trusted: trusted, runNonces: make(map[string]string), closedRuns: make(map[string]bool), integrityOnly: integrityOnly}
+	}
+	return &StreamingVerifier{v: newVerifier(false), integrity: newVerifier(true)}, nil
+}
+
+// Add verifies one exact v1 receipt wire representation and advances the
+// chain.  Once an error occurs the verifier remains failed.
+func (s *StreamingVerifier) Add(raw []byte) error {
+	if s.fail != nil {
+		return errors.New(s.fail.Error)
+	}
+	r, err := Unmarshal(raw)
+	if err != nil {
+		return s.latch(ChainResult{Valid: false, Error: err.Error(), FailureKind: ChainFailureIntegrity})
+	}
+	// Unmarshal is strict (duplicate keys, unknown signed fields, trailing
+	// tokens). Each chain walk below verifies the canonical signing projection
+	// with its segment signer, then applies the trusted-key boundary. Do not
+	// pre-verify only against the genesis key here: that would misclassify a
+	// rotated signer as a signature failure instead of the batch verifier's
+	// explicit trust failure.
+	// Keep an integrity-only walk in lockstep. VerifyChain deliberately
+	// downgrades a missing session-open to a lifecycle result only after it
+	// proves the full chain is otherwise intact; a streaming verifier must not
+	// turn that established fallback into an earlier hard failure.
+	if res, ok := s.integrity.add(r, s.count); !ok {
+		return s.latch(res)
+	}
+	if s.lifecycle == nil {
+		if res, ok := s.v.add(r, s.count); !ok {
+			if res.FailureKind != ChainFailureLifecycleOpen {
+				return s.latch(res)
+			}
+			// Preserve the strict failure, but continue the independent
+			// integrity walk. Finish returns the same augmented result as the
+			// batch verifier if every remaining receipt is intact.
+			s.lifecycle = &res
+		}
+	}
+	if s.first == nil {
+		first := r
+		s.first = &first
+	}
+	last := r
+	s.last = &last
+	s.count++
+	return nil
+}
+
+func (s *StreamingVerifier) latch(res ChainResult) error { s.fail = &res; return errors.New(res.Error) }
+
+// Finish completes verification.  Empty chains are rejected because a caller
+// that wants to prove evidence must have observed at least one signed receipt.
+func (s *StreamingVerifier) Finish() ChainResult {
+	if s.fail != nil {
+		return *s.fail
+	}
+	if s.count == 0 || s.first == nil || s.last == nil {
+		return ChainResult{Valid: false, Error: "empty chain"}
+	}
+	s.integrity.closeSegment()
+	if s.lifecycle != nil {
+		res := *s.lifecycle
+		res.IntegrityVerified = true
+		res.ReceiptCount = s.count
+		res.FinalSeq = s.last.ActionRecord.ChainSeq
+		res.RootHash = s.integrity.prevHash
+		res.StartTime = s.first.ActionRecord.Timestamp
+		res.EndTime = s.last.ActionRecord.Timestamp
+		res.SignerKeys = s.integrity.signerKeys
+		res.Segments = s.integrity.segments
+		return res
+	}
+	s.v.closeSegment()
+	return ChainResult{Valid: true, IntegrityVerified: true, ReceiptCount: s.count, FinalSeq: s.last.ActionRecord.ChainSeq, RootHash: s.v.prevHash, StartTime: s.first.ActionRecord.Timestamp, EndTime: s.last.ActionRecord.Timestamp, SignerKeys: s.v.signerKeys, Segments: s.v.segments}
+}
+
+func (v *chainVerifier) run(receipts []Receipt) ChainResult {
+	for i := range receipts {
+		if res, ok := v.add(receipts[i], uint64(i)); !ok {
+			return res
+		}
+	}
+
+	v.closeSegment()
+	first := receipts[0].ActionRecord
+	last := receipts[len(receipts)-1].ActionRecord
+	return ChainResult{
+		Valid:             true,
+		IntegrityVerified: true,
+		ReceiptCount:      uint64(len(receipts)),
+		FinalSeq:          last.ChainSeq,
+		RootHash:          v.prevHash,
+		StartTime:         first.Timestamp,
+		EndTime:           last.Timestamp,
+		SignerKeys:        v.signerKeys,
+		Segments:          v.segments,
+	}
+}
+
+func (v *chainVerifier) add(r Receipt, index uint64) (ChainResult, bool) {
+	if index > uint64(math.MaxInt) {
+		return v.brokenAt(r, "receipt index exceeds verifier capacity"), false
+	}
+	v.index = int(index)
+	marker := r.ActionRecord.KeyTransition
+	if index == 0 {
+		v.segmentStart = index
+		if res, ok := v.startFirstSegment(r); !ok {
+			return res, false
+		}
+	} else if marker != nil {
+		v.segmentStart = index
+		if res, ok := v.startRotatedSegment(r, marker); !ok {
+			return res, false
+		}
+	} else if res, ok := v.checkContinuation(r); !ok {
+		return res, false
+	}
+	if res, ok := v.verifyReceiptIntegrity(r, index); !ok {
+		return res, false
+	}
+	if !v.integrityOnly {
+		if res, ok := v.validateSessionControl(r); !ok {
+			return res, false
+		}
+	}
+	return v.advanceReceiptHash(r)
+}
+
+// startFirstSegment establishes the anchor and key for the genesis segment.
+// Returns ok=false with a failing result on violation.
+func (v *chainVerifier) startFirstSegment(r Receipt) (ChainResult, bool) {
+	marker := r.ActionRecord.KeyTransition
+	// Trust-on-first-use: when no trusted set was supplied, adopt the first
+	// receipt's signer_key as the sole trusted key. Otherwise the first
+	// segment's key must already be in the trusted set.
+	if len(v.trusted) == 0 && !v.trustChainKeys {
+		v.trusted = map[string]struct{}{r.SignerKey: {}}
+	}
+	if !v.keyTrusted(r.SignerKey) {
+		return v.untrusted(r), false
+	}
+	v.curKey = r.SignerKey
+
+	switch {
+	case marker != nil:
+		// A KeyTransition marker is continuity metadata for a boundary to a
+		// prior tail that must be present in the chain being verified. Accepting
+		// a marker on the first receipt would allow deletion/truncation of the
+		// prior segment while still returning CHAIN VALID for the suffix.
+		return v.brokenAt(r, "chain starts at a key_transition segment without the prior segment"), false
+	case strings.HasPrefix(r.ActionRecord.ChainPrevHash, genesisSessionOpenPrefix):
+		if res, ok := v.validateBoundGenesisOpen(r); !ok {
+			return res, false
+		}
+		v.prevHash = r.ActionRecord.ChainPrevHash
+		v.beginSegment(r, false)
+	default:
+		// Ordinary genesis: prev_hash must be the genesis sentinel.
+		if r.ActionRecord.ChainPrevHash != GenesisHash {
+			return v.brokenAt(r, "genesis receipt chain_prev_hash must be genesis or a bound session_open g1 hash"), false
+		}
+		if !v.integrityOnly && sessionOpen(r.ActionRecord.SessionControl) != nil {
+			return v.brokenAt(r, "session_open on legacy genesis must use bound g1 chain_prev_hash"), false
+		}
+		v.prevHash = GenesisHash
+		v.beginSegment(r, false)
+	}
+	v.segBaseSeq = r.ActionRecord.ChainSeq
+	return ChainResult{}, true
+}
+
+// startRotatedSegment validates a KeyTransition boundary mid-chain and switches
+// the expected key to the new segment.
+func (v *chainVerifier) startRotatedSegment(r Receipt, marker *KeyTransition) (ChainResult, bool) {
+	// Markers are only valid at a segment genesis (seq 0).
+	if r.ActionRecord.ChainSeq != 0 {
+		return v.brokenAt(r, "key_transition marker on a non-genesis receipt (seq != 0)"), false
+	}
+	// The boundary must reference the actual prior tail: prev_hash, the
+	// marker's prior hash, and the real prior-tail hash must all agree, and
+	// the marker must name the prior segment's key and final seq. v.prevHash
+	// holds the prior tail's hash (set by verifyReceipt on the prior receipt).
+	if marker.PriorChainHash != v.prevHash {
+		return v.brokenAt(r, "key_transition prior_chain_hash does not match actual prior tail hash"), false
+	}
+	if r.ActionRecord.ChainPrevHash != v.prevHash {
+		return v.brokenAt(r, "segment-genesis chain_prev_hash does not match prior tail hash"), false
+	}
+	if marker.PriorSignerKey != v.curKey {
+		return v.brokenAt(r, "key_transition prior_signer_key does not match prior segment key"), false
+	}
+	if r.SignerKey == v.curKey {
+		return v.brokenAt(r, "key_transition does not change signer key"), false
+	}
+	if v.curSeg != nil && marker.PriorChainSeq != v.curSeg.FinalSeq {
+		return v.brokenAt(r, "key_transition prior_chain_seq does not match prior segment final seq"), false
+	}
+	if open := sessionOpen(r.ActionRecord.SessionControl); !v.integrityOnly && open != nil {
+		if res, ok := v.validateRestartOpen(r, open, marker.PriorChainHash, marker.PriorChainSeq); !ok {
+			return res, false
+		}
+	}
+	// The boundary is structurally valid, but trust is NOT delegated by the
+	// marker (it is signed by the new key, which an attacker with write access
+	// could mint). The new segment's key must be in the operator's trusted set.
+	if !v.keyTrusted(r.SignerKey) {
+		v.beginSegment(r, true) // record the offending key in SignerKeys/Segments
+		return v.untrusted(r), false
+	}
+	v.closeSegment()
+	v.curKey = r.SignerKey
+	v.segBaseSeq = 0
+	v.beginSegment(r, true)
+	return ChainResult{}, true
+}
+
+func (v *chainVerifier) keyTrusted(key string) bool {
+	if v.trustChainKeys {
+		// The trusted set is every signer key the chain itself names, after
+		// normalizeTrustedKeys trims each one. A key trims to itself or is
+		// absent from that trimmed set, so membership needs no lookahead.
+		// An empty key fails normalization for the whole chain instead; the
+		// caller reports that.
+		return key == strings.TrimSpace(key)
+	}
+	_, ok := v.trusted[key]
+	return ok
+}
+
+// untrusted records the offending key and returns a failing result that names
+// it, so the operator can decide whether it is a legitimate rotation (re-run
+// with the key added to the trusted set) or an attacker key.
+func (v *chainVerifier) untrusted(r Receipt) ChainResult {
+	res := v.brokenAtKind(r, fmt.Sprintf("signer key %s is not in the trusted set", r.SignerKey), ChainFailureTrust)
+	res.UntrustedSignerKey = r.SignerKey
+	res.SignerKeys = v.signerKeys
+	return res
+}
+
+// checkContinuation enforces seq + prev_hash continuity within a segment for a
+// non-boundary receipt.
+func (v *chainVerifier) checkContinuation(r Receipt) (ChainResult, bool) {
+	// An ordinary seq-0 receipt mid-chain (no marker) is a fork/duplicate, not
+	// a valid boundary - reject. This also preserves the genesis check: only
+	// the first receipt may legitimately be seq 0 without a marker.
+	if r.ActionRecord.ChainSeq == 0 {
+		return v.brokenAt(r, "unexpected seq 0 without a key_transition boundary"), false
+	}
+	if open := sessionOpen(r.ActionRecord.SessionControl); !v.integrityOnly && open != nil {
+		if v.curSeg == nil {
+			return v.brokenAt(r, "session_open continuation has no prior segment"), false
+		}
+		if res, ok := v.validateRestartOpen(r, open, v.prevHash, v.curSeg.FinalSeq); !ok {
+			return res, false
+		}
+	}
+	return ChainResult{}, true
+}
+
+func (v *chainVerifier) validateBoundGenesisOpen(r Receipt) (ChainResult, bool) {
+	open := sessionOpen(r.ActionRecord.SessionControl)
+	if open == nil {
+		return v.brokenAt(r, "g1 chain_prev_hash requires SessionControl.Open"), false
+	}
+	if r.ActionRecord.ChainSeq != 0 {
+		return v.brokenAt(r, "bound session_open genesis must be chain_seq 0"), false
+	}
+	computed := ComputeSessionOpenGenesis(*open)
+	if r.ActionRecord.ChainPrevHash != computed {
+		return v.brokenAt(r, "session_open genesis hash mismatch"), false
+	}
+	if open.GenesisHash != computed {
+		return v.brokenAt(r, "session_open genesis_hash mismatch"), false
+	}
+	if open.ChainOpenSeq != r.ActionRecord.ChainSeq {
+		return v.brokenAt(r, "session_open chain_open_seq does not match receipt chain_seq"), false
+	}
+	if open.PriorChainHead != "" || open.PriorChainSeq != 0 {
+		return v.brokenAt(r, "bound genesis session_open must not carry prior chain tail"), false
+	}
+	return ChainResult{}, true
+}
+
+func (v *chainVerifier) validateRestartOpen(r Receipt, open *SessionOpen, priorHead string, priorSeq uint64) (ChainResult, bool) {
+	if strings.HasPrefix(r.ActionRecord.ChainPrevHash, genesisSessionOpenPrefix) {
+		return v.brokenAt(r, "restart session_open must not use g1 chain_prev_hash"), false
+	}
+	if open.GenesisHash != "" {
+		return v.brokenAt(r, "restart session_open must not carry genesis_hash"), false
+	}
+	if open.ChainOpenSeq != r.ActionRecord.ChainSeq {
+		return v.brokenAt(r, "session_open chain_open_seq does not match receipt chain_seq"), false
+	}
+	if open.PriorChainHead != priorHead {
+		return v.brokenAt(r, "session_open prior_chain_head does not match prior tail hash"), false
+	}
+	if open.PriorChainSeq != priorSeq {
+		return v.brokenAt(r, "session_open prior_chain_seq does not match prior tail seq"), false
+	}
+	return ChainResult{}, true
+}
+
+func (v *chainVerifier) validateSessionControl(r Receipt) (ChainResult, bool) {
+	ctrl := r.ActionRecord.SessionControl
+	open := sessionOpen(ctrl)
+	heartbeat := sessionHeartbeat(ctrl)
+	closeRecord := sessionClose(ctrl)
+	if ctrl != nil {
+		payloads := 0
+		if ctrl.Open != nil {
+			payloads++
+		}
+		if ctrl.Heartbeat != nil {
+			payloads++
+		}
+		if ctrl.Close != nil {
+			payloads++
+		}
+		if payloads != 1 {
+			return v.brokenAtKind(r, "session_control must carry exactly one payload", ChainFailureLifecycle), false
+		}
+		switch ctrl.Kind {
+		case SessionControlOpen:
+			if open == nil {
+				return v.brokenAtKind(r, "session_open kind missing open payload", ChainFailureLifecycle), false
+			}
+		case SessionControlHeartbeat:
+			if heartbeat == nil {
+				return v.brokenAtKind(r, "heartbeat kind missing heartbeat payload", ChainFailureLifecycle), false
+			}
+		case SessionControlClose:
+			if closeRecord == nil {
+				return v.brokenAtKind(r, "session_close kind missing close payload", ChainFailureLifecycle), false
+			}
+		default:
+			return v.brokenAtKind(r, "unknown session_control kind", ChainFailureLifecycle), false
+		}
+	}
+	if r.ActionRecord.RunNonce == "" {
+		if ctrl != nil {
+			return v.brokenAtKind(r, "session_control receipt missing run_nonce", ChainFailureLifecycle), false
+		}
+		return ChainResult{}, true
+	}
+	if open == nil {
+		openNonce, closed, ok, err := v.readRun(r.ActionRecord.RunNonce)
+		if err != nil {
+			return v.brokenAtKind(r, fmt.Sprintf("read session lifecycle state: %v", err), ChainFailureLifecycle), false
+		}
+		if !ok {
+			return v.brokenAtKind(r, "run_nonce first receipt is not a matching session_open", ChainFailureLifecycleOpen), false
+		}
+		if closed {
+			return v.brokenAtKind(r, "record observed after session_close", ChainFailureLifecycle), false
+		}
+		if heartbeat != nil {
+			if heartbeat.RunNonce != r.ActionRecord.RunNonce {
+				return v.brokenAtKind(r, "heartbeat run_nonce does not match receipt run_nonce", ChainFailureLifecycle), false
+			}
+			if v.activeRun == "" || v.activeOpen == "" {
+				return v.brokenAtKind(r, "heartbeat has no active session_open", ChainFailureLifecycle), false
+			}
+			if heartbeat.RunNonce != v.activeRun {
+				return v.brokenAtKind(r, "heartbeat run_nonce does not match active session_open", ChainFailureLifecycle), false
+			}
+			if heartbeat.OpenNonce != openNonce {
+				return v.brokenAtKind(r, "heartbeat open_nonce does not match session_open", ChainFailureLifecycle), false
+			}
+			if heartbeat.OpenNonce != v.activeOpen {
+				return v.brokenAtKind(r, "heartbeat open_nonce does not match active session_open", ChainFailureLifecycle), false
+			}
+			if heartbeat.ChainHead != v.prevHash {
+				return v.brokenAtKind(r, "heartbeat chain_head mismatch", ChainFailureLifecycle), false
+			}
+			if heartbeat.ChainSeqHead != r.ActionRecord.ChainSeq-1 {
+				return v.brokenAtKind(r, "heartbeat chain_seq_head mismatch", ChainFailureLifecycle), false
+			}
+		}
+		if closeRecord != nil {
+			if closeRecord.RunNonce != r.ActionRecord.RunNonce {
+				return v.brokenAtKind(r, "session_close run_nonce does not match receipt run_nonce", ChainFailureLifecycle), false
+			}
+			if v.activeRun == "" || v.activeOpen == "" {
+				return v.brokenAtKind(r, "session_close has no active session_open", ChainFailureLifecycle), false
+			}
+			if closeRecord.RunNonce != v.activeRun {
+				return v.brokenAtKind(r, "session_close run_nonce does not match active session_open", ChainFailureLifecycle), false
+			}
+			if closeRecord.OpenNonce != openNonce {
+				return v.brokenAtKind(r, "session_close open_nonce does not match session_open", ChainFailureLifecycle), false
+			}
+			if closeRecord.OpenNonce != v.activeOpen {
+				return v.brokenAtKind(r, "session_close open_nonce does not match active session_open", ChainFailureLifecycle), false
+			}
+			if closeRecord.RootHash != v.prevHash {
+				return v.brokenAtKind(r, "session_close root_hash mismatch", ChainFailureLifecycle), false
+			}
+			if closeRecord.FinalSeq != r.ActionRecord.ChainSeq {
+				return v.brokenAtKind(r, "session_close final_seq mismatch", ChainFailureLifecycle), false
+			}
+			segmentReceiptCount := uint64(1)
+			if v.curSeg != nil {
+				segmentReceiptCount = v.curSeg.Count + 1
+			}
+			if closeRecord.ReceiptCount != segmentReceiptCount {
+				return v.brokenAtKind(r, "session_close receipt_count mismatch", ChainFailureLifecycle), false
+			}
+			v.activeRun = ""
+			v.activeOpen = ""
+			if err := v.writeRun(r.ActionRecord.RunNonce, openNonce, true); err != nil {
+				return v.brokenAtKind(r, fmt.Sprintf("write session lifecycle state: %v", err), ChainFailureLifecycle), false
+			}
+		}
+		return ChainResult{}, true
+	}
+	if open.RunNonce != r.ActionRecord.RunNonce {
+		return v.brokenAtKind(r, "session_open run_nonce does not match receipt run_nonce", ChainFailureLifecycle), false
+	}
+	if open.OpenNonce == "" {
+		return v.brokenAtKind(r, "session_open open_nonce is empty", ChainFailureLifecycle), false
+	}
+	_, _, exists, err := v.readRun(r.ActionRecord.RunNonce)
+	if err != nil {
+		return v.brokenAtKind(r, fmt.Sprintf("read session lifecycle state: %v", err), ChainFailureLifecycle), false
+	}
+	if exists {
+		return v.brokenAtKind(r, "duplicate session_open for run_nonce", ChainFailureLifecycle), false
+	}
+	if err := v.writeRun(r.ActionRecord.RunNonce, open.OpenNonce, false); err != nil {
+		return v.brokenAtKind(r, fmt.Sprintf("write session lifecycle state: %v", err), ChainFailureLifecycle), false
+	}
+	v.activeRun = open.RunNonce
+	v.activeOpen = open.OpenNonce
+	return ChainResult{}, true
+}
+
+func sessionOpen(ctrl *SessionControl) *SessionOpen {
+	if ctrl == nil || ctrl.Kind != SessionControlOpen {
+		return nil
+	}
+	return ctrl.Open
+}
+
+func sessionHeartbeat(ctrl *SessionControl) *SessionHeartbeat {
+	if ctrl == nil || ctrl.Kind != SessionControlHeartbeat {
+		return nil
+	}
+	return ctrl.Heartbeat
+}
+
+func sessionClose(ctrl *SessionControl) *SessionClose {
+	if ctrl == nil || ctrl.Kind != SessionControlClose {
+		return nil
+	}
+	return ctrl.Close
+}
+
+func (v *chainVerifier) verifyReceiptIntegrity(r Receipt, index uint64) (ChainResult, bool) {
+	if err := VerifyWithKey(r, v.curKey); err != nil {
+		return v.brokenAt(r, fmt.Sprintf("signature: %v", err)), false
+	}
+
+	expectedSeq := v.segBaseSeq + (index - v.curSegStartIndex())
+	if r.ActionRecord.ChainSeq != expectedSeq {
+		return v.brokenAt(r, fmt.Sprintf("seq gap: expected %d, got %d", expectedSeq, r.ActionRecord.ChainSeq)), false
+	}
+
+	if r.ActionRecord.ChainPrevHash != v.prevHash {
+		return v.brokenAt(r, "chain_prev_hash mismatch"), false
+	}
+	return ChainResult{}, true
+}
+
+func (v *chainVerifier) advanceReceiptHash(r Receipt) (ChainResult, bool) {
+	hash, err := ReceiptHash(r)
+	if err != nil {
+		return v.brokenAt(r, fmt.Sprintf("hash computation: %v", err)), false
+	}
+	v.prevHash = hash
+	if v.curSeg != nil {
+		v.curSeg.FinalSeq = r.ActionRecord.ChainSeq
+		v.curSeg.Count++
+	}
+	return ChainResult{}, true
+}
+
+// curSegStartIndex returns the slice index at which the current segment began,
+// derived from segments already closed plus the count of the open segment.
+func (v *chainVerifier) curSegStartIndex() uint64 {
+	if v.compact {
+		return v.segmentStart
+	}
+	var n uint64
+	for _, s := range v.segments {
+		n += s.Count
+	}
+	return n
+}
+
+func (v *chainVerifier) beginSegment(r Receipt, boundary bool) {
+	v.curSeg = &ChainSegment{
+		SignerKey: r.SignerKey,
+		FirstSeq:  r.ActionRecord.ChainSeq,
+		FinalSeq:  r.ActionRecord.ChainSeq,
+		Boundary:  boundary,
+	}
+	v.appendSignerKey(r.SignerKey)
+}
+
+func (v *chainVerifier) closeSegment() {
+	if v.curSeg != nil {
+		if !v.compact {
+			v.segments = append(v.segments, *v.curSeg)
+		}
+		v.curSeg = nil
+	}
+}
+
+func (v *chainVerifier) appendSignerKey(key string) {
+	if v.compact {
+		if v.signerKeySet == nil {
+			v.signerKeySet = make(map[string]struct{})
+		}
+		if _, seen := v.signerKeySet[key]; !seen {
+			v.signerKeySet[key] = struct{}{}
+			v.signerKeys = append(v.signerKeys, key)
+		}
+		return
+	}
+	for _, k := range v.signerKeys {
+		if k == key {
+			return
+		}
+	}
+	v.signerKeys = append(v.signerKeys, key)
+}
+
+func (v *chainVerifier) brokenAt(r Receipt, msg string) ChainResult {
+	return v.brokenAtKind(r, msg, ChainFailureIntegrity)
+}
+
+func (v *chainVerifier) brokenAtKind(r Receipt, msg string, kind ChainFailureKind) ChainResult {
+	return ChainResult{
+		Valid:         false,
+		BrokenAtSeq:   r.ActionRecord.ChainSeq,
+		BrokenAtIndex: v.index,
+		Error:         fmt.Sprintf("seq %d: %s", r.ActionRecord.ChainSeq, msg),
+		FailureKind:   kind,
+		SignerKeys:    v.signerKeys,
+	}
+}
+
+// ExtractReceipts reads a flight recorder JSONL file and extracts all
+// action_receipt entries as Receipt structs, in file order.
+func ExtractReceipts(path string) ([]Receipt, error) {
+	clean := filepath.Clean(path)
+	entries, err := recorder.ReadHistoryEntries(clean)
+	if err != nil {
+		// A truncated read must not fall through to the raw-JSONL
+		// compatibility path: that path would return the receipts it managed
+		// to parse as though they were the whole chain. Mirrors
+		// ExtractReceiptsBytes.
+		if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) || recorder.IsEvidenceUnavailable(err) {
+			return nil, fmt.Errorf("reading entries: %w", err)
+		}
+		rawReceipts, rawErr := extractRawReceiptsJSONLFile(clean)
+		if rawErr != nil {
+			return nil, rawErr
+		}
+		if len(rawReceipts) > 0 {
+			return rawReceipts, nil
+		}
+		return nil, fmt.Errorf("reading entries: %w", err)
+	}
+	receipts, err := extractReceiptsFromEntries(entries)
+	if err != nil || len(receipts) > 0 {
+		return receipts, err
+	}
+	rawReceipts, rawErr := extractRawReceiptsJSONLFile(clean)
+	if rawErr != nil {
+		return nil, rawErr
+	}
+	return rawReceipts, nil
+}
+
+// ExtractReceiptsBytes extracts action_receipt entries from JSONL evidence
+// bytes using the same accepted formats as ExtractReceipts: recorder entries
+// first, then raw receipt JSONL as the compatibility fallback.
+func ExtractReceiptsBytes(data []byte) ([]Receipt, error) {
+	return ExtractReceiptsFromReader(bytes.NewReader(data))
+}
+
+// ExtractReceiptsFromReader is ExtractReceipts over an already-opened input.
+// A caller holding a secured snapshot uses it so the receipts come from the
+// bytes that snapshot checks, not from a second open of the pathname.
+func ExtractReceiptsFromReader(input io.ReadSeeker) ([]Receipt, error) {
+	entries, err := recorder.ReadHistoryEntriesFromReader(input)
+	if err != nil {
+		if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) || recorder.IsEvidenceUnavailable(err) {
+			return nil, fmt.Errorf("reading entries: %w", err)
+		}
+		rawReceipts, rawErr := extractRawReceiptsJSONLFrom(input)
+		if rawErr != nil {
+			return nil, rawErr
+		}
+		if len(rawReceipts) > 0 {
+			return rawReceipts, nil
+		}
+		return nil, fmt.Errorf("reading entries: %w", err)
+	}
+	receipts, err := extractReceiptsFromEntries(entries)
+	if err != nil || len(receipts) > 0 {
+		return receipts, err
+	}
+	return extractRawReceiptsJSONLFrom(input)
+}
+
+func extractRawReceiptsJSONLFrom(input io.ReadSeeker) ([]Receipt, error) {
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind evidence: %w", err)
+	}
+	return extractRawReceiptsJSONLReader(input)
+}
+
+// WholeRecorderResult describes a verified recorder file or selected recorder
+// session. Its receipts are the action-receipt subsequence; EntryCount counts
+// every recorder entry that was hash-chain-verified and accepted by taxonomy.
+type WholeRecorderResult struct {
+	Receipts   []Receipt
+	EntryCount int
+}
+
+// VerifyWholeRecorderEntries verifies every supplied recorder entry before
+// extracting its action receipts. It proves every entry present is chained and
+// in the known taxonomy; like any append-only hash chain, it does not prove the
+// file is complete, and hash linkage alone does not authenticate entries that
+// are not receipts. That authentication comes from signed checkpoints, which
+// the verify-receipt command checks against the pinned keys.
+func VerifyWholeRecorderEntries(entries []recorder.Entry) (WholeRecorderResult, error) {
+	var sessionID string
+	for i, e := range entries {
+		if !knownRecorderEntryType(e.Type) {
+			return WholeRecorderResult{}, fmt.Errorf("%w: %q at seq %d", ErrUnexpectedRecorderEntryType, e.Type, e.Sequence)
+		}
+		// recorder.VerifyChain pins the session only inside the v3 namespace,
+		// so a hash-valid legacy file can splice entries from two sessions and
+		// still link. Whole-recorder mode certifies a single recorder session,
+		// so it enforces that for every entry version.
+		if i == 0 {
+			sessionID = e.SessionID
+		} else if e.SessionID != sessionID {
+			return WholeRecorderResult{}, fmt.Errorf("%w: entry at seq %d belongs to session %q, not %q", ErrUnexpectedRecorderEntryType, e.Sequence, e.SessionID, sessionID)
+		}
+	}
+	if err := recorder.VerifyChain(entries); err != nil {
+		return WholeRecorderResult{}, fmt.Errorf("recorder hash chain: %w", err)
+	}
+	receipts, err := extractReceiptsFromEntries(entries)
+	if err != nil {
+		return WholeRecorderResult{}, err
+	}
+	return WholeRecorderResult{Receipts: receipts, EntryCount: len(entries)}, nil
+}
+
+// ExtractAndVerifyWholeRecorderBytes is the WHOLE-RECORDER mode of the two-mode
+// extraction contract. Where ExtractReceiptsBytes (receipt-chain mode) returns
+// only the receipt subsequence, this mode additionally verifies the recorder
+// hash chain over EVERY entry (recorder.VerifyChain) and rejects any entry
+// whose Type is outside the recorder taxonomy. A nil error therefore certifies
+// that every entry present is chained and in the known taxonomy, not merely
+// that the extracted receipts form a valid chain. It does not prove that no
+// entries were removed from the tail. It does not use the raw-receipt-JSONL
+// compatibility fallback: whole recorder verification requires real recorder
+// entries.
+func ExtractAndVerifyWholeRecorderBytes(data []byte) ([]Receipt, error) {
+	entries, err := recorder.ReadHistoryEntriesFromReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("reading entries: %w", err)
+	}
+	result, err := VerifyWholeRecorderEntries(entries)
+	if err != nil {
+		return nil, err
+	}
+	return result.Receipts, nil
+}
+
+// ExtractReceiptsWithSessionID reads a flight recorder JSONL file and returns
+// both the receipts and the session ID from the first entry. The session ID
+// comes from the recorder entry metadata, which is lost in plain ExtractReceipts.
+// Returns an empty session ID when the file contains no entries.
+func ExtractReceiptsWithSessionID(path string) ([]Receipt, string, error) {
+	entries, err := recorder.ReadHistoryEntries(filepath.Clean(path))
+	if err != nil {
+		return nil, "", fmt.Errorf("reading entries: %w", err)
+	}
+	var sessionID string
+	if len(entries) > 0 {
+		sessionID = entries[0].SessionID
+		for _, entry := range entries[1:] {
+			if entry.SessionID != sessionID {
+				return nil, "", fmt.Errorf("evidence file mixes recorder sessions %q and %q", sessionID, entry.SessionID)
+			}
+		}
+	}
+	receipts, err := extractReceiptsFromEntries(entries)
+	return receipts, sessionID, err
+}
+
+// ExtractReceiptsFromSessionDir reads all evidence files for a session from a
+// recorder directory and returns the action receipts in chain order.
+//
+// It reads the session's complete history through the authoritative walk, so
+// neither unrelated files in the directory nor the session's own length can
+// refuse or truncate it. It is the extraction verification and anchoring use;
+// the Bounded and WithLimits variants are for display.
+func ExtractReceiptsFromSessionDir(dir, sessionID string) ([]Receipt, error) {
+	location, err := recorder.ResolveEvidenceLocation(filepath.Clean(dir), "")
+	if err != nil {
+		return nil, fmt.Errorf("querying session receipts: resolve evidence location: %w", err)
+	}
+	return ExtractReceiptsFromResolvedSessionDir(location, sessionID)
+}
+
+// ExtractReceiptsFromSessionDirBounded reads action receipts for a session with
+// an optional hard ceiling on parsed recorder entries. The returned boolean is
+// true when the ceiling was reached before the full session was loaded. It is
+// a bounded display read; verification uses ExtractReceiptsFromSessionDir.
+func ExtractReceiptsFromSessionDirBounded(dir, sessionID string, maxEntriesRead int) ([]Receipt, bool, error) {
+	return ExtractReceiptsFromSessionDirWithLimits(dir, sessionID, maxEntriesRead, 0)
+}
+
+// ExtractReceiptsFromResolvedSessionDirBounded reads one already-resolved evidence location with an entry ceiling.
+func ExtractReceiptsFromResolvedSessionDirBounded(location recorder.EvidenceLocation, sessionID string, maxEntriesRead int) ([]Receipt, bool, error) {
+	return extractReceiptsFromResolvedSessionDirWithLimits(location, sessionID, maxEntriesRead, 0)
+}
+
+// ExtractReceiptsFromSessionDirWithLimits reads action receipts for a session
+// with hard ceilings on parsed recorder entries and evidence directory entries.
+func ExtractReceiptsFromSessionDirWithLimits(dir, sessionID string, maxEntriesRead, maxDirectoryEntries int) ([]Receipt, bool, error) {
+	result, err := recorder.QuerySession(filepath.Clean(dir), sessionID, &recorder.QueryFilter{
+		MaxEntriesRead:      maxEntriesRead,
+		MaxDirectoryEntries: maxDirectoryEntries,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("querying session receipts: %w", err)
+	}
+	receipts, err := extractReceiptsFromEntries(result.Entries)
+	return receipts, result.Truncated, err
+}
+
+func extractReceiptsFromResolvedSessionDirWithLimits(location recorder.EvidenceLocation, sessionID string, maxEntriesRead, maxDirectoryEntries int) ([]Receipt, bool, error) {
+	result, err := recorder.QuerySessionResolved(location, sessionID, &recorder.QueryFilter{
+		MaxEntriesRead:      maxEntriesRead,
+		MaxDirectoryEntries: maxDirectoryEntries,
+	})
+	if err != nil {
+		return nil, false, fmt.Errorf("querying session receipts: %w", err)
+	}
+	receipts, err := extractReceiptsFromEntries(result.Entries)
+	return receipts, result.Truncated, err
+}
+
+// ExtractReceiptsFromResolvedSessionDir reads the complete receipt chain of
+// one session in an already-resolved evidence location through the
+// authoritative walk. Only the receipts are retained.
+func ExtractReceiptsFromResolvedSessionDir(location recorder.EvidenceLocation, sessionID string) ([]Receipt, error) {
+	var receipts []Receipt
+	err := recorder.WalkSessionHistoryResolved(location, sessionID, func(e recorder.Entry) error {
+		r, ok, err := receiptFromChainEntry(e)
+		if err != nil {
+			return err
+		}
+		if ok {
+			receipts = append(receipts, r)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("querying session receipts: %w", err)
+	}
+	return receipts, nil
+}
+
+// evidenceReceiptEntryType is the recorder entry type for v2 evidence receipts.
+// Go's receipt-chain extraction is action-receipt based, so evidence_receipt is
+// a KNOWN operational type it skips rather than extracts (it is not a v1
+// receipt); it stays in the taxonomy so a mixed recorder log is not rejected.
+const evidenceReceiptEntryType = "evidence_receipt"
+
+// receiptChainSkippableTypes is the allowlist of KNOWN non-extracted recorder
+// entry types that receipt-chain extraction legitimately skips. It is the
+// complement, within the recorder taxonomy, of the extracted receipt type
+// (action_receipt). Any entry whose Type is outside {action_receipt} ∪ this set
+// is REJECTED (fail-closed) rather than silently skipped, so a file that mixes
+// a valid receipt chain with an unknown record type cannot be reported as a
+// "valid receipt subsequence". The set is the confirmed-complete operational
+// taxonomy: evidence_receipt, checkpoint, transcript_root, decision, capture,
+// capture_drop.
+var receiptChainSkippableTypes = map[string]struct{}{
+	evidenceReceiptEntryType: {},
+	"checkpoint":             {},
+	"transcript_root":        {},
+	"decision":               {},
+	"capture":                {},
+	"capture_drop":           {},
+}
+
+// knownRecorderEntryType reports whether t is inside the recorder taxonomy
+// (the extracted receipt type plus the skippable operational types).
+func knownRecorderEntryType(t string) bool {
+	if t == recorderEntryType {
+		return true
+	}
+	_, ok := receiptChainSkippableTypes[t]
+	return ok
+}
+
+// extractReceiptsFromEntries is the RECEIPT-CHAIN mode of the two-mode
+// extraction contract: it returns the receipt subsequence (action_receipt
+// entries), skips the known operational entry types, and REJECTS any entry
+// whose Type is outside the recorder taxonomy. The result certifies the
+// receipt subsequence, NOT whole-file integrity — for that, use
+// ExtractAndVerifyWholeRecorderBytes, which additionally verifies the recorder
+// hash chain over every entry.
+func extractReceiptsFromEntries(entries []recorder.Entry) ([]Receipt, error) {
+	var receipts []Receipt
+	for _, e := range entries {
+		r, ok, err := receiptFromChainEntry(e)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			receipts = append(receipts, r)
+		}
+	}
+	return receipts, nil
+}
+
+// receiptFromChainEntry is one step of extractReceiptsFromEntries: ok is
+// false for a known operational entry type, and an entry outside the recorder
+// taxonomy is an error.
+func receiptFromChainEntry(e recorder.Entry) (Receipt, bool, error) {
+	if e.Type == recorderEntryType {
+		r, err := receiptFromEntry(e)
+		if err != nil {
+			return Receipt{}, false, fmt.Errorf("receipt at seq %d: %w", e.Sequence, err)
+		}
+		return *r, true, nil
+	}
+	if !knownRecorderEntryType(e.Type) {
+		return Receipt{}, false, fmt.Errorf("%w: %q at seq %d", ErrUnexpectedRecorderEntryType, e.Type, e.Sequence)
+	}
+	return Receipt{}, false, nil
+}
+
+func extractRawReceiptsJSONLFile(path string) ([]Receipt, error) {
+	var receipts []Receipt
+	err := recorder.WalkEvidenceFileReader(filepath.Clean(path), func(input io.ReadSeeker) error {
+		var parseErr error
+		receipts, parseErr = extractRawReceiptsJSONLReader(input)
+		return parseErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reading raw receipts: %w", err)
+	}
+	return receipts, nil
+}
+
+func extractRawReceiptsJSONLReader(input io.Reader) ([]Receipt, error) {
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 0, 64<<10), 10<<20)
+	var receipts []Receipt
+	line := 0
+	for scanner.Scan() {
+		line++
+		raw := []byte(recorder.TrimEntryLine(string(scanner.Bytes())))
+		if len(raw) == 0 {
+			continue
+		}
+		r, err := Unmarshal(raw)
+		if err != nil {
+			if len(receipts) == 0 {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("parse raw receipt line %d: %w", line, err)
+		}
+		if r.Version != ReceiptVersion || r.Signature == "" || r.SignerKey == "" {
+			if len(receipts) == 0 {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("parse raw receipt line %d: missing receipt fields", line)
+		}
+		receipts = append(receipts, r)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan raw receipts: %w", err)
+	}
+	return receipts, nil
+}
+
+// ComputeTranscriptRoot builds a TranscriptRoot from a valid single-key chain.
+// It requires a non-empty trust anchor. For rotated chains, use
+// ComputeTranscriptRootTrusted with every trusted segment key.
+func ComputeTranscriptRoot(sessionID string, receipts []Receipt, expectedKeyHex string) (TranscriptRoot, error) {
+	if expectedKeyHex == "" {
+		return TranscriptRoot{}, fmt.Errorf("trust anchor required: pass expected signer key hex")
+	}
+	return ComputeTranscriptRootTrusted(sessionID, receipts, []string{expectedKeyHex})
+}
+
+// ComputeTranscriptRootTrusted builds a TranscriptRoot from a chain verified
+// against an explicit trusted key set (supports rotation). At least one trusted
+// key is required - transcript roots must be verified against a trust anchor,
+// never trust-on-first-use.
+func ComputeTranscriptRootTrusted(sessionID string, receipts []Receipt, trustedKeys []string) (TranscriptRoot, error) {
+	if len(receipts) == 0 {
+		return TranscriptRoot{}, fmt.Errorf("empty receipt chain")
+	}
+	normalizedKeys, err := normalizeTrustedKeys(trustedKeys)
+	if err != nil {
+		return TranscriptRoot{}, fmt.Errorf("trusted key set: %w", err)
+	}
+	if len(normalizedKeys) == 0 {
+		return TranscriptRoot{}, fmt.Errorf("trust anchor required: pass expected signer key hex")
+	}
+
+	result := VerifyChainTrusted(receipts, normalizedKeys)
+	if !result.Valid {
+		return TranscriptRoot{}, fmt.Errorf("invalid chain: %s", result.Error)
+	}
+
+	return TranscriptRoot{
+		SessionID:    sessionID,
+		FinalSeq:     result.FinalSeq,
+		RootHash:     result.RootHash,
+		ReceiptCount: result.ReceiptCount,
+		StartTime:    result.StartTime,
+		EndTime:      result.EndTime,
+	}, nil
+}

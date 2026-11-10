@@ -1,0 +1,3088 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package filesentry
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
+)
+
+func ptrBool(b bool) *bool { return &b }
+
+const (
+	filesentryPositiveBackstop    = 30 * time.Second
+	filesentryNegativeObservation = time.Second
+)
+
+func TestReadyBackendErrorPrefersQueuedFailure(t *testing.T) {
+	wantErr := errors.New("inotify queue overflow")
+	errorsCh := make(chan error, 1)
+	errorsCh <- wantErr
+
+	if got := readyBackendError(errorsCh); !errors.Is(got, wantErr) {
+		t.Fatalf("readyBackendError() = %v, want %v", got, wantErr)
+	}
+
+	if got := readyBackendError(errorsCh); got != nil {
+		t.Fatalf("readyBackendError() after drain = %v, want nil", got)
+	}
+
+	close(errorsCh)
+	if got := readyBackendError(errorsCh); got != nil {
+		t.Fatalf("readyBackendError() on closed channel = %v, want nil", got)
+	}
+}
+
+func TestStartPrefersQueuedBackendFailureOverCancellation(t *testing.T) {
+	backend, err := fsnotify.NewWatcher()
+	if err != nil {
+		t.Fatalf("fsnotify.NewWatcher: %v", err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+
+	wantErr := errors.New("inotify queue overflow")
+	backend.Errors = make(chan error, 1)
+	backend.Errors <- wantErr
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	watcher := &fsWatcher{watcher: backend}
+	if got := watcher.Start(ctx); !errors.Is(got, wantErr) {
+		t.Fatalf("Start() = %v, want queued backend failure %v", got, wantErr)
+	}
+}
+
+// armAndStart arms the watcher synchronously, then starts the event loop
+// in a goroutine. Returns after watches are installed.
+// Start errors are captured via channel and checked in t.Cleanup to avoid
+// calling t.Errorf from a detached goroutine (race with test completion).
+func armAndStart(t *testing.T, w Watcher, ctx context.Context) {
+	t.Helper()
+	if err := w.Arm(); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- w.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		_ = w.Close()
+		if err := <-startErr; err != nil {
+			t.Errorf("Start: %v", err)
+		}
+	})
+}
+
+func waitForPendingTimer(t *testing.T, w Watcher, path string) {
+	t.Helper()
+	fw, ok := w.(*fsWatcher)
+	if !ok {
+		t.Fatalf("watcher type %T is not *fsWatcher", w)
+	}
+	testwait.For(t, filesentryPositiveBackstop, func() bool {
+		fw.mu.Lock()
+		defer fw.mu.Unlock()
+		_, ok := fw.timers[path]
+		return ok
+	}, "pending file sentry timer for %s", path)
+}
+
+func TestWatcher_DetectsSecretWrite(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	// Use real scanner with default DLP patterns.
+	defaults := config.Defaults()
+	defaults.Internal = nil // no SSRF checks in tests
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a file containing a fake Anthropic API key.
+	// Build at runtime to avoid gosec G101.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "data.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		if f.PatternName == "" {
+			t.Error("expected DLP pattern match, got empty PatternName")
+		}
+		if f.Path != filepath.Join(dir, "data.json") {
+			t.Errorf("expected path %q, got %q", filepath.Join(dir, "data.json"), f.Path)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for finding")
+	}
+}
+
+func TestWatcher_CleanFileNoFinding(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a file with no secrets.
+	if err := os.WriteFile(filepath.Join(dir, "readme.txt"), []byte("hello world"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Wait past the debounce window. No finding should appear.
+	select {
+	case f := <-w.Findings():
+		t.Errorf("expected no finding for clean file, got %+v", f)
+	case <-time.After(filesentryNegativeObservation):
+		// Good - no finding emitted.
+	}
+}
+
+func TestWatcher_IgnoredPatterns(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a "node_modules" subdirectory before starting the watcher.
+	nmDir := filepath.Join(dir, "node_modules")
+	if err := os.MkdirAll(nmDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	cfg := &config.FileSentry{
+		Enabled:        true,
+		WatchPaths:     []config.WatchPath{{Path: dir}},
+		ScanContent:    ptrBool(true),
+		IgnorePatterns: []string{"node_modules/**"},
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a secret inside the ignored directory.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(nmDir, "leaked.txt"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		t.Errorf("expected no finding for ignored path, got %+v", f)
+	case <-time.After(filesentryNegativeObservation):
+		// Good - ignored path was not scanned.
+	}
+}
+
+func TestWatcher_ArmDoesNotScanExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "pre-arm.txt"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	armAndStart(t, w, ctx)
+
+	select {
+	case finding := <-w.Findings():
+		t.Fatalf("Arm scanned pre-child content: %+v", finding)
+	case <-time.After(filesentryNegativeObservation):
+	}
+}
+
+func TestWatcher_SubdirCreationReconcilesExistingFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:        true,
+		WatchPaths:     []config.WatchPath{{Path: dir}},
+		ScanContent:    ptrBool(true),
+		IgnorePatterns: []string{"ignored-secret.txt"},
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	// Arm installs only directory watches; it does not scan pre-existing
+	// content. Keep Start paused while the child directory and its first files
+	// appear, so the Create event must reconcile the missed first write.
+	if err := w.Arm(); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	subDir := filepath.Join(dir, "newdir")
+	if err := os.MkdirAll(subDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(subDir, "ignored-secret.txt"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile ignored: %v", err)
+	}
+	secretPath := filepath.Join(subDir, "first-secret.txt")
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startErr := make(chan error, 1)
+	go func() {
+		startErr <- w.Start(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		_ = w.Close()
+		if err := <-startErr; err != nil {
+			t.Errorf("Start: %v", err)
+		}
+	})
+
+	select {
+	case finding := <-w.Findings():
+		if finding.PatternName == "" {
+			t.Error("expected DLP pattern match in new subdirectory")
+		}
+		if finding.Path != secretPath {
+			t.Errorf("new-directory reconcile scanned %q, want non-ignored %q", finding.Path, secretPath)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for Create-event reconciliation Finding")
+	}
+}
+
+func TestWatcher_ReconcileNewDirectoryCoverage(t *testing.T) {
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+
+	newArmedWatcher := func(t *testing.T, dir string, ignore []string, onErr func(error)) *fsWatcher {
+		t.Helper()
+		cfg := &config.FileSentry{
+			Enabled:        true,
+			WatchPaths:     []config.WatchPath{{Path: dir}},
+			ScanContent:    ptrBool(true),
+			IgnorePatterns: ignore,
+		}
+		defaults := config.Defaults()
+		defaults.Internal = nil
+		defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+		sc := scanner.MustNew(defaults)
+		t.Cleanup(sc.Close)
+		w, err := NewWatcher(cfg, sc, nil, onErr)
+		if err != nil {
+			t.Fatalf("NewWatcher: %v", err)
+		}
+		t.Cleanup(func() { _ = w.Close() })
+		if err := w.Arm(); err != nil {
+			t.Fatalf("Arm: %v", err)
+		}
+		fw, ok := w.(*fsWatcher)
+		if !ok {
+			t.Fatalf("NewWatcher returned %T, want *fsWatcher", w)
+		}
+		return fw
+	}
+
+	t.Run("missing root", func(t *testing.T) {
+		dir := t.TempDir()
+		fw := newArmedWatcher(t, dir, nil, nil)
+		err := fw.reconcileNewDirectory(context.Background(), filepath.Join(dir, "missing"))
+		if err == nil {
+			t.Fatal("expected reconcile error for missing root")
+		}
+	})
+
+	t.Run("unreadable child", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 000 does not restrict root")
+		}
+		dir := t.TempDir()
+		fw := newArmedWatcher(t, dir, nil, nil)
+		child := filepath.Join(dir, "denied")
+		if err := os.MkdirAll(child, 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.Chmod(child, 0o000); err != nil {
+			t.Skipf("chmod not supported: %v", err)
+		}
+		err := fw.reconcileNewDirectory(context.Background(), dir)
+		_ = os.Chmod(child, 0o600)
+		if err == nil {
+			t.Fatal("expected reconcile error for unreadable child")
+		}
+	})
+
+	t.Run("handleEvent logs reconcile failure", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("chmod 000 does not restrict root")
+		}
+		dir := t.TempDir()
+		var errMu sync.Mutex
+		var logged []error
+		fw := newArmedWatcher(t, dir, nil, func(err error) {
+			errMu.Lock()
+			logged = append(logged, err)
+			errMu.Unlock()
+		})
+		newDir := filepath.Join(dir, "newdir")
+		if err := os.MkdirAll(newDir, 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.Chmod(newDir, 0o000); err != nil {
+			t.Skipf("chmod not supported: %v", err)
+		}
+		fw.handleEvent(context.Background(), fsnotify.Event{Name: newDir, Op: fsnotify.Create})
+		if err := fw.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		_ = os.Chmod(newDir, 0o600)
+		errMu.Lock()
+		defer errMu.Unlock()
+		for _, err := range logged {
+			if strings.Contains(err.Error(), "failed to reconcile new directory") {
+				return
+			}
+		}
+		t.Fatalf("logged errors = %v, want reconcile failure", logged)
+	})
+
+	t.Run("skips symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		outside := t.TempDir()
+		target := filepath.Join(outside, "secret.txt")
+		if err := os.WriteFile(target, []byte(secret), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		link := filepath.Join(dir, "alias.txt")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("Symlink: %v", err)
+		}
+		fw := newArmedWatcher(t, dir, nil, nil)
+		if err := fw.reconcileNewDirectory(context.Background(), dir); err != nil {
+			t.Fatalf("reconcileNewDirectory: %v", err)
+		}
+		select {
+		case finding := <-fw.Findings():
+			t.Fatalf("followed symlink and scanned %q", finding.Path)
+		case <-time.After(filesentryNegativeObservation):
+		}
+	})
+
+	t.Run("skips ignored directory", func(t *testing.T) {
+		dir := t.TempDir()
+		hidden := filepath.Join(dir, "hidden")
+		if err := os.MkdirAll(hidden, 0o750); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(hidden, "secret.txt"), []byte(secret), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		fw := newArmedWatcher(t, dir, []string{"hidden"}, nil)
+		if err := fw.reconcileNewDirectory(context.Background(), dir); err != nil {
+			t.Fatalf("reconcileNewDirectory: %v", err)
+		}
+		select {
+		case finding := <-fw.Findings():
+			t.Fatalf("scanned ignored directory file %q", finding.Path)
+		case <-time.After(filesentryNegativeObservation):
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte(secret), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		fw := newArmedWatcher(t, dir, nil, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err := fw.reconcileNewDirectory(ctx, dir)
+		if err == nil {
+			t.Fatal("expected reconcile error for cancelled context")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("reconcile error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("closed watcher", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "secret.txt"), []byte(secret), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		fw := newArmedWatcher(t, dir, nil, nil)
+		if err := fw.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := fw.reconcileNewDirectory(context.Background(), dir); err != nil {
+			t.Fatalf("reconcileNewDirectory after Close: %v", err)
+		}
+	})
+}
+
+func TestWatcher_ScanContentDisabled(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(false),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a secret - should NOT be scanned because scan_content is false.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "data.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		t.Errorf("expected no finding with scan_content=false, got %+v", f)
+	case <-time.After(filesentryNegativeObservation):
+		// Good.
+	}
+}
+
+func TestWatcher_CloseIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Errorf("first Close: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+}
+
+func TestWatcher_OversizedFileSkipped(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a file larger than maxFileSize (10MB). Use a sparse approach:
+	// write a small secret then pad with zeros to exceed the limit.
+	hugePath := filepath.Join(dir, "huge.bin")
+	f, err := os.OpenFile(filepath.Clean(hugePath), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	_, _ = f.WriteString(secret)
+	// Seek past 10MB to make the file large without writing all bytes.
+	if _, err := f.Seek(11*1024*1024, 0); err != nil {
+		t.Fatalf("Seek: %v", err)
+	}
+	_, _ = f.Write([]byte{0})
+	_ = f.Close()
+
+	select {
+	case finding := <-w.Findings():
+		t.Errorf("expected no finding for oversized file, got %+v", finding)
+	case <-time.After(filesentryNegativeObservation):
+		// Good - oversized file was skipped.
+	}
+}
+
+// TestWatcher_OversizedSkipIsVisibleAndCapConfigurable proves two things the
+// silent `return` behavior lacked: (1) an oversized file left unscanned surfaces
+// through the onError callback instead of vanishing, and (2) file_sentry
+// max_file_bytes overrides the default cap so an operator can tune it. A file
+// over the configured 64-byte cap must skip-with-notice; a file under it scans.
+func TestWatcher_OversizedSkipIsVisibleAndCapConfigurable(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:      true,
+		WatchPaths:   []config.WatchPath{{Path: dir}},
+		ScanContent:  ptrBool(true),
+		MaxFileBytes: 64,
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	var skipErr atomic.Pointer[string]
+	w, err := NewWatcher(cfg, sc, nil, func(e error) {
+		s := e.Error()
+		skipErr.Store(&s)
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	// Direct scanFile call keeps the assertion deterministic (no debounce race).
+	fsw := w.(*fsWatcher)
+
+	// Over the 64-byte cap: skipped, but the skip is reported via onError.
+	bigPath := filepath.Join(dir, "big.txt")
+	if err := os.WriteFile(bigPath, []byte(strings.Repeat("a", 200)), 0o600); err != nil {
+		t.Fatalf("WriteFile big: %v", err)
+	}
+	fsw.scanFile(context.Background(), bigPath, false)
+	got := skipErr.Load()
+	if got == nil {
+		t.Fatal("expected onError skip notification for oversized file, got none")
+	}
+	if !strings.Contains(*got, "oversized") {
+		t.Errorf("skip error should mention oversize, got: %s", *got)
+	}
+
+	// Under the cap: a secret is still detected, proving the configured cap
+	// (not the 10 MiB default) is what gates scanning.
+	skipErr.Store(nil)
+	smallPath := filepath.Join(dir, "small.txt")
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(smallPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile small: %v", err)
+	}
+	fsw.scanFile(context.Background(), smallPath, false)
+	select {
+	case f := <-w.Findings():
+		if f.Path != smallPath {
+			t.Errorf("expected finding for %q, got %q", smallPath, f.Path)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("expected finding for under-cap file with secret, got none")
+	}
+}
+
+func TestWatcher_OpenFailureIsVisible(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:      true,
+		WatchPaths:   []config.WatchPath{{Path: dir}},
+		ScanContent:  ptrBool(true),
+		MaxFileBytes: 64,
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	var openErr atomic.Pointer[string]
+	w, err := NewWatcher(cfg, sc, nil, func(e error) {
+		s := e.Error()
+		openErr.Store(&s)
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	missingPath := filepath.Join(dir, "missing.txt")
+	w.(*fsWatcher).scanFile(context.Background(), missingPath, false)
+
+	got := openErr.Load()
+	if got == nil {
+		t.Fatal("expected onError notification for open failure, got none")
+	}
+	if !strings.Contains(*got, "open failed") || !strings.Contains(*got, "left unscanned") {
+		t.Errorf("open error should mention open failure and unscanned file, got: %s", *got)
+	}
+}
+
+func TestWatcher_FlushScanReportsSkippedFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:      true,
+		WatchPaths:   []config.WatchPath{{Path: dir}},
+		ScanContent:  ptrBool(true),
+		MaxFileBytes: 64,
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	var errs []string
+	w, err := NewWatcher(cfg, sc, nil, func(e error) {
+		errs = append(errs, e.Error())
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	fsw := w.(*fsWatcher)
+
+	fsw.flushScan(filepath.Join(dir, "missing.txt"), false)
+	if len(errs) != 1 || !strings.Contains(errs[0], "open failed") {
+		t.Fatalf("expected open failure from flush scan, got %v", errs)
+	}
+
+	errs = nil
+	emptyPath := filepath.Join(dir, "empty.txt")
+	if err := os.WriteFile(emptyPath, nil, 0o600); err != nil {
+		t.Fatalf("WriteFile empty: %v", err)
+	}
+	fsw.flushScan(emptyPath, false)
+	if len(errs) != 0 {
+		t.Fatalf("expected empty file to skip without error, got %v", errs)
+	}
+
+	bigPath := filepath.Join(dir, "big.txt")
+	if err := os.WriteFile(bigPath, []byte(strings.Repeat("a", 128)), 0o600); err != nil {
+		t.Fatalf("WriteFile big: %v", err)
+	}
+	fsw.flushScan(bigPath, false)
+	if len(errs) != 1 || !strings.Contains(errs[0], "oversized") {
+		t.Fatalf("expected oversized error from flush scan, got %v", errs)
+	}
+
+	errs = nil
+	cleanPath := filepath.Join(dir, "clean.txt")
+	if err := os.WriteFile(cleanPath, []byte("plain project notes"), 0o600); err != nil {
+		t.Fatalf("WriteFile clean: %v", err)
+	}
+	fsw.flushScan(cleanPath, false)
+	if len(errs) != 0 {
+		t.Fatalf("expected clean file to scan without error, got %v", errs)
+	}
+	select {
+	case f := <-w.Findings():
+		t.Fatalf("expected no finding for clean flush scan, got %+v", f)
+	default:
+	}
+
+	secretPath := filepath.Join(dir, "secret.txt")
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	fsw.flushScan(secretPath, true)
+	select {
+	case f := <-w.Findings():
+		if f.Path != secretPath || !f.IsAgent {
+			t.Fatalf("flush finding = %+v, want path %q with IsAgent", f, secretPath)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("expected finding from flush scan")
+	}
+}
+
+func TestWatcher_ScanFileUsesOverflowLaneWhenFindingChannelFull(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	fsw := w.(*fsWatcher)
+
+	for i := 0; i < cap(fsw.findings); i++ {
+		fsw.findings <- Finding{Path: fmt.Sprintf("preload-%d", i)}
+	}
+
+	secretPath := filepath.Join(dir, "secret.txt")
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	fsw.scanFile(context.Background(), secretPath, false)
+	if got := len(fsw.findings); got != cap(fsw.findings) {
+		t.Fatalf("findings len = %d, want channel to remain full at %d", got, cap(fsw.findings))
+	}
+	select {
+	case finding := <-fsw.overflow:
+		if finding.Path != secretPath {
+			t.Fatalf("overflow path = %q, want %q", finding.Path, secretPath)
+		}
+	default:
+		t.Fatal("saturated finding was not preserved in the overflow lane")
+	}
+}
+
+func TestWatcher_FlushUsesOverflowLaneWhenFindingChannelFull(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	fsw := w.(*fsWatcher)
+
+	for i := 0; i < cap(fsw.findings); i++ {
+		fsw.findings <- Finding{Path: fmt.Sprintf("preload-%d", i)}
+	}
+
+	secretPath := filepath.Join(dir, "shutdown-secret.txt")
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	fsw.flushScan(secretPath, true)
+
+	select {
+	case finding := <-fsw.overflow:
+		if !finding.IsAgent || finding.Path != secretPath {
+			t.Fatalf("overflow finding = %+v, want agent flush for %q", finding, secretPath)
+		}
+	default:
+		t.Fatal("saturated shutdown finding was not preserved in overflow lane")
+	}
+}
+
+func TestWatcher_AgentOverflowReplacesNonAgentSample(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	var errorsMu sync.Mutex
+	var errorsSeen []string
+	w, err := NewWatcher(cfg, sc, nil, func(err error) {
+		errorsMu.Lock()
+		defer errorsMu.Unlock()
+		errorsSeen = append(errorsSeen, err.Error())
+	})
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	fsw := w.(*fsWatcher)
+
+	for i := 0; i < cap(fsw.findings); i++ {
+		fsw.findings <- Finding{Path: fmt.Sprintf("preload-%d", i)}
+	}
+	fsw.overflow <- Finding{Path: "non-agent-overflow", IsAgent: false}
+
+	secretPath := filepath.Join(dir, "agent-secret.txt")
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(secretPath, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile secret: %v", err)
+	}
+	fsw.scanFile(context.Background(), secretPath, true)
+
+	select {
+	case finding := <-fsw.overflow:
+		if !finding.IsAgent || finding.Path != secretPath {
+			t.Fatalf("overflow finding = %+v, want agent finding for %q", finding, secretPath)
+		}
+	default:
+		t.Fatal("agent finding did not replace non-agent overflow sample")
+	}
+	errorsMu.Lock()
+	defer errorsMu.Unlock()
+	if len(errorsSeen) != 1 || !strings.Contains(errorsSeen[0], "replaced by agent-attributed overflow") {
+		t.Fatalf("displaced finding was not reported: %v", errorsSeen)
+	}
+}
+
+func TestWatcher_OverflowCoalescingPreservesPendingPriority(t *testing.T) {
+	tests := []struct {
+		name       string
+		pending    Finding
+		incoming   Finding
+		wantReason string
+	}{
+		{
+			name:       "non-agent does not replace occupied lane",
+			pending:    Finding{Path: "pending-agent", IsAgent: true},
+			incoming:   Finding{Path: "incoming-non-agent", IsAgent: false},
+			wantReason: "priority lane already occupied",
+		},
+		{
+			name:       "second agent does not replace pending agent",
+			pending:    Finding{Path: "pending-agent", IsAgent: true},
+			incoming:   Finding{Path: "incoming-agent", IsAgent: true},
+			wantReason: "agent overflow already pending",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &fsWatcher{overflow: make(chan Finding, 1)}
+			w.overflow <- tt.pending
+
+			err := w.enqueueOverflow(tt.incoming)
+			if err == nil || !strings.Contains(err.Error(), tt.wantReason) {
+				t.Fatalf("enqueueOverflow error = %v, want %q", err, tt.wantReason)
+			}
+			select {
+			case got := <-w.overflow:
+				if got != tt.pending {
+					t.Fatalf("pending finding = %+v, want %+v", got, tt.pending)
+				}
+			default:
+				t.Fatal("pending priority finding was lost")
+			}
+		})
+	}
+}
+
+func TestWatcher_TryOverflowSendDoesNotBlockOnFullLane(t *testing.T) {
+	w := &fsWatcher{overflow: make(chan Finding, 1)}
+	pending := Finding{Path: "pending-agent", IsAgent: true}
+	w.overflow <- pending
+
+	if w.tryOverflowSend(Finding{Path: "incoming-agent", IsAgent: true}) {
+		t.Fatal("send to a full overflow lane unexpectedly succeeded")
+	}
+	if got := <-w.overflow; got != pending {
+		t.Fatalf("pending finding = %+v, want %+v", got, pending)
+	}
+}
+
+func TestWatcher_TryOverflowSendError(t *testing.T) {
+	t.Run("available_lane", func(t *testing.T) {
+		w := &fsWatcher{overflow: make(chan Finding, 1)}
+		incoming := Finding{Path: "incoming-agent", IsAgent: true}
+		if err := w.tryOverflowSendError(incoming, "lane refilled"); err != nil {
+			t.Fatalf("tryOverflowSendError: %v", err)
+		}
+		if got := <-w.overflow; got != incoming {
+			t.Fatalf("overflow finding = %+v, want %+v", got, incoming)
+		}
+	})
+
+	t.Run("full_lane", func(t *testing.T) {
+		w := &fsWatcher{overflow: make(chan Finding, 1)}
+		pending := Finding{Path: "pending-agent", IsAgent: true}
+		w.overflow <- pending
+		err := w.tryOverflowSendError(Finding{Path: "incoming-agent", IsAgent: true}, "lane refilled")
+		if err == nil || !strings.Contains(err.Error(), "lane refilled") {
+			t.Fatalf("tryOverflowSendError error = %v, want lane refilled", err)
+		}
+		if got := <-w.overflow; got != pending {
+			t.Fatalf("pending finding = %+v, want %+v", got, pending)
+		}
+	})
+}
+
+func TestWatcher_ClosedGuardsRejectNewWork(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(path, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		lineage Lineage
+	}{
+		{name: "before_lineage_snapshot", lineage: &mockLineage{hasFileOpen: true}},
+		{name: "before_timer_registration"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &fsWatcher{
+				cfg:     &config.FileSentry{},
+				lineage: tt.lineage,
+				timers:  make(map[string]*time.Timer),
+				pidSnap: make(map[string]bool),
+				closed:  true,
+			}
+			w.handleEvent(context.Background(), fsnotify.Event{Name: path, Op: fsnotify.Write})
+			if len(w.timers) != 0 || len(w.pidSnap) != 0 {
+				t.Fatalf("closed watcher accepted work: timers=%d pid snapshots=%d", len(w.timers), len(w.pidSnap))
+			}
+		})
+	}
+
+	t.Run("timer_callback", func(t *testing.T) {
+		sc := &countingDLPScanner{}
+		w := &fsWatcher{
+			cfg:       &config.FileSentry{ScanContent: ptrBool(true)},
+			scanner:   sc,
+			findings:  make(chan Finding, 1),
+			overflow:  make(chan Finding, 1),
+			timers:    make(map[string]*time.Timer),
+			pidSnap:   make(map[string]bool),
+			afterFunc: time.AfterFunc,
+		}
+		w.handleEvent(context.Background(), fsnotify.Event{Name: path, Op: fsnotify.Write})
+		w.mu.Lock()
+		w.closed = true
+		timer := w.timers[path]
+		w.mu.Unlock()
+		if timer == nil {
+			t.Fatal("debounce timer was not registered")
+		}
+
+		deadline := time.Now().Add(5 * debounceDelay)
+		testwait.For(
+			t,
+			filesentryPositiveBackstop,
+			func() bool { return time.Now().After(deadline) },
+			"debounce timer to fire after watcher closure",
+		)
+		if timer.Stop() {
+			t.Fatal("debounce timer had not fired")
+		}
+		if got := sc.calls.Load(); got != 0 {
+			t.Fatalf("closed timer callback ran %d scans", got)
+		}
+	})
+
+	t.Run("direct_scan", func(t *testing.T) {
+		sc := &countingDLPScanner{}
+		w := &fsWatcher{
+			cfg:      &config.FileSentry{ScanContent: ptrBool(true)},
+			scanner:  sc,
+			findings: make(chan Finding, 1),
+			overflow: make(chan Finding, 1),
+			closed:   true,
+		}
+		w.scanFile(context.Background(), path, true)
+		if got := sc.calls.Load(); got != 1 {
+			t.Fatalf("DLP scans = %d, want one scan stopped at delivery", got)
+		}
+		if got := len(w.findings) + len(w.overflow); got != 0 {
+			t.Fatalf("closed watcher delivered %d findings", got)
+		}
+	})
+}
+
+func TestWatcher_EmptyFileSkipped(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write an empty file.
+	if err := os.WriteFile(filepath.Join(dir, "empty.txt"), []byte{}, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case finding := <-w.Findings():
+		t.Errorf("expected no finding for empty file, got %+v", finding)
+	case <-time.After(filesentryNegativeObservation):
+		// Good.
+	}
+}
+
+func TestWatcher_WithLineageAttribution(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	// Use a mock lineage that always reports the file as open by an agent process.
+	lin := &mockLineage{hasFileOpen: true}
+
+	w, err := NewWatcher(cfg, sc, lin, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "agent-leak.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		if !f.IsAgent {
+			t.Error("expected IsAgent=true when lineage reports file is open")
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for finding")
+	}
+}
+
+// mockLineage is a test double for the Lineage interface.
+type mockLineage struct {
+	hasFileOpen bool
+}
+
+func (m *mockLineage) EnableSubreaper() error    { return nil }
+func (m *mockLineage) TrackPID(_ int)            {}
+func (m *mockLineage) IsDescendant(_ int) bool   { return false }
+func (m *mockLineage) HasFileOpen(_ string) bool { return m.hasFileOpen }
+
+type countingDLPScanner struct {
+	calls atomic.Int32
+}
+
+func (s *countingDLPScanner) ScanTextForDLP(context.Context, string) scanner.TextDLPResult {
+	s.calls.Add(1)
+	return scanner.TextDLPResult{
+		Matches: []scanner.TextDLPMatch{{
+			PatternName: "test secret",
+			Severity:    "critical",
+		}},
+	}
+}
+
+type blockingDLPScanner struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingDLPScanner) ScanTextForDLP(context.Context, string) scanner.TextDLPResult {
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return scanner.TextDLPResult{
+		Matches: []scanner.TextDLPMatch{{
+			PatternName: "shutdown secret",
+			Severity:    "critical",
+		}},
+	}
+}
+
+func TestWatcher_CloseWaitsForInFlightDebounceScan(t *testing.T) {
+	dir := t.TempDir()
+	secretPath := filepath.Join(dir, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("secret"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	sc := &blockingDLPScanner{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	w, err := NewWatcher(&config.FileSentry{ScanContent: ptrBool(true)}, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	fsw := w.(*fsWatcher)
+	fsw.handleEvent(context.Background(), fsnotify.Event{Name: secretPath, Op: fsnotify.Write})
+
+	select {
+	case <-sc.entered:
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("debounce scan did not start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- w.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before in-flight scan completed: %v", err)
+	case <-time.After(filesentryNegativeObservation / 10):
+	}
+
+	close(sc.release)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("Close did not finish after scan release")
+	}
+
+	finding, ok := <-w.Findings()
+	if !ok || finding.Path != secretPath {
+		t.Fatalf("in-flight finding = %+v, open=%t, want path %q", finding, ok, secretPath)
+	}
+}
+
+func TestWatcher_DebounceTimerRace(t *testing.T) {
+	// Smoke test over real fsnotify: a write burst still produces a finding
+	// for the written path. The identity check is covered by
+	// TestWatcher_StaleDebounceCallbackDoesNotDropLiveScan.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	sc := &countingDLPScanner{}
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write the same file rapidly and assert what survives scheduling: the
+	// burst produces a finding, and it describes the file that was written.
+	//
+	// This test asserts NO scan count, and that is deliberate. Three count
+	// shapes were tried and each was unsound:
+	//
+	//   "exactly 1" asserted a property of the OS scheduler. The timer is armed
+	//   in handleEvent, so window boundaries are set by when fsnotify delivers
+	//   events, not by when the writer wrote. A burst completed in microseconds
+	//   can still span two windows, which is what reddened CI.
+	//
+	//   A bound derived from the writer's elapsed time reads a different clock
+	//   than the one arming the timers, so it is wrong in both directions.
+	//
+	//   "fewer scans than writes" is vacuous: fsnotify already coalesces the
+	//   writes into fewer events, so disabling the debouncer entirely still
+	//   produced 6 scans for 10 writes and the assertion stayed green.
+	//
+	// The count assertions this test's name implies need control over the
+	// debounce clock, and two tests own that clock through the afterFunc seam:
+	// TestWatcher_BurstCoalescesToOneScan asserts a burst collapses to exactly
+	// one scan, and TestWatcher_StaleDebounceCallbackDoesNotDropLiveScan
+	// asserts the identity check keeps the live scan. This one stays a smoke
+	// check over real fsnotify: it cannot lie about a scan happening, and it
+	// cannot police either count. Removing the identity comparison still leaves
+	// this test green because the missed scan is a lower count.
+	const writes = 10
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	filePath := filepath.Join(dir, "rapid.json")
+	for i := range writes {
+		content := fmt.Sprintf("%s-%d", secret, i)
+		if err := os.WriteFile(filePath, []byte(content), 0o600); err != nil {
+			t.Fatalf("WriteFile[%d]: %v", i, err)
+		}
+	}
+
+	select {
+	case f := <-w.Findings():
+		if f.PatternName == "" {
+			t.Error("expected DLP match")
+		}
+		if f.Path != filePath {
+			t.Errorf("finding path = %q, want %q", f.Path, filePath)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for debounced finding")
+	}
+
+	if got := sc.calls.Load(); got < 1 {
+		t.Fatalf("ScanTextForDLP calls = %d, want the debounced scan to have run", got)
+	}
+}
+
+// A stale debounce callback that lost the replacement race must not delete
+// the live timer's map entry. Without that identity check the live callback
+// finds no timer and skips the scan of the quiet-period content.
+func TestWatcher_StaleDebounceCallbackDoesNotDropLiveScan(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secret.txt")
+	const firstContent = "first-write-body"
+	const finalContent = "final-write-body"
+	if err := os.WriteFile(path, []byte(firstContent), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	sc := &capturingDLPScanner{}
+	clock := &manualAfterFunc{}
+	w, err := NewWatcher(&config.FileSentry{ScanContent: ptrBool(true)}, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		clock.stopAll()
+		_ = w.Close()
+	})
+	fw := w.(*fsWatcher)
+	fw.afterFunc = clock.afterFunc
+
+	fw.handleEvent(context.Background(), fsnotify.Event{Name: path, Op: fsnotify.Write})
+	if err := os.WriteFile(path, []byte(finalContent), 0o600); err != nil {
+		t.Fatalf("WriteFile final: %v", err)
+	}
+	fw.handleEvent(context.Background(), fsnotify.Event{Name: path, Op: fsnotify.Write})
+
+	stale, live := clock.callbacks()
+	if stale == nil || live == nil {
+		t.Fatalf("armed callbacks = %d, want 2", clock.len())
+	}
+	if clock.timerAt(0) == clock.timerAt(1) {
+		t.Fatal("replacement reused the first timer pointer")
+	}
+
+	fw.mu.Lock()
+	current := fw.timers[path]
+	fw.mu.Unlock()
+	if current != clock.timerAt(1) {
+		t.Fatal("live timer is not the map entry for the path")
+	}
+
+	stale()
+	if got := sc.scanned(); len(got) != 0 {
+		t.Fatalf("stale callback scanned %#v, want no scan", got)
+	}
+	fw.mu.Lock()
+	current = fw.timers[path]
+	fw.mu.Unlock()
+	if current != clock.timerAt(1) {
+		t.Fatal("stale callback deleted the live timer map entry")
+	}
+
+	live()
+	got := sc.scanned()
+	if len(got) != 1 || got[0] != finalContent {
+		t.Fatalf("live scan = %#v, want one scan of %q", got, finalContent)
+	}
+}
+
+// capturingDLPScanner records the text of every scan, so a test can assert
+// WHICH content was scanned rather than only how many scans ran. The debounce
+// tests turn on that distinction: a stale callback and a live one differ by the
+// file body they see, not by their count.
+type capturingDLPScanner struct {
+	countingDLPScanner
+	mu    sync.Mutex
+	texts []string
+}
+
+// ScanTextForDLP records the scanned text before delegating to the embedded
+// counting scanner, so call count and content stay consistent with each other.
+func (s *capturingDLPScanner) ScanTextForDLP(ctx context.Context, text string) scanner.TextDLPResult {
+	s.mu.Lock()
+	s.texts = append(s.texts, text)
+	s.mu.Unlock()
+	return s.countingDLPScanner.ScanTextForDLP(ctx, text)
+}
+
+// scanned returns a copy of the recorded texts. A copy rather than the slice
+// itself, because the watcher may still be scanning on another goroutine.
+func (s *capturingDLPScanner) scanned() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, len(s.texts))
+	copy(out, s.texts)
+	return out
+}
+
+// manualAfterFunc returns real *time.Timer values that never fire on their
+// own so tests can invoke captured callbacks in a chosen order. Production
+// Stop() and pointer identity keep their exact semantics.
+type manualAfterFunc struct {
+	mu     sync.Mutex
+	fns    []func()
+	timers []*time.Timer
+}
+
+// afterFunc stands in for time.AfterFunc. It returns a REAL timer so the
+// production pointer-identity comparison and Stop() keep their exact meaning,
+// and records the callback so the test decides when each window fires.
+func (m *manualAfterFunc) afterFunc(_ time.Duration, cb func()) *time.Timer {
+	// Hour is longer than any test deadline; the test fires cb itself.
+	timer := time.NewTimer(time.Hour)
+	m.mu.Lock()
+	m.fns = append(m.fns, cb)
+	m.timers = append(m.timers, timer)
+	m.mu.Unlock()
+	return timer
+}
+
+// callbacks returns the first two armed callbacks, the stale one and the live
+// one, for the two-event replacement race.
+func (m *manualAfterFunc) callbacks() (stale, live func()) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.fns) < 2 {
+		return nil, nil
+	}
+	return m.fns[0], m.fns[1]
+}
+
+// A rapid burst must collapse to ONE scan, and this asserts the count without
+// touching the wall clock. The real-fsnotify test above deliberately asserts no
+// count: it observes whatever windows the scheduler happened to produce, so any
+// number it checks is a claim about scheduling rather than about the debouncer.
+// Driving handleEvent through the afterFunc seam fixes the window boundaries,
+// which is what makes a count meaningful here.
+//
+// This is the coalescing guarantee the debouncer actually owns: every event but
+// the last loses the replacement race and its callback must do nothing.
+func TestWatcher_BurstCoalescesToOneScan(t *testing.T) {
+	const writes = 10
+	const finalContent = "final-burst-body"
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "burst.txt")
+	if err := os.WriteFile(path, []byte("seed-body"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	sc := &capturingDLPScanner{}
+	clock := &manualAfterFunc{}
+	w, err := NewWatcher(&config.FileSentry{ScanContent: ptrBool(true)}, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	t.Cleanup(func() {
+		clock.stopAll()
+		_ = w.Close()
+	})
+	fw := w.(*fsWatcher)
+	fw.afterFunc = clock.afterFunc
+
+	for range writes {
+		fw.handleEvent(context.Background(), fsnotify.Event{Name: path, Op: fsnotify.Write})
+	}
+	if err := os.WriteFile(path, []byte(finalContent), 0o600); err != nil {
+		t.Fatalf("WriteFile final: %v", err)
+	}
+
+	if got := clock.len(); got != writes {
+		t.Fatalf("armed timers = %d, want %d", got, writes)
+	}
+	fw.mu.Lock()
+	current := fw.timers[path]
+	fw.mu.Unlock()
+	if current != clock.timerAt(writes-1) {
+		t.Fatal("map entry is not the last armed timer")
+	}
+
+	// Fire every window in the order it was armed. The first nine lost the race.
+	for i := range writes {
+		cb := clock.fnAt(i)
+		if cb == nil {
+			t.Fatalf("callback %d missing", i)
+		}
+		cb()
+	}
+
+	got := sc.scanned()
+	if len(got) != 1 || got[0] != finalContent {
+		t.Fatalf("scans = %#v, want exactly one scan of %q", got, finalContent)
+	}
+}
+
+// fnAt returns the callback armed by the i-th event, so a burst test can fire
+// every window in the order the watcher armed them.
+func (m *manualAfterFunc) fnAt(i int) func() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.fns) {
+		return nil
+	}
+	return m.fns[i]
+}
+
+// timerAt returns the timer handed back for the i-th event, which is what the
+// watcher stores in its map and compares against.
+func (m *manualAfterFunc) timerAt(i int) *time.Timer {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.timers) {
+		return nil
+	}
+	return m.timers[i]
+}
+
+// len reports how many debounce windows the watcher armed.
+func (m *manualAfterFunc) len() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.fns)
+}
+
+// stopAll releases every timer the fake handed out. The timers are real, so
+// leaving them armed would keep the runtime holding them for the full hour.
+func (m *manualAfterFunc) stopAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, timer := range m.timers {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+}
+
+func TestWatcher_ErrorHandlerInvoked(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	var errorCount atomic.Int32
+	onErr := func(_ error) { errorCount.Add(1) }
+	w, err := NewWatcher(cfg, sc, nil, onErr)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	// logError should invoke the handler.
+	fsw := w.(*fsWatcher)
+	fsw.logError(fmt.Errorf("test error"))
+	if errorCount.Load() != 1 {
+		t.Errorf("expected 1 error callback, got %d", errorCount.Load())
+	}
+}
+
+func TestWatcher_NilErrorHandler(t *testing.T) {
+	// logError with no handler should not panic.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fsw := w.(*fsWatcher)
+	fsw.logError(fmt.Errorf("no handler set")) // should not panic
+}
+
+func TestWatcher_PIDSnapshotAtEventTime(t *testing.T) {
+	// Verify that IsAgent is determined at event time, not scan time.
+	// The mock returns true initially, so the snapshot should capture it.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	lin := &mockLineage{hasFileOpen: true}
+
+	w, err := NewWatcher(cfg, sc, lin, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "pid-test.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		if !f.IsAgent {
+			t.Error("expected IsAgent=true from event-time snapshot")
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for finding")
+	}
+}
+
+func TestWatcher_NilLineageNoSnapshot(t *testing.T) {
+	// When lineage is nil, IsAgent should always be false (no crash).
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "no-lineage.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		if f.IsAgent {
+			t.Error("expected IsAgent=false when lineage is nil")
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for finding")
+	}
+}
+
+func TestWatcher_ScanContentNilDefaultsTrue(t *testing.T) {
+	// When ScanContent is nil (omitted from config), it should default to
+	// scanning content (same behavior as explicit true).
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: nil, // omitted
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(dir, "nil-scan.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		if f.PatternName == "" {
+			t.Error("expected finding when ScanContent is nil (defaults to true)")
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout — nil ScanContent should behave like true")
+	}
+}
+
+func TestFirstSegment(t *testing.T) {
+	tests := []struct {
+		pattern string
+		want    string
+	}{
+		{"node_modules/**", "node_modules"},
+		{".git/**", ".git"},
+		{"*.o", ""},
+		{"foo/bar/baz", "foo"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern, func(t *testing.T) {
+			if got := firstSegment(tt.pattern); got != tt.want {
+				t.Errorf("firstSegment(%q) = %q, want %q", tt.pattern, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWatcher_CloseFlushesLastWrite(t *testing.T) {
+	// Write a secret, then Close immediately (before debounce fires).
+	// Close should flush the pending scan and deliver the finding.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	armAndStart(t, w, ctx)
+
+	// Write a secret - this starts a debounce timer.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	lastWritePath := filepath.Join(dir, "last-write.json")
+	if writeErr := os.WriteFile(lastWritePath, []byte(secret), 0o600); writeErr != nil {
+		t.Fatalf("WriteFile: %v", writeErr)
+	}
+
+	waitForPendingTimer(t, w, lastWritePath)
+
+	// Close should flush the pending scan synchronously.
+	cancel()
+	_ = w.Close()
+
+	// The finding should be in the channel from the flush.
+	select {
+	case f := <-w.Findings():
+		if f.PatternName == "" {
+			t.Error("expected DLP match from flushed scan")
+		}
+	default:
+		t.Error("expected finding from Close flush, got none")
+	}
+}
+
+func TestWatcher_CloseFlushScanDisabled(t *testing.T) {
+	// When scan_content is false, Close flush should not scan.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(false),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	armAndStart(t, w, ctx)
+
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	noScanPath := filepath.Join(dir, "no-scan.json")
+	if writeErr := os.WriteFile(noScanPath, []byte(secret), 0o600); writeErr != nil {
+		t.Fatalf("WriteFile: %v", writeErr)
+	}
+	waitForPendingTimer(t, w, noScanPath)
+
+	cancel()
+	_ = w.Close()
+
+	// Channel is closed - reading returns zero values. Check that no
+	// real finding (with a pattern name) was emitted.
+	select {
+	case f, ok := <-w.Findings():
+		if ok && f.PatternName != "" {
+			t.Errorf("expected no finding with scan_content=false, got %+v", f)
+		}
+	default:
+		// Good.
+	}
+}
+
+func TestWatcher_CloseFlushEmptyFile(t *testing.T) {
+	// Empty file should be skipped during flush.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	armAndStart(t, w, ctx)
+
+	emptyPath := filepath.Join(dir, "empty.txt")
+	if writeErr := os.WriteFile(emptyPath, []byte("trigger"), 0o600); writeErr != nil {
+		t.Fatalf("WriteFile: %v", writeErr)
+	}
+	waitForPendingTimer(t, w, emptyPath)
+	if truncateErr := os.Truncate(emptyPath, 0); truncateErr != nil {
+		t.Fatalf("Truncate: %v", truncateErr)
+	}
+
+	cancel()
+	_ = w.Close()
+
+	select {
+	case f, ok := <-w.Findings():
+		if ok && f.PatternName != "" {
+			t.Errorf("expected no finding for empty file, got %+v", f)
+		}
+	default:
+		// Good.
+	}
+}
+
+func TestWatcher_StartContextCancelled(t *testing.T) {
+	// Start should return nil when context is cancelled.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if armErr := w.Arm(); armErr != nil {
+		t.Fatalf("Arm: %v", armErr)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- w.Start(ctx) }()
+
+	cancel()
+	select {
+	case startErr := <-done:
+		if startErr != nil {
+			t.Errorf("Start with cancelled ctx should return nil, got: %v", startErr)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("Start did not return after context cancellation")
+	}
+}
+
+func TestWatcher_FindingsChannelFull(t *testing.T) {
+	// When the findings channel is full, the watcher remains non-blocking and
+	// exposes saturation through the priority overflow lane.
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write many files with secrets without reading findings.
+	// The channel should not block.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	for i := range findingsChanSize + 10 {
+		path := filepath.Join(dir, fmt.Sprintf("flood-%d.json", i))
+		if writeErr := os.WriteFile(path, []byte(fmt.Sprintf("%s-%d", secret, i)), 0o600); writeErr != nil {
+			t.Fatalf("WriteFile[%d]: %v", i, writeErr)
+		}
+	}
+
+	// Wait until saturation reaches the overflow lane before draining. This
+	// proves burst handling remains non-blocking while making overflow visible.
+	deadline := time.After(filesentryPositiveBackstop)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for len(w.(*fsWatcher).overflow) == 0 {
+		select {
+		case <-tick.C:
+		case <-deadline:
+			t.Fatal("timeout: saturation did not reach the overflow lane")
+		}
+	}
+	drained := 0
+	// Drain remaining without blocking.
+	for {
+		select {
+		case <-w.Findings():
+			drained++
+		default:
+			goto done
+		}
+	}
+done:
+	_ = drained // at least 1 guaranteed by waitLoop above
+	select {
+	case <-w.(*fsWatcher).OverflowFindings():
+		// Saturation was visible instead of silently dropping every overflow.
+	default:
+		t.Fatal("expected a finding on the overflow lane")
+	}
+}
+
+func TestWatcher_PermissionDeniedSubdir(t *testing.T) {
+	// Arm should fail closed when a subdirectory under a strict watch path is
+	// unreadable. This physical-permission variant complements the deterministic
+	// best-effort and strict sibling tests below.
+	dir := t.TempDir()
+	if os.Geteuid() == 0 {
+		t.Skip("chmod 000 does not restrict root")
+	}
+
+	denied := filepath.Join(dir, "denied")
+	if err := os.MkdirAll(denied, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	// Make it unreadable.
+	if err := os.Chmod(denied, 0o000); err != nil {
+		t.Skipf("chmod not supported: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(denied, 0o750) })
+
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir, Required: true}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if armErr := w.Arm(); armErr == nil {
+		t.Error("expected Arm to fail on unreadable subdirectory")
+	}
+}
+
+func TestWatcher_StartReturnsOnClose(t *testing.T) {
+	// When the underlying watcher is closed, Start should return nil
+	// (channels become closed).
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+
+	if armErr := w.Arm(); armErr != nil {
+		t.Fatalf("Arm: %v", armErr)
+	}
+
+	// Close the watcher then Start - the channels are closed so Start exits.
+	_ = w.Close()
+
+	ctx := context.Background()
+	if startErr := w.Start(ctx); startErr != nil {
+		t.Errorf("Start after Close should return nil, got: %v", startErr)
+	}
+}
+
+func TestWatcher_ArmNonexistentPath(t *testing.T) {
+	// Strict mode rejects a missing root. The best-effort zero-coverage case is
+	// covered separately.
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: "/nonexistent/path/that/does/not/exist", Required: true}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := w.Arm(); err == nil {
+		t.Error("expected error for nonexistent required watch path")
+	}
+}
+
+// TestWatcher_ArmBestEffortStillRejectsZeroCoverage verifies that
+// best-effort means partial coverage is allowed, not that the runtime is
+// allowed to proceed while monitoring nothing.
+func TestWatcher_ArmBestEffortStillRejectsZeroCoverage(t *testing.T) {
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		BestEffort:  true,
+		WatchPaths:  []config.WatchPath{{Path: "/nonexistent/path/that/does/not/exist"}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	var errCallbacks int
+	onError := func(error) { errCallbacks++ }
+	w, err := NewWatcher(cfg, sc, nil, onError)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	armErr := w.Arm()
+	if armErr == nil {
+		t.Fatal("Arm: zero successfully armed paths must fail even in best_effort mode")
+	}
+	if !errors.Is(armErr, ErrNoWatchPaths) {
+		t.Fatalf("Arm error = %v, want errors.Is(ErrNoWatchPaths)", armErr)
+	}
+	degraded := w.DegradedPaths()
+	if len(degraded) != 1 {
+		t.Fatalf("expected 1 degraded path, got %d", len(degraded))
+	}
+	if degraded[0].Path != "/nonexistent/path/that/does/not/exist" {
+		t.Errorf("degraded path = %q, want /nonexistent/...", degraded[0].Path)
+	}
+	if degraded[0].Error == "" {
+		t.Error("expected non-empty error message on degraded path")
+	}
+	if errCallbacks != 1 {
+		t.Errorf("expected exactly one onError callback, got %d", errCallbacks)
+	}
+}
+
+func TestWatcher_ArmRejectsEmptyCoverage(t *testing.T) {
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if armErr := w.Arm(); !errors.Is(armErr, ErrNoWatchPaths) {
+		t.Fatalf("Arm error = %v, want errors.Is(ErrNoWatchPaths)", armErr)
+	}
+}
+
+func TestRecursiveAddResultErrorJoinsSkippedSubtrees(t *testing.T) {
+	result := recursiveAddResult{skipped: []skippedSubtree{
+		{path: "first", cause: fs.ErrPermission},
+		{path: "second", cause: fs.ErrNotExist},
+	}}
+	if err := result.err(); !errors.Is(err, fs.ErrPermission) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("recursive result error = %v, want both skipped causes", err)
+	}
+	if err := (recursiveAddResult{}).err(); err != nil {
+		t.Fatalf("empty recursive result error = %v, want nil", err)
+	}
+}
+
+// TestWatcher_ArmMixedPathsArmsTheArmable verifies that best-effort Arm()
+// keeps a healthy path armed while reporting a missing auxiliary path.
+func TestWatcher_ArmMixedPathsArmsTheArmable(t *testing.T) {
+	healthy := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:    true,
+		BestEffort: true,
+		WatchPaths: []config.WatchPath{
+			{Path: healthy},
+			{Path: "/nonexistent/aux"},
+		},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	degraded := w.DegradedPaths()
+	if len(degraded) != 1 {
+		t.Fatalf("expected 1 degraded entry (the missing aux), got %d", len(degraded))
+	}
+	if degraded[0].Path != "/nonexistent/aux" {
+		t.Errorf("degraded path = %q, want /nonexistent/aux", degraded[0].Path)
+	}
+
+	// Prove the healthy path is actually armed: writing a secret to it
+	// must produce a finding on the channel. Without this assertion, a
+	// regression that silently dropped the armable path would still pass
+	// the degraded-bookkeeping check above.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(filepath.Join(healthy, "leak.json"), []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	select {
+	case f := <-w.Findings():
+		if f.PatternName == "" {
+			t.Error("healthy path was armed but produced finding with empty PatternName")
+		}
+		if f.Path != filepath.Join(healthy, "leak.json") {
+			t.Errorf("finding path = %q, want %q", f.Path, filepath.Join(healthy, "leak.json"))
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for finding from healthy path (was it actually armed?)")
+	}
+}
+
+func TestWatcher_ArmBestEffortSkipsUnreadableSiblingsAndKeepsAccessiblePaths(t *testing.T) {
+	root := t.TempDir()
+	accessible := filepath.Join(root, "accessible")
+	skippedA := filepath.Join(root, "skipped-a")
+	skippedB := filepath.Join(root, "skipped-b")
+	for _, path := range []string{accessible, skippedA, skippedB} {
+		if err := os.Mkdir(path, 0o750); err != nil {
+			t.Fatalf("Mkdir %q: %v", path, err)
+		}
+	}
+	symlink := filepath.Join(root, "outside-link")
+	if err := os.Symlink(t.TempDir(), symlink); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		BestEffort:  true,
+		WatchPaths:  []config.WatchPath{{Path: root}},
+		ScanContent: ptrBool(true),
+	}
+	var reported []string
+	w, err := NewWatcher(cfg, nil, nil, func(err error) { reported = append(reported, err.Error()) })
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fw := w.(*fsWatcher)
+	addWatch := fw.addWatch
+	addCalls := make(map[string]int)
+	fw.addWatch = func(path string) error {
+		addCalls[path]++
+		if path == skippedA || path == skippedB {
+			return fs.ErrPermission
+		}
+		return addWatch(path)
+	}
+
+	if err := w.Arm(); err != nil {
+		t.Fatalf("Arm best_effort: %v", err)
+	}
+	degraded := w.DegradedPaths()
+	if len(degraded) != 2 {
+		t.Fatalf("degraded paths = %#v, want both skipped siblings", degraded)
+	}
+	for _, path := range []string{skippedA, skippedB} {
+		found := false
+		for _, degradedPath := range degraded {
+			if degradedPath.Path == path && strings.Contains(degradedPath.Error, "permission denied") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("missing reported skipped subtree %q in %#v", path, degraded)
+		}
+	}
+	if len(reported) != 2 {
+		t.Errorf("onError reports = %d, want every skipped subtree", len(reported))
+	}
+
+	watchList := make(map[string]struct{})
+	for _, path := range fw.watcher.WatchList() {
+		watchList[path] = struct{}{}
+	}
+	for _, path := range []string{root, accessible} {
+		if _, ok := watchList[path]; !ok {
+			t.Errorf("accessible path %q was not armed; watch list = %#v", path, watchList)
+		}
+	}
+	for _, path := range []string{skippedA, skippedB, symlink} {
+		if _, ok := watchList[path]; ok {
+			t.Errorf("untrusted or failed path %q must not be watched", path)
+		}
+	}
+}
+
+func TestWatcher_ArmStrictFailsAfterArmingAccessibleSiblings(t *testing.T) {
+	root := t.TempDir()
+	accessible := filepath.Join(root, "accessible")
+	skipped := filepath.Join(root, "skipped")
+	for _, path := range []string{accessible, skipped} {
+		if err := os.Mkdir(path, 0o750); err != nil {
+			t.Fatalf("Mkdir %q: %v", path, err)
+		}
+	}
+
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: root}},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fw := w.(*fsWatcher)
+	addWatch := fw.addWatch
+	fw.addWatch = func(path string) error {
+		if path == skipped {
+			return fs.ErrPermission
+		}
+		return addWatch(path)
+	}
+
+	if err := w.Arm(); err == nil {
+		t.Fatal("Arm strict: expected incomplete coverage to fail closed")
+	}
+	watchList := make(map[string]struct{})
+	for _, path := range fw.watcher.WatchList() {
+		watchList[path] = struct{}{}
+	}
+	if _, ok := watchList[accessible]; !ok {
+		t.Errorf("strict Arm stopped before accessible sibling was armed; watch list = %#v", watchList)
+	}
+	if degraded := w.DegradedPaths(); len(degraded) != 1 || degraded[0].Path != skipped {
+		t.Errorf("strict Arm degradation = %#v, want skipped subtree %q", degraded, skipped)
+	}
+}
+
+func TestWatcher_ArmUnreadableSubtreeFailsClosedUnlessIgnored(t *testing.T) {
+	// Windows os.Chmod cannot remove directory traversal, so the fixture would
+	// stay readable and the test would assert the opposite of what it means.
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permissions required to make a subtree unreadable")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions")
+	}
+	root := t.TempDir()
+	blocked := filepath.Join(root, "blocked")
+	if err := os.Mkdir(blocked, 0o750); err != nil {
+		t.Fatalf("Mkdir blocked subtree: %v", err)
+	}
+	if err := os.Chmod(blocked, 0); err != nil {
+		t.Fatalf("Chmod blocked subtree: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(blocked, 0o750)
+	})
+
+	for _, tt := range []struct {
+		name    string
+		ignored []string
+		wantErr bool
+	}{
+		{name: "strict coverage failure", wantErr: true},
+		{name: "ignore prevents coverage failure", ignored: []string{"blocked"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.FileSentry{Enabled: true, WatchPaths: []config.WatchPath{{Path: root}}, IgnorePatterns: tt.ignored}
+			w, err := NewWatcher(cfg, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("NewWatcher: %v", err)
+			}
+			defer func() { _ = w.Close() }()
+			armErr := w.Arm()
+			if (armErr != nil) != tt.wantErr {
+				t.Fatalf("Arm error = %v, want error=%t", armErr, tt.wantErr)
+			}
+			if tt.wantErr {
+				t.Logf("Arm error: %v", armErr)
+				for _, want := range []string{blocked, root, "permission denied", "incomplete watch coverage"} {
+					if !strings.Contains(armErr.Error(), want) {
+						t.Errorf("Arm error = %q, missing %q", armErr, want)
+					}
+				}
+			}
+		})
+	}
+	coverage := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: root}}})
+	if coverage.FailureCount != 1 || len(coverage.Failures) != 1 || coverage.Failures[0].Path != blocked {
+		t.Fatalf("CheckCoverage unreadable subtree = %#v, want blocked subtree", coverage)
+	}
+}
+
+func TestCheckCoverageDoesNotInstallWatchesAndReportsRoot(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: missing}}})
+	if report.FailureCount != 1 || len(report.Failures) != 1 {
+		t.Fatalf("CheckCoverage report = %#v, want one failure", report)
+	}
+	if report.Failures[0].Path != missing || report.Failures[0].Root != missing || !strings.Contains(report.Failures[0].Error, "no such file") {
+		t.Fatalf("CheckCoverage failure = %#v, want missing path, root, and cause", report.Failures[0])
+	}
+}
+
+func TestCheckCoverageNilAndBoundedFailures(t *testing.T) {
+	if report := CheckCoverage(context.Background(), nil); report.FailureCount != 1 || len(report.Failures) != 1 || report.Failures[0].Error != "file_sentry configuration is unavailable" {
+		t.Fatalf("CheckCoverage(context.Background(), nil) = %#v, want unavailable configuration failure", report)
+	}
+
+	base := t.TempDir()
+	watchPaths := make([]config.WatchPath, 0, maxArmDiagnosticSamples+1)
+	for i := range maxArmDiagnosticSamples + 1 {
+		watchPaths = append(watchPaths, config.WatchPath{Path: filepath.Join(base, fmt.Sprintf("missing-%d", i))})
+	}
+	report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: watchPaths})
+	if report.FailureCount != maxArmDiagnosticSamples+1 || len(report.Failures) != maxArmDiagnosticSamples {
+		t.Fatalf("CheckCoverage bounded report = %#v, want count=%d samples=%d", report, maxArmDiagnosticSamples+1, maxArmDiagnosticSamples)
+	}
+
+	if report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: base}}}); report.FailureCount != 0 {
+		t.Fatalf("CheckCoverage accessible root = %#v, want no failures", report)
+	}
+	fileRoot := filepath.Join(base, "not-a-directory")
+	if err := os.WriteFile(fileRoot, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile root fixture: %v", err)
+	}
+	linkRoot := filepath.Join(base, "root-link")
+	if err := os.Symlink(base, linkRoot); err != nil {
+		t.Skipf("Symlink root fixture: %v", err)
+	}
+	for _, path := range []string{fileRoot, linkRoot} {
+		if report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: path}}}); report.FailureCount != 1 {
+			t.Fatalf("CheckCoverage(context.Background(), %q) = %#v, want one rejected root", path, report)
+		}
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	deletedWD := t.TempDir()
+	if err := os.Chdir(deletedWD); err != nil {
+		t.Fatalf("Chdir deleted working directory: %v", err)
+	}
+	if err := os.Remove(deletedWD); err != nil {
+		t.Fatalf("Remove working directory: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	if report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: "relative"}}}); report.FailureCount != 1 || len(report.Failures) != 1 {
+		t.Fatalf("CheckCoverage unresolved relative root = %#v, want one failure", report)
+	}
+}
+
+func TestWatcher_ArmRequiredWatchPathHasTypedErrorSignal(t *testing.T) {
+	root := t.TempDir()
+	accessible := filepath.Join(root, "accessible")
+	skipped := filepath.Join(root, "skipped")
+	for _, path := range []string{accessible, skipped} {
+		if err := os.Mkdir(path, 0o750); err != nil {
+			t.Fatalf("Mkdir %q: %v", path, err)
+		}
+	}
+
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		BestEffort:  true,
+		WatchPaths:  []config.WatchPath{{Path: root, Required: true}},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fw := w.(*fsWatcher)
+	addWatch := fw.addWatch
+	fw.addWatch = func(path string) error {
+		if path == skipped {
+			return fs.ErrPermission
+		}
+		return addWatch(path)
+	}
+
+	armErr := w.Arm()
+	if !errors.Is(armErr, ErrRequiredWatchPath) {
+		t.Fatalf("Arm error = %v, want errors.Is(ErrRequiredWatchPath)", armErr)
+	}
+	if errors.Is(armErr, ErrNoWatchPaths) {
+		t.Fatalf("Arm error = %v, accessible sibling means ErrNoWatchPaths must be false", armErr)
+	}
+}
+
+func TestWatcher_ArmDeduplicatesConfiguredRoots(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o750); err != nil {
+		t.Fatalf("Mkdir child: %v", err)
+	}
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: root}, {Path: root}},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fw := w.(*fsWatcher)
+	addWatch := fw.addWatch
+	addCalls := make(map[string]int)
+	fw.addWatch = func(path string) error {
+		addCalls[path]++
+		return addWatch(path)
+	}
+	if err := w.Arm(); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+	for _, path := range []string{root, child} {
+		if addCalls[path] != 1 {
+			t.Errorf("watch add calls for %q = %d, want 1", path, addCalls[path])
+		}
+	}
+}
+
+func TestWatcher_ArmDuplicateRootMergesRequiredCoverage(t *testing.T) {
+	healthy := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+	cfg := &config.FileSentry{
+		Enabled:    true,
+		BestEffort: true,
+		WatchPaths: []config.WatchPath{
+			{Path: healthy},
+			{Path: missing},
+			{Path: missing + string(filepath.Separator), Required: true},
+		},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	armErr := w.Arm()
+	if !errors.Is(armErr, ErrRequiredWatchPath) {
+		t.Fatalf("Arm error = %v, want ErrRequiredWatchPath for normalized required duplicate", armErr)
+	}
+	if errors.Is(armErr, ErrNoWatchPaths) {
+		t.Fatalf("Arm error = %v, healthy sibling should remain armed", armErr)
+	}
+}
+
+func TestWatcher_ArmBoundsFailureDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	for i := range maxArmDiagnosticSamples + 1 {
+		if err := os.Mkdir(filepath.Join(root, fmt.Sprintf("failed-%d", i)), 0o750); err != nil {
+			t.Fatalf("Mkdir: %v", err)
+		}
+	}
+	var callbacks atomic.Int32
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		BestEffort:  true,
+		WatchPaths:  []config.WatchPath{{Path: root}},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, func(error) { callbacks.Add(1) })
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	fw := w.(*fsWatcher)
+	addWatch := fw.addWatch
+	fw.addWatch = func(path string) error {
+		if path != root {
+			return fs.ErrPermission
+		}
+		return addWatch(path)
+	}
+	if err := w.Arm(); err != nil {
+		t.Fatalf("Arm best_effort: %v", err)
+	}
+	if got := len(w.DegradedPaths()); got != maxArmDiagnosticSamples {
+		t.Fatalf("DegradedPaths length = %d, want bounded %d", got, maxArmDiagnosticSamples)
+	}
+	if got, want := w.DegradedPathCount(), maxArmDiagnosticSamples+1; got != want {
+		t.Fatalf("DegradedPathCount = %d, want %d", got, want)
+	}
+	if got, want := callbacks.Load(), int32(maxArmDiagnosticSamples+1); got != want {
+		t.Fatalf("onError calls = %d, want %d sampled plus aggregate", got, want)
+	}
+}
+
+func TestWatcher_RearmAfterRemovedRootRegistersNewBackendWatch(t *testing.T) {
+	rootParent := t.TempDir()
+	root := filepath.Join(rootParent, "watch-root")
+	if err := os.Mkdir(root, 0o750); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	cfg := &config.FileSentry{Enabled: true, WatchPaths: []config.WatchPath{{Path: root}}, ScanContent: ptrBool(true)}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Arm(); err != nil {
+		t.Fatalf("initial Arm: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	startErr := make(chan error, 1)
+	go func() { startErr <- w.Start(ctx) }()
+
+	if err := os.Remove(root); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	fw := w.(*fsWatcher)
+	testwait.For(t, filesentryPositiveBackstop, func() bool {
+		fw.mu.Lock()
+		defer fw.mu.Unlock()
+		_, watched := fw.watchedPaths[root]
+		return !watched
+	}, "removed root cleared from cached watch registrations")
+	if err := os.Mkdir(root, 0o750); err != nil {
+		t.Fatalf("recreate root: %v", err)
+	}
+	if err := w.Arm(); err != nil {
+		t.Fatalf("re-arm recreated root: %v", err)
+	}
+	watchList := make(map[string]struct{})
+	for _, path := range fw.watcher.WatchList() {
+		watchList[path] = struct{}{}
+	}
+	if _, ok := watchList[root]; !ok {
+		t.Fatalf("recreated root missing backend watch: %#v", watchList)
+	}
+	cancel()
+	if err := <-startErr; err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+func TestWatcher_AddDirectoryDoesNotDuplicateAnArmedWatch(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: root}},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+	if err := w.Arm(); err != nil {
+		t.Fatalf("Arm: %v", err)
+	}
+
+	added, err := w.(*fsWatcher).addDirectory(root)
+	if err != nil {
+		t.Fatalf("addDirectory: %v", err)
+	}
+	if added {
+		t.Fatal("addDirectory added an already armed watch")
+	}
+}
+
+func TestWatcher_ArmRejectsSymlinkRoot(t *testing.T) {
+	target := t.TempDir()
+	root := filepath.Join(t.TempDir(), "watch-root-link")
+	if err := os.Symlink(target, root); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		BestEffort:  true,
+		WatchPaths:  []config.WatchPath{{Path: root}},
+		ScanContent: ptrBool(true),
+	}
+	w, err := NewWatcher(cfg, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := w.Arm(); err == nil {
+		t.Fatal("Arm: symlink root must fail rather than silently monitoring nothing")
+	}
+	degraded := w.DegradedPaths()
+	if len(degraded) != 1 || degraded[0].Path != root || !strings.Contains(degraded[0].Error, "symlink") {
+		t.Errorf("symlink degradation = %#v", degraded)
+	}
+}
+
+func TestWatcher_ArmRejectsFilePath(t *testing.T) {
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "not-a-dir.txt")
+	if err := os.WriteFile(filePath, []byte("hi"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: filePath, Required: true}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	if err := w.Arm(); err == nil {
+		t.Error("expected error when watch_path is a file, not a directory")
+	}
+}
+
+func TestWatcher_RenameIntoPlace(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a secret to a temp file OUTSIDE the watched directory,
+	// then rename it into the watched directory. This must still be detected.
+	tmpFile := filepath.Join(t.TempDir(), "staged.txt")
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	if err := os.WriteFile(tmpFile, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	dest := filepath.Join(dir, "renamed-secret.txt")
+	if err := os.Rename(tmpFile, dest); err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+
+	select {
+	case f := <-w.Findings():
+		if f.PatternName == "" {
+			t.Error("expected DLP pattern match for renamed-in file")
+		}
+		if f.Path != dest {
+			t.Errorf("expected path %q, got %q", dest, f.Path)
+		}
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout — rename-into-place write was not detected")
+	}
+}
+
+func TestWatcher_FileRemovalNoFinding(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.FileSentry{
+		Enabled:     true,
+		WatchPaths:  []config.WatchPath{{Path: dir}},
+		ScanContent: ptrBool(true),
+	}
+
+	defaults := config.Defaults()
+	defaults.Internal = nil
+	defaults.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(defaults)
+	defer sc.Close()
+
+	w, err := NewWatcher(cfg, sc, nil, nil)
+	if err != nil {
+		t.Fatalf("NewWatcher: %v", err)
+	}
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	armAndStart(t, w, ctx)
+
+	// Write a secret file, wait for finding, then remove it.
+	secret := "sk-ant-" + "api03-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+	path := filepath.Join(dir, "will-delete.txt")
+	if err := os.WriteFile(path, []byte(secret), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Consume the write finding.
+	select {
+	case <-w.Findings():
+	case <-time.After(filesentryPositiveBackstop):
+		t.Fatal("timeout waiting for write finding")
+	}
+
+	// Now remove the file - should NOT produce a finding.
+	_ = os.Remove(path)
+
+	select {
+	case f := <-w.Findings():
+		t.Errorf("expected no finding for file removal, got %+v", f)
+	case <-time.After(filesentryNegativeObservation):
+		// Good.
+	}
+}
+
+func TestIsIgnored(t *testing.T) {
+	tests := []struct {
+		name     string
+		patterns []string
+		path     string
+		want     bool
+	}{
+		{
+			name:     "exact match",
+			patterns: []string{"*.o"},
+			path:     "/tmp/test/main.o",
+			want:     true,
+		},
+		{
+			name:     "no match",
+			patterns: []string{"*.o"},
+			path:     "/tmp/test/main.go",
+			want:     false,
+		},
+		{
+			name:     "directory pattern",
+			patterns: []string{"node_modules/**"},
+			path:     "/tmp/project/node_modules",
+			want:     true,
+		},
+		{
+			name:     "git directory",
+			patterns: []string{".git/**"},
+			path:     "/tmp/project/.git",
+			want:     true,
+		},
+		{
+			name:     "so extension",
+			patterns: []string{"*.so"},
+			path:     "/tmp/lib/libfoo.so",
+			want:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := &fsWatcher{
+				cfg: &config.FileSentry{IgnorePatterns: tt.patterns},
+			}
+			if got := w.isIgnored(tt.path); got != tt.want {
+				t.Errorf("isIgnored(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheckCoverage_AllRootsIgnoredReportsNoWatchablePaths covers the state
+// where traversal records no failure and still leaves nothing to watch: every
+// configured root matches an ignore pattern. Arming fails closed here, so a
+// failure-only report would look healthy while startup refuses to run.
+func TestCheckCoverage_AllRootsIgnoredReportsNoWatchablePaths(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.FileSentry{
+		WatchPaths:     []config.WatchPath{{Path: root}},
+		IgnorePatterns: []string{filepath.Base(root)},
+	}
+	report := CheckCoverage(context.Background(), cfg)
+	if report.FailureCount != 0 {
+		t.Fatalf("FailureCount = %d, want 0; an ignored root is not a failure", report.FailureCount)
+	}
+	if report.WatchablePaths != 0 {
+		t.Fatalf("WatchablePaths = %d, want 0", report.WatchablePaths)
+	}
+	if !report.NoWatchablePaths() {
+		t.Fatal("NoWatchablePaths() = false; an ignored-away configuration must not read as covered")
+	}
+}
+
+// TestCheckCoverage_ReachableRootCountsWatchablePaths is the negative control:
+// a normal reachable root must NOT report the no-watchable-paths state.
+func TestCheckCoverage_ReachableRootCountsWatchablePaths(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "child"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: root}}})
+	if report.FailureCount != 0 || report.NoWatchablePaths() {
+		t.Fatalf("report = %+v, want a clean reachable result", report)
+	}
+	if report.WatchablePaths < 2 {
+		t.Fatalf("WatchablePaths = %d, want the root and its child counted", report.WatchablePaths)
+	}
+}
+
+// TestCheckCoverage_CarriesRequiredFlag proves the required flag travels with
+// the failure instead of being reconstructed from a path, which is what breaks
+// when the absolute form cannot be resolved.
+func TestCheckCoverage_CarriesRequiredFlag(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "absent")
+	report := CheckCoverage(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: missing, Required: true}}})
+	if len(report.Failures) != 1 {
+		t.Fatalf("Failures = %+v, want one", report.Failures)
+	}
+	if !report.Failures[0].Required {
+		t.Fatal("Required = false on a failure from a required root")
+	}
+}
+
+// TestCheckCoverage_CancelledContextTruncates proves the walk honours
+// cancellation and reports the result as a lower bound rather than as coverage.
+// An unbounded diagnostic on a huge tree or a slow mount is what this prevents.
+func TestCheckCoverage_CancelledContextTruncates(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "child"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	report := CheckCoverage(ctx, &config.FileSentry{WatchPaths: []config.WatchPath{{Path: root}}})
+	if !report.Truncated {
+		t.Fatalf("report = %+v, want Truncated on a cancelled walk", report)
+	}
+	if report.FailureCount != 0 {
+		t.Fatalf("FailureCount = %d, want 0; a cancellation is not a coverage failure", report.FailureCount)
+	}
+	// A truncated walk must not present as the no-watchable-paths verdict
+	// either, since it never finished looking.
+	if report.NoWatchablePaths() {
+		t.Fatal("NoWatchablePaths() = true on a cancelled walk; truncation is not proof of absence")
+	}
+}
+
+// TestCheckCoverage_FlatFilesCountTowardWalkBudget proves the entry budget
+// counts files, not only directories. A watch root that is a large flat
+// directory would otherwise walk unbounded while the budget only saw the root.
+func TestCheckCoverage_FlatFilesCountTowardWalkBudget(t *testing.T) {
+	root := t.TempDir()
+	for i := 0; i < 8; i++ {
+		path := filepath.Join(root, fmt.Sprintf("f-%d", i))
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Budget 3: root directory plus eight files is nine entries. Counting only
+	// directories would visit one dir and report complete coverage.
+	report := checkCoverageWithBudget(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: root}}}, 3)
+	if !report.Truncated {
+		t.Fatalf("report = %+v, want Truncated when flat files exceed the entry budget", report)
+	}
+	if report.FailureCount != 0 {
+		t.Fatalf("FailureCount = %d, want 0; budget exhaustion is not a coverage failure", report.FailureCount)
+	}
+}
+
+// TestCheckCoverage_FlatFilesUnderBudgetAreNotTruncated is the negative control
+// for the flat-file budget: a small tree must still complete.
+func TestCheckCoverage_FlatFilesUnderBudgetAreNotTruncated(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report := checkCoverageWithBudget(context.Background(), &config.FileSentry{WatchPaths: []config.WatchPath{{Path: root}}}, 8)
+	if report.Truncated || report.FailureCount != 0 || report.NoWatchablePaths() {
+		t.Fatalf("report = %+v, want a complete one-dir walk", report)
+	}
+	if report.WatchablePaths != 1 {
+		t.Fatalf("WatchablePaths = %d, want the root directory only", report.WatchablePaths)
+	}
+}
+
+type incompleteDLPScanner struct{ matches []scanner.TextDLPMatch }
+
+func (s incompleteDLPScanner) ScanTextForDLP(context.Context, string) scanner.TextDLPResult {
+	return scanner.TextDLPResult{Incomplete: true, Matches: s.matches}
+}
+
+func TestWatcherIncompleteDLPScanIsError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ordinary.txt")
+	if err := os.WriteFile(path, []byte("ordinary content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, found := range []bool{false, true} {
+		sc := incompleteDLPScanner{}
+		if found {
+			sc.matches = []scanner.TextDLPMatch{{PatternName: "fixture"}}
+		}
+		errorsFound := make(chan error, 1)
+		w := &fsWatcher{
+			cfg: &config.FileSentry{}, scanner: sc,
+			findings: make(chan Finding, 1), onError: func(err error) { errorsFound <- err },
+		}
+		w.scanFile(t.Context(), path, false)
+		select {
+		case err := <-errorsFound:
+			if !errors.Is(err, scanner.ErrTextDLPIncomplete) {
+				t.Fatalf("unscanned file error = %v", err)
+			}
+		default:
+			t.Fatal("incomplete file scan produced no error")
+		}
+		if got := len(w.findings) > 0; got != found {
+			t.Fatalf("incomplete scan finding present=%v, want %v", got, found)
+		}
+	}
+}

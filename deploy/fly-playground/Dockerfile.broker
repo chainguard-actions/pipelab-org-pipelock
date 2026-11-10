@@ -1,0 +1,59 @@
+# Copyright 2026 Josh Waldrep
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pipelock playground BROKER image (the always-on public front door).
+#
+# Small static binary on distroless: no shell, no agent, runs as nonroot. It
+# leases per-visitor VMs via the Fly Machines API (HTTPS, hence ca-certs) and
+# reverse-proxies the session API to them over the app's private network. It
+# holds the Fly token + gate secret (delivered as Fly secrets/env), never an
+# agent secret beyond passing a per-session model key through to a leased VM.
+#
+# The broker serves the static playground viewer at / (via --static-dir /srv/ui).
+# That viewer lives in the public site repo, not here, so it is supplied as a
+# BuildKit named build context ("ui") instead of being vendored into this repo —
+# keeping the image build reproducible without copying the site into pipelock.
+#
+# Build from the REPO ROOT (see deploy/fly-playground/build-images.sh):
+#   docker build -f deploy/fly-playground/Dockerfile.broker \
+#     --build-context ui=<site-repo>/static/playground/demo \
+#     -t pipelock-playground-broker .
+
+ARG GO_VERSION=1.26
+
+FROM golang:${GO_VERSION}-bookworm@sha256:5f68ec6805843bd3981a951ffada82a26a0bd2631045c8f7dba483fa868f5ec5 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+ENV CGO_ENABLED=0
+RUN go build -trimpath -ldflags "-s -w -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION}" -o /out/pipelock-playground-broker ./cmd/pipelock-playground-broker
+RUN go install github.com/randall77/makefat@v0.0.0-20260406194835-1b91746796b7
+RUN GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION}" -o /out/pipelock-verifier-linux ./cmd/pipelock-verifier \
+ && GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION}" -o /out/pipelock-verifier-macos-amd64 ./cmd/pipelock-verifier \
+ && GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION}" -o /out/pipelock-verifier-macos-arm64 ./cmd/pipelock-verifier \
+ && makefat /out/pipelock-verifier-macos /out/pipelock-verifier-macos-amd64 /out/pipelock-verifier-macos-arm64 \
+ && GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION}" -o /out/pipelock-verifier-windows.exe ./cmd/pipelock-verifier
+
+# Stage the static UI here (a shell-having stage) and normalize perms with a real
+# chmod. The broker runs as nonroot, so served assets MUST be world-readable or
+# its file server returns 403. Some built assets (the verifier wasm) arrive 0600
+# with a restrictive POSIX ACL from the build host; BuildKit's COPY --chmod does
+# NOT reliably override an ACL'd source, so fix perms with a RUN chmod instead.
+COPY --from=ui . /srv-ui
+RUN chmod -R a+rX /srv-ui
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db061a14da60299baff8450a17fe0ccc514a16639
+COPY --from=build /out/pipelock-playground-broker /usr/local/bin/pipelock-playground-broker
+COPY --from=build /out/pipelock-verifier-linux /usr/local/bin/pipelock-verifier-linux
+COPY --from=build /out/pipelock-verifier-macos /usr/local/bin/pipelock-verifier-macos
+COPY --from=build /out/pipelock-verifier-windows.exe /usr/local/bin/pipelock-verifier-windows.exe
+# Bundle the static playground viewer at /srv/ui (served at / via --static-dir),
+# taking the perm-normalized copy from the build stage above. Copying between
+# stages preserves the chmod'd (world-readable) perms, so the nonroot broker can
+# read every asset including the verifier wasm.
+COPY --from=build /srv-ui /srv/ui
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/pipelock-playground-broker"]
+CMD ["serve"]

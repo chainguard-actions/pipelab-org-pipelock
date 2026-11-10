@@ -1,0 +1,232 @@
+# TLS Interception Setup Guide
+
+Pipelock can intercept CONNECT tunnel traffic by performing a TLS MITM: it terminates TLS with the client using a forged certificate, scans the decrypted request and response, then forwards to the upstream server over a separate TLS connection. This closes the body-blindness gap that exists with opaque CONNECT tunnels.
+
+Without TLS interception, Pipelock can enforce controls on CONNECT metadata and tunnel accounting, including handshake-header DLP when header scanning is enabled. It cannot inspect the encrypted HTTPS content. Interception exposes the inner request and response to the configured DLP and response scanners; the controls available without it are listed below.
+
+## What is enforced when interception is off
+
+An HTTPS request through a CONNECT tunnel is encrypted end to end, so with interception disabled Pipelock sees the CONNECT host and handshake, but cannot read the inner request path, query, body, or response. For HTTPS traffic in that mode:
+
+- **Enforced (from CONNECT metadata or tunnel accounting):** destination allowlist/blocklist, SSRF on the CONNECT host, URL DLP/entropy checks that apply to the CONNECT host, connection rate limits, data budget, CONNECT handshake-header DLP, kill switch, and receipt gates. A `request_policy` or contract rule is enforced only to the extent it matches CONNECT metadata (the synthetic `https://host/`); any rule that matches inner HTTPS method, path, query, headers, or body requires interception.
+- **Not applied to the encrypted HTTPS content:** path/query entropy, body DLP, `request_body_scanning`, and `response_scanning`. These operate on plaintext the proxy never sees for HTTPS, so they silently do not inspect HTTPS request paths, bodies, or responses.
+
+This is expected behavior, not a bypass: tunnel-level controls still apply, but HTTPS content visibility does not exist unless Pipelock terminates TLS. Plaintext HTTP through the forward proxy is unaffected (its full URL and body are visible, so all scanners apply).
+
+When the forward proxy accepts CONNECT tunnels and interception is off, Pipelock prints a startup and hot-reload advisory so the coverage gap is never silent:
+
+```text
+WARNING: tls_interception: TLS interception is disabled while the forward proxy accepts CONNECT tunnels. HTTPS traffic is not decrypted, so content scanning (request_body_scanning, response_scanning, path/query entropy, and body DLP) does not inspect HTTPS request paths, bodies, or responses. Pipelock still enforces controls that evaluate from CONNECT metadata or tunnel accounting (destination allowlist/blocklist, SSRF on the CONNECT host, rate limits, data budget, CONNECT handshake-header DLP, kill switch, and receipt gates); request_policy and contract rules that match inner HTTPS method, path, query, headers, or body require tls_interception. Enable tls_interception (and distribute its CA) to scan HTTPS content, or accept tunnel-level-only visibility for HTTPS content as a deliberate posture.
+```
+
+Enable interception (below) to scan HTTPS content, or accept tunnel-level-only HTTPS content visibility as a deliberate posture.
+
+## Quick Start
+
+```bash
+# 1. Generate a CA
+pipelock tls init
+
+# 2. Trust it (prints platform-specific instructions)
+pipelock tls install-ca
+
+# 3. Enable in config
+cat >> pipelock.yaml << 'EOF'
+tls_interception:
+  enabled: true
+EOF
+
+# 4. Run
+pipelock run --config pipelock.yaml
+```
+
+## Step 1: Generate the CA
+
+```bash
+pipelock tls init
+```
+
+This creates two files in your pipelock home directory: `~/.pipelock/` by default, or the `--home <dir>` or `PIPELOCK_HOME` directory when either is set:
+- `ca.pem`: the CA certificate (share this, it's public)
+- `ca-key.pem`: the CA private key (protect this, `0600` permissions)
+
+`pipelock run` and `pipelock check` resolve the default CA path the same way, so the proxy loads the CA that `tls init` wrote as long as both commands use the same `--home` or `PIPELOCK_HOME`. If the resolved home has no CA but `~/.pipelock` does (for example you set `--home`/`PIPELOCK_HOME` after already running `tls init` once), startup refuses rather than silently loading the older CA; the error names both directories and suggests setting `tls_interception.ca_cert`/`ca_key` to keep using the older CA, or running `pipelock tls init` with the new home. The examples below assume the plain `~/.pipelock` default.
+
+Options:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--out` | pipelock home (`--home`, `PIPELOCK_HOME`, or `~/.pipelock`) | Output directory |
+| `--org` | `Pipelock` | Organization name in certificate subject |
+| `--validity` | `87600h` (10 years) | How long the CA is valid |
+| `--force` | `false` | Overwrite existing files |
+
+Custom output directory:
+
+```bash
+pipelock tls init --out /etc/pipelock/tls --org "My Company"
+```
+
+If using a custom directory, set `ca_cert` and `ca_key` in your config:
+
+```yaml
+tls_interception:
+  enabled: true
+  ca_cert: /etc/pipelock/tls/ca.pem
+  ca_key: /etc/pipelock/tls/ca-key.pem
+```
+
+> **Use `pipelock tls init` — don't hand-mint the CA with openssl RSA.** Pipelock's CA loader (`certgen.LoadCA`) calls `x509.ParseECPrivateKey` on the key file, so it requires an ECDSA private key (any curve the `crypto/ecdsa` package accepts — P-224, P-256, P-384, P-521). RSA and Ed25519 CA keys are rejected at startup with `load TLS CA: parse ec private key` and pipelock exits rather than run without interception. `pipelock tls init` generates a P-256 ECDSA CA, which is what end-entity certs pipelock mints at runtime also use; if you need an org-rooted CA chain, an ECDSA intermediate (e.g. `openssl ecparam -name prime256v1`) signed from your root will load. End-entity certs for your upstream servers signed by this CA can be RSA without issue — the ECDSA constraint is only on the CA key itself.
+
+## Step 2: Trust the CA
+
+The agent (or whatever makes HTTPS connections through pipelock) must trust the CA certificate. Otherwise TLS handshakes fail with certificate verification errors.
+
+### System Trust Store
+
+```bash
+pipelock tls install-ca
+```
+
+This prints platform-specific instructions. You still need to run the commands it shows.
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo cp ~/.pipelock/ca.pem /usr/local/share/ca-certificates/pipelock-ca.crt
+sudo update-ca-certificates
+```
+
+**Linux (RHEL/Fedora):**
+```bash
+sudo cp ~/.pipelock/ca.pem /etc/pki/ca-trust/source/anchors/pipelock-ca.crt
+sudo update-ca-trust extract
+```
+
+**macOS:**
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain ~/.pipelock/ca.pem
+```
+
+**Windows (elevated Command Prompt):**
+```cmd
+certutil -addstore -f "ROOT" %USERPROFILE%\.pipelock\ca.pem
+```
+
+### Per-Application Trust
+
+Some tools ignore the system trust store. Set the CA path explicitly:
+
+**Node.js / npm:**
+```bash
+export NODE_EXTRA_CA_CERTS=~/.pipelock/ca.pem
+```
+
+**Python (requests/httpx):**
+```bash
+export REQUESTS_CA_BUNDLE=~/.pipelock/ca.pem
+export SSL_CERT_FILE=~/.pipelock/ca.pem
+```
+
+**Go:**
+```bash
+export SSL_CERT_FILE=~/.pipelock/ca.pem
+```
+
+**curl:**
+```bash
+curl --cacert ~/.pipelock/ca.pem https://example.com
+# Or set globally:
+export CURL_CA_BUNDLE=~/.pipelock/ca.pem
+```
+
+## Step 3: Configure
+
+Minimal config:
+
+```yaml
+tls_interception:
+  enabled: true
+```
+
+Full options:
+
+```yaml
+tls_interception:
+  enabled: true
+  ca_cert: ""                    # default: <pipelock home>/ca.pem (--home, PIPELOCK_HOME, or ~/.pipelock)
+  ca_key: ""                     # default: <pipelock home>/ca-key.pem (same precedence)
+  max_response_bytes: 5242880    # 5MB, block responses larger than this
+  passthrough_domains:           # bypass interception for these domains
+    - "*.pinned-service.com"
+    - "api.payment-provider.com"
+```
+
+### Passthrough Domains
+
+Some services use certificate pinning or mutual TLS that breaks under interception. Add them to `passthrough_domains`:
+
+```yaml
+tls_interception:
+  enabled: true
+  passthrough_domains:
+    - "*.apple.com"              # Apple services pin certificates
+    - "mtls.internal.corp.com"   # mTLS endpoint
+```
+
+Passthrough connections are spliced (bidirectional byte copy) without decryption. Hostname-level scanning (blocklist, SSRF, SNI verification) still applies.
+
+Supports exact match (`api.example.com`) and wildcard prefix (`*.example.com` matches `sub.example.com` and `deep.sub.example.com`, but not the apex `example.com`). Entries must be ASCII hostnames with no whitespace and at most one trailing dot. A wildcard over any public suffix (`*.com`, `*.co.uk`, `*.github.io`, `*.s3.amazonaws.com`) is refused at load; list exact hosts instead (`mybucket.s3.amazonaws.com`), or keep intercepting that traffic with a trusted local CA.
+
+### Fail-Closed Behavior
+
+TLS interception is fail-closed:
+- Compressed responses Pipelock cannot decode (anything other than single-layer gzip or deflate): blocked (scanning would be bypassed)
+- Responses larger than `max_response_bytes`: blocked
+- TLS handshake failures: connection closed
+- Certificate generation errors: connection closed
+
+## Verifying It Works
+
+```bash
+# Start pipelock with TLS interception
+pipelock run --config pipelock.yaml &
+
+# Test through the proxy (should succeed)
+HTTPS_PROXY=http://127.0.0.1:8888 curl -s https://example.com
+
+# Test DLP through CONNECT tunnel (should be blocked)
+HTTPS_PROXY=http://127.0.0.1:8888 \
+  curl -s "https://httpbin.org/post" \
+  -d "token=AKIAIOSFODNN7EXAMPLE"
+```
+
+Check the pipelock logs (stderr) for scan results.
+
+## Troubleshooting
+
+### "certificate signed by unknown authority"
+
+The agent doesn't trust the pipelock CA. Either:
+1. Install the CA in the system trust store (Step 2)
+2. Set the per-application CA env var (see above)
+3. Add the domain to `passthrough_domains` if you can't modify the client
+
+### "x509: certificate is valid for X, not Y"
+
+The hostname in the request doesn't match what pipelock generated. This usually means a DNS or proxy misconfiguration. Check that `HTTPS_PROXY` is set correctly and the target hostname resolves properly.
+
+### Compressed response blocked
+
+Pipelock decodes a single-layer gzip or deflate response and scans it normally. It blocks a response during interception when it can't decode it: the upstream sent an encoding Pipelock cannot decode, such as `br` or `zstd`, or a stacked or malformed body. Pipelock's transport sets `Accept-Encoding: identity` to request uncompressed responses, but some servers ignore this.
+
+If you trust the domain, add it to `passthrough_domains`.
+
+### Performance
+
+TLS interception adds latency for the MITM handshake. Pipelock mitigates this with:
+- Connection pooling (shared `http.Transport` reuses TCP+TLS connections)
+- Bounded certificate cache (avoids regenerating leaf certs for repeated hosts)
+- ECDSA P-256 keys (faster than RSA for signing)
+
+For high-throughput environments, consider using passthrough for trusted high-volume domains.

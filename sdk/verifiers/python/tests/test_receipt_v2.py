@@ -1,0 +1,857 @@
+# Copyright 2026 Josh Waldrep
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from pipelock_aarp_verify.cli import main
+from pipelock_aarp_verify.receipt import (
+    ReceiptError,
+    _canonicalize_action_record,
+    compute_session_open_genesis,
+    load_evidence_chain,
+    receipt_hash,
+    verify_evidence_chain,
+    verify_receipt_file,
+)
+
+ROOT = Path(__file__).resolve().parents[4]
+CORPUS = ROOT / "sdk/conformance/testdata/corpus"
+CORPUS_KEY = json.loads((CORPUS / "test-key.json").read_text())["public_key_hex"]
+TESTDATA = ROOT / "sdk/conformance/testdata"
+TESTDATA_KEY_INFO = json.loads((TESTDATA / "test-key.json").read_text())
+TESTDATA_KEY = TESTDATA_KEY_INFO["public_key_hex"]
+TESTDATA_TRUSTED_KEYS = f"{TESTDATA_KEY_INFO['public_key_hex']},{TESTDATA_KEY_INFO['rotated_public_key_hex']}"
+VALID_SPANNED_V2 = (
+    ROOT
+    / "internal/contract/testdata/golden/"
+    / "valid_evidence_receipt_proxy_decision_with_spans.json"
+)
+VALID_PLAIN_V2 = (
+    ROOT
+    / "internal/contract/testdata/golden/"
+    / "valid_evidence_receipt_proxy_decision.json"
+)
+V2_GOLDEN_PUBLIC_KEY = (
+    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+)
+V2_GOLDEN_POLICY_HASH = (
+    "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+)
+V2_PRIVATE_SEED_HEX = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+TESTDATA_PRIVATE_SEED_HEX = TESTDATA_KEY_INFO["seed_hex"]
+
+
+def _write_canonical_v2_receipt(source: Path, tmp_path: Path, name: str) -> Path:
+    receipt = json.loads(source.read_text())
+    receipt["signature"]["signer_key_id"] = V2_GOLDEN_PUBLIC_KEY
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(receipt))
+    return path
+
+
+def test_valid_spanned_v2_receipt_verifies(tmp_path: Path) -> None:
+    report = verify_receipt_file(
+        _write_canonical_v2_receipt(VALID_SPANNED_V2, tmp_path, "valid-spanned"),
+        V2_GOLDEN_PUBLIC_KEY,
+    )
+    assert report["valid"] is True, report.get("error")
+    assert report["action_id"] == "01F8MECHZX3TBDSZ7XRADM79ZS"
+    assert report["verdict"] == "block"
+    assert report["transport"] == "forward"
+    assert report["signer_key"] == V2_GOLDEN_PUBLIC_KEY
+    assert report["policy_hash"] == V2_GOLDEN_POLICY_HASH
+
+
+def test_valid_plain_v2_receipt_verifies(tmp_path: Path) -> None:
+    report = verify_receipt_file(
+        _write_canonical_v2_receipt(VALID_PLAIN_V2, tmp_path, "valid-plain"),
+        V2_GOLDEN_PUBLIC_KEY,
+    )
+    assert report["valid"] is True, report.get("error")
+    assert report["policy_hash"] == V2_GOLDEN_POLICY_HASH
+
+
+def test_relabelled_v2_signer_is_rejected_under_pinned_key(tmp_path: Path) -> None:
+    path = _write_canonical_v2_receipt(VALID_PLAIN_V2, tmp_path, "relabeled")
+    receipt = json.loads(path.read_text())
+    receipt["signature"]["signer_key_id"] = "attacker-label"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "signer_key_id does not match pinned public key" in report["error"]
+
+
+def test_receipt_rejects_number_outside_cross_language_range(tmp_path: Path) -> None:
+    text = VALID_PLAIN_V2.read_text()
+    poisoned = text.replace('"chain_seq": 1', '"chain_seq": 9007199254740993')
+    assert poisoned != text
+    path = tmp_path / "unsafe-number.json"
+    path.write_text(poisoned)
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "cross-language exact range" in report["error"]
+
+
+def test_valid_v1_run_nonce_receipt_verifies() -> None:
+    report = verify_receipt_file(CORPUS / "golden/11-run-nonce-bound.json", CORPUS_KEY)
+    assert report["valid"] is True, report.get("error")
+    assert report["action_id"] == "conformance-00010"
+    assert report["signer_key"] == CORPUS_KEY
+
+
+def test_tampered_v1_run_nonce_receipt_rejects() -> None:
+    report = verify_receipt_file(
+        CORPUS / "malicious/m15-run-nonce-tampered.json", CORPUS_KEY
+    )
+    assert report["valid"] is False
+    assert "signature verification failed" in report["error"]
+
+
+def test_tampered_v1_receipt_rejects_even_when_unpinned_allowed() -> None:
+    report = verify_receipt_file(
+        CORPUS / "malicious/m15-run-nonce-tampered.json",
+        "",
+        allow_unpinned=True,
+    )
+    assert report["valid"] is False
+    assert "signature verification failed" in report["error"]
+
+
+def test_v1_receipt_with_unsigned_top_level_field_rejects(tmp_path: Path) -> None:
+    receipt = json.loads((CORPUS / "golden/11-run-nonce-bound.json").read_text())
+    receipt["unsigned_sidecar"] = "not-signed"
+    path = tmp_path / "unsigned-sidecar.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, CORPUS_KEY)
+    assert report["valid"] is False
+    assert "receipt: unknown field unsigned_sidecar" in report["error"]
+
+
+def test_v1_receipt_with_unsigned_action_field_rejects(tmp_path: Path) -> None:
+    receipt = json.loads((CORPUS / "golden/11-run-nonce-bound.json").read_text())
+    receipt["action_record"]["unsigned_sidecar"] = "not-signed"
+    path = tmp_path / "unsigned-action-field.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, CORPUS_KEY)
+    assert report["valid"] is False
+    assert "action_record: unknown field unsigned_sidecar" in report["error"]
+
+
+def test_v1_receipt_with_malformed_run_nonce_rejects_before_signature(
+    tmp_path: Path,
+) -> None:
+    receipt = json.loads((CORPUS / "golden/11-run-nonce-bound.json").read_text())
+    receipt["action_record"]["run_nonce"] = "0123456789ABCDEF0123456789ABCDEF"
+    path = tmp_path / "malformed-run-nonce.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, CORPUS_KEY)
+    assert report["valid"] is False
+    assert "run_nonce must be 32 lowercase hex chars" in report["error"]
+
+
+def test_legacy_v1_receipt_without_run_nonce_still_verifies() -> None:
+    report = verify_receipt_file(CORPUS / "golden/01-allow-clean-get.json", CORPUS_KEY)
+    assert report["valid"] is True, report.get("error")
+
+
+def test_missing_v2_policy_hash_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_PLAIN_V2.read_text())
+    del receipt["policy_hash"]
+    path = tmp_path / "missing-policy-hash.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "policy_hash" in report["error"]
+
+
+def test_reserved_defer_v2_payload_kind_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_PLAIN_V2.read_text())
+    receipt["payload_kind"] = "defer_opened"
+    path = tmp_path / "reserved-defer.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "known but not implemented" in report["error"]
+
+
+def test_tampered_spanned_v2_receipt_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["payload"]["source_spans"][0]["rule_id"] = "aws_access_key_tampered"
+    path = tmp_path / "tampered.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "signature verification failed" in report["error"]
+
+
+def test_unknown_spanned_v2_field_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["payload"]["source_spans"][0]["raw_match"] = "lowentropy"
+    path = tmp_path / "unknown.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "unknown field raw_match" in report["error"]
+
+
+def test_empty_dlp_normalized_suffix_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["payload"]["source_spans"][0]["normalized_view"] = "dlp_normalized:"
+    path = tmp_path / "empty-view.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "normalized_view is invalid" in report["error"]
+
+
+def test_optional_span_metadata_must_be_string(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["payload"]["source_spans"][0]["redacted_sample"] = 42
+    path = tmp_path / "bad-optional-span-field.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "redacted_sample must be a string" in report["error"]
+
+
+def test_unsupported_canonicalization_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["canonicalization"]["jcs_profile"] = "rfc8785"
+    path = tmp_path / "bad-canonicalization.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "canonicalization.jcs_profile is invalid" in report["error"]
+
+
+def test_missing_source_spans_crit_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["crit"] = ["canonicalization"]
+    path = tmp_path / "missing-source-span-crit.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "crit must include source_spans" in report["error"]
+
+
+def test_unknown_crit_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    receipt["crit"] = ["canonicalization", "source_spans", "future_extension"]
+    path = tmp_path / "unknown-crit.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "crit has unknown field future_extension" in report["error"]
+
+
+def test_source_spans_crit_on_plain_payload_rejects(tmp_path: Path) -> None:
+    receipt = json.loads(VALID_PLAIN_V2.read_text())
+    receipt["crit"] = ["canonicalization", "source_spans"]
+    path = tmp_path / "plain-source-span-crit.json"
+    path.write_text(json.dumps(receipt))
+
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "crit source_spans is invalid for proxy_decision" in report["error"]
+
+
+def test_spanned_v2_receipt_does_not_expose_oracle_key() -> None:
+    receipt = json.loads(VALID_SPANNED_V2.read_text())
+    span = receipt["payload"]["source_spans"][0]
+    assert span["match_hash_alg"] == "hmac-sha256"
+    assert span["match_hash"].startswith("hmac-sha256:")
+    assert "golden-span-mac-key" not in json.dumps(receipt)
+
+
+def test_receipt_cli_json(capsys, tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    path = _write_canonical_v2_receipt(VALID_SPANNED_V2, tmp_path, "cli")
+    code = main(["receipt", str(path), "--key", V2_GOLDEN_PUBLIC_KEY, "--json"])
+    captured = capsys.readouterr()
+    assert code == 0
+    body = json.loads(captured.out)
+    assert body["valid"] is True
+
+
+def test_receipt_cli_without_key_is_unpinned_nonzero(capsys) -> None:  # type: ignore[no-untyped-def]
+    code = main(["receipt", str(VALID_SPANNED_V2), "--json"])
+    captured = capsys.readouterr()
+    assert code == 1
+    body = json.loads(captured.out)
+    assert body["valid"] is False
+    assert body["unpinned"] is True
+
+
+def test_receipt_cli_allow_unpinned_exits_zero(capsys) -> None:  # type: ignore[no-untyped-def]
+    code = main(["receipt", str(VALID_SPANNED_V2), "--allow-unpinned", "--json"])
+    captured = capsys.readouterr()
+    assert code == 0
+    body = json.loads(captured.out)
+    assert body["valid"] is True
+    assert body["unpinned"] is True
+
+
+def test_v2_multi_receipt_chain_verifies() -> None:
+    report = verify_evidence_chain(_build_v2_chain(2), V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is True, report.get("error")
+    assert report["receipt_count"] == 2
+    assert report["final_seq"] == 1
+
+
+def test_v1_legacy_go_generated_chain_verifies() -> None:
+    receipts = load_evidence_chain(TESTDATA / "valid-chain.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report.get("error")
+    assert report["receipt_count"] == 5
+    assert report["final_seq"] == 4
+
+
+def test_v1_g1_go_generated_chain_verifies() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report.get("error")
+    assert report["receipt_count"] == 5
+    assert report["final_seq"] == 4
+
+
+def test_v1_g1_restart_chain_verifies_with_prior_tail_fields() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-restart-chain.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report.get("error")
+    assert report["receipt_count"] == 5
+    assert report["final_seq"] == 4
+    restart_open = receipts[2]["action_record"]["session_control"]["open"]
+    assert restart_open["prior_chain_seq"] == 1
+    assert restart_open["prior_chain_head"] != ""
+
+
+def test_v1_g1_restart_close_receipt_count_mismatch_rejects_valid_signature() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-restart-chain.jsonl"))
+    )
+    receipts[4]["action_record"]["session_control"]["close"]["receipt_count"] = 3
+    _sign_v1_action_receipt(receipts[4])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "session_close receipt_count mismatch" in report["error"]
+
+
+def test_v1_g1_genesis_vectors_match_go() -> None:
+    vectors = json.loads((TESTDATA / "g1-genesis-vectors.json").read_text())
+    assert len(vectors) >= 5
+    for vector in vectors:
+        assert compute_session_open_genesis(vector["open"]) == vector["expected"]
+
+
+def test_v1_g1_broken_genesis_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-broken-genesis.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert report["broken_at_seq"] == 0
+    assert "session_open genesis hash mismatch" in report["error"]
+
+
+def test_v1_g1_legacy_session_open_on_genesis_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-legacy-open-genesis.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert report["broken_at_seq"] == 0
+    assert "session_open on legacy genesis" in report["error"]
+
+
+def test_v1_g1_inconsistent_heartbeat_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-inconsistent-heartbeat.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert report["broken_at_seq"] == 3
+    assert "heartbeat chain_head mismatch" in report["error"]
+
+
+def test_v1_g1_inconsistent_close_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-inconsistent-close.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert report["broken_at_seq"] == 4
+    assert "session_close root_hash mismatch" in report["error"]
+
+
+def test_v1_g1_ambiguous_session_control_fixture_is_rejected() -> None:
+    for name in (
+        "g1-ambiguous-session-control.jsonl",
+        "g1-ambiguous-open-close.jsonl",
+        "g1-ambiguous-heartbeat-close.jsonl",
+    ):
+        receipts = load_evidence_chain(TESTDATA / name)
+        report = verify_evidence_chain(receipts, TESTDATA_KEY)
+        assert report["valid"] is False, name
+        assert "session_control must carry exactly one payload" in report["error"]
+
+
+def test_v1_g1_rotated_close_count_valid_fixture_verifies() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-rotated-close-count-valid.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_TRUSTED_KEYS)
+    assert report["valid"] is True, report.get("error")
+    assert report["receipt_count"] == 6
+    assert report["final_seq"] == 2
+
+
+def test_v1_g1_rotated_same_key_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-rotated-same-key-invalid.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_TRUSTED_KEYS)
+    assert report["valid"] is False
+    assert "key_transition does not change signer key" in report["error"]
+    unpinned = verify_evidence_chain(receipts, "", allow_unpinned=True)
+    assert unpinned["valid"] is False
+    assert "key_transition does not change signer key" in unpinned["error"]
+
+
+def test_v1_g1_rotated_close_count_invalid_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-rotated-close-count-invalid.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_TRUSTED_KEYS)
+    assert report["valid"] is False
+    assert "session_close receipt_count mismatch" in report["error"]
+
+
+def test_v1_g1_plain_action_after_close_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-plain-after-close.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "record observed after session_close" in report["error"]
+
+
+def test_v1_g1_empty_run_nonce_after_close_fixture_verifies() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-empty-run-nonce-after-close.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report.get("error")
+
+
+def test_v1_g1_heartbeat_after_close_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-heartbeat-after-close.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "record observed after session_close" in report["error"]
+
+
+def test_v1_g1_close_without_open_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-close-without-open.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "first receipt is not a matching session_open" in report["error"]
+
+
+def test_v1_g1_new_session_after_close_fixture_verifies() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-new-session-after-close.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report.get("error")
+
+
+def test_v1_g1_reopen_closed_run_fixture_is_rejected() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-reopen-closed-run.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "duplicate session_open for run_nonce" in report["error"]
+
+
+def test_v1_g1_signed_field_tampering_is_rejected() -> None:
+    def tamper_open_posture_signer(receipts: list[dict[str, object]]) -> None:
+        receipts[0]["action_record"]["session_control"]["open"][
+            "posture_signer_key_id"
+        ] = "posture-key-tampered"
+
+    def tamper_decision_phase(receipts: list[dict[str, object]]) -> None:
+        receipts[1]["action_record"]["decision_phase"] = "outcome"
+
+    def tamper_heartbeat_beat(receipts: list[dict[str, object]]) -> None:
+        receipts[3]["action_record"]["session_control"]["heartbeat"]["beat"] = 2
+
+    def tamper_heartbeat_fsync(receipts: list[dict[str, object]]) -> None:
+        receipts[3]["action_record"]["session_control"]["heartbeat"][
+            "fsync_errors_gated"
+        ] = 99
+
+    def tamper_close_root_hash(receipts: list[dict[str, object]]) -> None:
+        receipts[4]["action_record"]["session_control"]["close"]["root_hash"] = (
+            "tampered-root"
+        )
+
+    def tamper_close_durability(receipts: list[dict[str, object]]) -> None:
+        receipts[4]["action_record"]["session_control"]["close"][
+            "durability_blocks"
+        ] = 99
+
+    cases = {
+        "session_open_posture_signer_key_id": tamper_open_posture_signer,
+        "decision_phase": tamper_decision_phase,
+        "heartbeat_beat": tamper_heartbeat_beat,
+        "heartbeat_fsync_errors_gated": tamper_heartbeat_fsync,
+        "close_root_hash": tamper_close_root_hash,
+        "close_durability_blocks": tamper_close_durability,
+    }
+    for name, mutate in cases.items():
+        receipts = json.loads(
+            json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+        )
+        mutate(receipts)
+        report = verify_evidence_chain(receipts, TESTDATA_KEY)
+        assert report["valid"] is False, name
+        assert "signature" in report["error"], name
+
+
+def test_v1_g1_missing_session_open_required_field_rejects() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+    del receipts[0]["action_record"]["session_control"]["open"]["open_nonce"]
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "session_control.open.open_nonce is required" in report["error"]
+
+
+def test_v1_g1_oversized_heartbeat_seconds_rejects_controlled() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+    receipts[0]["action_record"]["session_control"]["open"]["heartbeat_seconds"] = 2**64
+    _sign_v1_action_receipt(receipts[0])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "session_control.open.heartbeat_seconds must be a uint64" in report["error"]
+
+
+def test_v1_g1_restart_prior_tail_mismatch_rejects_valid_signature() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-restart-chain.jsonl"))
+    )
+    receipts[2]["action_record"]["session_control"]["open"]["prior_chain_head"] = (
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+    _sign_v1_action_receipt(receipts[2])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "session_open prior_chain_head does not match chain tail" in report["error"]
+
+
+def test_v1_g1_heartbeat_chain_head_mismatch_rejects_valid_signature() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+    receipts[3]["action_record"]["session_control"]["heartbeat"]["chain_head"] = (
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    )
+    _sign_v1_action_receipt(receipts[3])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "heartbeat chain_head mismatch" in report["error"]
+
+
+def test_v1_g1_close_root_hash_mismatch_rejects_valid_signature() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+    receipts[4]["action_record"]["session_control"]["close"]["root_hash"] = (
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    )
+    _sign_v1_action_receipt(receipts[4])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "session_close root_hash mismatch" in report["error"]
+
+
+def test_v1_g1_session_control_missing_record_run_nonce_rejects_valid_signature() -> (
+    None
+):
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+    del receipts[3]["action_record"]["run_nonce"]
+    _sign_v1_action_receipt(receipts[3])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert report["broken_at_seq"] == 3
+    assert "session_control receipt missing run_nonce" in report["error"]
+
+
+def test_v1_g1_non_terminal_close_rejects_valid_signature() -> None:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+
+    heartbeat = receipts[3]["action_record"]["session_control"]["heartbeat"]
+    close = receipts[4]["action_record"]["session_control"]["close"]
+    close["root_hash"] = receipts[3]["action_record"]["chain_prev_hash"]
+    close["final_seq"] = 3
+    close["receipt_count"] = 4
+    receipts[3]["action_record"]["session_control"] = {
+        "kind": "session_close",
+        "close": close,
+    }
+    _sign_v1_action_receipt(receipts[3])
+
+    receipts[4]["action_record"]["chain_prev_hash"] = receipt_hash(receipts[3])
+    heartbeat["chain_head"] = receipts[4]["action_record"]["chain_prev_hash"]
+    heartbeat["chain_seq_head"] = 3
+    receipts[4]["action_record"]["session_control"] = {
+        "kind": "heartbeat",
+        "heartbeat": heartbeat,
+    }
+    _sign_v1_action_receipt(receipts[4])
+
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "record observed after session_close" in report["error"]
+
+
+def test_mixed_action_and_evidence_chain_verifies_action_subsequence(
+    tmp_path: Path,
+) -> None:
+    # Go's receipt-chain mode verifies the action_receipt subsequence and skips
+    # evidence_receipt entries; a default Pipelock run interleaves both.
+    lines = (TESTDATA / "g1-valid-chain.jsonl").read_text().splitlines()
+    evidence = json.loads(VALID_PLAIN_V2.read_text())
+    evidence_line = json.dumps({"type": "evidence_receipt", "detail": evidence})
+    mixed = tmp_path / "mixed.jsonl"
+    mixed.write_text("\n".join([lines[0], evidence_line, *lines[1:]]) + "\n")
+
+    receipts = load_evidence_chain(mixed)
+    assert len(receipts) == len(lines)
+    assert all(receipt.get("record_type") is None for receipt in receipts)
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report
+
+    evidence_only = tmp_path / "evidence-only.jsonl"
+    evidence_only.write_text(evidence_line + "\n")
+    only = load_evidence_chain(evidence_only)
+    assert len(only) == 1
+    assert only[0]["record_type"] == "evidence_receipt_v2"
+
+
+def test_jsonl_chain_rejects_number_outside_cross_language_range(
+    tmp_path: Path,
+) -> None:
+    text = (TESTDATA / "g1-valid-chain.jsonl").read_text()
+    poisoned = text.replace('"chain_seq":0', '"chain_seq":9007199254740993', 1)
+    assert poisoned != text
+    path = tmp_path / "unsafe-chain.jsonl"
+    path.write_text(poisoned)
+
+    try:
+        load_evidence_chain(path)
+    except ReceiptError as exc:
+        assert "cross-language exact range" in str(exc)
+    else:
+        raise AssertionError("unsafe JSONL number unexpectedly loaded")
+
+
+def test_v2_tampered_chain_fails_closed() -> None:
+    receipts = _build_v2_chain(2)
+    receipts[1]["chain_prev_hash"] = "sha256:0"
+    report = verify_evidence_chain(receipts, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "signature" in report["error"] or "chain_prev_hash" in report["error"]
+
+
+def test_v2_truncated_middle_receipt_fails_closed() -> None:
+    receipts = _build_v2_chain(3)
+    del receipts[1]
+    report = verify_evidence_chain(receipts, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is False
+    assert "signature" in report["error"] or "seq gap" in report["error"]
+
+
+def _build_v2_chain(count: int) -> list[dict[str, object]]:
+    base = json.loads(VALID_PLAIN_V2.read_text())
+    receipts: list[dict[str, object]] = []
+    prev_hash = "genesis"
+    for i in range(count):
+        receipt = json.loads(json.dumps(base))
+        receipt["event_id"] = f"01F8MECHZX3TBDSZ7XRADM79V{i}"
+        receipt["chain_seq"] = i
+        receipt["chain_prev_hash"] = prev_hash
+        _sign_v2_receipt(receipt)
+        receipts.append(receipt)
+        prev_hash = receipt_hash(receipt)
+    return receipts
+
+
+def _sign_v2_receipt(receipt: dict[str, object]) -> None:
+    from pipelock_aarp_verify.canonical import canonicalize
+
+    assert isinstance(receipt["signature"], dict)
+    receipt["signature"] = {
+        "signer_key_id": "",
+        "key_purpose": "",
+        "algorithm": "",
+        "signature": "",
+    }
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(V2_PRIVATE_SEED_HEX))
+    sig = key.sign(canonicalize(receipt))
+    receipt["signature"] = {
+        "signer_key_id": V2_GOLDEN_PUBLIC_KEY,
+        "key_purpose": "receipt-signing",
+        "algorithm": "ed25519",
+        "signature": f"ed25519:{sig.hex()}",
+    }
+
+
+def _sign_v1_action_receipt(receipt: dict[str, object]) -> None:
+    action_record = receipt["action_record"]
+    assert isinstance(action_record, dict)
+    digest = hashlib.sha256(_canonicalize_action_record(action_record)).digest()
+    key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(TESTDATA_PRIVATE_SEED_HEX))
+    sig = key.sign(digest)
+    receipt["signature"] = f"ed25519:{sig.hex()}"
+    receipt["signer_key"] = TESTDATA_KEY
+
+
+# Root hash the Go reference verifier reports for g1-ext-chain.jsonl. Every
+# verifier pins the same value, so a divergence in ext link bytes fails here.
+EXT_CHAIN_ROOT_HASH = "19805bc704923ef6a602abdfa3dc4982134997a69e3fff7a627b3f1805511d1b"
+
+
+def test_ext_chain_vector_verifies_with_go_root_hash() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-ext-chain.jsonl")
+    assert len(receipts) == 5
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is True, report
+    assert report["root_hash"] == EXT_CHAIN_ROOT_HASH
+
+
+def test_ext_bytes_edited_after_linking_break_chain_at_seq_one() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-ext-tampered-invalid.jsonl")
+    report = verify_evidence_chain(receipts, TESTDATA_KEY)
+    assert report["valid"] is False
+    assert report["broken_at_seq"] == 1
+    assert "chain_prev_hash mismatch" in report["error"]
+
+
+def test_removing_or_changing_ext_in_memory_breaks_link() -> None:
+    removed = load_evidence_chain(TESTDATA / "g1-ext-chain.jsonl")
+    del removed[0]["ext"]
+    assert verify_evidence_chain(removed, TESTDATA_KEY)["valid"] is False
+
+    changed = load_evidence_chain(TESTDATA / "g1-ext-chain.jsonl")
+    changed[0]["ext"]["posture_proof_availability"] = "readable"
+    assert verify_evidence_chain(changed, TESTDATA_KEY)["valid"] is False
+
+
+def test_receipt_hash_covers_explicit_null_ext() -> None:
+    receipts = load_evidence_chain(TESTDATA / "g1-ext-chain.jsonl")
+    with_null = receipts[2]
+    assert "ext" in with_null and with_null["ext"] is None
+    without = {k: v for k, v in with_null.items() if k != "ext"}
+    assert receipt_hash(with_null) != receipt_hash(without)
+
+
+def test_go_raw_message_bytes_compacts_and_html_escapes() -> None:
+    from pipelock_aarp_verify.rawjson import go_raw_message_bytes, object_member_span
+
+    line_sep = chr(0x2028)
+    esc_a = "\\" + "u0041"
+    raw = '{ "10" : [ 1.0 , 1E+2 ] ,\t"a" : "<&> ' + esc_a + "\\/ " + line_sep + '" }'
+    assert go_raw_message_bytes(raw) == (
+        '{"10":[1.0,1E+2],"a":"\\u003c\\u0026\\u003e ' + esc_a + '\\/ \\u2028"}'
+    )
+    line = '{"detail" : {"ext" : { "x" : "}" } , "version":1}}'
+    detail = object_member_span(line, 0, "detail")
+    assert detail is not None
+    ext = object_member_span(line, detail[0], "ext")
+    assert ext is not None
+    assert line[ext[0] : ext[1]] == '{ "x" : "}" }'
+
+
+def test_jsonl_chain_splits_on_line_feed_only(tmp_path: Path) -> None:
+    # Go leaves U+0085 raw inside JSON strings and splits recorder files on LF
+    # only; str.splitlines() would cut such an entry in half.
+    text = (TESTDATA / "g1-ext-chain.jsonl").read_text(encoding="utf-8")
+    assert chr(0x85) in text
+    receipts = load_evidence_chain(TESTDATA / "g1-ext-chain.jsonl")
+    assert len(receipts) == 5
+
+
+def _resign_open_with_policy_hash(policy_hash: object) -> dict[str, object]:
+    receipts = json.loads(
+        json.dumps(load_evidence_chain(TESTDATA / "g1-valid-chain.jsonl"))
+    )
+    first = receipts[0]
+    action_record = first["action_record"]
+    open_record = action_record["session_control"]["open"]
+    open_record["policy_hash"] = policy_hash
+    if isinstance(policy_hash, str):
+        open_record.pop("genesis_hash", None)
+        genesis = compute_session_open_genesis(open_record)
+        open_record["genesis_hash"] = genesis
+        action_record["chain_prev_hash"] = genesis
+    _sign_v1_action_receipt(first)
+    return first
+
+
+def test_session_open_accepts_bare_hex_policy_hash_like_go() -> None:
+    # Go's emitter writes the bare hex config hash and Go applies no format
+    # rule to session_control.open.policy_hash.
+    bare = "c611d973228752db025ba2ecef19fe011ad5f8de94ea697cbaa0d2f67386158f"
+    report = verify_evidence_chain([_resign_open_with_policy_hash(bare)], TESTDATA_KEY)
+    assert report["valid"] is True, report
+    empty = verify_evidence_chain([_resign_open_with_policy_hash("")], TESTDATA_KEY)
+    assert empty["valid"] is True, empty
+
+
+def test_session_open_rejects_non_string_policy_hash() -> None:
+    report = verify_evidence_chain([_resign_open_with_policy_hash(7)], TESTDATA_KEY)
+    assert report["valid"] is False
+    assert "session_control.open.policy_hash must be a string" in report["error"]
+
+
+def test_unicode_tags_source_span_verifies(tmp_path: Path) -> None:
+    for view in (
+        "for_matching:unicode_tags_decoded",
+        "invisible_spaced:for_matching:unicode_tags_decoded",
+        "vowel_fold:for_matching:unicode_tags_decoded",
+        "dlp_normalized:unicode_tags",
+        "leetspeak:for_matching:unicode_tags_decoded",
+        "leetspeak:for_matching:base64_decoded",
+        "leetspeak:for_matching:hex_decoded",
+        "dlp_normalized:unicode_tags:url_userinfo_username_escaped",
+    ):
+        receipt = json.loads(VALID_SPANNED_V2.read_text())
+        span = receipt["payload"]["source_spans"][0]
+        span["normalized_view"] = view
+        span.pop("char_offset", None)
+        span.pop("char_length", None)
+        _sign_v2_receipt(receipt)
+        path = tmp_path / "tag-view.json"
+        path.write_text(json.dumps(receipt))
+        report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+        assert report["valid"] is True, report.get("error")
+
+
+def test_text_encoding_shared_receipt_verifies() -> None:
+    path = ROOT / "sdk/verifiers/fixtures/unicode-tags-receipt.json"
+    report = verify_receipt_file(path, V2_GOLDEN_PUBLIC_KEY)
+    assert report["valid"] is True, report.get("error")
+    assert report["source_span_count"] == 29

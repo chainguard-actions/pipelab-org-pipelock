@@ -1,0 +1,1322 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package dashboard
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"embed"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"html/template"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/evidenceview"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+)
+
+const (
+	contentSecurityPolicy = "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'"
+	contentTypeHTML       = "text/html; charset=utf-8"
+	contentTypeSVG        = "image/svg+xml; charset=utf-8"
+	contentTypeText       = "text/plain; charset=utf-8"
+	auditSessionMaxBytes  = 128
+)
+
+const (
+	// The dashboard tab favicon uses the compact Pipelock brand mark
+	// (assets/pipelock-favicon.svg): a 64x64 dark rounded tile with the teal
+	// padlock, matching the project site favicon. The prior 400x480 full
+	// wordmark logo rendered as an unreadable blob at browser-tab size.
+	dashboardFaviconSVGBase64 = `PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlBpcGVsb2NrIGZhdmljb24iPgogIDxyZWN0IHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjEyIiBmaWxsPSIjMGUwZTExIi8+PGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoOCA4KSBzY2FsZSguMikiPiAgPGcgYXJpYS1sYWJlbD0iUGlwZWxvY2sgbG9jayBtYXJrIj4KICAgIDxwYXRoIGQ9Ik03MiAxMTJWNjhDNzIgMzUgOTMgMTggMTIwIDE4UzE2OCAzNSAxNjggNjhWMTEyIiBmaWxsPSJub25lIiBzdHJva2U9IiMwMGU1YTAiIHN0cm9rZS13aWR0aD0iMjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogICAgPHJlY3QgeD0iNDYiIHk9IjEwNCIgd2lkdGg9IjE0OCIgaGVpZ2h0PSIxMTAiIHJ4PSIxNCIgZmlsbD0iIzBlMGUxMSIgc3Ryb2tlPSIjMDBlNWEwIiBzdHJva2Utd2lkdGg9IjMiLz4KICAgIDxyZWN0IHg9IjU1IiB5PSIxMTMiIHdpZHRoPSIxMzAiIGhlaWdodD0iOTIiIHJ4PSI5IiBmaWxsPSJub25lIiBzdHJva2U9IiMwMGU1YTAiIHN0cm9rZS1vcGFjaXR5PSIwLjE4Ii8+CiAgICA8Y2lyY2xlIGN4PSIxMjAiIGN5PSIxNTAiIHI9IjEzIiBmaWxsPSIjMDBlNWEwIi8+PGNpcmNsZSBjeD0iMTIwIiBjeT0iMTUwIiByPSI2IiBmaWxsPSIjMDkwOTBiIi8+CiAgICA8cGF0aCBkPSJNMTE2IDE1OGg4djI0YTQgNCAwIDAgMS04IDB6IiBmaWxsPSIjMDBlNWEwIi8+CiAgPC9nPjwvZz4KPC9zdmc+Cg==`
+	dashboardFaviconDataURL   = "data:image/svg+xml;base64," + dashboardFaviconSVGBase64
+)
+
+var dashboardFaviconSVG = mustDecodeDashboardFavicon()
+
+//go:embed nav.tmpl.html overview.tmpl.html evidence.tmpl.html exemptions.tmpl.html agents.tmpl.html investigator.tmpl.html fleetoverview.tmpl.html workbench.tmpl.html incident.tmpl.html budgets.tmpl.html trustkeys.tmpl.html
+var templateFS embed.FS
+
+// errTrustedOuterAuthBoundaryRequired is returned (wrapped, via panic) when an
+// embedder sets TrustedOuterAuth without declaring the external boundary that
+// justifies disabling this handler's own authentication.
+var errTrustedOuterAuthBoundaryRequired = errors.New("TrustedOuterAuthBoundary must be set when TrustedOuterAuth is true")
+
+var (
+	overviewTemplate      = parseDashboardTemplate("overview.tmpl.html")
+	evidenceTemplate      = parseDashboardTemplate("evidence.tmpl.html")
+	exemptionsTemplate    = parseDashboardTemplate("exemptions.tmpl.html")
+	agentsTemplate        = parseDashboardTemplate("agents.tmpl.html")
+	investigatorTemplate  = parseDashboardTemplate("investigator.tmpl.html")
+	fleetoverviewTemplate = parseDashboardTemplate("fleetoverview.tmpl.html")
+	workbenchTemplate     = parseDashboardTemplate("workbench.tmpl.html")
+	incidentTemplate      = parseDashboardTemplate("incident.tmpl.html")
+	budgetsTemplate       = parseDashboardTemplate("budgets.tmpl.html")
+	trustKeysTemplate     = parseDashboardTemplate("trustkeys.tmpl.html")
+)
+
+func parseDashboardTemplate(name string) *template.Template {
+	return template.Must(template.New(name).ParseFS(templateFS, name, "nav.tmpl.html"))
+}
+
+func mustDecodeDashboardFavicon() []byte {
+	data, err := base64.StdEncoding.DecodeString(dashboardFaviconSVGBase64)
+	if err != nil {
+		panic(fmt.Sprintf("decode dashboard favicon: %v", err))
+	}
+	return data
+}
+
+type pageData struct {
+	Nav             NavContext
+	Sessions        []SessionSummary
+	SelectedSession string
+	Evidence        SessionEvidence
+	HasEvidence     bool
+	RawAllowed      bool
+	Operability     OperabilityHealth
+}
+
+type exemptionsPageData struct {
+	Nav       NavContext
+	Inventory ExemptionInventory
+}
+
+// NavContext is the shared, authorization-filtered dashboard navigation state.
+type NavContext struct {
+	Active      string
+	ActiveLabel string
+	Entries     []NavEntry
+	ScriptNonce string
+}
+
+// NavEntry is one top-level dashboard link the current request is allowed to
+// follow.
+type NavEntry struct {
+	Key    string
+	Label  string
+	Path   string
+	Active bool
+}
+
+// Permission is the bounded dashboard route/action vocabulary consumed by the
+// RBAC seam. Keep these stable: external auth adapters map identities to these
+// strings, while handlers stay unaware of user/role storage.
+type Permission string
+
+const (
+	PermissionEvidenceRead     Permission = "dashboard:evidence:read"
+	PermissionRawRead          Permission = "dashboard:raw:read"
+	PermissionExemptionsRead   Permission = "dashboard:exemptions:read"
+	PermissionAgentsRead       Permission = "dashboard:agents:read"
+	PermissionBudgetsRead      Permission = "dashboard:budgets:read"
+	PermissionFleetRead        Permission = "dashboard:fleet:read"
+	PermissionSignedActionRead Permission = "dashboard:signed_action:read"
+	PermissionIncidentRead     Permission = "dashboard:incident:read"
+	PermissionTrustKeysRead    Permission = "dashboard:trust_keys:read"
+)
+
+const (
+	agentsFeatureForbidden = "Pipelock Enterprise agents feature required\n"
+	fleetFeatureForbidden  = "Pipelock Enterprise fleet feature required\n"
+)
+
+type routeSpec struct {
+	navKey           string
+	navLabel         string // Nonempty only for routes shown in navigation.
+	pattern          string
+	feature          string
+	forbiddenMessage string
+	permission       Permission
+	handler          func(*dashboardHandler) http.Handler
+}
+
+type navRouteSpec struct {
+	key     string
+	label   string
+	pattern string
+}
+
+var (
+	dashboardRouteSpecList = []routeSpec{
+		evidenceRouteSpec("/overview", "overview", "Overview", func(d *dashboardHandler) http.Handler {
+			return http.HandlerFunc(d.handleOverview)
+		}),
+		evidenceRouteSpec("/", "overview", "", func(d *dashboardHandler) http.Handler {
+			return http.HandlerFunc(d.handleOverview)
+		}),
+		evidenceRouteSpec("/evidence", "evidence", "Evidence", func(d *dashboardHandler) http.Handler {
+			return http.HandlerFunc(d.handleIndex)
+		}),
+		{
+			pattern:          "/exemptions",
+			navKey:           "exemptions",
+			navLabel:         "Exemptions",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionExemptionsRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleExemptions)
+			},
+		},
+		{
+			pattern:          "/session/",
+			navKey:           "evidence",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionEvidenceRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleSession)
+			},
+		},
+		{
+			pattern:          "/agents",
+			navKey:           "agents",
+			navLabel:         "Agents",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionAgentsRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleAgents)
+			},
+		},
+		{
+			pattern:          "/agent/",
+			navKey:           "agents",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionAgentsRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleAgent)
+			},
+		},
+		{
+			pattern:          "/budgets",
+			navKey:           "budgets",
+			navLabel:         "Budgets",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionBudgetsRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleBudgets)
+			},
+		},
+		{
+			pattern:          "/trust-keys",
+			navKey:           "trust-keys",
+			navLabel:         "Trust & Keys",
+			feature:          license.FeatureAgents,
+			forbiddenMessage: agentsFeatureForbidden,
+			permission:       PermissionTrustKeysRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleTrustKeys)
+			},
+		},
+		{
+			pattern:          "/fleet",
+			navKey:           "fleet",
+			navLabel:         "Fleet",
+			feature:          license.FeatureFleet,
+			forbiddenMessage: fleetFeatureForbidden,
+			permission:       PermissionFleetRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleFleetOverview)
+			},
+		},
+		{
+			pattern:          "/fleet/",
+			navKey:           "fleet",
+			feature:          license.FeatureFleet,
+			forbiddenMessage: fleetFeatureForbidden,
+			permission:       PermissionFleetRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleFleetOverview)
+			},
+		},
+		{
+			pattern:          "/workbench",
+			navKey:           "workbench",
+			navLabel:         "Workbench",
+			feature:          license.FeatureFleet,
+			forbiddenMessage: fleetFeatureForbidden,
+			permission:       PermissionSignedActionRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleWorkbench)
+			},
+		},
+		{
+			pattern:          "/workbench/",
+			navKey:           "workbench",
+			feature:          license.FeatureFleet,
+			forbiddenMessage: fleetFeatureForbidden,
+			permission:       PermissionSignedActionRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleWorkbench)
+			},
+		},
+		{
+			pattern:          "/incident",
+			navKey:           "incident",
+			navLabel:         "Incident",
+			feature:          license.FeatureFleet,
+			forbiddenMessage: fleetFeatureForbidden,
+			permission:       PermissionIncidentRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleIncident)
+			},
+		},
+		{
+			pattern:          "/incident/",
+			navKey:           "incident",
+			feature:          license.FeatureFleet,
+			forbiddenMessage: fleetFeatureForbidden,
+			permission:       PermissionIncidentRead,
+			handler: func(d *dashboardHandler) http.Handler {
+				return http.HandlerFunc(d.handleIncident)
+			},
+		},
+	}
+	dashboardNavRouteSpecs = navRouteSpecs(dashboardRouteSpecList)
+)
+
+func evidenceRouteSpec(pattern, navKey, navLabel string, handler func(*dashboardHandler) http.Handler) routeSpec {
+	return routeSpec{
+		pattern:          pattern,
+		navKey:           navKey,
+		navLabel:         navLabel,
+		feature:          license.FeatureAgents,
+		forbiddenMessage: agentsFeatureForbidden,
+		permission:       PermissionEvidenceRead,
+		handler:          handler,
+	}
+}
+
+func navRouteSpecs(specs []routeSpec) []navRouteSpec {
+	var nav []navRouteSpec
+	for _, spec := range specs {
+		if spec.navLabel != "" {
+			nav = append(nav, navRouteSpec{key: spec.navKey, label: spec.navLabel, pattern: spec.pattern})
+		}
+	}
+	return nav
+}
+
+func dashboardRouteSpecs() []routeSpec {
+	return dashboardRouteSpecList
+}
+
+// AllPermissions returns the complete bounded permission vocabulary: every
+// permission referenced by a dashboard route plus the raw-view elevation.
+// Derived from the route specs so it cannot drift from what handlers actually
+// require; auth adapters use it to prove their mapping covers every permission
+// (an unmapped permission fails closed and disables its route).
+func AllPermissions() []Permission {
+	seen := map[Permission]struct{}{PermissionRawRead: {}}
+	all := []Permission{PermissionRawRead}
+	for _, spec := range dashboardRouteSpecList {
+		if _, ok := seen[spec.permission]; ok {
+			continue
+		}
+		seen[spec.permission] = struct{}{}
+		all = append(all, spec.permission)
+	}
+	return all
+}
+
+// New returns a read-only HTTP handler for the Enterprise Evidence dashboard.
+//
+// SECURITY: this handler serves sensitive evidence (signed receipt payloads,
+// destinations, block reasons, signer fingerprints, session IDs). The
+// license-feature check is NOT authentication. Mount this handler ONLY on an
+// authenticated, admin-only listener, and never on the agent-reachable proxy
+// port. Set Options.Authorize to enforce an authenticated principal per
+// request; it fails closed when it returns an error. When both Authorize and
+// AuthorizePermission are nil, set Options.TrustedOuterAuth only if the
+// surrounding router provides the authentication boundary, and set
+// Options.TrustedOuterAuthBoundary to name that boundary — New panics if
+// TrustedOuterAuth is set without it. New then logs one startup line naming
+// the declared boundary: a warning that this handler's own auth is disabled
+// when Authorize and AuthorizePermission are both nil, or an informational
+// line noting per-request authorization remains active when either callback
+// is also configured. TrustedOuterAuth is not itself authentication — it
+// only asserts that something outside this handler provides it.
+func New(opts Options) http.Handler {
+	if opts.TrustedOuterAuth && strings.TrimSpace(opts.TrustedOuterAuthBoundary) == "" {
+		panic(fmt.Errorf("dashboard.New: %w", errTrustedOuterAuthBoundaryRequired))
+	}
+	if opts.TrustedOuterAuth {
+		if opts.Authorize == nil && opts.AuthorizePermission == nil {
+			slog.Warn("dashboard: own authentication is disabled; relying on an external boundary",
+				"boundary", opts.TrustedOuterAuthBoundary)
+		} else {
+			slog.Info("dashboard: outer authentication boundary declared; per-request authorization remains active",
+				"boundary", opts.TrustedOuterAuthBoundary)
+		}
+	}
+	model := NewReadModel(opts)
+	mux := http.NewServeMux()
+	d := &dashboardHandler{
+		model:               model,
+		hasFeature:          opts.HasFeature,
+		authorize:           opts.Authorize,
+		authorizePermission: opts.AuthorizePermission,
+		authorizeRaw:        opts.AuthorizeRaw,
+		authorizeFleetScope: opts.AuthorizeFleetScope,
+		trustedOuterAuth:    opts.TrustedOuterAuth,
+		auditWriter:         opts.AuditWriter,
+		defaultFleetScope:   normalizeDecisionScope(opts.DefaultFleetScope),
+	}
+	mux.HandleFunc("/favicon.ico", handleFavicon)
+	for _, spec := range dashboardRouteSpecList {
+		mux.Handle(spec.pattern, d.routeGate(spec, spec.handler(d)))
+	}
+	return mux
+}
+
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeSVG)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write(dashboardFaviconSVG)
+}
+
+type dashboardHandler struct {
+	model               *ReadModel
+	hasFeature          func(string) bool
+	authorize           func(*http.Request) error
+	authorizePermission func(*http.Request, Permission) error
+	authorizeRaw        func(*http.Request) error
+	authorizeFleetScope func(*http.Request, DecisionScope, bool) error
+	trustedOuterAuth    bool
+	auditWriter         io.Writer
+	auditMu             sync.Mutex
+	// defaultFleetScope is the org/fleet the fleet view falls back to when a
+	// request supplies neither org_id nor fleet_id (a plain "Fleet" nav click).
+	// Only a fully-empty scope is defaulted; a partial scope stays an error.
+	defaultFleetScope DecisionScope
+}
+
+type rawAllowedContextKey struct{}
+
+type navContextKey struct{}
+
+type authAuditInfoContextKey struct{}
+
+type routeAuthorizationCache struct {
+	identityChecked bool
+	identityErr     error
+	permissions     map[Permission]error
+}
+
+type routeAccessResult struct {
+	status           int
+	body             string
+	permissionDenied bool
+}
+
+func (r routeAccessResult) allowed() bool {
+	return r.status == 0
+}
+
+// AuthAuditInfo is the bounded identity metadata appended to dashboard access
+// logs. Callers must pass only sanitized values, never bearer tokens or raw
+// claims.
+type AuthAuditInfo struct {
+	Method         string
+	Subject        string
+	SubjectSHA256  string
+	MTLSSPKISHA256 string
+	Roles          []string
+	FailureReason  string
+}
+
+// WithAuthAuditInfo attaches dashboard authentication metadata to a request
+// context for access logging.
+func WithAuthAuditInfo(ctx context.Context, info AuthAuditInfo) context.Context {
+	info.Roles = append([]string(nil), info.Roles...)
+	return context.WithValue(ctx, authAuditInfoContextKey{}, info)
+}
+
+// rawAllowed reports whether this request may see the raw view (destinations
+// and full signed payloads). Fail closed: raw is shown only when an authorizer
+// is configured and accepts the request.
+func (d *dashboardHandler) rawAllowed(r *http.Request) bool {
+	if d.authorizeRaw == nil || d.authorizeRaw(r) != nil {
+		return false
+	}
+	if d.authorizePermission != nil {
+		return d.authorizePermission(r, PermissionRawRead) == nil
+	}
+	return true
+}
+
+func rawAllowedFromContext(r *http.Request) bool {
+	raw, _ := r.Context().Value(rawAllowedContextKey{}).(bool)
+	return raw
+}
+
+func navFromContext(r *http.Request) NavContext {
+	nav, _ := r.Context().Value(navContextKey{}).(NavContext)
+	return nav
+}
+
+func authAuditInfoFromRequest(r *http.Request) AuthAuditInfo {
+	info, _ := r.Context().Value(authAuditInfoContextKey{}).(AuthAuditInfo)
+	info.Method = AuditLogValue(info.Method)
+	if info.SubjectSHA256 == "" {
+		info.SubjectSHA256 = auditHashField(info.Subject)
+	} else {
+		info.SubjectSHA256 = AuditLogValue(info.SubjectSHA256)
+	}
+	info.MTLSSPKISHA256 = AuditLogValue(info.MTLSSPKISHA256)
+	if len(info.Roles) == 0 {
+		info.Roles = []string{"-"}
+	}
+	for i, role := range info.Roles {
+		info.Roles[i] = AuditLogValue(role)
+	}
+	info.FailureReason = AuditLogValue(info.FailureReason)
+	return info
+}
+
+// recordAudit writes one access-log line for an authenticated request. Viewing
+// evidence is itself an audited action. No-op when no writer is configured.
+func (d *dashboardHandler) recordAudit(r *http.Request, raw bool, permission Permission) {
+	if d.auditWriter == nil {
+		return
+	}
+	role := "metadata"
+	if raw {
+		role = "raw"
+	}
+	session := sessionFromRequest(r)
+	sessionDisplay, sessionHash := auditSessionField(session)
+	auth := authAuditInfoFromRequest(r)
+	d.auditMu.Lock()
+	defer d.auditMu.Unlock()
+	_, _ = fmt.Fprintf(d.auditWriter, "%s pipelock-dashboard access role=%s permission=%q method=%s path=%q session=%q session_sha256=%s org_sha256=%s fleet_sha256=%s artifact_sha256=%s auth_method=%s auth_subject_sha256=%q mtls_spki_sha256=%q auth_roles=%q remote=%s\n",
+		time.Now().UTC().Format(time.RFC3339), role, permission, r.Method, r.URL.Path, sessionDisplay, sessionHash,
+		auditHashField(r.URL.Query().Get("org_id")), auditHashField(r.URL.Query().Get("fleet_id")),
+		auditHashField(r.URL.Query().Get("artifact_hash")), auth.Method, auth.SubjectSHA256, auth.MTLSSPKISHA256, strings.Join(auth.Roles, ","), r.RemoteAddr)
+}
+
+func (d *dashboardHandler) recordPermissionDeniedAudit(r *http.Request, permission Permission) {
+	if d.auditWriter == nil {
+		return
+	}
+	session := sessionFromRequest(r)
+	sessionDisplay, sessionHash := auditSessionField(session)
+	auth := authAuditInfoFromRequest(r)
+	reason := auth.FailureReason
+	if reason == "-" {
+		// Keep the reason value operators already alert on. Earlier releases
+		// emitted permission_denied on this line, so renaming it would break
+		// existing SIEM rules silently.
+		reason = "permission_denied"
+	}
+	d.auditMu.Lock()
+	defer d.auditMu.Unlock()
+	_, _ = fmt.Fprintf(d.auditWriter, "%s pipelock-dashboard denied permission=%q method=%s path=%q session=%q session_sha256=%s auth_method=%s auth_subject_sha256=%q mtls_spki_sha256=%q auth_roles=%q reason=%s remote=%s\n",
+		time.Now().UTC().Format(time.RFC3339), permission, r.Method, r.URL.Path,
+		sessionDisplay, sessionHash, auth.Method, auth.SubjectSHA256, auth.MTLSSPKISHA256, strings.Join(auth.Roles, ","), reason, r.RemoteAddr)
+}
+
+func sessionFromRequest(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return "-"
+	}
+	if session := r.URL.Query().Get("session"); session != "" {
+		return session
+	}
+	if !strings.HasPrefix(r.URL.Path, "/session/") {
+		return "-"
+	}
+	// Trim to the session ID for the audit field. The investigator path is
+	// /session/<id>/receipt/<action-id>, so cut at the first "/" to log <id>
+	// rather than the full sub-path.
+	rest := strings.TrimPrefix(r.URL.Path, "/session/")
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		rest = rest[:i]
+	}
+	if rest == "" {
+		return "-"
+	}
+	return rest
+}
+
+func auditSessionField(session string) (display, hash string) {
+	sum := sha256.Sum256([]byte(session))
+	hash = hex.EncodeToString(sum[:])
+
+	var b strings.Builder
+	truncated := false
+	for _, r := range session {
+		if b.Len() >= auditSessionMaxBytes {
+			truncated = true
+			break
+		}
+		if r >= 0x20 && r <= 0x7e {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('?')
+	}
+	display = b.String()
+	if truncated && len(display) > 3 {
+		display = display[:auditSessionMaxBytes-3] + "..."
+	}
+	if display == "" {
+		display = "-"
+	}
+	return display, hash
+}
+
+func auditHashField(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+// AuditLogValue normalizes untrusted values before they are written to dashboard audit logs.
+func AuditLogValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if r >= 0x20 && r <= 0x7e {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('?')
+	}
+	if b.Len() == 0 {
+		return "-"
+	}
+	return b.String()
+}
+
+func (d *dashboardHandler) recordDecisionScopeAudit(r *http.Request, raw bool, scope DecisionScope, page any) {
+	if d.auditWriter == nil {
+		return
+	}
+	role := "metadata"
+	if raw {
+		role = "raw"
+	}
+	var decisionSource, fleetSource, decisionFound, fleetFound, divergence bool
+	var decisionError, decisionMissing bool
+	conflict := "-"
+	decisionErrorReason := "-"
+	var decisionState string
+	switch p := page.(type) {
+	case WorkbenchPage:
+		decisionSource = p.SourceConfigured
+		decisionFound = p.HasReplay
+		decisionError = p.ReplayError
+		decisionErrorReason = p.ReplayErrorReason
+		decisionMissing = p.ReplayNotFound
+		divergence = p.HasReplay && p.Replay.Divergence
+		if p.HasReplay && p.Replay.Conflict != "" {
+			conflict = p.Replay.Conflict
+		}
+	case IncidentPage:
+		decisionSource = p.DecisionSourceConfigured
+		fleetSource = p.FleetSourceConfigured
+		decisionFound = p.HasDecision
+		decisionError = p.DecisionError
+		decisionErrorReason = p.DecisionErrorReason
+		decisionMissing = p.DecisionMissing
+		fleetFound = p.HasFleet
+		divergence = p.HasDecision && p.Decision.Divergence
+		if p.HasDecision && p.Decision.Conflict != "" {
+			conflict = p.Decision.Conflict
+		}
+	}
+	switch {
+	case !decisionSource:
+		decisionState = "unconfigured"
+	case decisionError:
+		decisionState = "unavailable"
+	case decisionMissing:
+		decisionState = "not_found"
+	case decisionFound:
+		decisionState = "found"
+	default:
+		decisionState = "unknown"
+	}
+	decisionErrorReason = AuditLogValue(decisionErrorReason)
+	d.auditMu.Lock()
+	defer d.auditMu.Unlock()
+	_, _ = fmt.Fprintf(d.auditWriter, "%s pipelock-dashboard scope role=%s method=%s path=%q org_sha256=%s fleet_sha256=%s artifact_sha256=%s decision_source=%t fleet_source=%t decision_state=%q decision_error_reason=%q decision_found=%t decision_error=%t decision_missing=%t fleet_found=%t divergence=%t conflict=%q remote=%s\n",
+		time.Now().UTC().Format(time.RFC3339), role, r.Method, r.URL.Path,
+		auditHashField(scope.OrgID), auditHashField(scope.FleetID), auditHashField(scope.ArtifactHash),
+		decisionSource, fleetSource, decisionState, decisionErrorReason, decisionFound, decisionError, decisionMissing, fleetFound, divergence, conflict, r.RemoteAddr)
+}
+
+func (d *dashboardHandler) authorizeFleetScopeRequest(w http.ResponseWriter, r *http.Request, scope DecisionScope, sourceConfigured bool, raw bool) bool {
+	if !sourceConfigured {
+		return true
+	}
+	if d.authorizeFleetScope == nil {
+		http.Error(w, "fleet scope authorization required", http.StatusForbidden)
+		return false
+	}
+	if err := d.authorizeFleetScope(r, normalizeDecisionScope(scope), raw); err != nil {
+		http.Error(w, "fleet scope not authorized", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func (d *dashboardHandler) routeGate(spec routeSpec, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scriptNonce, err := newDashboardScriptNonce()
+		if err != nil {
+			http.Error(w, "could not initialize dashboard response", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Security-Policy", dashboardContentSecurityPolicy(scriptNonce))
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		authCache := &routeAuthorizationCache{}
+		access := d.authorizeRoute(r, spec, authCache)
+		if !access.allowed() {
+			if access.permissionDenied {
+				d.recordPermissionDeniedAudit(r, spec.permission)
+			}
+			w.Header().Set("Content-Type", contentTypeText)
+			w.WriteHeader(access.status)
+			_, _ = w.Write([]byte(access.body))
+			return
+		}
+		raw := d.rawAllowed(r)
+		nav := d.navContext(r, authCache, scriptNonce)
+		d.recordAudit(r, raw, spec.permission)
+		ctx := context.WithValue(r.Context(), rawAllowedContextKey{}, raw)
+		ctx = context.WithValue(ctx, navContextKey{}, nav)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func newDashboardScriptNonce() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(nonce[:]), nil
+}
+
+func dashboardContentSecurityPolicy(scriptNonce string) string {
+	if scriptNonce == "" {
+		return contentSecurityPolicy
+	}
+	return contentSecurityPolicy + "; script-src 'self' 'nonce-" + scriptNonce + "'"
+}
+
+func (d *dashboardHandler) authorizeRoute(r *http.Request, spec routeSpec, cache *routeAuthorizationCache) routeAccessResult {
+	if !knownPermission(spec.permission) {
+		return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n"}
+	}
+	if d.hasFeature == nil || !d.hasFeature(spec.feature) {
+		return routeAccessResult{status: http.StatusForbidden, body: spec.forbiddenMessage}
+	}
+	if d.authorize == nil && d.authorizePermission == nil && !d.trustedOuterAuth {
+		return routeAccessResult{status: http.StatusForbidden, body: "dashboard authentication required\n"}
+	}
+	if d.authorize != nil {
+		if cache != nil && cache.identityChecked {
+			if cache.identityErr != nil {
+				return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n"}
+			}
+		} else {
+			err := d.authorize(r)
+			if cache != nil {
+				cache.identityChecked = true
+				cache.identityErr = err
+			}
+			if err != nil {
+				return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n"}
+			}
+		}
+	}
+	if d.authorizePermission != nil {
+		err, ok := error(nil), false
+		if cache != nil {
+			if cache.permissions == nil {
+				cache.permissions = make(map[Permission]error)
+			}
+			err, ok = cache.permissions[spec.permission]
+		}
+		if !ok {
+			err = d.authorizePermission(r, spec.permission)
+			if cache != nil {
+				cache.permissions[spec.permission] = err
+			}
+		}
+		if err != nil {
+			return routeAccessResult{status: http.StatusForbidden, body: "forbidden\n", permissionDenied: true}
+		}
+	}
+	return routeAccessResult{}
+}
+
+func (d *dashboardHandler) navContext(r *http.Request, cache *routeAuthorizationCache, scriptNonce string) NavContext {
+	active := activeNavKey(r.URL.Path)
+	nav := NavContext{
+		Active:      active,
+		ActiveLabel: navLabel(active),
+		ScriptNonce: scriptNonce,
+	}
+	for _, route := range dashboardRouteSpecList {
+		if route.navLabel == "" || !d.authorizeRoute(r, route, cache).allowed() {
+			continue
+		}
+		nav.Entries = append(nav.Entries, NavEntry{
+			Key:    route.navKey,
+			Label:  route.navLabel,
+			Path:   route.pattern,
+			Active: route.navKey == active,
+		})
+	}
+	return nav
+}
+
+func activeNavKey(path string) string {
+	for _, spec := range dashboardRouteSpecList {
+		// The root handler is a ServeMux fallback, but only the root URL
+		// activates Overview. Detail prefixes retain their parent page key.
+		if path == spec.pattern || (spec.pattern != "/" && strings.HasSuffix(spec.pattern, "/") && strings.HasPrefix(path, spec.pattern)) {
+			return spec.navKey
+		}
+	}
+	return ""
+}
+
+func navLabel(key string) string {
+	for _, spec := range dashboardNavRouteSpecs {
+		if spec.key == key {
+			return spec.label
+		}
+	}
+	return "Dashboard"
+}
+
+func knownPermission(permission Permission) bool {
+	for _, known := range AllPermissions() {
+		if permission == known {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *dashboardHandler) handleOverview(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/overview" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	scope := d.model.defaultFleetScope
+	if d.hasFeature != nil && d.hasFeature(license.FeatureFleet) &&
+		d.model.fleetSource != nil && scope.OrgID != "" && scope.FleetID != "" {
+		if !d.authorizeFleetScopeRequest(w, r, scope, true, rawAllowedFromContext(r)) {
+			return
+		}
+	}
+	page, err := d.model.Overview(r.Context(), rawAllowedFromContext(r))
+	if err != nil {
+		writeEvidenceReadError(w, err, "could not build overview")
+		return
+	}
+	page.Nav = navFromContext(r)
+	var buf bytes.Buffer
+	if err := overviewTemplate.Execute(&buf, page); err != nil {
+		http.Error(w, "could not render overview", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func writeEvidenceReadError(w http.ResponseWriter, err error, fallback string) {
+	if errors.Is(err, errReceiptGroupNeedsVerification) {
+		http.Error(w, "receipt group evidence requires group verification; run pipelock verify-receipt with --chain set to the evidence directory and --key set to a trusted public key", http.StatusConflict)
+		return
+	}
+	http.Error(w, fallback, http.StatusInternalServerError)
+}
+
+func (d *dashboardHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/evidence" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+
+	sessions, err := d.model.Sessions()
+	if err != nil {
+		writeEvidenceReadError(w, err, "could not read evidence sessions")
+		return
+	}
+
+	selected := r.URL.Query().Get("session")
+	if selected == "" && len(sessions) > 0 {
+		selected = sessions[0].ID
+	}
+	d.render(w, r, sessions, selected, rawAllowedFromContext(r))
+}
+
+func (d *dashboardHandler) handleExemptions(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/exemptions" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	inventory := d.model.Exemptions()
+	// Exemption scopes/attributes are a map of internal destinations, IP
+	// allowlists, addresses, and enforcement exceptions — as sensitive as the
+	// evidence view's raw destinations. Fail closed: strip them in Go unless
+	// this request is authorized for raw, so raw values never reach a
+	// metadata-only response.
+	if !rawAllowedFromContext(r) {
+		inventory = redactExemptions(inventory)
+	}
+	data := exemptionsPageData{Nav: navFromContext(r), Inventory: inventory}
+	var buf bytes.Buffer
+	if err := exemptionsTemplate.Execute(&buf, data); err != nil {
+		http.Error(w, "could not render exemptions", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func requireGet(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet {
+		return true
+	}
+	w.Header().Set("Allow", http.MethodGet)
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
+type agentsPageData struct {
+	Nav        NavContext
+	Groups     []evidenceview.AgentGroup
+	Filter     FilterSpec
+	RawAllowed bool
+}
+
+type investigatorPageData struct {
+	Nav         NavContext
+	SessionID   string
+	Seq         string
+	Explanation evidenceview.DecisionExplanation
+	// Records lists every record of the action in chain order.
+	Records []evidenceview.DecisionExplanation
+	// Incomplete marks a bounded view in which a later record of the action
+	// may be missing, so the verdict shown may not be final.
+	Incomplete bool
+	RawAllowed bool
+}
+
+func (d *dashboardHandler) handleAgents(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/agents" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	filter := d.model.ResolveFilter(r)
+	groups, err := d.model.Agents(filter)
+	if err != nil {
+		http.Error(w, "could not read agent evidence", http.StatusInternalServerError)
+		return
+	}
+	data := agentsPageData{
+		Nav:        navFromContext(r),
+		Groups:     groups,
+		Filter:     filter,
+		RawAllowed: rawAllowedFromContext(r),
+	}
+	var buf bytes.Buffer
+	if err := agentsTemplate.Execute(&buf, data); err != nil {
+		http.Error(w, "could not render agents view", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (d *dashboardHandler) handleAgent(w http.ResponseWriter, r *http.Request) {
+	if !requireGet(w, r) {
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/agent/")
+	if rest == "" || strings.Contains(rest, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	agentID := rest
+	filter := d.model.ResolveFilter(r)
+	group, found, err := d.model.Agent(agentID, filter)
+	if err != nil {
+		http.Error(w, "could not read agent evidence", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	data := agentsPageData{
+		Nav:        navFromContext(r),
+		Groups:     []evidenceview.AgentGroup{group},
+		Filter:     filter,
+		RawAllowed: rawAllowedFromContext(r),
+	}
+	var buf bytes.Buffer
+	if err := agentsTemplate.Execute(&buf, data); err != nil {
+		http.Error(w, "could not render agent view", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (d *dashboardHandler) handleFleetOverview(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/fleet" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	q := r.URL.Query()
+	orgID := q.Get("org_id")
+	fleetID := q.Get("fleet_id")
+	// A plain "Fleet" nav click carries no scope. When neither is supplied,
+	// fall back to the operator-configured default (the conductor org/fleet the
+	// dashboard reads) so the view resolves instead of 400ing. A partial scope
+	// (only one supplied) is deliberately NOT defaulted; it stays an explicit
+	// error so a half-specified request never silently reads a different fleet.
+	if orgID == "" && fleetID == "" {
+		orgID = d.defaultFleetScope.OrgID
+		fleetID = d.defaultFleetScope.FleetID
+	}
+	if err := validateFleetScope(orgID, fleetID, d.model.fleetSource != nil); err != nil {
+		http.Error(w, "invalid fleet scope", http.StatusBadRequest)
+		return
+	}
+	if !d.authorizeFleetScopeRequest(w, r, DecisionScope{OrgID: orgID, FleetID: fleetID}, d.model.fleetSource != nil, rawAllowedFromContext(r)) {
+		return
+	}
+	overview, err := d.model.FleetOverview(r.Context(), orgID, fleetID, rawAllowedFromContext(r))
+	if err != nil {
+		if errors.Is(err, errInvalidFleetScope) {
+			http.Error(w, "invalid fleet scope", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "could not read fleet overview", http.StatusInternalServerError)
+		return
+	}
+	overview.Nav = navFromContext(r)
+	var buf bytes.Buffer
+	if err := fleetoverviewTemplate.Execute(&buf, overview); err != nil {
+		http.Error(w, "could not render fleet overview", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+type decisionScopePageOptions struct {
+	path             string
+	tmpl             *template.Template
+	buildErr         string
+	renderErr        string
+	sourceConfigured func(*ReadModel) bool
+	build            func(context.Context, DecisionScope, bool) (any, error)
+}
+
+func (d *dashboardHandler) serveDecisionScopePage(w http.ResponseWriter, r *http.Request, opts decisionScopePageOptions) {
+	if r.URL.Path != opts.path {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	scope := decisionScopeFromRequest(r)
+	if err := validateDecisionScope(scope); err != nil {
+		http.Error(w, "invalid decision scope", http.StatusBadRequest)
+		return
+	}
+	raw := rawAllowedFromContext(r)
+	sourceConfigured := scope.ArtifactHash != "" && opts.sourceConfigured != nil && opts.sourceConfigured(d.model)
+	if !d.authorizeFleetScopeRequest(w, r, scope, sourceConfigured, raw) {
+		return
+	}
+	page, err := opts.build(r.Context(), scope, raw)
+	if err != nil {
+		http.Error(w, opts.buildErr, http.StatusInternalServerError)
+		return
+	}
+	if scope.ArtifactHash != "" {
+		d.recordDecisionScopeAudit(r, raw, scope, page)
+	}
+	page = withNavContext(page, navFromContext(r))
+	var buf bytes.Buffer
+	if err := opts.tmpl.Execute(&buf, page); err != nil {
+		http.Error(w, opts.renderErr, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func withNavContext(page any, nav NavContext) any {
+	switch p := page.(type) {
+	case WorkbenchPage:
+		p.Nav = nav
+		return p
+	case IncidentPage:
+		p.Nav = nav
+		return p
+	default:
+		return page
+	}
+}
+
+// handleWorkbench serves the read-only Signed Action Workbench. It is GET-only
+// and reaches no write path: it renders static prepare guidance and, when a
+// conductor decision source is wired and an artifact hash is supplied, the
+// read-only replay of that past decision.
+func (d *dashboardHandler) handleWorkbench(w http.ResponseWriter, r *http.Request) {
+	d.serveDecisionScopePage(w, r, decisionScopePageOptions{
+		path:      "/workbench",
+		tmpl:      workbenchTemplate,
+		buildErr:  "could not build workbench view",
+		renderErr: "could not render workbench",
+		sourceConfigured: func(m *ReadModel) bool {
+			return m.conductorSource != nil
+		},
+		build: func(ctx context.Context, scope DecisionScope, raw bool) (any, error) {
+			return d.model.Workbench(ctx, scope, raw)
+		},
+	})
+}
+
+// handleIncident serves the read-only Incident Cockpit. It is GET-only and
+// reaches no write path: it correlates a conductor decision replay with the
+// bounded fleet applied-state summary.
+func (d *dashboardHandler) handleIncident(w http.ResponseWriter, r *http.Request) {
+	d.serveDecisionScopePage(w, r, decisionScopePageOptions{
+		path:      "/incident",
+		tmpl:      incidentTemplate,
+		buildErr:  "could not build incident view",
+		renderErr: "could not render incident view",
+		sourceConfigured: func(m *ReadModel) bool {
+			return m.conductorSource != nil || m.fleetSource != nil
+		},
+		build: func(ctx context.Context, scope DecisionScope, raw bool) (any, error) {
+			return d.model.Incident(ctx, scope, raw)
+		},
+	})
+}
+
+func decisionScopeFromRequest(r *http.Request) DecisionScope {
+	q := r.URL.Query()
+	return DecisionScope{
+		OrgID:        q.Get("org_id"),
+		FleetID:      q.Get("fleet_id"),
+		ArtifactHash: q.Get("artifact_hash"),
+	}
+}
+
+func (d *dashboardHandler) handleBudgets(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/budgets" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	overview, err := d.model.Budgets(r.Context(), rawAllowedFromContext(r))
+	if err != nil {
+		http.Error(w, "could not read agent budgets", http.StatusInternalServerError)
+		return
+	}
+	overview.Nav = navFromContext(r)
+	var buf bytes.Buffer
+	if err := budgetsTemplate.Execute(&buf, overview); err != nil {
+		http.Error(w, "could not render budgets", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (d *dashboardHandler) handleTrustKeys(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/trust-keys" {
+		http.NotFound(w, r)
+		return
+	}
+	if !requireGet(w, r) {
+		return
+	}
+	page, err := d.model.TrustKeys()
+	if err != nil {
+		writeEvidenceReadError(w, err, "could not audit trust and keys")
+		return
+	}
+	page.Nav = navFromContext(r)
+	var buf bytes.Buffer
+	if err := trustKeysTemplate.Execute(&buf, page); err != nil {
+		http.Error(w, "could not render trust and keys", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (d *dashboardHandler) handleSession(w http.ResponseWriter, r *http.Request) {
+	if !requireGet(w, r) {
+		return
+	}
+
+	rest := strings.TrimPrefix(r.URL.Path, "/session/")
+	if rest == "" {
+		http.NotFound(w, r)
+		return
+	}
+	// Handle /session/<id>/receipt/<action-id> — the investigator route.
+	if strings.Contains(rest, "/") {
+		d.handleSessionReceipt(w, r, rest)
+		return
+	}
+	selected := rest
+	sessions, err := d.model.Sessions()
+	if err != nil {
+		writeEvidenceReadError(w, err, "could not read evidence sessions")
+		return
+	}
+	d.render(w, r, sessions, selected, rawAllowedFromContext(r))
+}
+
+func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.Request, rest string) {
+	// Expected: <sessionID>/receipt/<action-id>
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) != 3 || parts[1] != "receipt" || parts[0] == "" || parts[2] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	sessionID := parts[0]
+	// Reject path traversal.
+	if strings.Contains(sessionID, "..") || strings.Contains(sessionID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	actionID := parts[2]
+	detail, found, err := d.model.ReceiptActionDetail(sessionID, actionID)
+	if err != nil {
+		http.Error(w, "could not read receipt detail", http.StatusInternalServerError)
+		return
+	}
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+	raw := rawAllowedFromContext(r)
+	explanation, records := detail.Headline, detail.Records
+	if !raw {
+		explanation = evidenceview.RedactExplanation(explanation)
+		redacted := make([]evidenceview.DecisionExplanation, len(records))
+		for i, rec := range records {
+			redacted[i] = evidenceview.RedactExplanation(rec)
+		}
+		records = redacted
+	}
+	data := investigatorPageData{
+		Nav:         navFromContext(r),
+		SessionID:   sessionID,
+		Seq:         explanation.ChainSeq.Detail,
+		Explanation: explanation,
+		Records:     records,
+		Incomplete:  detail.Incomplete,
+		RawAllowed:  raw,
+	}
+	var buf bytes.Buffer
+	if err := investigatorTemplate.Execute(&buf, data); err != nil {
+		http.Error(w, "could not render investigator view", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}
+
+func (d *dashboardHandler) render(w http.ResponseWriter, r *http.Request, sessions []SessionSummary, selected string, raw bool) {
+	data := pageData{
+		Nav:             navFromContext(r),
+		Sessions:        sessions,
+		SelectedSession: selected,
+		RawAllowed:      raw,
+		Operability:     d.model.OperabilityHealth(),
+	}
+	if selected != "" {
+		evidence, err := d.model.Session(selected)
+		if err != nil {
+			writeEvidenceReadError(w, err, "could not read selected evidence")
+			return
+		}
+		// Fail closed: strip destinations and signed payloads in Go before
+		// templating unless this request is authorized for raw, so the raw
+		// bytes never reach the response.
+		if !raw {
+			evidence = redactRaw(evidence)
+		}
+		data.Evidence = evidence
+		data.HasEvidence = true
+	}
+
+	var buf bytes.Buffer
+	if err := evidenceTemplate.Execute(&buf, data); err != nil {
+		http.Error(w, "could not render evidence", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", contentTypeHTML)
+	_, _ = w.Write(buf.Bytes())
+}

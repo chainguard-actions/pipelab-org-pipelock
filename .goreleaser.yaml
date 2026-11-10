@@ -1,0 +1,322 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pipelock
+    main: ./cmd/pipelock
+    binary: pipelock
+    env:
+      - CGO_ENABLED=0
+    tags:
+      - enterprise
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version={{.Version}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.BuildDate={{.CommitDate}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.GitCommit={{.ShortCommit}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.GoVersion={{.Env.GOVERSION}}
+      - -X github.com/luckyPipewrench/pipelock/internal/proxy.Version={{.Version}}
+      - -X github.com/luckyPipewrench/pipelock/internal/license.PublicKeyHex={{.Env.LICENSE_PUBLIC_KEY}}
+      - -X github.com/luckyPipewrench/pipelock/internal/rules.KeyringHex={{.Env.RULES_KEYRING_HEX}}
+      - -X github.com/luckyPipewrench/pipelock/internal/release.PublicKeyringHex={{.Env.RELEASE_KEYRING_HEX}}
+
+  # License service: cluster-only webhook handler for Polar subscription events.
+  # Linux-only (runs in k8s), not distributed via Homebrew or public archives.
+  - id: license-service
+    main: ./cmd/license-service
+    binary: license-service
+    env:
+      - CGO_ENABLED=0
+    tags:
+      - enterprise
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+  # Pipelock-verifier: standalone receipt + Audit Packet validator. No
+  # network surface, no proxy, no scanner. Shipped as a separate binary so
+  # consumers (CI runners, third parties) can drop in a pure-verifier without
+  # provisioning the full firewall stack. Intentionally NOT distributed via
+  # Homebrew or container images yet; raw archives are sufficient for the
+  # bring-your-own-verifier audit use case and keep the surface tight while
+  # the API stabilizes pre-v1. Add brews + dockers stanzas when the action
+  # repo or external pilots ask for them.
+  - id: pipelock-verifier
+    main: ./cmd/pipelock-verifier
+    binary: pipelock-verifier
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version={{.Version}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.BuildDate={{.CommitDate}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.GitCommit={{.ShortCommit}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.GoVersion={{.Env.GOVERSION}}
+
+archives:
+  - id: pipelock
+    ids: [pipelock]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+  - id: pipelock-verifier
+    ids: [pipelock-verifier]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      pipelock-verifier_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+signs:
+  - cmd: cosign
+    certificate: '${artifact}.pem'
+    args:
+      - sign-blob
+      - '--yes'
+      - '--output-certificate=${certificate}'
+      - '--output-signature=${signature}'
+      - '${artifact}'
+    artifacts: checksum
+    output: true
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+      - '^style:'
+      - '^build:'
+      - '^Merge '
+      - 'go mod tidy'
+  groups:
+    - title: '🚀 Features'
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: '🐛 Bug Fixes'
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: '🔒 Security'
+      regexp: '^.*?sec(urity)?(\(.+\))??!?:.+$'
+      order: 2
+    - title: '⚡ Performance'
+      regexp: '^.*?perf(\(.+\))??!?:.+$'
+      order: 3
+    - title: '📦 Dependencies'
+      regexp: '^.*?((build|chore)\(deps.*?\)|deps(\(.+\))?)!?:.+$'
+      order: 4
+    - title: 'Other Changes'
+      order: 999
+
+release:
+  footer: |
+    ---
+    📚 Docs: https://pipelab.org  •  💬 Community: https://discord.gg/badNfhGKTc
+
+    Pipelock is an open-source agent firewall. Come poke holes in it.
+
+brews:
+  - ids: [pipelock]
+    # Generate the exact formula into dist/homebrew/Formula/pipelock.rb, but do
+    # not publish it during the build job. The protected promotion job commits
+    # this file only after the offline release-manifest signature verifies.
+    skip_upload: true
+    repository:
+      owner: luckyPipewrench
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/pipelab-org/pipelock"
+    description: "Security firewall for AI agents"
+    license: "Apache-2.0 AND Elastic-2.0"
+    directory: Formula
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    install: |
+      bin.install "pipelock"
+    test: |
+      system "#{bin}/pipelock", "version"
+
+dockers:
+  - image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock:{{ .Version }}-staging-amd64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=pipelock"
+      - "--label=org.opencontainers.image.description=Agent firewall for AI agents. Network scanning, process containment, and tool policy enforcement."
+      - "--label=org.opencontainers.image.url=https://pipelab.org"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      - "--label=org.opencontainers.image.documentation=https://pipelab.org/learn/"
+      - "--label=org.opencontainers.image.vendor=luckyPipewrench"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .CommitDate }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0 AND Elastic-2.0"
+    dockerfile: Dockerfile.goreleaser
+
+  - image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock:{{ .Version }}-staging-arm64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=pipelock"
+      - "--label=org.opencontainers.image.description=Agent firewall for AI agents. Network scanning, process containment, and tool policy enforcement."
+      - "--label=org.opencontainers.image.url=https://pipelab.org"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      - "--label=org.opencontainers.image.documentation=https://pipelab.org/learn/"
+      - "--label=org.opencontainers.image.vendor=luckyPipewrench"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .CommitDate }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0 AND Elastic-2.0"
+    goarch: arm64
+    dockerfile: Dockerfile.goreleaser
+
+  # Init container image for K8s sidecar deployments (MCP stdio wrapping).
+  # Alpine-based so `cp` is available for copying the binary to shared volumes.
+  - image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-init:{{ .Version }}-staging-amd64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=pipelock-init"
+      - "--label=org.opencontainers.image.description=Init container that installs the Pipelock binary into a shared volume for sidecar deployments."
+      - "--label=org.opencontainers.image.url=https://pipelab.org"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      - "--label=org.opencontainers.image.documentation=https://pipelab.org/learn/"
+      - "--label=org.opencontainers.image.vendor=luckyPipewrench"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .CommitDate }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0 AND Elastic-2.0"
+    dockerfile: Dockerfile.init
+
+  - image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-init:{{ .Version }}-staging-arm64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=pipelock-init"
+      - "--label=org.opencontainers.image.description=Init container that installs the Pipelock binary into a shared volume for sidecar deployments."
+      - "--label=org.opencontainers.image.url=https://pipelab.org"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      - "--label=org.opencontainers.image.documentation=https://pipelab.org/learn/"
+      - "--label=org.opencontainers.image.vendor=luckyPipewrench"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .CommitDate }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0 AND Elastic-2.0"
+    goarch: arm64
+    dockerfile: Dockerfile.init
+
+  # License service: webhook handler for Polar subscription events.
+  # Alpine-based (needs writable fs for SQLite + audit ledger).
+  - image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-license-service:{{ .Version }}-staging-amd64"
+    ids: [license-service]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=pipelock-license-service"
+      - "--label=org.opencontainers.image.description=Pipelock license service. Webhook handler for subscription events and license issuance."
+      - "--label=org.opencontainers.image.url=https://pipelab.org"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      - "--label=org.opencontainers.image.documentation=https://pipelab.org/learn/"
+      - "--label=org.opencontainers.image.vendor=luckyPipewrench"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .CommitDate }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0 AND Elastic-2.0"
+    dockerfile: Dockerfile.license-service
+
+  - image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-license-service:{{ .Version }}-staging-arm64"
+    ids: [license-service]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=pipelock-license-service"
+      - "--label=org.opencontainers.image.description=Pipelock license service. Webhook handler for subscription events and license issuance."
+      - "--label=org.opencontainers.image.url=https://pipelab.org"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+      - "--label=org.opencontainers.image.documentation=https://pipelab.org/learn/"
+      - "--label=org.opencontainers.image.vendor=luckyPipewrench"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.created={{ .CommitDate }}"
+      - "--label=org.opencontainers.image.licenses=Apache-2.0 AND Elastic-2.0"
+    goarch: arm64
+    dockerfile: Dockerfile.license-service
+
+docker_manifests:
+  - name_template: "{{ .Env.IMAGE_NAMESPACE }}/pipelock:{{ .Version }}-staging"
+    image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock:{{ .Version }}-staging-amd64"
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock:{{ .Version }}-staging-arm64"
+
+  - name_template: "{{ .Env.IMAGE_NAMESPACE }}/pipelock-init:{{ .Version }}-staging"
+    image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-init:{{ .Version }}-staging-amd64"
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-init:{{ .Version }}-staging-arm64"
+
+  - name_template: "{{ .Env.IMAGE_NAMESPACE }}/pipelock-license-service:{{ .Version }}-staging"
+    image_templates:
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-license-service:{{ .Version }}-staging-amd64"
+      - "{{ .Env.IMAGE_NAMESPACE }}/pipelock-license-service:{{ .Version }}-staging-arm64"

@@ -1,0 +1,777 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//! Real evidence directories written by pipelock runs (see
+//! sdk/conformance/testdata/run-chains/README.md). Every variant's expected
+//! verdict is generated from the Go reference, so these tests hold the Rust
+//! verifier to Go's verdict on each one.
+
+mod common;
+
+use pipelock_verifier_rs::chain_set::{verify_base, BaseVerifyOptions};
+use pipelock_verifier_rs::rotation::load_rotation_endorsement_file;
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+// Found from the recorder entry hash chain, which only the Go verifiers check.
+const VARIANTS: [&str; 9] = [
+    "valid",
+    "tampered-predecessor",
+    "tampered-successor",
+    "link-edited",
+    "link-deleted",
+    "double-successor",
+    "link-wrong-tail",
+    "link-appended",
+    "key-rotated",
+];
+
+struct Case {
+    variant: &'static str,
+    expect_file: &'static str,
+    both_keys: bool,
+    endorse: bool,
+}
+
+fn cases() -> Vec<Case> {
+    let mut out: Vec<Case> = VARIANTS
+        .iter()
+        .map(|variant| Case {
+            variant,
+            expect_file: "expect.json",
+            both_keys: false,
+            endorse: false,
+        })
+        .collect();
+    out.push(Case {
+        variant: "key-rotated",
+        expect_file: "expect-both-keys.json",
+        both_keys: true,
+        endorse: false,
+    });
+    out.push(Case {
+        variant: "key-rotated",
+        expect_file: "expect-endorsed.json",
+        both_keys: false,
+        endorse: true,
+    });
+    out
+}
+
+fn fixtures() -> PathBuf {
+    common::repo_root().join("sdk/conformance/testdata/run-chains")
+}
+
+fn recovery_fixture() -> PathBuf {
+    common::repo_root().join("sdk/conformance/testdata/recovery-seals/valid")
+}
+
+fn read_trimmed(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+        .trim()
+        .to_string()
+}
+
+fn key() -> String {
+    read_trimmed(&fixtures().join("signer-key.hex"))
+}
+
+fn endorsement_path(case: &Case) -> PathBuf {
+    fixtures()
+        .join(case.variant)
+        .join("rotation-endorsement.json")
+}
+
+fn options(case: &Case) -> BaseVerifyOptions {
+    let mut trusted_keys = vec![key()];
+    if case.both_keys {
+        trusted_keys.push(read_trimmed(&fixtures().join("rotated-signer-key.hex")));
+    }
+    let endorsements = if case.endorse {
+        vec![load_rotation_endorsement_file(&endorsement_path(case)).expect("endorsement")]
+    } else {
+        Vec::new()
+    };
+    BaseVerifyOptions {
+        trusted_keys,
+        endorsements,
+    }
+}
+
+fn expect(case: &Case) -> Value {
+    serde_json::from_str(&read_trimmed(
+        &fixtures().join(case.variant).join(case.expect_file),
+    ))
+    .expect("expect json")
+}
+
+fn run_cli(args: &[&str]) -> (i32, String, String) {
+    let output = Command::new(env!("CARGO_BIN_EXE_pipelock-verifier-rs"))
+        .args(args)
+        .args(if args.first() == Some(&"chain") {
+            vec!["--allow-prefix"]
+        } else {
+            vec![]
+        })
+        .output()
+        .expect("run verifier");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn signed_run_chain_streams_past_the_former_input_cap_and_rejects_long_lines() {
+    let fixtures = fixtures();
+    let source = fixtures
+        .join("valid")
+        .join("evidence-proxy.run.03b13ee13e01e7f770480f62ea42f1fe-0.jsonl");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "pipelock-rust-streaming-{}-{unique}",
+        std::process::id()
+    ));
+    fs::create_dir(&dir).expect("create temporary directory");
+    let target = dir.join("evidence-proxy.run.03b13ee13e01e7f770480f62ea42f1fe-0.jsonl");
+    let mut expanded = fs::read(source).expect("read signed producer fixture");
+    for _ in 0..((8 << 20) / 2 + 1) {
+        expanded.extend_from_slice(b"\r\n");
+    }
+    fs::write(&target, expanded).expect("write expanded JSONL");
+    let target_arg = target.to_str().expect("utf8 path");
+    let key_arg = fixtures.join("signer-key.hex");
+    let key_arg = key_arg.to_str().expect("utf8 key path");
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        "--allow-prefix",
+        target_arg,
+        "--key",
+        key_arg,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("json report");
+    assert_eq!(report["valid"], true);
+    assert_eq!(report["receipt_count"], 2);
+
+    fs::write(
+        &target,
+        [vec![b' '; (1 << 20) + 1], b"\r\n".to_vec()].concat(),
+    )
+    .expect("write overlong line");
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        "--allow-prefix",
+        target_arg,
+        "--key",
+        key_arg,
+        "--json",
+    ]);
+    assert_ne!(code, 0, "{stdout}{stderr}");
+    assert!(!stdout.contains("\"valid\":true"), "{stdout}{stderr}");
+    assert!(stderr.contains("recorder entry limit"), "{stdout}{stderr}");
+    fs::remove_dir_all(dir).expect("remove temporary directory");
+}
+
+#[test]
+fn endorsement_usage_precedes_missing_file_in_directory_mode() {
+    let directory = fixtures().join("valid");
+    let missing = directory.join("missing-endorsement.json");
+    let (status, _, stderr) = run_cli(&[
+        "chain",
+        directory.to_str().expect("fixture path"),
+        "--dir",
+        "--allow-unpinned",
+        "--rotation-endorsement",
+        missing.to_str().expect("missing path"),
+    ]);
+    assert_eq!(status, 64, "{stderr}");
+    assert!(stderr.contains("cannot be combined"), "{stderr}");
+}
+
+#[test]
+fn run_chain_fixtures_match_go_reference() {
+    for case in cases() {
+        let name = format!("{}/{}", case.variant, case.expect_file);
+        let exp = expect(&case);
+        let report = verify_base(&fixtures().join(case.variant), "proxy", &options(&case))
+            .unwrap_or_else(|err| panic!("{name}: {err}"));
+
+        let chains: Vec<Value> = report
+            .chains
+            .iter()
+            .map(|c| serde_json::json!({"session": c.session, "valid": c.valid}))
+            .collect();
+        assert_eq!(Value::Array(chains), exp["chains"], "{name}: chains");
+
+        let linked: Vec<Value> = report
+            .chains
+            .iter()
+            .filter_map(|c| {
+                c.link.as_ref().map(|l| {
+                    serde_json::json!({
+                        "session": c.session,
+                        "predecessor_session": l.predecessor_session,
+                        "predecessor_tail_seq": l.predecessor_tail_seq,
+                        "trust": c.link_trust,
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(Value::Array(linked), exp["linked"], "{name}: linked");
+        assert_eq!(
+            serde_json::json!(report.unlinked()),
+            exp["unlinked"],
+            "{name}: unlinked"
+        );
+
+        let mut got: Vec<(String, String)> = report
+            .findings
+            .iter()
+            .map(|f| (f.kind.clone(), f.session.clone()))
+            .collect();
+        got.sort();
+        let want: Vec<(String, String)> = exp["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .map(|f| {
+                (
+                    f["kind"].as_str().unwrap_or_default().to_string(),
+                    f["session"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "{name}: findings");
+        assert_eq!(report.healthy(), want.is_empty(), "{name}: healthy");
+    }
+}
+
+#[test]
+fn run_chain_cli_reaches_go_verdict() {
+    for case in cases() {
+        let name = format!("{}/{}", case.variant, case.expect_file);
+        let exp = expect(&case);
+        let dir = fixtures().join(case.variant);
+        let key = key();
+        let rotated = fs::read_to_string(fixtures().join("rotated-signer-key.hex"))
+            .expect("rotated key")
+            .trim()
+            .to_string();
+        let endorsement = endorsement_path(&case);
+        let mut args = vec![
+            "chain",
+            dir.to_str().expect("utf8 path"),
+            "--dir",
+            "--key",
+            key.as_str(),
+            "--json",
+        ];
+        // --key repeats, as the Go reference's does, to pin a trusted key set.
+        if case.both_keys {
+            args.extend(["--key", rotated.as_str()]);
+        }
+        if case.endorse {
+            args.push("--rotation-endorsement");
+            args.push(endorsement.to_str().expect("utf8 path"));
+        }
+        let (code, stdout, stderr) = run_cli(&args);
+        let want_valid = exp["valid"].as_bool().expect("valid");
+        assert_eq!(code, if want_valid { 0 } else { 1 }, "{name}: {stderr}");
+        let report: Value = serde_json::from_str(&stdout).expect("json report");
+        assert_eq!(report["valid"], Value::Bool(want_valid), "{name}");
+        assert_eq!(report["base"], "proxy", "{name}");
+        assert_eq!(
+            report["continuity"]["unlinked"], exp["unlinked"],
+            "{name}: unlinked"
+        );
+        let sessions: Vec<Value> = report["chains"]
+            .as_array()
+            .expect("chains")
+            .iter()
+            .map(|c| c["session"].clone())
+            .collect();
+        let want_sessions: Vec<Value> = exp["chains"]
+            .as_array()
+            .expect("chains")
+            .iter()
+            .map(|c| c["session"].clone())
+            .collect();
+        assert_eq!(sessions, want_sessions, "{name}: sessions");
+        let finding_pairs = |v: &Value| -> Vec<(String, String)> {
+            let mut out: Vec<(String, String)> = v
+                .as_array()
+                .expect("findings")
+                .iter()
+                .map(|f| {
+                    (
+                        f["kind"].as_str().unwrap_or_default().to_string(),
+                        f["session"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            finding_pairs(&report["continuity"]["findings"]),
+            finding_pairs(&exp["findings"]),
+            "{name}: findings"
+        );
+    }
+}
+
+#[test]
+fn rotation_endorsement_requires_operator_pinned_root() {
+    let fixture = fixtures().join("key-rotated");
+    let endorsement = fixture.join("rotation-endorsement.json");
+    let exp: Value = serde_json::from_str(
+        &fs::read_to_string(fixture.join("expect-endorsed.json")).expect("expectation"),
+    )
+    .expect("json expectation");
+    let session = exp["linked"][0]["session"]
+        .as_str()
+        .expect("successor session");
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        fixture.to_str().expect("fixture path"),
+        "--dir",
+        "--session-id",
+        session,
+        "--rotation-endorsement",
+        endorsement.to_str().expect("endorsement path"),
+        "--json",
+    ]);
+    assert_eq!(code, 64, "{stdout}{stderr}");
+    assert!(stderr.contains("requires --key"), "{stderr}");
+    assert!(!stdout.contains("\"valid\": true"), "{stdout}");
+}
+
+#[test]
+fn missing_rotation_link_does_not_corrupt_predecessor_run_report() {
+    let source = fixtures().join("key-rotated");
+    let dir = tempdir("missing-rotation-link");
+    for entry in fs::read_dir(&source).expect("read fixture") {
+        let entry = entry.expect("fixture entry");
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("chain-link-")
+        {
+            continue;
+        }
+        fs::copy(entry.path(), dir.join(entry.file_name())).expect("copy fixture");
+    }
+    let endorsement = source.join("rotation-endorsement.json");
+    let key = key();
+    let (code, stdout, _) = run_cli(&[
+        "chain",
+        dir.to_str().expect("utf8 path"),
+        "--dir",
+        "--key",
+        &key,
+        "--rotation-endorsement",
+        endorsement.to_str().expect("utf8 path"),
+        "--json",
+    ]);
+    assert_eq!(code, 1);
+    let report: Value = serde_json::from_str(&stdout).expect("json report");
+    assert_eq!(report["valid"], false);
+    let chains = report["chains"].as_array().expect("chains");
+    assert_eq!(
+        chains
+            .iter()
+            .map(|chain| chain["valid"].as_bool())
+            .collect::<Vec<_>>(),
+        vec![Some(true), Some(false)]
+    );
+    fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn run_chain_cli_human_output_lists_linked_and_unlinked_runs() {
+    let dir = fixtures().join("valid");
+    let key = key();
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        dir.to_str().expect("utf8 path"),
+        "--dir",
+        "--key",
+        &key,
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stdout.contains("RESTART CONTINUITY OK: base \"proxy\": 2 chain(s), 1 linked, 0 attested discontinuity(s), 1 unlinked")
+    );
+    assert!(stdout.contains("(same_key)"));
+    assert!(stdout.contains("  result:     VALID PREFIX, END UNPROVEN"));
+}
+
+#[test]
+fn recovery_seal_fixture_is_reported_as_an_unhealthy_attested_discontinuity() {
+    let fixture = recovery_fixture();
+    let evidence = fixture.join("evidence");
+    let seal: Value =
+        serde_json::from_str(&read_trimmed(&fixture.join("seal.json"))).expect("seal fixture JSON");
+    let predecessor = seal["predecessor_session"].as_str().expect("predecessor");
+    let successor = seal["successor_session"].as_str().expect("successor");
+    let pinned = read_trimmed(&fixture.join("signer.pub"));
+    let report = verify_base(
+        &evidence,
+        "proxy",
+        &BaseVerifyOptions {
+            trusted_keys: vec![pinned.clone()],
+            endorsements: Vec::new(),
+        },
+    )
+    .expect("verify recovery fixture");
+    let run = report
+        .chains
+        .iter()
+        .find(|chain| chain.session == successor)
+        .expect("successor chain");
+    assert!(run.recovery_seal.is_some());
+    assert!(!report.healthy(), "a valid seal still records damage");
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| { finding.kind == "corrupt_chain" && finding.session == predecessor }));
+    assert!(report.findings.iter().any(|finding| {
+        finding.kind == "attested_discontinuity" && finding.session == successor
+    }));
+
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        evidence.to_str().expect("evidence path"),
+        "--dir",
+        "--key",
+        &pinned,
+        "--json",
+    ]);
+    assert_eq!(code, 1, "{stderr}");
+    let output: Value = serde_json::from_str(&stdout).expect("JSON report");
+    assert_eq!(
+        output["continuity"]["discontinuities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!output["continuity"]["unlinked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session.as_str() == Some(successor)));
+    assert!(output["continuity"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|finding| finding["kind"] == "attested_discontinuity"));
+    assert!(evidence
+        .join(format!("chain-link-{predecessor}.json"))
+        .is_file());
+}
+
+#[test]
+fn recovery_seal_tamper_replay_and_removal_fail_closed() {
+    let fixture = recovery_fixture();
+    let seal: Value =
+        serde_json::from_str(&read_trimmed(&fixture.join("seal.json"))).expect("seal fixture JSON");
+    let predecessor = seal["predecessor_session"].as_str().unwrap();
+    let successor = seal["successor_session"].as_str().unwrap();
+    let shard = seal["shard"].as_str().unwrap();
+    let pinned = read_trimmed(&fixture.join("signer.pub"));
+
+    let verify = |dir: &Path| {
+        verify_base(
+            dir,
+            "proxy",
+            &BaseVerifyOptions {
+                trusted_keys: vec![pinned.clone()],
+                endorsements: Vec::new(),
+            },
+        )
+        .expect("verify test evidence")
+    };
+
+    let tampered = tempdir("recovery-seal-tampered");
+    copy_fixture_evidence(&fixture.join("evidence"), &tampered);
+    let shard_path = tampered.join(shard);
+    let mut bytes = fs::read(&shard_path).expect("read predecessor shard");
+    bytes.push(0);
+    fs::write(&shard_path, bytes).expect("tamper predecessor shard");
+    let report = verify(&tampered);
+    assert!(!report.healthy());
+    assert!(report.unlinked().iter().any(|session| session == successor));
+    assert!(report
+        .chains
+        .iter()
+        .all(|chain| chain.recovery_seal.is_none()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "invalid_recovery_seal"));
+    assert!(!report
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "attested_discontinuity"));
+    fs::remove_dir_all(&tampered).expect("cleanup");
+
+    let replayed_shard = tempdir("recovery-seal-replayed-shard");
+    copy_fixture_evidence(&fixture.join("evidence"), &replayed_shard);
+    let (stem, number) = shard
+        .strip_suffix(".jsonl")
+        .expect("shard suffix")
+        .rsplit_once('-')
+        .expect("shard sequence");
+    let replay_name = format!("{stem}-{}.jsonl", number.parse::<u64>().unwrap() + 1);
+    fs::rename(replayed_shard.join(shard), replayed_shard.join(replay_name))
+        .expect("move damaged bytes to another shard identity");
+    let report = verify(&replayed_shard);
+    assert!(!report.healthy());
+    assert!(report.unlinked().iter().any(|session| session == successor));
+    assert!(report
+        .chains
+        .iter()
+        .all(|chain| chain.recovery_seal.is_none()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "invalid_recovery_seal"));
+    fs::remove_dir_all(&replayed_shard).expect("cleanup");
+
+    let replayed = tempdir("recovery-seal-replayed");
+    copy_fixture_evidence(&fixture.join("evidence"), &replayed);
+    let original_claim = replayed.join(format!("chain-link-{predecessor}.json"));
+    let replay_claim = replayed.join(format!("chain-link-{successor}.json"));
+    fs::rename(&original_claim, &replay_claim).expect("replay claim into another slot");
+    let report = verify(&replayed);
+    assert!(!report.healthy());
+    assert!(report.unlinked().iter().any(|session| session == successor));
+    assert!(report
+        .chains
+        .iter()
+        .all(|chain| chain.recovery_seal.is_none()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "invalid_recovery_seal"));
+    fs::remove_dir_all(&replayed).expect("cleanup");
+
+    let missing = tempdir("recovery-seal-missing");
+    copy_fixture_evidence(&fixture.join("evidence"), &missing);
+    fs::remove_file(missing.join(format!("chain-link-{predecessor}.json"))).expect("remove claim");
+    let report = verify(&missing);
+    assert!(!report.healthy());
+    assert!(report
+        .chains
+        .iter()
+        .all(|chain| chain.recovery_seal.is_none()));
+    assert!(report.unlinked().iter().any(|session| session == successor));
+    assert!(!report
+        .findings
+        .iter()
+        .any(|finding| finding.kind == "attested_discontinuity"));
+    fs::remove_dir_all(&missing).expect("cleanup");
+}
+
+fn copy_fixture_evidence(source: &Path, destination: &Path) {
+    for entry in fs::read_dir(source).expect("read evidence fixture") {
+        let entry = entry.expect("fixture entry");
+        fs::copy(entry.path(), destination.join(entry.file_name())).expect("copy evidence file");
+    }
+}
+
+#[test]
+fn run_chain_cli_with_wrong_key_fails_every_run() {
+    let dir = fixtures().join("valid");
+    let wrong = "11".repeat(32);
+    let (code, stdout, _) = run_cli(&[
+        "chain",
+        dir.to_str().expect("utf8 path"),
+        "--dir",
+        "--key",
+        &wrong,
+        "--json",
+    ]);
+    assert_eq!(code, 1);
+    let report: Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(report["valid"], false);
+    for chain in report["chains"].as_array().expect("chains") {
+        assert_eq!(chain["valid"], false);
+    }
+}
+
+/// A named run verifies that run's chain and still runs the whole-base pass,
+/// as the Go reference does, so its report carries the base's continuity.
+#[test]
+fn explicit_session_id_verifies_that_run_and_checks_its_base() {
+    let dir = fixtures().join("valid");
+    let key = key();
+    let exp = expect(&cases()[0]);
+    let session = exp["chains"][0]["session"].as_str().expect("session");
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        dir.to_str().expect("utf8 path"),
+        "--dir",
+        "--key",
+        &key,
+        "--session-id",
+        session,
+        "--json",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let report: Value = serde_json::from_str(&stdout).expect("json");
+    let chains = report["chains"].as_array().expect("chains");
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains[0]["session"], session);
+    assert_eq!(
+        chains[0]["path"],
+        format!("{} (session {session})", dir.display())
+    );
+    assert_eq!(chains[0]["valid"], true);
+    assert_eq!(report["valid"], true);
+    assert_eq!(
+        report["continuity"]["chain_count"].as_u64(),
+        Some(exp["chains"].as_array().expect("chains").len() as u64)
+    );
+    assert_eq!(report["continuity"]["healthy"], true);
+
+    // The legacy base session named explicitly has no shards here, so its
+    // chain has no receipts.
+    let (code, stdout, stderr) = run_cli(&[
+        "chain",
+        dir.to_str().expect("utf8 path"),
+        "--dir",
+        "--key",
+        &key,
+        "--session-id=proxy",
+        "--json",
+    ]);
+    assert_eq!(code, 1);
+    let report: Value = serde_json::from_str(&stdout).expect("json");
+    assert_eq!(report["chains"][0]["error"], "no receipts in chain");
+    assert!(
+        stderr.starts_with("verification failed: ") && stderr.contains("proxy"),
+        "{stderr}"
+    );
+}
+
+// Each malformed link below must be rejected as an invalid link, never
+// silently skipped (which would read as an honest unlinked restart).
+#[test]
+fn malformed_link_files_are_findings_not_skipped() {
+    let valid = fixtures().join("valid");
+    let link_name = fs::read_dir(&valid)
+        .expect("read dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| n.starts_with("chain-link-"))
+        .expect("link file");
+    let original = read_trimmed(&valid.join(&link_name));
+    let obj: serde_json::Map<String, Value> = serde_json::from_str(&original).expect("link object");
+    let with = |key: &str, value: Value| {
+        let mut o = obj.clone();
+        o.insert(key.to_string(), value);
+        Value::Object(o).to_string()
+    };
+    let upper_key = obj["successor_signer_key"]
+        .as_str()
+        .expect("key")
+        .to_uppercase();
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "duplicate key",
+            original.replacen('{', "{\"version\":1,", 1),
+            "duplicate",
+        ),
+        (
+            "case-folded alias",
+            with("Version", Value::from(1)),
+            "aliases \"version\"",
+        ),
+        (
+            "unknown field",
+            with("extra", Value::Bool(true)),
+            "unknown field \"extra\"",
+        ),
+        ("trailing tokens", format!("{original} {{}}"), "trailing"),
+        (
+            "version 2",
+            with("version", Value::from(2)),
+            "unsupported chain link version",
+        ),
+        (
+            "uppercase key hex",
+            with("successor_signer_key", Value::from(upper_key)),
+            "successor_signer_key is invalid",
+        ),
+        (
+            "non-canonical linked_at",
+            with("linked_at", Value::from("2026-09-27T17:12:14.500Z0")),
+            "linked_at",
+        ),
+        ("not an object", "[]".to_string(), "not a JSON object"),
+    ];
+    let opts = BaseVerifyOptions {
+        trusted_keys: vec![key()],
+        endorsements: Vec::new(),
+    };
+    for (name, body, detail) in cases {
+        let dir = tempdir(name);
+        for entry in fs::read_dir(&valid)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+        {
+            fs::copy(entry.path(), dir.join(entry.file_name())).expect("copy");
+        }
+        fs::write(dir.join(&link_name), body).expect("write link");
+        let report = verify_base(&dir, "proxy", &opts).expect("verify");
+        let finding = report
+            .findings
+            .iter()
+            .find(|f| f.kind == "invalid_link")
+            .unwrap_or_else(|| panic!("{name}: want invalid_link, got {:?}", report.findings));
+        assert!(
+            finding.detail.contains(detail),
+            "{name}: detail {:?} lacks {detail:?}",
+            finding.detail
+        );
+        assert!(
+            report.chains.iter().all(|c| c.link.is_none()),
+            "{name}: a rejected link must not attach"
+        );
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+    // Positive control: the unmodified link attaches with no finding.
+    let control = verify_base(&valid, "proxy", &opts).expect("verify");
+    assert!(control.findings.is_empty());
+    assert_eq!(
+        control.chains.iter().filter(|c| c.link.is_some()).count(),
+        1
+    );
+}
+
+fn tempdir(tag: &str) -> PathBuf {
+    let dir = std::fs::canonicalize(std::env::temp_dir())
+        .expect("canonical temp dir")
+        .join(format!(
+            "run-chains-{}-{}-{}",
+            tag.replace(' ', "-"),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+    fs::create_dir_all(&dir).expect("mkdir");
+    dir
+}

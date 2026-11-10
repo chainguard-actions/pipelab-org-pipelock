@@ -1,0 +1,737 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package licenseservice
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	// testWebhookSecretB64 is the base64-encoded HMAC key for webhook tests.
+	// Pre-computed: base64("test-secret-key-1234567890").
+	testWebhookSecretB64 = "dGVzdC1zZWNyZXQta2V5LTEy" + "MzQ1Njc4OTA=" //nolint:gosec // gitleaks:allow
+
+	testSubscriptionID     = "sub_test123"
+	testOrderID            = "order_test789"
+	testWebhookMsgID       = "msg_test456"
+	testProductID          = "prod_abc"
+	testProductName        = "Pipelock Pro Monthly"
+	testCustomerEmail      = "test@example.com"
+	testPolarAPIToken      = "polar_" + "test_token"
+	testSubscriptionJSON   = `{"id":"sub_test123"}`
+	testContentTypeJSON    = "application/json"
+	testStatusCanceled     = "canceled"
+	testStatusPending      = "pending"
+	testIntervalMonth      = "month"
+	testDeliveryStatusSent = "sent"
+	testEmailNew           = "new@example.com"
+	testIntervalYear       = "year"
+	testLicenseIDOld       = "lic_old"
+)
+
+// signWebhook computes a webhook HMAC-SHA256 signature for testing, mirroring
+// the production key derivation: whsec_ secrets are prefix-stripped + base64
+// decoded; all other secrets (including polar_whs_) use raw string bytes.
+func signWebhook(t *testing.T, body []byte, timestamp, secret string) string {
+	t.Helper()
+
+	var secretBytes []byte
+	if strings.HasPrefix(secret, "whsec_") {
+		var err error
+		secretBytes, err = base64.StdEncoding.DecodeString(secret[6:])
+		if err != nil {
+			t.Fatalf("decode test secret: %v", err)
+		}
+	} else {
+		secretBytes = []byte(secret)
+	}
+
+	signedContent := testWebhookMsgID + "." + timestamp + "." + string(body)
+	mac := hmac.New(sha256.New, secretBytes)
+	mac.Write([]byte(signedContent))
+	sig := mac.Sum(nil)
+
+	return "v1," + base64.StdEncoding.EncodeToString(sig)
+}
+
+func TestValidateWebhookSignature(t *testing.T) {
+	body := []byte(`{"type":"subscription.created","data":{"id":"sub_123"}}`)
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+
+	secret := "whsec_" + testWebhookSecretB64
+	sig := signWebhook(t, body, timestamp, secret)
+
+	tests := []struct {
+		name      string
+		body      []byte
+		msgID     string
+		timestamp string
+		signature string
+		secret    string
+		wantErr   bool
+	}{
+		{
+			name:      "valid signature",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: sig,
+			secret:    secret,
+			wantErr:   false,
+		},
+		{
+			name:      "missing webhook-id",
+			body:      body,
+			msgID:     "",
+			timestamp: timestamp,
+			signature: sig,
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "missing webhook-timestamp",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: "",
+			signature: sig,
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "missing webhook-signature",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: "",
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "wrong signature",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: "v1,aW52YWxpZHNpZ25hdHVyZQ==",
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "tampered body",
+			body:      []byte(`{"type":"subscription.created","data":{"id":"sub_TAMPERED"}}`),
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: sig,
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "expired timestamp",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10),
+			signature: signWebhook(t, body, strconv.FormatInt(time.Now().Add(-10*time.Minute).Unix(), 10), secret),
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "future timestamp beyond tolerance",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10),
+			signature: signWebhook(t, body, strconv.FormatInt(time.Now().Add(10*time.Minute).Unix(), 10), secret),
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "invalid timestamp",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: "not-a-number",
+			signature: signWebhook(t, body, "not-a-number", secret),
+			secret:    secret,
+			wantErr:   true,
+		},
+		{
+			name:      "secret without whsec prefix",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: signWebhook(t, body, timestamp, testWebhookSecretB64),
+			secret:    testWebhookSecretB64,
+			wantErr:   false,
+		},
+		{
+			name:      "multiple signatures with valid last",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: "v1,aW52YWxpZA== " + sig,
+			secret:    secret,
+			wantErr:   false,
+		},
+		{
+			name:      "non-v1 prefix skipped",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: "v2,abc123 " + sig,
+			secret:    secret,
+			wantErr:   false,
+		},
+		{
+			name:      "malformed base64 in signature skipped",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: "v1,!!!not-base64!!! " + sig,
+			secret:    secret,
+			wantErr:   false,
+		},
+		{
+			name:      "invalid base64 secret",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: sig,
+			secret:    "whsec_" + "!!!not-base64",
+			wantErr:   true,
+		},
+		{
+			name:      "polar_whs_ prefix uses raw bytes",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: signWebhook(t, body, timestamp, "polar_whs_"+"test-polar-secret"),
+			secret:    "polar_whs_" + "test-polar-secret",
+			wantErr:   false,
+		},
+		{
+			name:      "bare secret without prefix uses raw bytes",
+			body:      body,
+			msgID:     testWebhookMsgID,
+			timestamp: timestamp,
+			signature: signWebhook(t, body, timestamp, "raw-secret"+"-no-prefix"), //nolint:gosec // test value, not real secret
+			secret:    "raw-secret" + "-no-prefix",                                //nolint:gosec // test value, not real secret
+			wantErr:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateWebhookSignature(tt.body, tt.msgID, tt.timestamp, tt.signature, tt.secret)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ValidateWebhookSignature() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseWebhookEvent(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    []byte
+		wantErr bool
+	}{
+		{
+			name:    "valid event",
+			body:    []byte(`{"type":"subscription.created","data":{"id":"sub_123"}}`),
+			wantErr: false,
+		},
+		{
+			name:    "missing type field",
+			body:    []byte(`{"data":{"id":"sub_123"}}`),
+			wantErr: true,
+		},
+		{
+			name:    "empty type field",
+			body:    []byte(`{"type":"","data":{"id":"sub_123"}}`),
+			wantErr: true,
+		},
+		{
+			name:    "invalid json",
+			body:    []byte(`{not valid json`),
+			wantErr: true,
+		},
+		{
+			name:    "duplicate type",
+			body:    []byte(`{"type":"subscription.created","type":"order.paid","data":{"id":"sub_123"}}`),
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event, err := ParseWebhookEvent(tt.body)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseWebhookEvent() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && event.Type == "" {
+				t.Error("ParseWebhookEvent() returned event with empty type")
+			}
+		})
+	}
+}
+
+func TestExtractSubscriptionID(t *testing.T) {
+	tests := []struct {
+		name    string
+		data    json.RawMessage
+		want    string
+		wantErr bool
+	}{
+		{
+			name:    "valid id",
+			data:    json.RawMessage(`{"id":"sub_abc123"}`),
+			want:    "sub_abc123",
+			wantErr: false,
+		},
+		{
+			name:    "empty id",
+			data:    json.RawMessage(`{"id":""}`),
+			want:    "",
+			wantErr: true,
+		},
+		{
+			name:    "missing id field",
+			data:    json.RawMessage(`{"status":"active"}`),
+			want:    "",
+			wantErr: true,
+		},
+		{
+			name:    "invalid json",
+			data:    json.RawMessage(`{broken`),
+			want:    "",
+			wantErr: true,
+		},
+		{
+			name:    "duplicate id",
+			data:    json.RawMessage(`{"id":"sub_good","id":"sub_bad"}`),
+			want:    "",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ExtractSubscriptionID(tt.data)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ExtractSubscriptionID() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("ExtractSubscriptionID() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPolarClient_GetSubscription(t *testing.T) {
+	tests := []struct {
+		name         string
+		statusCode   int
+		body         string
+		wantErr      bool
+		wantStatus   string
+		wantAmount   int
+		wantCurrency string
+	}{
+		{
+			name:       "active subscription",
+			statusCode: http.StatusOK,
+			body: `{
+				"id": "sub_test123",
+				"status": "active",
+				"customer": {"email": "test@example.com", "metadata": {}},
+					"product": {"id": "prod_abc", "name": "Pro", "metadata": {"pipelock_tier": "pro"}},
+					"recurring_interval": "month",
+					"amount": 2900,
+					"currency": "usd",
+					"current_period_end": "2026-04-12T00:00:00Z"
+				}`,
+			wantErr:      false,
+			wantStatus:   "active",
+			wantAmount:   2900,
+			wantCurrency: "usd",
+		},
+		{
+			name:       "404 not found",
+			statusCode: http.StatusNotFound,
+			body:       `{"error": "not found"}`,
+			wantErr:    true,
+		},
+		{
+			name:       "500 server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error": "internal error"}`,
+			wantErr:    true,
+		},
+		{
+			name:       "invalid json response",
+			statusCode: http.StatusOK,
+			body:       `{not valid json`,
+			wantErr:    true,
+		},
+		{
+			name:       "duplicate security field",
+			statusCode: http.StatusOK,
+			body:       `{"id":"sub_test123","status":"active","status":"canceled"}`,
+			wantErr:    true,
+		},
+		{
+			name:       "oversized valid prefix",
+			statusCode: http.StatusOK,
+			body:       `{"id":"sub_test123","status":"active"}` + strings.Repeat(" ", (1<<20)+1),
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// Verify authorization header is sent.
+				if auth := r.Header.Get("Authorization"); auth != "Bearer "+testPolarAPIToken {
+					t.Errorf("expected Bearer token, got %q", auth)
+				}
+				// Verify correct endpoint path.
+				wantPath := fmt.Sprintf("/v1/subscriptions/%s", testSubscriptionID)
+				if r.URL.Path != wantPath {
+					t.Errorf("got path %q, want %q", r.URL.Path, wantPath)
+				}
+
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			client := NewPolarClient(testPolarAPIToken, srv.URL, defaultPolarAPIVersion)
+			sub, err := client.GetSubscription(t.Context(), testSubscriptionID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetSubscription() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil && sub.Status != tt.wantStatus {
+				t.Errorf("GetSubscription() status = %q, want %q", sub.Status, tt.wantStatus)
+			}
+			if err == nil && sub.AmountCents != tt.wantAmount {
+				t.Errorf("GetSubscription() amount = %d, want %d", sub.AmountCents, tt.wantAmount)
+			}
+			if err == nil && sub.Currency != tt.wantCurrency {
+				t.Errorf("GetSubscription() currency = %q, want %q", sub.Currency, tt.wantCurrency)
+			}
+		})
+	}
+}
+
+func TestPolarClient_LastProviderSuccess(t *testing.T) {
+	success := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"sub_test123"}`))
+	}))
+	t.Cleanup(success.Close)
+
+	client := NewPolarClient(testPolarAPIToken, success.URL, defaultPolarAPIVersion)
+	if got := client.LastProviderSuccess(); !got.IsZero() {
+		t.Fatalf("LastProviderSuccess() before a request = %s, want zero time", got)
+	}
+	if _, err := client.GetSubscription(t.Context(), testSubscriptionID); err != nil {
+		t.Fatalf("GetSubscription() error = %v", err)
+	}
+	lastSuccess := client.LastProviderSuccess()
+	if lastSuccess.IsZero() {
+		t.Fatal("LastProviderSuccess() after a successful request is zero")
+	}
+
+	failure := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(failure.Close)
+	client.baseURL = failure.URL
+	if _, err := client.GetSubscription(t.Context(), testSubscriptionID); err == nil {
+		t.Fatal("GetSubscription() succeeded against failed provider")
+	}
+	if got := client.LastProviderSuccess(); !got.Equal(lastSuccess) {
+		t.Errorf("LastProviderSuccess() after a failed request = %s, want %s", got, lastSuccess)
+	}
+}
+
+func TestPolarClient_GetOrder(t *testing.T) {
+	tests := []struct {
+		name         string
+		statusCode   int
+		body         string
+		wantErr      bool
+		wantPaid     bool
+		wantStatus   string
+		wantRefunded int
+		wantTotal    int
+		wantNet      int
+		wantCurrency string
+	}{
+		{
+			name:       "paid order",
+			statusCode: http.StatusOK,
+			body: `{
+				"id": "order_test789",
+				"status": "paid",
+				"paid": true,
+				"billing_reason": "purchase",
+				"total_amount": 535000,
+				"net_amount": 500000,
+				"refunded_amount": 0,
+				"currency": "usd",
+				"customer": {"email": "buyer@example.com", "metadata": {}},
+				"product": {"id": "prod_eval", "name": "Enterprise Eval", "metadata": {"pipelock_tier": "enterprise_eval"}}
+			}`,
+			wantErr:      false,
+			wantPaid:     true,
+			wantStatus:   "paid",
+			wantRefunded: 0,
+			wantTotal:    535000,
+			wantNet:      500000,
+			wantCurrency: "usd",
+		},
+		{
+			name:       "partially refunded order",
+			statusCode: http.StatusOK,
+			body: `{
+				"id": "order_test789",
+				"status": "partially_refunded",
+				"paid": true,
+				"billing_reason": "purchase",
+				"total_amount": 535000,
+				"net_amount": 500000,
+				"refunded_amount": 100000,
+				"currency": "usd",
+				"customer": {"email": "buyer@example.com", "metadata": {}},
+				"product": {"id": "prod_eval", "name": "Enterprise Eval", "metadata": {"pipelock_tier": "enterprise_eval"}}
+			}`,
+			wantErr:      false,
+			wantPaid:     true,
+			wantStatus:   "partially_refunded",
+			wantRefunded: 100000,
+			wantTotal:    535000,
+			wantNet:      500000,
+			wantCurrency: "usd",
+		},
+		{
+			name:       "404 not found",
+			statusCode: http.StatusNotFound,
+			body:       `{"error": "not found"}`,
+			wantErr:    true,
+		},
+		{
+			name:       "invalid json",
+			statusCode: http.StatusOK,
+			body:       `{not valid`,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if auth := r.Header.Get("Authorization"); auth != "Bearer "+testPolarAPIToken {
+					t.Errorf("expected Bearer token, got %q", auth)
+				}
+				wantPath := fmt.Sprintf("/v1/orders/%s", testOrderID)
+				if r.URL.Path != wantPath {
+					t.Errorf("got path %q, want %q", r.URL.Path, wantPath)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			client := NewPolarClient(testPolarAPIToken, srv.URL, defaultPolarAPIVersion)
+			order, err := client.GetOrder(t.Context(), testOrderID)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetOrder() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if order.Paid != tt.wantPaid {
+				t.Errorf("Paid = %v, want %v", order.Paid, tt.wantPaid)
+			}
+			if order.Status != tt.wantStatus {
+				t.Errorf("Status = %q, want %q", order.Status, tt.wantStatus)
+			}
+			if order.RefundedAmount != tt.wantRefunded {
+				t.Errorf("RefundedAmount = %d, want %d", order.RefundedAmount, tt.wantRefunded)
+			}
+			if order.TotalAmount != tt.wantTotal {
+				t.Errorf("TotalAmount = %d, want %d", order.TotalAmount, tt.wantTotal)
+			}
+			if order.NetAmount != tt.wantNet {
+				t.Errorf("NetAmount = %d, want %d", order.NetAmount, tt.wantNet)
+			}
+			if order.Currency != tt.wantCurrency {
+				t.Errorf("Currency = %q, want %q", order.Currency, tt.wantCurrency)
+			}
+		})
+	}
+}
+
+func TestOrderEventConstants(t *testing.T) {
+	if EventOrderPaid != "order.paid" {
+		t.Errorf("EventOrderPaid = %q", EventOrderPaid)
+	}
+	if EventOrderRefunded != "order.refunded" {
+		t.Errorf("EventOrderRefunded = %q", EventOrderRefunded)
+	}
+	if EventOrderUpdated != "order.updated" {
+		t.Errorf("EventOrderUpdated = %q", EventOrderUpdated)
+	}
+}
+
+func TestPolarClient_GetSubscription_NetworkError(t *testing.T) {
+	// Closed server causes a network error on client.Do.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Close()
+
+	client := NewPolarClient(testPolarAPIToken, srv.URL, defaultPolarAPIVersion)
+	_, err := client.GetSubscription(t.Context(), testSubscriptionID)
+	if err == nil {
+		t.Fatal("expected network error for closed server, got nil")
+	}
+}
+
+func TestIsSubscriptionEvent(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		want      bool
+	}{
+		{"subscription created", EventSubscriptionCreated, true},
+		{"subscription updated", EventSubscriptionUpdated, true},
+		{"subscription active", EventSubscriptionActive, true},
+		{"subscription revoked", EventSubscriptionRevoked, true},
+		{"subscription canceled", EventSubscriptionCanceled, true},
+		{"order created", "order.created", false},
+		{"checkout completed", "checkout.completed", false},
+		{"empty string", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isSubscriptionEvent(tt.eventType)
+			if got != tt.want {
+				t.Errorf("isSubscriptionEvent(%q) = %v, want %v", tt.eventType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPolarClient_SendsVersionHeader proves every API read pins its contract.
+// Polar serves whatever version is Current to an unpinned request, and Current
+// rolls forward each quarter, so a missing header here means the response shape
+// can change under a running deployment without any code change.
+func TestPolarClient_SendsVersionHeader(t *testing.T) {
+	calls := []struct {
+		name     string
+		wantPath string
+		body     string
+		invoke   func(*PolarClient) error
+	}{
+		{
+			name:     "GetSubscription",
+			wantPath: "/v1/subscriptions/" + testSubscriptionID,
+			body:     `{"id":"` + testSubscriptionID + `","status":"active"}`,
+			invoke: func(c *PolarClient) error {
+				_, err := c.GetSubscription(t.Context(), testSubscriptionID)
+				return err
+			},
+		},
+		{
+			name:     "GetOrder",
+			wantPath: "/v1/orders/order_123",
+			body:     `{"id":"order_123","status":"paid"}`,
+			invoke: func(c *PolarClient) error {
+				_, err := c.GetOrder(t.Context(), "order_123")
+				return err
+			},
+		},
+	}
+
+	for _, call := range calls {
+		for _, version := range []string{defaultPolarAPIVersion, "2026-10"} {
+			t.Run(call.name+"/"+version, func(t *testing.T) {
+				var got string
+				var seen bool
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					seen = true
+					got = r.Header.Get("Polar-Version")
+					if r.URL.Path != call.wantPath {
+						t.Errorf("got path %q, want %q", r.URL.Path, call.wantPath)
+					}
+					_, _ = w.Write([]byte(call.body))
+				}))
+				defer srv.Close()
+
+				client := NewPolarClient(testPolarAPIToken, srv.URL, version)
+				if err := call.invoke(client); err != nil {
+					t.Fatalf("%s: %v", call.name, err)
+				}
+				if !seen {
+					t.Fatal("upstream was never called")
+				}
+				if got != version {
+					t.Errorf("Polar-Version = %q, want %q", got, version)
+				}
+			})
+		}
+	}
+}
+
+// TestPolarClient_404NamesVersionPin covers the operability direction. A
+// retired Polar-Version is answered with 404 on every request, which otherwise
+// reads exactly like "no such subscription". The error must name the pin, or
+// the operator has a total fulfillment outage and no control to reach for.
+func TestPolarClient_404NamesVersionPin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"detail":"Not Found"}`))
+	}))
+	defer srv.Close()
+
+	client := NewPolarClient(testPolarAPIToken, srv.URL, "2026-01")
+	_, err := client.GetSubscription(t.Context(), testSubscriptionID)
+	if err == nil {
+		t.Fatal("expected an error on 404")
+	}
+	for _, want := range []string{"2026-01", "POLAR_API_VERSION"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("404 error %q does not mention %q", err.Error(), want)
+		}
+	}
+
+	// A non-404 failure keeps the plain shape: the version pin is not a
+	// plausible remedy for a 500, and suggesting it would misdirect.
+	srv500 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv500.Close()
+
+	client500 := NewPolarClient(testPolarAPIToken, srv500.URL, "2026-01")
+	_, err = client500.GetSubscription(t.Context(), testSubscriptionID)
+	if err == nil {
+		t.Fatal("expected an error on 500")
+	}
+	if strings.Contains(err.Error(), "POLAR_API_VERSION") {
+		t.Errorf("500 error should not suggest the version pin: %q", err.Error())
+	}
+}

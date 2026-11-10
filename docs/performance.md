@@ -1,0 +1,270 @@
+# Performance
+
+Pipelock's request-side URL scanner adds microseconds of overhead in the
+benchmarks below. The proxy is generally I/O bound while waiting for upstream
+responses. Response scanning and MCP scanning on large payloads can use
+measurable CPU at high throughput (see tables below).
+
+The scanner and MCP latency tables use medians from three runs on an AMD Ryzen 7 7800X3D (8 cores / 16 threads), Linux/amd64, at released v3.6.0 commit `3e868ac5d` with Go 1.26.8 and `GOMAXPROCS=4`. The standard `make bench` run used Go's default one-second benchmark target and `-count=3`. A few heavy cases still have high variance: the 256KiB uniform-filler clean case completed only three iterations per sample, and the 20-query URL case completed five or six. Fixture-backed browser and saved JavaScript bundle benchmarks were skipped because they need generated input directories. Response scanning evaluates patterns in parallel, so its figures depend on the CPUs available. This refresh covers scanner and MCP Go benchmarks only. Unicode normalization, the multi-core scaling curves, concurrent scaling, HTTP proxy overhead, CPU-at-scale estimates, and deployment sizing below remain historical or guidance and weren't recalculated for v3.6.0. Run `make bench` to measure your hardware. See [benchmarks.md](benchmarks.md) for the raw ns/op data and full run details.
+
+## Required-receipt workload
+
+The released 3.7.0 binary's million-request run sustained 333 requests/s with eight chains and required receipts, with zero missing of 5,855,850 expected receipt records and a valid signed group. It used an 8-CPU quota on a 6-core/12-thread i7-10750H. The [measurement table](benchmarks.md#million-request-receipt-run) includes latency, calibration, the measured binary's identity and the narrower receipt detection boundary. It is separate from the historical scanner microbenchmarks below.
+
+## Scanning Latency (single request)
+
+Throughput in these tables is the reciprocal of latency for requests handled one after another. It is not a one-core capacity figure: the measurements had four CPUs available, and response and MCP scanning evaluate their patterns in parallel. See the concurrent scaling section for multi-request throughput.
+
+### URL Scanning (fetch/forward proxy hot path)
+
+Ordered URL pipeline: length and parsing checks, scheme, CRLF injection, path
+traversal, allowlist/blocklist policy, immutable SSRF and DLP floors, configured
+DLP, path and subdomain entropy, DNS SSRF/rebinding, rate limit, data budget,
+and final context checks.
+
+| Operation | Latency | Throughput (one request at a time) |
+|-----------|---------|--------------------:|
+| Allowed URL (DNS SSRF, rate limit and data budget off) | ~25 μs | ~40,000/sec |
+| Blocklist block (early exit) | ~2.6 μs | ~381,000/sec |
+| DLP pattern match (65 patterns, pre-filtered) | ~12 μs | ~82,000/sec |
+| DLP pre-filter only (clean text, two small allocations) | ~0.58 μs | ~1,729,000/sec |
+| Entropy detection | ~46 μs | ~21,700/sec |
+| URL rejected by length check | ~140 ns | ~7,128,000/sec |
+| Complex URL (ports, query params) | ~158 μs | ~6,300/sec |
+
+The `BenchmarkScan_ManyQueryParamsAllowed` case uses a clean allowed URL with 20 query parameters, forcing all DLP passes to complete. It measured ~206 ms and allocated ~43.5 MB. This is a deliberately heavy stress case, not a typical URL scan. Each sample completed only five or six iterations.
+
+### Canary Text Scanning
+
+| Operation | Latency | Throughput (one request at a time) |
+|-----------|---------|------------------------------------:|
+| Ordinary clean text with a canary configured | ~21 μs | ~47,700/sec |
+| Nested-encoded payload | ~36 μs | ~27,800/sec |
+
+An earlier interleaved comparison measured clean-text canary scanning about 54% slower than v3.5.0 in the release-candidate comparison. This v3.6.0 run didn't include a v3.5.0 control, so it reports the released build's cost but doesn't remeasure that percentage.
+
+### MCP Scanning (tool call/response inspection)
+
+JSON-RPC parsing + text extraction + prompt injection pattern matching.
+
+| Operation | Latency | Throughput (one request at a time) |
+|-----------|---------|--------------------:|
+| Clean tool response | ~197 μs | ~5,100/sec |
+| Injection detected (early exit) | ~155 μs | ~6,500/sec |
+| Text extraction | ~6.6 μs | ~152,000/sec |
+
+### Response Scanning (fetched content injection detection)
+
+Pattern matching against 34 prompt-injection and state/control patterns on
+fetched page content.
+
+| Operation | Latency | Throughput (one request at a time) |
+|-----------|---------|--------------------:|
+| Short clean text (~90B) | ~69 μs | ~14,400/sec |
+| 10KB clean text | ~4.0 ms | ~250/sec |
+| Injection detected (early exit) | ~73 μs | ~13,800/sec |
+| State/control clean | ~406 μs | ~2,500/sec |
+| State/control match | ~290 μs | ~3,400/sec |
+
+The current run also tested clean and injected bodies at 64KiB and 256KiB. Latency ranged from about 17.6ms to 112.6ms for 64KiB and 66.0ms to 439.8ms for 256KiB, depending on content shape and injection position. The 256KiB uniform-filler clean case completed only three iterations per sample. See [benchmarks.md](benchmarks.md) for each case. The earlier keyword pre-filter percentage comparisons and content-size tiering proposal are historical notes, not conclusions from this release-tag run.
+
+### Supporting Operations
+
+The Unicode measurements are historical Go 1.25 results; Unicode normalization wasn't included in the v3.6.0 scanner/MCP run.
+
+| Operation | Latency |
+|-----------|---------|
+| Unicode normalization (DLP mode, historical) | ~1.1 μs |
+| Unicode normalization (matching mode, historical) | ~1.3 μs |
+| Unicode normalization (tool text mode, historical) | ~2.1 μs |
+| Shannon entropy calculation | ~2.2 μs |
+| Domain matching (exact) | ~2.4 ns |
+| Domain matching (wildcard) | ~43 ns |
+
+## Concurrent Scaling
+
+The scanner's core detection pipeline (scheme, blocklist, DLP, entropy, SSRF) is stateless per request with no shared mutable state. Config reads use atomic pointer swap. Rate limiting and data budget tracking use per-scanner mutexes, but these are low-contention (one lock acquisition per request). Benchmarks below are run with rate limiting and data budget disabled to isolate scanning throughput.
+
+### Parallel throughput (`b.RunParallel`)
+
+The v3.6.0 tagged run includes parallel samples at `GOMAXPROCS=4`, but not the full CPU-count sweep below. For example, `Parallel_URLScan` measured ~48.9 μs/op (~20,500 ops/sec), `Parallel_ResponseScan` ~20.4 μs/op (~49,100 ops/sec), and `Parallel_MCPScanClean` ~53.5 μs/op (~18,700 ops/sec). These are concurrent `b.RunParallel` samples; they are not the one-request-at-a-time figures in the earlier tables. The 1/2/4/8/16 CPU scaling curves below remain historical and were not refreshed for v3.6.0.
+
+**URL Scanning:**
+
+| GOMAXPROCS | ns/op | Throughput | Scaling vs 1 |
+|-----------:|------:|----------:|---------:|
+| 1 | 87,503 | 11,400/sec | 1.0x |
+| 2 | 43,870 | 22,800/sec | 2.0x |
+| 4 | 21,309 | 46,900/sec | 4.1x |
+| 8 | 15,060 | 66,400/sec | 5.8x |
+| 16 | 13,417 | 74,500/sec | 6.5x |
+
+**DLP Block (early exit):**
+
+| GOMAXPROCS | ns/op | Throughput | Scaling vs 1 |
+|-----------:|------:|----------:|---------:|
+| 1 | 5,793 | 172,600/sec | 1.0x |
+| 2 | 2,881 | 347,100/sec | 2.0x |
+| 4 | 1,473 | 678,900/sec | 3.9x |
+| 8 | 1,031 | 970,000/sec | 5.6x |
+| 16 | 869 | 1,150,700/sec | 6.7x |
+
+**Response Scanning (short content):**
+
+| GOMAXPROCS | ns/op | Throughput | Scaling vs 1 |
+|-----------:|------:|----------:|---------:|
+| 1 | 129,955 | 7,700/sec | 1.0x |
+| 2 | 67,390 | 14,800/sec | 1.9x |
+| 4 | 35,491 | 28,200/sec | 3.7x |
+| 8 | 25,390 | 39,400/sec | 5.1x |
+| 16 | 18,250 | 54,800/sec | 7.1x |
+
+**Response Scanning (10KB content):**
+
+| GOMAXPROCS | ns/op | Throughput | Scaling vs 1 |
+|-----------:|------:|----------:|---------:|
+| 1 | 16,203,683 | 62/sec | 1.0x |
+| 2 | 8,245,280 | 121/sec | 2.0x |
+| 4 | 4,158,378 | 240/sec | 3.9x |
+| 8 | 2,566,365 | 390/sec | 6.3x |
+| 16 | 2,460,095 | 407/sec | 6.6x |
+
+**MCP Scanning (clean response):**
+
+| GOMAXPROCS | ns/op | Throughput | Scaling vs 1 |
+|-----------:|------:|----------:|---------:|
+| 1 | 127,944 | 7,800/sec | 1.0x |
+| 4 | 33,450 | 29,900/sec | 3.8x |
+| 8 | 20,312 | 49,200/sec | 6.3x |
+| 16 | 17,482 | 57,200/sec | 7.3x |
+
+**Blocklist (early exit):**
+
+| GOMAXPROCS | ns/op | Throughput | Scaling vs 1 |
+|-----------:|------:|----------:|---------:|
+| 1 | 2,059 | 485,700/sec | 1.0x |
+| 2 | 1,005 | 995,000/sec | 2.0x |
+| 4 | 529 | 1,890,400/sec | 3.9x |
+| 8 | 369 | 2,710,000/sec | 5.6x |
+| 16 | 325 | 3,076,900/sec | 6.3x |
+
+### Concurrent throughput scaling (goroutine ramp)
+
+Sustained 2-second runs at increasing goroutine counts. Measures total operations completed, not per-goroutine latency.
+
+**URL Scan:**
+
+| Goroutines | Ops/sec | Scaling |
+|-----------:|--------:|--------:|
+| 1 | 19,466 | 1.0x |
+| 2 | 37,122 | 1.9x |
+| 4 | 67,722 | 3.5x |
+| 8 | 106,321 | 5.5x |
+| 16 | 121,337 | 6.2x |
+| 32 | 115,875 | 6.0x |
+| 64 | 123,959 | 6.4x |
+
+**Response Scan:**
+
+| Goroutines | Ops/sec | Scaling |
+|-----------:|--------:|--------:|
+| 1 | 8,284 | 1.0x |
+| 2 | 16,135 | 1.9x |
+| 4 | 31,417 | 3.8x |
+| 8 | 52,405 | 6.3x |
+| 16 | 62,776 | 7.6x |
+| 32 | 66,575 | 8.0x |
+| 64 | 65,470 | 7.9x |
+
+**The pattern:** near-linear scaling up to physical core count (8), small gains from hyperthreading (16), then plateau. No degradation past core count. Adding more concurrent agents doesn't slow anything down, you just stop getting additional throughput once all cores are saturated.
+
+### HTTP Proxy Overhead (historical)
+
+These Go 1.25 results were measured with [hey](https://github.com/rakyll/hey) against the running proxy. They weren't rerun in the v3.6.0 scanner/MCP benchmark run.
+
+| Concurrency | Requests | Req/sec | P50 | P99 |
+|------------:|--------:|--------:|----:|----:|
+| 50 | 2,000 | 43,474 | 0.5 ms | 18.5 ms |
+| 200 | 10,000 | 102,600 | 0.7 ms | 23.2 ms |
+| 500 | 20,000 | 97,268 | 2.0 ms | 51.9 ms |
+
+This measures HTTP accept/parse/route/respond overhead. Actual scanning latency adds the per-operation costs from the tables above.
+
+## CPU Cost at Scale (historical)
+
+These estimates predate the v3.6.0 release-tag run. They cover scanning overhead only, not network I/O, and were not recalculated here.
+
+### Request-side scanning (URL + MCP)
+
+| Request rate | CPU (URL scan) | CPU (MCP scan) |
+|-------------|---------------:|---------------:|
+| 100/sec | 0.9% of 1 core | 1.3% of 1 core |
+| 1,000/sec | 8.8% of 1 core | 12.8% of 1 core |
+| 10,000/sec | 88% of 1 core | 1.3 cores |
+| 100,000/sec | 8.8 cores | 12.8 cores |
+
+### Response-side scanning
+
+| Request rate | CPU (short ~90B) | CPU (10KB content) |
+|-------------|---------------:|---------------:|
+| 100/sec | 1.3% of 1 core | 1.6 cores |
+| 1,000/sec | 13.0% of 1 core | 16.2 cores |
+
+Response scanning is the most CPU-intensive path. At high throughput with large payloads, it dominates. For request-side scanning only, 1,000 requests per second uses less than 15% of a single CPU core. Network latency (waiting for upstream HTTP responses) dominates total request time by orders of magnitude.
+
+## Deployment Sizing
+
+The recommendations below are older rules of thumb. The v3.6.0 scanner/MCP benchmark run didn't measure deployment-level request mixes or memory use.
+
+| Deployment | Expected load | CPU recommendation |
+|------------|--------------|-------------------|
+| Single developer (local proxy) | 1-10 req/sec | Any (negligible overhead) |
+| Team sidecar (per-agent) | 10-100 req/sec | 0.1 CPU, 64MB RAM |
+| Shared proxy (small org) | 100-1,000 req/sec | 0.5 CPU, 128MB RAM |
+| Platform deployment | 10,000+ req/sec | 2+ CPU, 256MB RAM |
+
+Memory usage is dominated by the DLP regex compilation (~40MB RSS at idle with default patterns) and scales linearly with concurrent connections, not pattern count.
+
+### Binary size
+
+A Linux/amd64 OSS build from commit `23bb3f4a8`, built with Go 1.25.10 and `CGO_ENABLED=0 make build`, measured 32,759,992 bytes (31.2 MiB). The Makefile uses `-trimpath` and strips symbols with `-s -w`; `file pipelock` reported a statically linked executable. This measurement excludes the `enterprise` build tag. Size varies with the source revision, Go version, target platform, build tags, and linker flags.
+
+To measure your build from the repository root:
+
+```bash
+CGO_ENABLED=0 make build
+go version
+file pipelock
+wc -c < pipelock
+```
+
+## Design Decisions That Affect Performance
+
+**Early exit on block.** Blocked URLs short-circuit at the first failing layer. Blocklist hits measured ~2.6μs in the v3.6.0 run. DLP matches exit before DNS resolution.
+
+**Pre-DNS checks.** CRLF injection, path traversal, allowlist, blocklist, and DLP checks all execute before any network call. This prevents secret exfiltration via DNS queries and keeps the fast path fast.
+
+**Stateless detection pipeline.** Each scan allocates its own working state. The core detection layers (scheme through SSRF) have no shared mutable state, enabling linear scaling with cores. Rate limiting and data budget use per-scanner mutexes but are low-contention.
+
+**Fire-and-forget event emission.** Webhook events use an async buffered channel. Syslog is UDP. Neither blocks the scanning pipeline.
+
+**Atomic config reload.** Hot-reload swaps the entire scanner via `atomic.Pointer`, so scanning never blocks on config changes.
+
+## Reproducing These Numbers
+
+```bash
+# Released-tag scanner and MCP benchmark suite
+GOMAXPROCS=4 make bench
+
+# Parallel scaling (URL scanner)
+go test -run '^$' -bench=BenchmarkParallel -benchtime=3s -cpu=1,2,4,8,16 ./internal/scanner/
+
+# Parallel scaling (MCP scanner)
+go test -run '^$' -bench=BenchmarkParallel -benchtime=3s -cpu=1,4,8,16 ./internal/mcp/
+
+# Concurrent throughput scaling test (~28s)
+PIPELOCK_BENCH_SCALING=1 go test -v -run=TestConcurrentThroughputScaling ./internal/scanner/
+
+# HTTP proxy overhead (requires running pipelock instance)
+hey -n 10000 -c 200 http://localhost:8888/health
+```

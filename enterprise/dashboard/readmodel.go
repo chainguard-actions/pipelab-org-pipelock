@@ -1,0 +1,533 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package dashboard
+
+import (
+	"crypto/rand"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/evidenceview"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+)
+
+// Bounded filter value constants.
+const (
+	verdictAllow   = config.ActionAllow
+	verdictBlock   = config.ActionBlock
+	verdictWarn    = config.ActionWarn
+	verdictDefer   = config.ActionDefer
+	verdictNoMatch = "__invalid_verdict__"
+
+	chainIntact  = "intact"
+	chainBroken  = "broken"
+	chainAny     = "any"
+	chainNoMatch = "__invalid_chain__"
+
+	agentFilterMaxRunes = 128
+
+	pipUntampered = "U"
+)
+
+const fleetRedactionKeySize = 32
+
+const dashboardEvidenceDirectoryEntryLimit = 256
+
+// FilterSpec describes a bounded filter for the agent/session list. Unknown
+// non-empty enum values fail closed to no matches.
+type FilterSpec struct {
+	Verdict string // "allow", "block", "warn", "defer", or "" (any)
+	Agent   string // case-insensitive substring of the agent name, or "" (any)
+	Chain   string // "intact", "broken", "any", or "" (any)
+}
+
+// Options configures the read-only Evidence dashboard.
+type Options struct {
+	ReceiptDir  string
+	TrustedKeys map[string]TrustedKey
+	// TrustCRLSource returns the currently verified signed CRL used only for
+	// read-side key revocation cross-reference. A non-nil error is rendered as
+	// a failure; it is never treated as an empty CRL.
+	TrustCRLSource func() (*license.CRL, error)
+	// AnchorResolver loads and selects verification material for one session.
+	// The resolver is read-only and must return a real anchor.Backend; labels or
+	// state-marker fields alone are not verification.
+	AnchorResolver AnchorResolver
+	Config         *config.Config
+	HasFeature     func(string) bool
+	// Authorize, when non-nil, runs per request after the license-feature check
+	// and fails the request closed (403) on a non-nil error. It is the handler's
+	// authentication/authorization seam, distinct from the license entitlement
+	// check. Nil means the surrounding router must own authentication.
+	Authorize func(*http.Request) error
+	// AuthorizePermission, when non-nil, gates route/action access after the
+	// request passes the coarse authentication boundary. It is the RBAC seam:
+	// callers can map local users, mTLS identities, or OIDC claims to the
+	// bounded dashboard permission vocabulary without changing handlers.
+	// Nil preserves the legacy token-only model where Authorize owns all
+	// metadata-route access.
+	AuthorizePermission func(*http.Request, Permission) error
+	// TrustedOuterAuth explicitly opts into mounting the dashboard behind an
+	// authentication boundary outside this handler. It is required when both
+	// Authorize and AuthorizePermission are nil; otherwise routes fail closed.
+	// Setting it requires TrustedOuterAuthBoundary to also be set; New panics
+	// otherwise, because this option disables the handler's own auth entirely.
+	TrustedOuterAuth bool
+	// TrustedOuterAuthBoundary names the external authentication boundary that
+	// fronts this handler (e.g. "ingress mTLS + internal admin listener",
+	// "corp SSO reverse proxy on 10.x"). Required when TrustedOuterAuth is
+	// true; it is not verified, only recorded, so New logs it at startup and
+	// AllPermissions/route-gate behavior is unaffected. Ignored when
+	// TrustedOuterAuth is false.
+	TrustedOuterAuthBoundary string
+	// AuthorizeRaw gates the sensitive raw view (receipt destinations and full
+	// signed payloads). A request is shown raw detail only when AuthorizeRaw is
+	// non-nil AND returns nil for it; every other authenticated request gets the
+	// redacted metadata view. Nil means raw detail is redacted for everyone
+	// (fail closed): a destination URL can carry a capability token, and the raw
+	// payload is the largest exfil surface, so raw is least-privilege by default.
+	// When AuthorizePermission is configured, raw detail also requires
+	// PermissionRawRead.
+	AuthorizeRaw func(*http.Request) error
+	// AuthorizeFleetScope gates reads keyed by an operator-supplied org/fleet
+	// scope before any conductor replay or fleet source is called. Nil is
+	// fail-closed when a read source is configured for the requested page.
+	AuthorizeFleetScope func(*http.Request, DecisionScope, bool) error
+	// AuditWriter, when non-nil, receives access lines for authenticated
+	// dashboard requests and scope lines for replay/fleet correlation lookups.
+	// Scope values are logged as stable hashes, not raw org/fleet/artifact
+	// identifiers. Viewing evidence is itself an audited action. Nil disables
+	// the access log.
+	AuditWriter io.Writer
+	FleetSource FleetDataSource
+	// DefaultFleetScope is the org/fleet the fleet views fall back to when a
+	// request omits both org_id and fleet_id (e.g. a plain nav click on
+	// "Fleet"). It is the operator-configured conductor org/fleet the dashboard
+	// is allowed to read. A partial scope (only one of the two) is never
+	// defaulted; it stays an explicit error. Empty when no conductor source is
+	// configured.
+	DefaultFleetScope DecisionScope
+	// ConductorSource, when non-nil, is the read-only conductor decision
+	// dry-run/replay seam (BE-2) consumed by the Signed Action Workbench and
+	// Incident Cockpit. It exposes no publish/kill/rollback method, so no write
+	// path to fleet state is reachable through it. Nil renders the explicit
+	// unconfigured-replay state, exactly like FleetSource.
+	ConductorSource ConductorDecisionSource
+	// BudgetSource, when non-nil, is the read-only per-agent budget seam for
+	// the Pro budgets panel. Nil-degrades to an empty "no source configured"
+	// panel.
+	BudgetSource     BudgetDataSource
+	ReceiptReadLimit int
+	TimelineLimit    int
+	// FilterPresets maps named presets to bounded filter specs. Loaded from
+	// --filter-presets-file at startup. A preset name in the "preset" query
+	// param pre-fills the same bounded params; explicit query params override.
+	FilterPresets map[string]FilterSpec
+	// ExemptionStore, when non-nil, is a durable lifecycle store overlaid
+	// onto the read-only exemptions inventory. Its records add
+	// owner/reason/expiry/status/last-matched to matching entries.
+	ExemptionStore *ExemptionStore
+	// DeliveryInboxPath and ReadModelIndexPath are read-only health inputs.
+	// The dashboard does not mutate either store.
+	DeliveryInboxPath  string
+	ReadModelIndexPath string
+	// LegalHoldStore, when non-nil, supplies operator-authored retention hold
+	// metadata for read-only dashboard display. Dashboard HTTP handlers never
+	// mutate it; operators use the dashboard legal-hold CLI.
+	LegalHoldStore *LegalHoldStore
+	// Now supplies the current time for lifecycle rendering. Nil uses time.Now.
+	Now func() time.Time
+}
+
+// ReadModel builds dashboard views over recorder sessions and receipts.
+type ReadModel struct {
+	receiptDir         string
+	trustedKeys        map[string]TrustedKey
+	trustCRLSource     func() (*license.CRL, error)
+	anchorResolver     AnchorResolver
+	cfg                *config.Config
+	hasFeature         func(string) bool
+	receiptReadLimit   int
+	timelineLimit      int
+	filterPresets      map[string]FilterSpec
+	fleetSource        FleetDataSource
+	conductorSource    ConductorDecisionSource
+	budgetSource       BudgetDataSource
+	defaultFleetScope  DecisionScope
+	fleetRedactionKey  [fleetRedactionKeySize]byte
+	exemptionStore     *ExemptionStore
+	legalHoldStore     *LegalHoldStore
+	deliveryInboxPath  string
+	readModelIndexPath string
+	now                func() time.Time
+}
+
+// NewReadModel creates a dashboard read model from Options.
+func NewReadModel(opts Options) *ReadModel {
+	receiptReadLimit := opts.ReceiptReadLimit
+	if receiptReadLimit <= 0 {
+		receiptReadLimit = dashboardReceiptReadLimit
+	}
+	timelineLimit := opts.TimelineLimit
+	if timelineLimit <= 0 {
+		timelineLimit = dashboardTimelineLimit
+	}
+	var fleetRedactionKey [fleetRedactionKeySize]byte
+	if _, err := rand.Read(fleetRedactionKey[:]); err != nil {
+		panic(fmt.Errorf("generate dashboard fleet redaction key: %w", err))
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &ReadModel{
+		receiptDir:         opts.ReceiptDir,
+		trustedKeys:        cloneTrustedKeys(opts.TrustedKeys),
+		trustCRLSource:     opts.TrustCRLSource,
+		anchorResolver:     opts.AnchorResolver,
+		cfg:                opts.Config,
+		hasFeature:         opts.HasFeature,
+		receiptReadLimit:   receiptReadLimit,
+		timelineLimit:      timelineLimit,
+		filterPresets:      opts.FilterPresets,
+		fleetSource:        opts.FleetSource,
+		conductorSource:    opts.ConductorSource,
+		budgetSource:       opts.BudgetSource,
+		defaultFleetScope:  normalizeDecisionScope(opts.DefaultFleetScope),
+		fleetRedactionKey:  fleetRedactionKey,
+		exemptionStore:     opts.ExemptionStore,
+		legalHoldStore:     opts.LegalHoldStore,
+		deliveryInboxPath:  opts.DeliveryInboxPath,
+		readModelIndexPath: opts.ReadModelIndexPath,
+		now:                now,
+	}
+}
+
+// Sessions lists available recorder sessions and computes their compact state.
+func (m *ReadModel) Sessions() ([]SessionSummary, error) {
+	if err := m.requireSingleSessionEvidence(); err != nil {
+		return nil, err
+	}
+	ids, err := recorder.ListSessionsBounded(m.receiptDir, dashboardEvidenceDirectoryEntryLimit)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+
+	summaries := make([]SessionSummary, 0, len(ids))
+	for _, id := range ids {
+		receipts, readLimited, err := receipt.ExtractReceiptsFromSessionDirWithLimits(m.receiptDir, id, m.receiptReadLimit, dashboardEvidenceDirectoryEntryLimit)
+		if err != nil {
+			return nil, fmt.Errorf("read session %s receipts: %w", id, err)
+		}
+		summaries = append(summaries, sessionSummary(id, receipts, m.trustedKeys, readLimited, m.receiptReadLimit))
+	}
+	return summaries, nil
+}
+
+// Session reads one session's complete evidence.
+func (m *ReadModel) Session(id string) (SessionEvidence, error) {
+	if err := m.requireSingleSessionEvidence(); err != nil {
+		return SessionEvidence{}, err
+	}
+	receipts, readLimited, err := receipt.ExtractReceiptsFromSessionDirWithLimits(m.receiptDir, id, m.receiptReadLimit, dashboardEvidenceDirectoryEntryLimit)
+	if err != nil {
+		return SessionEvidence{}, fmt.Errorf("read session %s receipts: %w", id, err)
+	}
+	return sessionEvidence(id, receipts, m.trustedKeys, readLimited, m.receiptReadLimit, m.timelineLimit), nil
+}
+
+// Agents lists sessions grouped by agent with bounded rollup counts,
+// optionally filtered by the given FilterSpec.
+func (m *ReadModel) Agents(filter FilterSpec) ([]evidenceview.AgentGroup, error) {
+	sessions, err := m.Sessions()
+	if err != nil {
+		return nil, err
+	}
+	sessions = applyFilter(sessions, normalizeFilter(filter))
+	return evidenceview.GroupByAgent(sessions), nil
+}
+
+// Agent returns one agent's group (its sessions + rollup), optionally filtered.
+func (m *ReadModel) Agent(id string, filter FilterSpec) (evidenceview.AgentGroup, bool, error) {
+	groups, err := m.Agents(filter)
+	if err != nil {
+		return evidenceview.AgentGroup{}, false, err
+	}
+	for _, g := range groups {
+		if g.Agent == id {
+			return g, true, nil
+		}
+	}
+	return evidenceview.AgentGroup{}, false, nil
+}
+
+// ReceiptActionDetail is every record of one action: a headline chosen by a
+// fixed order, and all records in chain order so a finding and the delivery
+// outcome are both visible whichever one the headline is.
+type ReceiptActionDetail struct {
+	Headline evidenceview.DecisionExplanation
+	Records  []evidenceview.DecisionExplanation
+	// Incomplete reports that the bounded evidence view ended while a later
+	// record of this action could still exist, so the headline verdict may
+	// not be final. A block headline is never incomplete: nothing later can
+	// make a denied action less denied.
+	Incomplete bool
+}
+
+// ReceiptDetail loads one receipt by session ID and globally unique action ID,
+// returning the headline DecisionExplanation. The CALLER redacts per RBAC.
+func (m *ReadModel) ReceiptDetail(sessionID, actionID string) (evidenceview.DecisionExplanation, bool, error) {
+	detail, found, err := m.ReceiptActionDetail(sessionID, actionID)
+	if err == nil && detail.Incomplete {
+		// A lone explanation has nowhere to say it may not be final.
+		return evidenceview.DecisionExplanation{}, false, fmt.Errorf("%w: receipt %s outcome may lie beyond the bounded evidence view", recorder.ErrEvidenceReadLimitExceeded, actionID)
+	}
+	return detail.Headline, found, err
+}
+
+// ReceiptActionDetail loads every record of one action. The CALLER redacts
+// per RBAC, record by record.
+func (m *ReadModel) ReceiptActionDetail(sessionID, actionID string) (ReceiptActionDetail, bool, error) {
+	receipts, truncated, err := receipt.ExtractReceiptsFromSessionDirWithLimits(m.receiptDir, sessionID, m.receiptReadLimit, dashboardEvidenceDirectoryEntryLimit)
+	if err != nil {
+		return ReceiptActionDetail{}, false, fmt.Errorf("read session %s receipts: %w", sessionID, err)
+	}
+	var matched []*receipt.Receipt
+	for i := range receipts {
+		r := &receipts[i]
+		if !receiptBelongsToAction(r, actionID) {
+			continue
+		}
+		matched = append(matched, r)
+	}
+	if len(matched) == 0 {
+		if truncated {
+			return ReceiptActionDetail{}, false, fmt.Errorf("%w: receipt %s was not found in the bounded evidence view", recorder.ErrEvidenceReadLimitExceeded, actionID)
+		}
+		return ReceiptActionDetail{}, false, nil
+	}
+	headline := headlineReceipt(matched)
+	sort.SliceStable(matched, func(i, j int) bool { return receiptChainLess(matched[i], matched[j]) })
+	detail := ReceiptActionDetail{Headline: evidenceview.ExplainReceipt(*headline)}
+	// No record closes an action's set: a corrective resolution, a WebSocket
+	// session-close block or a response finding linked through ParentActionID
+	// can follow any record, phased or not. A truncated view is therefore
+	// incomplete unless it already shows a block, which nothing later can make
+	// less of a denial.
+	detail.Incomplete = truncated && headline.ActionRecord.Verdict != config.ActionBlock
+	for _, r := range matched {
+		detail.Records = append(detail.Records, evidenceview.ExplainReceipt(*r))
+	}
+	return detail, true, nil
+}
+
+// ResolveFilter resolves a FilterSpec from query params, falling back to a
+// named preset if no explicit params are given.
+func (m *ReadModel) ResolveFilter(r *http.Request) FilterSpec {
+	q := r.URL.Query()
+	verdict := q.Get("verdict")
+	agent := truncateFilterValue(q.Get("agent"), agentFilterMaxRunes)
+	chain := q.Get("chain")
+	preset := q.Get("preset")
+
+	// If no explicit params, try a named preset.
+	if verdict == "" && agent == "" && chain == "" && preset != "" && m.filterPresets != nil {
+		if p, ok := m.filterPresets[preset]; ok {
+			// Explicit query params override the preset.
+			return FilterSpec{
+				Verdict: overrideIfSet(verdict, p.Verdict),
+				Agent:   overrideIfSet(agent, p.Agent),
+				Chain:   overrideIfSet(chain, p.Chain),
+			}
+		}
+	}
+	return FilterSpec{Verdict: verdict, Agent: agent, Chain: chain}
+}
+
+func overrideIfSet(explicit, preset string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return preset
+}
+
+func truncateFilterValue(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	for i := range value {
+		if maxRunes == 0 {
+			return value[:i]
+		}
+		maxRunes--
+	}
+	return value
+}
+
+// normalizeFilter clamps filter values to the enumerated bounded set.
+// Unknown non-empty enum values become no-match sentinels.
+func normalizeFilter(f FilterSpec) FilterSpec {
+	switch f.Verdict {
+	case "", verdictAllow, verdictBlock, verdictWarn, verdictDefer:
+		// valid
+	default:
+		f.Verdict = verdictNoMatch
+	}
+	switch f.Chain {
+	case "", chainIntact, chainBroken, chainAny:
+		// valid
+	default:
+		f.Chain = chainNoMatch
+	}
+	return f
+}
+
+func applyFilter(sessions []SessionSummary, f FilterSpec) []SessionSummary {
+	if f.Verdict == verdictNoMatch || f.Chain == chainNoMatch {
+		return nil
+	}
+	if f.Verdict == "" && f.Agent == "" && f.Chain == "" {
+		return sessions
+	}
+	agentQuery := strings.ToLower(strings.TrimSpace(f.Agent))
+	filtered := make([]SessionSummary, 0, len(sessions))
+	for _, s := range sessions {
+		if agentQuery != "" && !strings.Contains(strings.ToLower(s.Agent), agentQuery) {
+			continue
+		}
+		if f.Chain != "" && f.Chain != chainAny {
+			match := false
+			for _, pip := range s.Pips {
+				if pip.Label == pipUntampered {
+					switch f.Chain {
+					case chainIntact:
+						match = pip.State == StateVerify || pip.State == StateLimited
+					case chainBroken:
+						match = pip.State == StateFail
+					}
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+		// Verdict filter: keep sessions that carried at least one receipt with
+		// the requested verdict. This is a session-level filter (an agent is
+		// shown if any of its receipts matched), not a per-receipt filter.
+		if f.Verdict != "" && !s.HasVerdict(f.Verdict) {
+			continue
+		}
+		filtered = append(filtered, s)
+	}
+	return filtered
+}
+
+// terminalReceiptPhase reports whether r records the final phase of its
+// action: an outcome after an intent, or a resolution after a defer.
+func terminalReceiptPhase(r *receipt.Receipt) bool {
+	switch r.ActionRecord.DecisionPhase {
+	case receipt.DecisionPhaseOutcome, receipt.DecisionPhaseResolution:
+		return true
+	default:
+		return false
+	}
+}
+
+// receiptBelongsToAction includes records linked directly to the action.
+// Resolutions and response findings use their own action IDs and name the
+// affected action through ParentActionID, including phase-less findings.
+func receiptBelongsToAction(r *receipt.Receipt, actionID string) bool {
+	ar := r.ActionRecord
+	return ar.ActionID == actionID || (ar.ParentActionID != "" && ar.ParentActionID == actionID)
+}
+
+// headlineReceipt picks the record that heads an action's detail page. It
+// is the maximum of one fixed key, so the choice never depends on file order.
+// A defer settled by a resolution in the set drops out first. Among the rest
+// the most severe verdict wins, then a terminal record, then chain order.
+// Outcome emitters on some transports record allow whatever the admission
+// decided, so severity comes before phase; the full record list on the page
+// keeps every other record visible.
+func headlineReceipt(records []*receipt.Receipt) *receipt.Receipt {
+	settled := make(map[string]bool)
+	for _, r := range records {
+		if r.ActionRecord.DecisionPhase == receipt.DecisionPhaseResolution {
+			settled[r.ActionRecord.ParentActionID] = true
+			settled[r.ActionRecord.ActionID] = true
+		}
+	}
+	var best *receipt.Receipt
+	for _, r := range records {
+		if r.ActionRecord.DecisionPhase == receipt.DecisionPhaseDefer && settled[r.ActionRecord.ActionID] {
+			continue
+		}
+		if best == nil || headlineLess(best, r) {
+			best = r
+		}
+	}
+	if best == nil {
+		// Only settled defers remain, which cannot happen while their
+		// resolutions are in the same set; fall back to chain order.
+		best = records[len(records)-1]
+	}
+	return best
+}
+
+// headlineLess orders candidate headline records; it is a strict total order
+// over distinct records.
+func headlineLess(a, b *receipt.Receipt) bool {
+	if ra, rb := receiptVerdictRank(a.ActionRecord.Verdict), receiptVerdictRank(b.ActionRecord.Verdict); ra != rb {
+		return ra < rb
+	}
+	if ta, tb := terminalReceiptPhase(a), terminalReceiptPhase(b); ta != tb {
+		return !ta
+	}
+	return receiptChainLess(a, b)
+}
+
+// receiptChainLess orders records by chain position, then time, then action ID.
+// Signed receipt identity breaks ties between conflicting records at one position.
+func receiptChainLess(a, b *receipt.Receipt) bool {
+	ar, br := a.ActionRecord, b.ActionRecord
+	if ar.ChainSeq != br.ChainSeq {
+		return ar.ChainSeq < br.ChainSeq
+	}
+	if !ar.Timestamp.Equal(br.Timestamp) {
+		return ar.Timestamp.Before(br.Timestamp)
+	}
+	if ar.ActionID != br.ActionID {
+		return ar.ActionID < br.ActionID
+	}
+	if ar.DecisionPhase != br.DecisionPhase {
+		return ar.DecisionPhase < br.DecisionPhase
+	}
+	if a.SignerKey != b.SignerKey {
+		return a.SignerKey < b.SignerKey
+	}
+	return a.Signature < b.Signature
+}
+
+// receiptVerdictRank orders verdicts by how much they say about the action:
+// block, then any other non-allow verdict, then allow.
+func receiptVerdictRank(verdict string) int {
+	switch verdict {
+	case config.ActionBlock:
+		return 2
+	case config.ActionAllow, "":
+		return 0
+	default:
+		return 1
+	}
+}

@@ -1,0 +1,706 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package rules
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+// Confidence ordering for filtering: high=3 > medium=2 > low=1.
+var confidenceRank = map[string]int{
+	confidenceHigh:   3,
+	confidenceMedium: 2,
+	confidenceLow:    1,
+}
+
+// reservedBundlePrefix is the namespace reserved for official bundles.
+const reservedBundlePrefix = "pipelock-"
+
+var errBundleFileTooLarge = errors.New("bundle file exceeds maximum size")
+
+// LoadOptions controls bundle loading behavior.
+type LoadOptions struct {
+	MinConfidence        string              // high, medium, low
+	IncludeExperimental  bool                // load experimental-status rules
+	Disabled             []string            // namespaced rule IDs or glob patterns
+	TrustedKeys          []config.TrustedKey // additional trusted signing keys
+	SkipEmbeddedKeys     bool                // exclude compiled official keyring from trust
+	PipelockVersion      string              // current binary version for min_pipelock check
+	AllowUnversionedLoad bool                // load min_pipelock bundles with a warning on an unprovable version
+	AllowStale           bool                // accept expired bundles with warning
+	TierKeyMapping       map[string]string   // tier → expected signing key fingerprint
+	saveFreshnessState   func(string, *FreshnessState) error
+	definitions          []ruleTypeDefinition
+}
+
+// StandardBundleName is the reserved name for the official standard pack.
+// When a bundle with this name loads, its patterns replace the compiled
+// standard-tier defaults (instead of being additive like community/pro).
+const StandardBundleName = "pipelock-standard"
+
+// StandardSource describes where the standard tier patterns came from.
+type StandardSource string
+
+const (
+	// StandardSourceBundle means patterns came from a signed standard bundle.
+	StandardSourceBundle StandardSource = "bundle"
+	// StandardSourceCompiled means patterns came from compiled defaults (fallback).
+	StandardSourceCompiled StandardSource = "compiled"
+	// StandardSourceNone means standard tier is disabled (include_defaults: false).
+	StandardSourceNone StandardSource = "none"
+)
+
+// LoadResult contains patterns extracted from all loaded bundles.
+type LoadResult struct {
+	DLP              []config.DLPPattern
+	Injection        []config.ResponseScanPattern
+	ToolPoison       []CompiledToolPoisonRule
+	Errors           []BundleError
+	Loaded           []LoadedBundle
+	Degraded         bool           // one or more installed bundles failed to load
+	Warnings         []string       // non-fatal warnings (expired bundles, etc.)
+	StandardDLP      StandardSource // where DLP standard tier came from
+	StandardResponse StandardSource // where response standard tier came from
+}
+
+// CompiledToolPoisonRule is a pre-compiled regex for tool-poison detection.
+type CompiledToolPoisonRule struct {
+	Name          string
+	RuleID        string // namespaced (bundle:rule)
+	Re            *regexp.Regexp
+	ScanField     string // "description" or "name"
+	Bundle        string
+	BundleVersion string
+}
+
+// BundleError describes a per-bundle load failure.
+type BundleError struct {
+	Name     string
+	Reason   string
+	Class    BundleErrorClass
+	Official bool // true if bundle was signed by an official key (not just name-based)
+}
+
+// BundleErrorClass separates possible tampering from operational availability
+// failures so strict startup can fail closed only on installed bundle integrity
+// loss.
+type BundleErrorClass string
+
+const (
+	// BundleErrorClassAvailability covers missing optional stores and transient
+	// filesystem/read problems where failing startup would create avoidable DoS.
+	BundleErrorClassAvailability BundleErrorClass = "availability"
+	// BundleErrorClassIntegrity covers installed-bundle provenance, hash,
+	// lockfile, freshness, and content failures that can indicate tampering.
+	BundleErrorClassIntegrity BundleErrorClass = "integrity"
+)
+
+// LoadedBundle describes a successfully loaded bundle (for diagnostics).
+type LoadedBundle struct {
+	Name                  string
+	Version               string
+	TestedThroughPipelock string
+	Tier                  string // standard, community, pro (v2+)
+	MonotonicVersion      uint64 // rollback-prevention counter (v2+)
+	Source                string
+	Rules                 int // total rules loaded after filtering
+	DLP                   int
+	Injection             int
+	ToolPoison            int
+	Unsigned              bool
+	Expired               bool // bundle is past expires_at but loaded in stale mode
+}
+
+type loadRuleFunc func(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, patternName, namespacedID string, loaded *LoadedBundle) error
+
+// IntegrityErrors returns load failures that indicate installed-bundle
+// provenance or freshness integrity loss.
+func (r *LoadResult) IntegrityErrors() []BundleError {
+	if r == nil {
+		return nil
+	}
+	return r.errorsByClass(BundleErrorClassIntegrity)
+}
+
+// AvailabilityErrors returns load failures caused by missing optional stores or
+// operational filesystem/compatibility availability.
+func (r *LoadResult) AvailabilityErrors() []BundleError {
+	if r == nil {
+		return nil
+	}
+	return r.errorsByClass(BundleErrorClassAvailability)
+}
+
+func (r *LoadResult) errorsByClass(class BundleErrorClass) []BundleError {
+	var out []BundleError
+	for _, err := range r.Errors {
+		if err.ClassOrDefault() == class {
+			out = append(out, err)
+		}
+	}
+	return out
+}
+
+// ClassOrDefault returns the recorded class, failing CLOSED for anything that
+// is not an explicitly recognized class. A zero-value (unclassified) OR an
+// unrecognized/typo'd class value defaults to integrity, so an unclassified
+// failure refuses strict startup rather than silently booting degraded — and a
+// future value the strict-startup integrity filter would not recognize can't
+// slip through as tolerated. Every loader constructor sets a known class
+// explicitly (see TestBundleErrorConstructorsSetClass), so this default is a
+// fail-safe backstop, never a value real code relies on.
+func (e BundleError) ClassOrDefault() BundleErrorClass {
+	switch e.Class {
+	case BundleErrorClassAvailability, BundleErrorClassIntegrity:
+		return e.Class
+	default:
+		return BundleErrorClassIntegrity
+	}
+}
+
+// DegradedBundleNames returns a stable, de-duplicated list of bundles or state
+// resources that failed during this load.
+func (r *LoadResult) DegradedBundleNames() []string {
+	if r == nil || len(r.Errors) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(r.Errors))
+	for _, err := range r.Errors {
+		if err.Name == "" {
+			continue
+		}
+		seen[err.Name] = struct{}{}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// LoadBundles reads all bundles from rulesDir, verifies integrity,
+// filters by options, and returns merged patterns. For v2+ bundles,
+// freshness checks (rollback prevention, expiry) are enforced.
+// If any installed bundle fails to load, Degraded is set to true.
+func LoadBundles(rulesDir string, opts LoadOptions) *LoadResult {
+	result := &LoadResult{}
+
+	if rulesDir == "" {
+		return result
+	}
+	// Preserve the optional-directory and availability semantics before opening
+	// the freshness lock. This reads names only; bundle bytes and freshness state
+	// are read below after interrupted transactions have recovered.
+	if _, err := os.ReadDir(rulesDir); err != nil {
+		if os.IsNotExist(err) {
+			return result
+		}
+		result.Errors = append(result.Errors, BundleError{Name: rulesDir, Reason: fmt.Sprintf("reading rules directory: %v", err), Class: BundleErrorClassAvailability})
+		return result
+	}
+
+	minRank := confidenceRank[opts.MinConfidence]
+	now := time.Now()
+
+	// Load → check → record → save freshness state under flock to prevent
+	// concurrent processes from racing on .freshness.json.
+	freshnessState := &FreshnessState{HighestSeen: make(map[string]uint64)}
+	lockErr := WithFreshnessLock(rulesDir, func() error {
+		if err := RecoverBundleTransactionsLocked(rulesDir); err != nil {
+			result.Errors = append(result.Errors, BundleError{Name: ".pipelock-state/rules-transactions", Reason: err.Error(), Class: BundleErrorClassIntegrity})
+			result.Degraded = true
+			return nil
+		}
+		entries, err := os.ReadDir(rulesDir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			// Permission errors, ENOTDIR, I/O failures: report, don't swallow.
+			result.Errors = append(result.Errors, BundleError{Name: rulesDir, Reason: fmt.Sprintf("reading rules directory: %v", err), Class: BundleErrorClassAvailability})
+			return nil
+		}
+		// Read the directory only after recovery while holding the same lock that
+		// protects the freshness state, so a loader cannot observe a candidate
+		// between its rename and its redo recovery.
+		var dirs []os.DirEntry
+		for _, entry := range entries {
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && !strings.HasSuffix(entry.Name(), ".bak") {
+				dirs = append(dirs, entry)
+			}
+		}
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
+		var loadErr error
+		freshnessState, loadErr = LoadFreshnessStateLocked(rulesDir)
+		if loadErr != nil {
+			result.Errors = append(result.Errors, BundleError{
+				Name:   ".freshness.json",
+				Reason: loadErr.Error(),
+				Class:  BundleErrorClassIntegrity,
+			})
+			result.Degraded = true
+			return nil
+		}
+		bctx := &bundleExecCtx{
+			MinRank:        minRank,
+			Result:         result,
+			FreshnessState: freshnessState,
+			Now:            now,
+			Definitions:    opts.definitions,
+		}
+		for _, d := range dirs {
+			bundleDir := filepath.Join(rulesDir, d.Name())
+			loadOneBundle(bundleDir, d.Name(), opts, bctx)
+		}
+
+		// Save updated freshness state if any v2+ bundles were loaded.
+		saveFreshness := opts.saveFreshnessState
+		if saveFreshness == nil {
+			saveFreshness = SaveFreshnessState
+		}
+		for _, lb := range result.Loaded {
+			if lb.MonotonicVersion > 0 {
+				persistLoadedFreshness(rulesDir, freshnessState, result, saveFreshness)
+				break
+			}
+		}
+		return nil
+	})
+	if lockErr != nil {
+		result.Errors = append(result.Errors, BundleError{Name: ".freshness.json", Reason: fmt.Sprintf("freshness lock: %v", lockErr), Class: BundleErrorClassAvailability})
+		result.Degraded = true
+	}
+
+	if len(result.Errors) > 0 {
+		result.Degraded = true
+	}
+
+	// Keep the legacy standard-pack warning, but key it only off verified
+	// official status so attacker-controlled names cannot trigger it.
+	for _, be := range result.Errors {
+		if be.Official {
+			result.Warnings = append(result.Warnings,
+				fmt.Sprintf("DEGRADED: standard pack %q failed to load: %s — running core-only", be.Name, be.Reason))
+			break
+		}
+	}
+
+	return result
+}
+
+func persistLoadedFreshness(rulesDir string, state *FreshnessState, result *LoadResult, save func(string, *FreshnessState) error) {
+	if err := save(rulesDir, state); err != nil {
+		result.Errors = append(result.Errors, BundleError{
+			Name:   ".freshness.json",
+			Reason: fmt.Sprintf("saving freshness state: %v", err),
+			Class:  BundleErrorClassIntegrity,
+		})
+		result.Degraded = true
+		// The accepted bundles are not durably protected against rollback after a
+		// failed save, so do not return any of their usable rules to the caller.
+		result.DLP = nil
+		result.Injection = nil
+		result.ToolPoison = nil
+	}
+}
+
+// bundleExecCtx groups execution context passed through the bundle loading
+// pipeline. Extracted from loadOneBundle's parameter list per the options-struct
+// convention (>6 params → struct).
+type bundleExecCtx struct {
+	MinRank        int
+	Result         *LoadResult
+	FreshnessState *FreshnessState
+	Now            time.Time
+	Definitions    []ruleTypeDefinition
+}
+
+func cloneFreshnessState(state *FreshnessState) *FreshnessState {
+	cloned := &FreshnessState{
+		HighestSeen: make(map[string]uint64),
+		FormatFloor: make(map[string]int),
+	}
+	if state == nil {
+		return cloned
+	}
+	cloned.Context = state.Context
+	cloned.Digest = state.Digest
+	for key, version := range state.HighestSeen {
+		cloned.HighestSeen[key] = version
+	}
+	for name, format := range state.FormatFloor {
+		cloned.FormatFloor[name] = format
+	}
+	return cloned
+}
+
+func (ctx *bundleExecCtx) ruleTypeDefinitionFor(ruleType string) (ruleTypeDefinition, bool) {
+	if ctx.Definitions == nil {
+		return ruleTypeDefinitionFor(ruleType)
+	}
+	for _, definition := range ctx.Definitions {
+		if definition.ID == ruleType {
+			return definition, true
+		}
+	}
+	return ruleTypeDefinition{}, false
+}
+
+// loadOneBundle loads a single bundle directory and appends results or errors.
+func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecCtx) {
+	bundlePath := filepath.Join(bundleDir, bundleFilename)
+	lockPath := filepath.Join(bundleDir, lockFilename)
+
+	// Read and size-check bundle.yaml.
+	data, err := ReadBundleFile(bundlePath)
+	if err != nil {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: classifyBundleFileReadError(err)})
+		return
+	}
+
+	// Read lock file.
+	lock, err := ReadLockFile(lockPath)
+	if err != nil {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: fmt.Sprintf("reading lock file: %v", err), Class: BundleErrorClassIntegrity})
+		return
+	}
+
+	// Verify integrity against the exact bytes we just read (no TOCTOU).
+	trustEmbeddedKeys := !opts.SkipEmbeddedKeys
+	if err := VerifyIntegrityBytesWithPolicy(data, bundleDir, lock.Unsigned, lock.SignerFingerprint, lock.BundleSHA256, TrustPolicy{TrustedKeys: opts.TrustedKeys, TrustEmbeddedKeys: trustEmbeddedKeys}); err != nil {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: fmt.Sprintf("integrity check: %v", err), Class: BundleErrorClassIntegrity})
+		return
+	}
+
+	// Parse and validate bundle YAML.
+	bundle, err := ParseBundle(data)
+	if err != nil {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: fmt.Sprintf("parse error: %v", err), Class: BundleErrorClassIntegrity})
+		return
+	}
+	bundleWarnings := make([]string, 0, 1)
+
+	// Check min_pipelock version requirement. An unprovable development version
+	// warns and loads by default, while the strict opt-in and all checked
+	// compatibility failures refuse.
+	if err := CheckMinPipelockVerdict(bundle.MinPipelock, opts.PipelockVersion); err != nil {
+		if !errors.Is(err, ErrUnverifiableVersion) || !opts.AllowUnversionedLoad {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassAvailability})
+			return
+		}
+		bundleWarnings = append(bundleWarnings, fmt.Sprintf(
+			"bundle %q loaded although min_pipelock %q could not be verified: running version %q is not a released version",
+			bundle.Name, bundle.MinPipelock, opts.PipelockVersion))
+	}
+	if warning, err := TestedThroughPipelockWarning(bundle.TestedThroughPipelock, opts.PipelockVersion); err != nil {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassIntegrity})
+		return
+	} else if warning != "" {
+		bundleWarnings = append(bundleWarnings, fmt.Sprintf("bundle %q: %s", bundle.Name, warning))
+	}
+
+	// Check pipelock-* name reservation: only official signers allowed.
+	// Track official status for degraded-mode detection (based on verified
+	// signature, not directory name).
+	official := !lock.Unsigned && strings.HasPrefix(bundle.Name, reservedBundlePrefix) && isOfficialFingerprint(lock.SignerFingerprint, trustEmbeddedKeys)
+	if strings.HasPrefix(bundle.Name, reservedBundlePrefix) && !official {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{
+			Name:   dirName,
+			Reason: fmt.Sprintf("bundle name %q uses reserved prefix %q but signer is not official", bundle.Name, reservedBundlePrefix),
+			Class:  BundleErrorClassIntegrity,
+		})
+		return
+	}
+
+	// Once an identity has loaded v2, accepting its older v1 representation would
+	// bypass every v2 freshness field. Enforce the format floor for all formats.
+	if fr := CheckFormatFloor(bundle, ctx.FreshnessState); !fr.OK {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: fr.Message, Class: BundleErrorClassIntegrity})
+		return
+	}
+
+	// V2+ freshness checks: rollback prevention, expiry, tier-key binding.
+	if bundle.FormatVersion >= 2 {
+		// V2 bundles MUST be signed. Unsigned v2 bundles could forge any
+		// tier/key_id and bypass tier-key binding entirely.
+		if lock.Unsigned {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{
+				Name:     dirName,
+				Official: official,
+				Class:    BundleErrorClassIntegrity,
+				Reason:   "format_version 2 bundles must be signed (unsigned v2 bundles are rejected)",
+			})
+			return
+		}
+
+		// Tier-key binding: verify the signing key matches the declared tier.
+		if err := CheckTierKeyBinding(bundle, lock.SignerFingerprint, opts.TierKeyMapping); err != nil {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: err.Error(), Class: BundleErrorClassIntegrity})
+			return
+		}
+
+		// Required features: reject bundles needing engine features we don't support.
+		if err := CheckRequiredFeatures(bundle.RequiredFeatures); err != nil {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: err.Error(), Class: BundleErrorClassAvailability})
+			return
+		}
+
+		// Freshness: rollback prevention and expiry.
+		fr := CheckFreshness(bundle, ctx.FreshnessState, ctx.Now, opts.AllowStale)
+		if !fr.OK {
+			class := BundleErrorClassAvailability
+			if fr.Rollback || fr.Expired {
+				class = BundleErrorClassIntegrity
+			}
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: fr.Message, Class: class})
+			return
+		}
+		if fr.Expired {
+			bundleWarnings = append(bundleWarnings, fr.Message)
+		}
+
+	}
+
+	// Stage every rule and freshness mutation so a later loader failure cannot
+	// leak part of this bundle into the shared result or persisted state.
+	stagedCtx := &bundleExecCtx{
+		MinRank:        ctx.MinRank,
+		Result:         &LoadResult{Warnings: bundleWarnings},
+		FreshnessState: cloneFreshnessState(ctx.FreshnessState),
+		Now:            ctx.Now,
+		Definitions:    ctx.Definitions,
+	}
+	if bundle.FormatVersion >= 2 {
+		RecordVersion(stagedCtx.FreshnessState, bundle.Tier, bundle.Name, bundle.MonotonicVersion)
+	}
+	RecordFormat(stagedCtx.FreshnessState, bundle.Name, bundle.FormatVersion)
+
+	// Filter and convert rules.
+	loaded := LoadedBundle{
+		Name:                  bundle.Name,
+		Version:               bundle.Version,
+		TestedThroughPipelock: bundle.TestedThroughPipelock,
+		Tier:                  bundle.Tier,
+		MonotonicVersion:      bundle.MonotonicVersion,
+		Source:                lock.Source,
+		Unsigned:              lock.Unsigned,
+	}
+
+	// Rules carrying the ignored exempt_domains field are reported once per
+	// bundle, before the status and confidence filters so a filtered rule is
+	// still named, and bounded to one line so a bundle full of them cannot
+	// flood the log on every reload.
+	var exemptRuleIDs []string
+	for i := range bundle.Rules {
+		r := &bundle.Rules[i]
+		if len(r.Pattern.ExemptDomains) > 0 {
+			exemptRuleIDs = append(exemptRuleIDs, r.ID)
+		}
+
+		// Status filter: deprecated always skipped.
+		if r.Status == StatusDeprecated {
+			continue
+		}
+
+		// Status filter: experimental skipped unless opted in.
+		if r.Status == StatusExperimental && !opts.IncludeExperimental {
+			continue
+		}
+
+		// Confidence filter.
+		ruleRank := confidenceRank[r.Confidence]
+		if ruleRank < ctx.MinRank {
+			continue
+		}
+
+		// Disabled filter: check namespaced ID against exact match and globs.
+		nsID := NamespacedID(bundle.Name, r.ID)
+		if isDisabled(nsID, opts.Disabled) {
+			continue
+		}
+
+		// Standard bundle uses canonical names (matching compiled defaults)
+		// so it can replace them 1:1 without duplicate scanning. Community
+		// and pro bundles use namespaced IDs to avoid collisions.
+		patternName := nsID
+		if bundle.Name == StandardBundleName {
+			patternName = r.Name
+		}
+
+		definition, ok := stagedCtx.ruleTypeDefinitionFor(r.Type)
+		if !ok || definition.Load == nil {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{
+				Name:   dirName,
+				Reason: fmt.Sprintf("rule type %q has no runtime loader", r.Type),
+				Class:  BundleErrorClassIntegrity,
+			})
+			return
+		}
+		if err := definition.Load(stagedCtx, bundle, r, patternName, nsID, &loaded); err != nil {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: err.Error(), Class: BundleErrorClassIntegrity})
+			return
+		}
+	}
+	if len(exemptRuleIDs) > 0 {
+		stagedCtx.Result.Warnings = append(stagedCtx.Result.Warnings, fmt.Sprintf(
+			"bundle %q rules %s set pattern.exempt_domains, which is ignored; exemptions belong in the local pipelock config, not in a deny-only bundle",
+			bundle.Name, strings.Join(exemptRuleIDs, ", ")))
+	}
+
+	loaded.Rules = loaded.DLP + loaded.Injection + loaded.ToolPoison
+	ctx.Result.DLP = append(ctx.Result.DLP, stagedCtx.Result.DLP...)
+	ctx.Result.Injection = append(ctx.Result.Injection, stagedCtx.Result.Injection...)
+	ctx.Result.ToolPoison = append(ctx.Result.ToolPoison, stagedCtx.Result.ToolPoison...)
+	ctx.Result.Warnings = append(ctx.Result.Warnings, stagedCtx.Result.Warnings...)
+	*ctx.FreshnessState = *stagedCtx.FreshnessState
+	ctx.Result.Loaded = append(ctx.Result.Loaded, loaded)
+}
+
+func loadDLPRule(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, patternName, _ string, loaded *LoadedBundle) error {
+	ctx.Result.DLP = append(ctx.Result.DLP, config.DLPPattern{
+		Name:          patternName,
+		Regex:         rule.Pattern.Regex,
+		Severity:      rule.Severity,
+		Validator:     rule.Pattern.Validator,
+		Bundle:        bundle.Name,
+		BundleVersion: bundle.Version,
+	})
+	loaded.DLP++
+	return nil
+}
+
+// caseInsensitiveRuleRegex applies the bundle contract that every rule
+// matches regardless of case. Response patterns are compiled verbatim, so the
+// flag must be added here; DLP patterns get it at scanner compile time and
+// tool-poison rules get it when the loader compiles them. When the rule
+// already opens with a flag group, i joins that group, so (?s) becomes (?is)
+// rather than gaining a second group. A rule whose leading group already sets
+// or clears i keeps it, and a span can still opt out with (?-i:...).
+func caseInsensitiveRuleRegex(regex string) string {
+	flags, ok := leadingRegexFlags(regex)
+	if !ok {
+		return "(?i)" + regex
+	}
+	if strings.ContainsRune(flags, 'i') {
+		return regex
+	}
+	return "(?i" + regex[len("(?"):]
+}
+
+// leadingRegexFlags returns the flags of a "(?flags)" group at the start of
+// regex, such as "s" for (?s) or "m-s" for (?m-s).
+func leadingRegexFlags(regex string) (string, bool) {
+	if !strings.HasPrefix(regex, "(?") {
+		return "", false
+	}
+	end := strings.IndexByte(regex, ')')
+	if end <= len("(?") {
+		return "", false
+	}
+	flags := regex[len("(?"):end]
+	if strings.Count(flags, "-") > 1 || strings.Trim(flags, "imsU-") != "" {
+		return "", false
+	}
+	return flags, true
+}
+
+func loadInjectionRule(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, patternName, _ string, loaded *LoadedBundle) error {
+	ctx.Result.Injection = append(ctx.Result.Injection, config.ResponseScanPattern{
+		Name:          patternName,
+		Regex:         caseInsensitiveRuleRegex(rule.Pattern.Regex),
+		Bundle:        bundle.Name,
+		BundleVersion: bundle.Version,
+	})
+	loaded.Injection++
+	return nil
+}
+
+func loadToolPoisonRule(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, _ string, namespacedID string, loaded *LoadedBundle) error {
+	compiled, err := regexp.Compile("(?i)" + rule.Pattern.Regex)
+	if err != nil {
+		return fmt.Errorf("compile tool-poison rule %q after validation: %w", rule.ID, err)
+	}
+	ctx.Result.ToolPoison = append(ctx.Result.ToolPoison, CompiledToolPoisonRule{
+		Name:          namespacedID,
+		RuleID:        namespacedID,
+		Re:            compiled,
+		ScanField:     rule.Pattern.ScanField,
+		Bundle:        bundle.Name,
+		BundleVersion: bundle.Version,
+	})
+	loaded.ToolPoison++
+	return nil
+}
+
+// ReadBundleFile reads a bundle artifact with a stat-first size check.
+func ReadBundleFile(path string) ([]byte, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat bundle file: %w", err)
+	}
+
+	if info.Size() > MaxBundleFileSize {
+		return nil, fmt.Errorf("size %d exceeds maximum %d bytes: %w", info.Size(), MaxBundleFileSize, errBundleFileTooLarge)
+	}
+
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading bundle file: %w", err)
+	}
+
+	return data, nil
+}
+
+func classifyBundleFileReadError(err error) BundleErrorClass {
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, errBundleFileTooLarge) {
+		return BundleErrorClassIntegrity
+	}
+	return BundleErrorClassAvailability
+}
+
+// isDisabled checks whether a namespaced rule ID matches any entry in the
+// disabled list. Exact string match is tried first, then glob patterns
+// using path.Match (not filepath.Match, which is OS-specific).
+func isDisabled(nsID string, disabled []string) bool {
+	for _, pattern := range disabled {
+		// Exact match first.
+		if nsID == pattern {
+			return true
+		}
+
+		// Glob match (path.Match uses forward-slash semantics, suitable
+		// for colon-separated namespace IDs).
+		if matched, err := path.Match(pattern, nsID); err == nil && matched {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isOfficialFingerprint checks whether the given fingerprint matches any
+// key in the embedded keyring. This compares hex fingerprint strings rather
+// than raw keys, since the lock file stores the fingerprint, not the key.
+func isOfficialFingerprint(fp string, trustEmbeddedKeys bool) bool {
+	if !trustEmbeddedKeys {
+		return false
+	}
+	for _, key := range EmbeddedKeyring() {
+		if KeyFingerprint(key) == fp {
+			return true
+		}
+	}
+	return false
+}

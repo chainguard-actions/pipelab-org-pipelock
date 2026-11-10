@@ -1,0 +1,52 @@
+# Pipelock Quickstart
+
+Run an AI agent behind Pipelock with enforced network isolation. Docker's `internal: true` network restricts the agent to the proxy for internet access. Give the proxy only the access its configured functions need; leak detection may retain selected environment and configured secret-file values in memory.
+
+## Start
+
+```bash
+docker compose up
+```
+
+This starts two containers:
+
+- **pipelock:** fetch proxy on both networks, scanning all traffic
+- **agent:** Alpine placeholder on the internal network only (replace with your agent)
+
+Set your agent's `HTTP_PROXY` and `HTTPS_PROXY` to `http://pipelock:8888`. The agent container already has these configured.
+
+Pin a specific version with `PIPELOCK_VERSION=3.8.0 docker compose up`. `PIPELOCK_IMAGE_NAMESPACE` defaults to `pipelab-org`. For releases through 3.7.1, also select the legacy namespace, for example `PIPELOCK_IMAGE_NAMESPACE=luckypipewrench PIPELOCK_VERSION=3.7.1 docker compose up`. See [Releases](https://github.com/pipelab-org/pipelock/releases) for available tags.
+
+## Verify
+
+Run 5 tests that prove isolation and scanning work. No external network needed.
+
+```bash
+docker compose --profile verify up --abort-on-container-exit --exit-code-from verify
+```
+
+| # | Test | What it proves |
+|---|------|---------------|
+| 1 | Network isolation | Verify container cannot reach the attacker container directly |
+| 2 | Proxy works | Fetch through pipelock succeeds |
+| 3 | DLP blocks secrets | AWS key in URL is blocked |
+| 4 | Injection blocked | Response scanning blocks pages with prompt injection |
+| 5 | MCP tool poisoning | Tool description scanning catches poisoned tool |
+
+Exit code 0 means all passed. Use this in CI to gate deployments.
+
+## Customize
+
+**Replace the agent.** Change `image` and `command` in `docker-compose.yml`. Keep the agent on `pipelock-internal` only.
+
+**Edit the allowlist.** `pipelock.yaml` controls which domains agents can reach, DLP patterns, response scanning rules, and MCP tool policies. See the [configuration reference](../../docs/configuration.md).
+
+**Review internal-service trust.** The verification profile keeps default SSRF protection and exempts only its Compose-local `attacker` fixture by hostname. Remove that `trusted_domains` entry when you adapt this config, then add only the internal services your deployment must reach.
+
+**Docker version.** Docker >= 25.0.5 recommended. Older versions have a DNS leak on internal networks ([CVE-2024-29018](https://github.com/moby/moby/security/advisories/GHSA-mq39-4gv4-mvpx)).
+
+## Next steps
+
+- [Deployment recipes](../../docs/guides/deployment-recipes.md) for Kubernetes, systemd, and advanced Docker setups
+- [Configuration reference](../../docs/configuration.md) for all config options
+- [Framework guides](../../docs/guides/) for Claude Code, Cursor, and other agents

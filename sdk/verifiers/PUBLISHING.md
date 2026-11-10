@@ -1,0 +1,180 @@
+# Publishing the reference verifiers
+
+The TypeScript and Rust reference verifiers under `sdk/verifiers/` are published
+so third parties can install a Pipelock receipt verifier with one command:
+
+| Language   | Registry  | Package                  | Install                              |
+| ---------- | --------- | ------------------------ | ------------------------------------ |
+| TypeScript | npm       | `@pipelock/verifier-ts`  | `npm install -g @pipelock/verifier-ts` |
+| Rust       | crates.io | `pipelock-verifier-rs`   | `cargo install --locked pipelock-verifier-rs` |
+| Python     | PyPI      | `pipelock-verify`        | `pip install pipelock-verify` (separate repo) |
+| Go         | —         | `cmd/pipelock-verifier`  | built from this repo / release binaries |
+
+The TypeScript and Rust packages publish from their own `verifier-v*` tag. A
+Pipelock product tag does not publish them. GitHub OIDC trusted publishing sends
+both packages to their registries without stored npm or crates.io tokens.
+
+## Publishing access
+
+Publishing is restricted to authorized project release maintainers. The npm scope and crates.io package already exist. Releases use the trusted-publisher configuration described below; ordinary contributions don't require registry login or publishing credentials.
+
+## Before every publish
+
+1. **Version alignment.** Bump the package version to track the receipt schema
+   it verifies. Both packages currently verify Audit Packet v0 + ActionReceipt
+   v1 + EvidenceReceipt v2 (spanned). Keep `package.json` `version` and
+   `Cargo.toml` `version` in lockstep with each other and with the receipt
+   format they support; do not publish a verifier that cannot verify the current
+   receipts.
+2. **Conformance must be green.** The cross-language conformance gate
+   (`.github/workflows/verifiers.yaml`) must pass on the commit you publish from.
+   The published source must be the in-repo verifier — always publish from a
+   clean checkout via the build/publish commands below; never hand-edit a package
+   after building. (Note: registries don't pin a consumer's transitive deps for
+   you — npm `install` ignores `package-lock.json`, and `cargo install` only uses
+   the packaged `Cargo.lock` with `--locked`, which the install docs use.)
+3. **Rust schema drift guard.** `sdk/verifiers/rust/audit-packet-v0.json` is a
+   vendored copy of `sdk/audit-packet/v0.json` (the crate must be self-contained
+   for `cargo publish`). If the canonical schema changed, re-vendor and commit:
+   ```bash
+   cp sdk/audit-packet/v0.json sdk/verifiers/rust/audit-packet-v0.json
+   ```
+   The `Schema vendor drift guard` CI step fails the build if these diverge.
+
+## Publish: TypeScript → npm
+
+```bash
+cd sdk/verifiers/ts
+npm ci
+npm test                     # build + run the full suite
+npm publish --dry-run        # inspect tarball contents; confirm dist/ + v0.schema.json present
+# Real publish: push the verifier-v* tag (see "Product release gate"). Don't run npm publish locally.
+```
+
+Verify: `npm view @pipelock/verifier-ts version` shows the new version, and
+`npm install -g @pipelock/verifier-ts@<version>` then
+`pipelock-verifier-ts receipt <file> --key <hex>` works.
+
+## Publish: Rust → crates.io
+
+```bash
+cd sdk/verifiers/rust
+cargo test --release
+cargo package --list         # confirm audit-packet-v0.json is in the package
+cargo publish --dry-run      # builds the packaged crate in isolation
+# Real publish: push the verifier-v* tag (see "Product release gate"). Don't run cargo publish locally.
+```
+
+Verify: the crate appears at <https://crates.io/crates/pipelock-verifier-rs>, and
+`cargo install --locked pipelock-verifier-rs` builds and runs offline.
+
+## Ordering note
+
+The README install lines (`npm install -g …` / `cargo install …`) only become
+true once the publish succeeds. Publish first, then merge / release the docs that
+point at the published packages, so the public docs are never ahead of reality.
+
+## Product release gate
+
+Do not publish a new verifier version while product or live-proof changes may
+still alter verifier source. After the candidate survives those checks:
+
+A verifier version bump intentionally blocks product releases until its tag is
+published and the registry digests are pinned in the installer inventory.
+
+1. Create the approved annotated `verifier-vX.Y.Z` tag and let
+   `publish-verifiers.yaml` publish both packages.
+2. Wait until npm and crates.io expose the new version. Record the peeled source
+   commit, npm `dist.integrity`, and crates.io checksum in
+   `release/verifier-installers.json`.
+3. Merge that metadata-only update and use the resulting product commit as the
+   new candidate. Runtime proof that does not consume this CI-only change stays
+   valid.
+4. Run `scripts/release-verifier-install-gate.sh --tag vX.Y.Z`. The gate builds
+   the Go verifier from the candidate, installs the exact public TypeScript,
+   Rust, and Python packages in empty directories, and requires every verifier
+   to accept a candidate receipt and reject its changed copy.
+
+The product release workflow repeats this gate before it builds or uploads
+release artifacts. A missing verifier tag, stale package, mismatched source
+commit, changed registry digest, install failure, valid-receipt rejection, or
+tampered-receipt acceptance stops the release.
+
+The install gate returns `0` for success, `2` for a contradiction or an unclassified failure, `3` for a proven registry transport outage after retries, and `64` for invalid arguments. Only `3` is retryable. Malformed metadata, digest or source mismatches, and unknown tool failures return `2`. Every nonzero code blocks publication.
+
+## Auto-publish on release tag
+
+`.github/workflows/publish-verifiers.yaml` publishes both verifiers automatically
+when a `verifier-v*` tag is pushed (e.g. `verifier-v0.2.0`). The verifiers version
+independently of pipelock, so a pipelock `v*` release tag does NOT trigger it.
+Authentication is OIDC trusted publishing on both registries: no npm or crates.io
+tokens are stored in the repository. `workflow_dispatch` runs the build/verify path
+only (a dry run) by default. Real publishes always require an immutable
+`verifier-v*` tag: pushing the tag publishes, and a manual dispatch only publishes
+when it is run from a `verifier-v*` tag with "Dry run" unchecked (a dispatch from a
+branch only ever runs the build/verify job).
+
+### One-time setup
+
+Configure these once. A trusted publisher can only be configured on a
+package/crate that already exists.
+
+A repository administrator configures the `verifier-release` GitHub environment with the project's authorized release reviewers. Both publishing jobs use this environment. Real publication requires environment approval; an environment without required reviewers doesn't provide that gate.
+
+npm (`@pipelock/verifier-ts`): package page, Settings, Trusted Publisher, add a
+GitHub Actions publisher with:
+
+- Organization or user: `pipelab-org`
+- Repository: `pipelock`
+- Workflow filename: `publish-verifiers.yaml` (filename only, not a path)
+- Environment: `verifier-release`
+- Allowed actions: `npm publish`
+
+crates.io (`pipelock-verifier-rs`): crate page, Settings, Trusted Publishing, add
+a GitHub publisher with:
+
+- Repository owner: `pipelab-org`
+- Repository name: `pipelock`
+- Workflow filename: `publish-verifiers.yaml`
+- Environment: `verifier-release`
+
+### Repository transfer
+
+The publisher settings for future releases must name `pipelab-org/pipelock`, `publish-verifiers.yaml`, and `verifier-release` on both registries. Check the registry settings and the GitHub environment's required reviewer before approving a release. A repository field in a package doesn't establish the registry's trusted publisher configuration.
+
+Published releases retain their original provenance. The installer gate binds the historical old-owner releases to their exact version, tag and peeled commit; later releases require the new repository. npm provenance must bind that repository, workflow path, tag, source commit and package digest. Keep historical identities unchanged when preparing a new inventory entry.
+
+### Cutting a release
+
+1. Bump the version in `sdk/verifiers/ts/package.json` and `sdk/verifiers/rust/Cargo.toml` (keep them in lockstep; re-vendor the schema if the canonical one changed) and merge it.
+2. From the clean, reviewed release commit, derive the verifier tag from the manifests and check it before creating an annotated tag:
+
+   ```bash
+   set -euo pipefail
+   verifier_version="$(python3 -c 'import json; print(json.load(open("sdk/verifiers/ts/package.json"))["version"])')"
+   verifier_tag="verifier-v${verifier_version}"
+   scripts/check-verifier-publish-tag.sh "$verifier_tag"
+   git tag -a "$verifier_tag" -m "Release ${verifier_tag}"
+   git push origin "refs/tags/${verifier_tag}"
+   ```
+
+3. The `build` job runs the tests and verification builds, then the two publish jobs wait for approval of the `verifier-release` environment and publish both packages. No long-lived registry tokens are stored; the publish jobs use short-lived OIDC credentials.
+
+Try it first with the `workflow_dispatch` dry run (Actions, Publish verifiers, Run
+workflow, leave "Dry run" checked): it runs only the unprivileged `build` job (tests
+plus `npm pack` and `cargo package`), so the path is exercised without publishing or
+minting any registry credential.
+
+### Hardening (built into the workflow)
+
+- OIDC only; no `CARGO_REGISTRY_TOKEN` / `NODE_AUTH_TOKEN` stored. npm emits build provenance where supported for a public repo + public package.
+- All third-party code (dependency install scripts, test suites, the TS build, the Rust verification build) runs in the unprivileged `build` job, which has no `id-token` and cannot mint a publish credential. The `id-token: write` publish jobs run no dependency or build code: `publish-npm` uploads the tarball already packed by `build` (no `npm ci`, no prepack), and `publish-crates` uses `cargo publish --no-verify` (no dependency or build-script compilation).
+- Both publish jobs run in the `verifier-release` environment, so a required reviewer gates every real publish.
+- The crates publish job re-checks schema drift before publishing.
+- Recommended: restrict who can push `verifier-v*` tags (protected tags / ruleset). The tag is the trigger.
+
+## Related: GitHub Action `verify` mode
+
+Documenting a `verify` mode on the existing security-scan Action (so a consumer's
+CI can gate on a verifying receipt) is a **separate follow-up** — it does not add
+a new Action, and it is not part of the distribution work above.

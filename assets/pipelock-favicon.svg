@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="Pipelock favicon">
+  <rect width="64" height="64" rx="12" fill="#0e0e11"/><g transform="translate(8 8) scale(.2)">  <g aria-label="Pipelock lock mark">
+    <path d="M72 112V68C72 35 93 18 120 18S168 35 168 68V112" fill="none" stroke="#00e5a0" stroke-width="22" stroke-linecap="round"/>
+    <rect x="46" y="104" width="148" height="110" rx="14" fill="#0e0e11" stroke="#00e5a0" stroke-width="3"/>
+    <rect x="55" y="113" width="130" height="92" rx="9" fill="none" stroke="#00e5a0" stroke-opacity="0.18"/>
+    <circle cx="120" cy="150" r="13" fill="#00e5a0"/><circle cx="120" cy="150" r="6" fill="#09090b"/>
+    <path d="M116 158h8v24a4 4 0 0 1-8 0z" fill="#00e5a0"/>
+  </g></g>
+</svg>

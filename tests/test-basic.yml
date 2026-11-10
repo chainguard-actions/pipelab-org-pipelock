@@ -1,0 +1,49 @@
+name: Test basic audit of a directory
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project to scan
+        run: |
+          mkdir -p /tmp/pl-clean-project /tmp/pl-alt-temp
+          printf '# Clean project\n\nNothing sensitive here.\n' > /tmp/pl-clean-project/README.md
+          printf 'def add(a, b):\n    return a + b\n' > /tmp/pl-clean-project/main.py
+      - id: action
+        uses: .
+        env:
+          # act's artifact server rejects upload-artifact v7 requests; keep reports
+          # out of runner.temp so the upload step finds no files and is ignored.
+          RUNNER_TEMP: /tmp/pl-alt-temp
+        with:
+          directory: /tmp/pl-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          scan-diff: 'false'
+      - name: Assert outputs
+        env:
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICAL: ${{ steps.action.outputs.critical-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "score=$SCORE findings=$FINDINGS critical=$CRITICAL config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]] || [ "$SCORE" -gt 100 ]; then echo "FAIL: score not 0-100"; exit 1; fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then echo "FAIL: findings-count not integer"; exit 1; fi
+          if ! [[ "$CRITICAL" =~ ^[0-9]+$ ]]; then echo "FAIL: critical-count not integer"; exit 1; fi
+          if [ "$CRITICAL" -gt "$FINDINGS" ]; then echo "FAIL: critical > findings"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: generated config missing"; exit 1; fi
+          case "$CONFIG_PATH" in
+            */pipelock-reports/suggested.yaml) ;;
+            *) echo "FAIL: unexpected config path"; exit 1 ;;
+          esac
+          echo "PASS"
+      - name: Assert binary installed on PATH
+        run: |
+          if ! command -v pipelock; then echo "FAIL: pipelock not on PATH"; exit 1; fi
+          pipelock version
+          echo "PASS"

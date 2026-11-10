@@ -1,0 +1,1126 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package diag
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/certgen"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtimeconfig"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+const (
+	doctorStatusOK      = "ok"
+	doctorStatusWarn    = "warn"
+	doctorStatusFail    = "fail"
+	doctorStatusInfo    = "info"
+	doctorSurfaceHTTP   = "http"
+	doctorSurfaceMCP    = "mcp"
+	doctorSurfaceHost   = "host"
+	doctorSurfaceConfig = "config"
+)
+
+const doctorRootBannerText = "running as root: readability checks reflect root's view, not pipelock-proxy's. Re-run as the service user for an accurate readability report."
+
+type doctorReport struct {
+	ConfigFile    string              `json:"config_file"`
+	Mode          string              `json:"mode"`
+	Version       string              `json:"version"`
+	RootRunBanner string              `json:"root_run_banner,omitempty"`
+	Summary       doctorSummary       `json:"summary"`
+	Checks        []doctorReportCheck `json:"checks"`
+}
+
+type doctorSummary struct {
+	OK       int `json:"ok"`
+	Warnings int `json:"warnings"`
+	Failures int `json:"failures"`
+	Info     int `json:"info"`
+}
+
+type doctorReportCheck struct {
+	Name       string `json:"name"`
+	Surface    string `json:"surface"`
+	Status     string `json:"status"`
+	Configured bool   `json:"configured"`
+	Reachable  bool   `json:"reachable"`
+	Enforcing  bool   `json:"enforcing"`
+	Detail     string `json:"detail,omitempty"`
+	Next       string `json:"next,omitempty"`
+}
+
+func DoctorCmd() *cobra.Command {
+	var configFile string
+	var jsonOutput bool
+	var noColor bool
+	var checkPorts bool
+	var startup bool
+
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Report whether configured protections are actually enforceable",
+		Long: `Report the difference between configured protections and protections that
+can actually enforce in the current topology. This command does not perform
+network access. It checks local config, filesystem reachability, and known
+deployment prerequisites so operators can catch no-op security settings before
+claiming production coverage.
+
+Readability checks reflect the calling user's view. When run as root (sudo),
+DAC checks are bypassed and any file the kernel can stat will look readable.
+Re-run as the pipelock service user for an accurate "can the service read
+this" report.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, cfgLabel, err := loadTestConfig(configFile)
+			if err != nil {
+				return cliutil.ExitCodeError(2, err)
+			}
+			report := buildDoctorReport(cfg, cfgLabel)
+			if startup {
+				report.Checks = append(report.Checks, checkDoctorStartup(cfg)...)
+				report.Summary = retallyDoctorSummary(report.Checks)
+			}
+			if checkPorts {
+				report.Checks = append(report.Checks, checkPortsReport(cfg)...)
+				// Rebuild summary tallies so the appended port checks count
+				// against pass/warn/fail exit codes alongside the built-in
+				// checks. Re-tally rather than incremental-add so the same
+				// code path produces summary either way.
+				report.Summary = retallyDoctorSummary(report.Checks)
+			}
+			if jsonOutput {
+				report.RootRunBanner = doctorRootBannerMessage()
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(report); err != nil {
+					return fmt.Errorf("encode doctor report JSON: %w", err)
+				}
+			} else {
+				printDoctorReport(cmd, report, !noColor && cliutil.UseColor())
+			}
+			if report.Summary.Failures > 0 {
+				return cliutil.ExitCodeError(2, fmt.Errorf("%d doctor failure(s)", report.Summary.Failures))
+			}
+			if report.Summary.Warnings > 0 {
+				return cliutil.ExitCodeError(1, fmt.Errorf("%d doctor warning(s)", report.Summary.Warnings))
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file (default: built-in defaults)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output report as JSON")
+	cmd.Flags().BoolVar(&noColor, "no-color", false, "disable color output")
+	cmd.Flags().BoolVar(&checkPorts, "check-ports", false, "report which process holds each configured listener port (Linux /proc; run as root for cross-user visibility)")
+	cmd.Flags().BoolVar(&startup, "startup", false, "check read-only startup preconditions for this host")
+
+	return cmd
+}
+
+func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
+	report := doctorReport{
+		ConfigFile: cfgLabel,
+		Mode:       cfg.Mode,
+		Version:    cliutil.Version,
+	}
+	report.Checks = []doctorReportCheck{
+		checkDoctorPromptInjectionDetection(cfg),
+		checkDoctorHTTPProxy(cfg),
+		checkDoctorMetrics(cfg),
+		checkDoctorTLSInterception(cfg),
+		checkDoctorTLSInterceptionCoverage(cfg),
+		checkDoctorRequestBodyScanning(cfg),
+		checkDoctorBrowserShield(cfg),
+		checkDoctorMCPWrapperFeatures(cfg),
+		checkDoctorMCPBinaryIntegrity(cfg),
+		checkDoctorMCPToolProvenance(cfg),
+		checkDoctorMCPIdentities(cfg, currentDoctorGOOS()),
+		checkDoctorFileSentry(cfg),
+		checkDoctorFlightRecorder(cfg),
+		checkDoctorLicense(cfg),
+		checkDoctorSentry(cfg),
+		checkDoctorDeploymentBoundary(cfg),
+	}
+	for _, warning := range cfg.MCPCompatibilityWarnings() {
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name:    warning.Field + "_compatibility",
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusWarn,
+			Detail:  warning.Message,
+		})
+	}
+	// Informational: this config blocks more than its mode name suggests, which
+	// is the fail-closed direction, so it does not raise doctor's warning exit.
+	for _, warning := range cfg.ModeAuditEnforcedWarnings() {
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name:    warning.Field + "_audit_enforced",
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusInfo,
+			Detail:  cfgLabel + ": " + warning.Message,
+		})
+	}
+	for _, warning := range cfg.ResponseScanning.SizeExemptScanLimitWarnings(time.Now()) {
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name:    warning.Field,
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusWarn,
+			Detail:  cfgLabel + ": " + warning.Message,
+		})
+	}
+	report.Checks = append(report.Checks, checkDoctorConfigSemantics(cfg)...)
+	for _, diagnostic := range cfg.MCPTaintDiagnostics() {
+		surface := doctorSurfaceMCP
+		if diagnostic.Field == "taint.mcp_recorder" {
+			surface = doctorSurfaceConfig
+		}
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name: diagnostic.Field, Surface: surface, Status: doctorStatusInfo,
+			Configured: cfg.Taint.Enabled, Detail: diagnostic.Message,
+		})
+	}
+	report.Checks = append(report.Checks, checkDoctorAvailableKnobs(cfg)...)
+	report.Summary = retallyDoctorSummary(report.Checks)
+	return report
+}
+
+func retallyDoctorSummary(checks []doctorReportCheck) doctorSummary {
+	var summary doctorSummary
+	for _, check := range checks {
+		switch check.Status {
+		case doctorStatusOK:
+			summary.OK++
+		case doctorStatusWarn:
+			summary.Warnings++
+		case doctorStatusFail:
+			summary.Failures++
+		default:
+			summary.Info++
+		}
+	}
+	return summary
+}
+
+func checkDoctorLicense(cfg *config.Config) doctorReportCheck {
+	if cfg.LicenseKey == "" {
+		return doctorReportCheck{
+			Name:    "license_status",
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusInfo,
+			Detail:  "no enterprise license configured",
+		}
+	}
+	lic, verified, err := doctorVerifiedLicense(cfg)
+	if err != nil {
+		status := doctorStatusWarn
+		if errors.Is(err, license.ErrLicenseExpired) || errors.Is(err, license.ErrLicenseRevoked) {
+			status = doctorStatusFail
+		}
+		return doctorReportCheck{
+			Name:       "license_status",
+			Surface:    doctorSurfaceConfig,
+			Status:     status,
+			Configured: true,
+			Detail:     "license verification failed: " + err.Error(),
+			Next:       "run `pipelock license status` for details and install a valid license token",
+		}
+	}
+	if !verified {
+		return doctorReportCheck{
+			Name:       "license_status",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Detail:     fmt.Sprintf("license %s is present but signature could not be verified because no public key is available", lic.ID),
+			Next:       "set license_public_key in dev builds or use an official build with an embedded key",
+		}
+	}
+	if cfg.LicenseRevoked {
+		return doctorReportCheck{
+			Name:       "license_status",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     fmt.Sprintf("license %s is revoked: %s", lic.ID, cfg.LicenseRevocationReason),
+			Next:       "install a renewed license token before relying on enterprise agent profiles",
+		}
+	}
+	if lic.ExpiresAt > 0 && time.Now().Unix() > lic.ExpiresAt {
+		return doctorReportCheck{
+			Name:       "license_status",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     fmt.Sprintf("license %s expired on %s", lic.ID, time.Unix(lic.ExpiresAt, 0).UTC().Format(time.DateOnly)),
+			Next:       "install a renewed license token before relying on enterprise agent profiles",
+		}
+	}
+	warning := license.ExpiryStatus(lic, time.Now())
+	if warning.Active {
+		status := doctorStatusWarn
+		if warning.Severity == license.ExpirySeverityInfo {
+			status = doctorStatusInfo
+		}
+		return doctorReportCheck{
+			Name:       "license_status",
+			Surface:    doctorSurfaceConfig,
+			Status:     status,
+			Configured: true,
+			Reachable:  true,
+			Enforcing:  true,
+			Detail: fmt.Sprintf("license %s: %s; %d-day lifetime-aware band severity=%s",
+				lic.ID, warning.Message(), warning.ThresholdDays, warning.Severity),
+			Next: "act before the shown expiry to avoid licensed runtime surfaces stopping",
+		}
+	}
+	detail := "license token is configured"
+	if lic.ExpiresAt > 0 {
+		detail = fmt.Sprintf("license %s expires on %s", lic.ID, time.Unix(lic.ExpiresAt, 0).UTC().Format(time.DateOnly))
+	}
+	if cfg.LicenseCRLFile != "" {
+		detail += "; signed CRL configured"
+	}
+	if len(cfg.LicenseIntermediateCert) > 0 {
+		detail += "; intermediate certificate configured"
+	}
+	return doctorReportCheck{
+		Name:       "license_status",
+		Surface:    doctorSurfaceConfig,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     detail,
+	}
+}
+
+func doctorVerifiedLicense(cfg *config.Config) (license.License, bool, error) {
+	pubKey, err := doctorLicensePublicKey(cfg)
+	if err != nil {
+		if cfg.LicensePublicKey != "" {
+			return license.License{}, false, err
+		}
+		lic, decodeErr := license.DecodeUnverified(cfg.LicenseKey)
+		if decodeErr != nil {
+			return license.License{}, false, decodeErr
+		}
+		return lic, false, nil
+	}
+	opts, optErr := license.ResolveVerifyOptions(license.ResolveInputs{
+		RootPub:          pubKey,
+		CRLFile:          cfg.LicenseCRLFile,
+		IntermediateCert: cfg.LicenseIntermediateCert,
+		IntermediateFile: cfg.LicenseIntermediateFile,
+		RequireSet:       true,
+		Require:          cfg.LicenseRequireIntermediateResolved,
+		MaxAge:           cfg.LicenseCRLMaxAgeResolved,
+	})
+	if optErr != nil {
+		return license.License{}, true, optErr
+	}
+	lic, verifyErr := license.VerifyTokenWithOptions(cfg.LicenseKey, opts)
+	return lic, true, verifyErr
+}
+
+func doctorLicensePublicKey(cfg *config.Config) (ed25519.PublicKey, error) {
+	if key := license.EmbeddedPublicKey(); key != nil {
+		return key, nil
+	}
+	if cfg.LicensePublicKey == "" {
+		return nil, errors.New("no license public key available")
+	}
+	keyBytes, err := hex.DecodeString(cfg.LicensePublicKey)
+	if err != nil || len(keyBytes) != ed25519.PublicKeySize {
+		return nil, errors.New("invalid license public key")
+	}
+	return ed25519.PublicKey(keyBytes), nil
+}
+
+func checkDoctorMetrics(cfg *config.Config) doctorReportCheck {
+	check := doctorReportCheck{
+		Name: "metrics", Surface: doctorSurfaceHTTP, Status: doctorStatusInfo,
+		Detail: "metrics are not exposed unless metrics_listen is set; counters still collect internally",
+	}
+	if cfg.MetricsListen != "" {
+		check.Configured = true
+		check.Detail = "dedicated metrics listener configured at " + cfg.MetricsListen + "; restrict network access from agents"
+	}
+	return check
+}
+
+func checkDoctorHTTPProxy(cfg *config.Config) doctorReportCheck {
+	configured := cfg.ForwardProxy.Enabled || cfg.FetchProxy.Listen != "" || cfg.WebSocketProxy.Enabled || cfg.ReverseProxy.Enabled
+	if !configured {
+		return doctorReportCheck{
+			Name:    "http_proxy",
+			Surface: doctorSurfaceHTTP,
+			Status:  doctorStatusFail,
+			Detail:  "no HTTP, forward, WebSocket, or reverse proxy listener is enabled",
+			Next:    "enable at least one proxy listener for agent network traffic",
+		}
+	}
+	if !doctorGlobalEnforce(cfg) {
+		return doctorReportCheck{
+			Name:       "http_proxy",
+			Surface:    doctorSurfaceHTTP,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Reachable:  true,
+			Detail:     "proxy listener is configured, but global enforce=false means observation/audit mode",
+			Next:       "set enforce=true before claiming blocking enforcement",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "http_proxy",
+		Surface:    doctorSurfaceHTTP,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "proxy listener is configured; OS/container policy must still force agents to use it",
+		Next:       "pair this with contain/network-policy checks so direct raw egress is blocked",
+	}
+}
+
+func checkDoctorTLSInterception(cfg *config.Config) doctorReportCheck {
+	if !cfg.TLSInterception.Enabled {
+		return doctorReportCheck{
+			Name:    "tls_interception",
+			Surface: doctorSurfaceHTTP,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled; HTTPS bodies are not visible unless traffic is plaintext or otherwise terminated",
+			Next:    "enable TLS interception and install the Pipelock CA for Browser Shield/body scanning on HTTPS",
+		}
+	}
+	missing := missingReadableFiles(cfg.TLSInterception.CACertPath, cfg.TLSInterception.CAKeyPath)
+	if len(missing) > 0 {
+		return doctorReportCheck{
+			Name:       "tls_interception",
+			Surface:    doctorSurfaceHTTP,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     "configured but CA material is not readable: " + strings.Join(missing, ", "),
+			Next:       "fix ca_cert/ca_key paths or rerun TLS/contain CA setup",
+		}
+	}
+	if !doctorGlobalEnforce(cfg) {
+		return doctorReportCheck{
+			Name:       "tls_interception",
+			Surface:    doctorSurfaceHTTP,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Reachable:  true,
+			Detail:     "CA material is readable, but global enforce=false means findings on intercepted bodies are not blocking",
+			Next:       "set enforce=true before claiming blocking enforcement on intercepted HTTPS",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "tls_interception",
+		Surface:    doctorSurfaceHTTP,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "CA material is readable; clients still need to trust the CA",
+		Next:       "verify agent and browser trust stores use this CA",
+	}
+}
+
+func checkDoctorTLSInterceptionCoverage(cfg *config.Config) doctorReportCheck {
+	msg, ok := cfg.TLSInterceptionCoverageAdvisory()
+	if !ok {
+		return doctorReportCheck{
+			Name:    "tls_interception_coverage",
+			Surface: doctorSurfaceHTTP,
+			Status:  doctorStatusOK,
+			Detail:  "CONNECT HTTPS content visibility matches enabled TLS interception and content scanners",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "tls_interception_coverage",
+		Surface:    doctorSurfaceHTTP,
+		Status:     doctorStatusWarn,
+		Configured: true,
+		Reachable:  true,
+		Detail:     msg,
+		Next:       "enable tls_interception and install the Pipelock CA, or document tunnel-level-only HTTPS content visibility as an intentional posture",
+	}
+}
+
+func checkDoctorRequestBodyScanning(cfg *config.Config) doctorReportCheck {
+	if !cfg.RequestBodyScanning.Enabled {
+		return doctorReportCheck{
+			Name:    "request_body_scanning",
+			Surface: doctorSurfaceHTTP,
+			Status:  doctorStatusWarn,
+			Detail:  "disabled; POST bodies and headers can miss DLP unless another layer sees them",
+			Next:    "enable request_body_scanning for agent HTTP/TLS proxy paths",
+		}
+	}
+	if !doctorGlobalEnforce(cfg) {
+		return doctorReportCheck{
+			Name:       "request_body_scanning",
+			Surface:    doctorSurfaceHTTP,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Reachable:  true,
+			Detail:     "enabled, but global enforce=false means request body findings are not blocking",
+			Next:       "set enforce=true and request_body_scanning.action=block for blocking enforcement",
+		}
+	}
+	if cfg.RequestBodyScanning.Action != config.ActionBlock {
+		return doctorReportCheck{
+			Name:       "request_body_scanning",
+			Surface:    doctorSurfaceHTTP,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Reachable:  true,
+			Detail:     "enabled with action=" + cfg.RequestBodyScanning.Action + "; this is not blocking enforcement",
+			Next:       "set request_body_scanning.action=block before claiming enforcement",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "request_body_scanning",
+		Surface:    doctorSurfaceHTTP,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "configured on proxy paths; CONNECT HTTPS bodies require TLS interception",
+	}
+}
+
+func checkDoctorBrowserShield(cfg *config.Config) doctorReportCheck {
+	if !cfg.BrowserShield.Enabled {
+		return doctorReportCheck{
+			Name:    "browser_shield",
+			Surface: doctorSurfaceHTTP,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled",
+			Next:    "enable browser_shield where agent browser responses should be rewritten",
+		}
+	}
+	status := doctorStatusOK
+	detail := "enabled; only enforces on response bodies visible to Pipelock"
+	next := "prove with a shieldable HTTPS response through the proxy"
+	enforcing := cfg.TLSInterception.Enabled
+	switch {
+	case !cfg.TLSInterception.Enabled:
+		status = doctorStatusWarn
+		detail = "enabled, but HTTPS Browser Shield coverage needs TLS interception or plaintext response bodies"
+		next = "enable TLS interception or limit the claim to plaintext/fetch-visible bodies"
+		enforcing = false
+	case !doctorGlobalEnforce(cfg):
+		status = doctorStatusWarn
+		detail = "enabled with TLS interception, but global enforce=false means findings are not blocking"
+		next = "set enforce=true before claiming blocking enforcement on browser responses"
+		enforcing = false
+	}
+	return doctorReportCheck{
+		Name:       "browser_shield",
+		Surface:    doctorSurfaceHTTP,
+		Status:     status,
+		Configured: true,
+		Reachable:  cfg.TLSInterception.Enabled,
+		Enforcing:  enforcing,
+		Detail:     detail,
+		Next:       next,
+	}
+}
+
+func checkDoctorMCPWrapperFeatures(cfg *config.Config) doctorReportCheck {
+	var modes []string
+	configured := false
+	for _, mode := range []struct {
+		name string
+		mode config.RuntimeMode
+	}{
+		{"MCP proxy", config.RuntimeMCPProxy},
+		{"MCP listener", config.RuntimeForwardWithMCPListener},
+		{"MCP scan", config.RuntimeMCPScan},
+	} {
+		effective, _ := runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
+			Mode: mode.mode, DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
+		}, nil, mode.name)
+		var enabled []string
+		if mode.mode != config.RuntimeMCPScan && effective.MCPInputScanning.Enabled {
+			enabled = append(enabled, "mcp_input_scanning")
+		}
+		if effective.MCPToolScanning.Enabled {
+			enabled = append(enabled, "mcp_tool_scanning")
+		}
+		if mode.mode != config.RuntimeMCPScan && effective.MCPToolPolicy.Enabled {
+			enabled = append(enabled, "mcp_tool_policy")
+		}
+		if mode.mode != config.RuntimeMCPScan && effective.MCPSessionBinding.Enabled {
+			enabled = append(enabled, "mcp_session_binding")
+		}
+		features := "disabled"
+		if len(enabled) > 0 {
+			configured = true
+			features = strings.Join(enabled, ", ")
+		}
+		modes = append(modes, mode.name+": "+features)
+	}
+	modes = append(modes, "forward proxy without MCP listener: no MCP scanning")
+	status := doctorStatusInfo
+	if configured {
+		status = doctorStatusWarn
+	}
+	return doctorReportCheck{
+		Name:       "mcp_wrapper_scanning",
+		Surface:    doctorSurfaceMCP,
+		Status:     status,
+		Configured: configured,
+		Detail:     "effective configuration by mode: " + strings.Join(modes, "; ") + "; topology, reachability, and enforcement are unproven",
+		Next:       "prove the agent uses the intended MCP proxy or listener; scan mode only inspects supplied input",
+	}
+}
+
+func checkDoctorMCPBinaryIntegrity(cfg *config.Config) doctorReportCheck {
+	if !cfg.MCPBinaryIntegrity.Enabled {
+		return doctorReportCheck{
+			Name:    "mcp_binary_integrity",
+			Surface: doctorSurfaceMCP,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled",
+			Next:    "enable after generating a real manifest for wrapped MCP server binaries",
+		}
+	}
+	check := doctorReportCheck{
+		Name:       "mcp_binary_integrity",
+		Surface:    doctorSurfaceMCP,
+		Configured: true,
+		Detail:     "configured; enforcement only runs before pipelock-spawned MCP subprocesses",
+		Next:       "generate/mount the manifest and prove MCP servers are launched through the wrapper",
+	}
+	if cfg.MCPBinaryIntegrity.ManifestPath == "" {
+		check.Status = doctorStatusFail
+		check.Detail = "enabled but manifest_path is empty"
+		return check
+	}
+	if pathReadableFile(cfg.MCPBinaryIntegrity.ManifestPath) {
+		check.Status = doctorStatusWarn
+		check.Reachable = true
+		check.Detail = "manifest is readable, but wrapper invocation still must be proven"
+		return check
+	}
+	check.Status = doctorStatusFail
+	check.Detail = "enabled but manifest is not readable: " + cfg.MCPBinaryIntegrity.ManifestPath
+	return check
+}
+
+func checkDoctorMCPToolProvenance(cfg *config.Config) doctorReportCheck {
+	if !cfg.MCPToolProvenance.Enabled {
+		return doctorReportCheck{
+			Name:    "mcp_tool_provenance",
+			Surface: doctorSurfaceMCP,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled",
+			Next:    "enable where signed tools/list provenance should be required",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "mcp_tool_provenance",
+		Surface:    doctorSurfaceMCP,
+		Status:     doctorStatusWarn,
+		Configured: true,
+		Detail:     "configured in " + cfg.MCPToolProvenance.Mode + " mode; enforcement only runs on tools/list traffic through MCP wrapper/listener paths",
+		Next:       "prove signed and unsigned tools/list fixtures through the live MCP path",
+	}
+}
+
+func checkDoctorFileSentry(cfg *config.Config) doctorReportCheck {
+	if !cfg.FileSentry.Enabled {
+		return doctorReportCheck{
+			Name:    "file_sentry",
+			Surface: doctorSurfaceMCP,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled",
+			Next:    "enable with reachable watch_paths where workspace drift should be detected",
+		}
+	}
+	check := doctorReportCheck{
+		Name:       "file_sentry",
+		Surface:    doctorSurfaceMCP,
+		Configured: true,
+		Detail:     "configured; coverage preflight has not run",
+		Next:       "run doctor as the user that starts pipelock",
+	}
+	if len(cfg.FileSentry.WatchPaths) == 0 {
+		check.Status = doctorStatusFail
+		check.Detail = "enabled but no watch_paths are configured; coverage preflight could not run"
+		return check
+	}
+	coverage := filesentry.CheckCoverage(context.Background(), &cfg.FileSentry)
+	checkedUser := "the current user"
+	if current, err := user.Current(); err == nil && current.Username != "" {
+		checkedUser = current.Username
+	}
+	return fileSentryCoverageVerdict(check, cfg, coverage, checkedUser)
+}
+
+// fileSentryCoverageVerdict maps a coverage report onto the doctor check. It is
+// separate from the walk so every verdict, including the ones a real filesystem
+// cannot easily produce on demand, is directly testable from a report value.
+func fileSentryCoverageVerdict(check doctorReportCheck, cfg *config.Config, coverage filesentry.CoverageReport, checkedUser string) doctorReportCheck {
+	truncatedDetail := ""
+	if coverage.Truncated {
+		// Reachable stays false: a partial walk is a lower bound, not coverage.
+		truncatedDetail = "; traversal stopped at its entry budget, so the unvisited remainder is unchecked rather than proven reachable"
+	}
+
+	if coverage.FailureCount > 0 {
+		check.Status = doctorStatusFail
+		if cfg.FileSentry.BestEffort && !fileSentryRequiredCoverageFailed(cfg.FileSentry.WatchPaths, coverage) {
+			check.Status = doctorStatusWarn
+		}
+		check.Detail = "coverage preflight checked as " + checkedUser + "; inaccessible subtree(s): " + formatFileSentryCoverageFailures(coverage) + truncatedDetail
+		check.Next = "grant the service user read and execute access, add a matching file_sentry.ignore_patterns entry, or set file_sentry.best_effort: true to trade coverage for availability"
+		if fileSentryRequiredCoverageFailed(cfg.FileSentry.WatchPaths, coverage) {
+			// best_effort cannot rescue a required root, so offering it here
+			// would name a control that cannot resolve this failure.
+			check.Next = "grant the service user read and execute access to the required path, add a matching file_sentry.ignore_patterns entry, or drop required: true for that root"
+		}
+		return check
+	}
+	// Zero watchable paths with no failure means every configured root was
+	// ignored away. Arming has nothing to watch and fails closed regardless of
+	// best_effort, so reporting OK here would be the exact fail-open this check
+	// exists to prevent.
+	if coverage.NoWatchablePaths() {
+		check.Status = doctorStatusFail
+		check.Detail = "coverage preflight checked as " + checkedUser + "; no configured watch path survives file_sentry.ignore_patterns, so arming has nothing to watch and startup fails closed"
+		check.Next = "narrow file_sentry.ignore_patterns so at least one configured root remains watchable, or disable file_sentry deliberately"
+		return check
+	}
+	if coverage.Truncated {
+		check.Status = doctorStatusWarn
+		check.Detail = "coverage preflight checked as " + checkedUser + truncatedDetail
+		check.Next = "narrow watch_paths or ignore_patterns so the configured tree can be traversed within the preflight budget"
+		return check
+	}
+	check.Status = doctorStatusOK
+	check.Reachable = true
+	// Enforcing stays false deliberately. A traversal preflight proves coverage
+	// is reachable, not that the watcher is running: file sentry applies to
+	// subprocess MCP mode, so enforcement still depends on the agent launching
+	// through the Pipelock MCP wrapper. Claiming enforcement from a filesystem
+	// walk would let a green check stand in for a proof it never performed.
+	check.Detail = "coverage preflight completed as " + checkedUser + "; all configured watch subtrees were traversable (result applies to the doctor's user); wrapper/sidecar lifecycle is still unproven"
+	check.Next = "prove the agent launches through the Pipelock MCP wrapper so the armed watcher actually runs"
+	return check
+}
+
+// fileSentryRequiredCoverageFailed reports whether any coverage failure belongs
+// to a root the operator marked required. The flag travels on the failure, so a
+// root whose absolute path could not be resolved keeps its required status
+// instead of being silently downgraded to an optional warning.
+func fileSentryRequiredCoverageFailed(watchPaths []config.WatchPath, coverage filesentry.CoverageReport) bool {
+	for _, failure := range coverage.Failures {
+		if failure.Required {
+			return true
+		}
+	}
+	// Omitted failures cannot safely be classified as optional, so preserve the
+	// strict result when any required root could have produced one.
+	if coverage.FailureCount <= len(coverage.Failures) {
+		return false
+	}
+	for _, watchPath := range watchPaths {
+		if watchPath.Required {
+			return true
+		}
+	}
+	return false
+}
+
+func formatFileSentryCoverageFailures(coverage filesentry.CoverageReport) string {
+	parts := make([]string, 0, len(coverage.Failures)+1)
+	for _, failure := range coverage.Failures {
+		parts = append(parts, fmt.Sprintf("%s (watch root %s: %s)", failure.Path, failure.Root, failure.Error))
+	}
+	if omitted := coverage.FailureCount - len(coverage.Failures); omitted > 0 {
+		parts = append(parts, fmt.Sprintf("%d additional subtree failure(s) omitted", omitted))
+	}
+	return strings.Join(parts, "; ")
+}
+
+func checkDoctorFlightRecorder(cfg *config.Config) doctorReportCheck {
+	if !cfg.FlightRecorder.Enabled {
+		return doctorReportCheck{
+			Name:    "flight_recorder",
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled",
+			Next:    "enable flight_recorder to emit signed decision receipts",
+		}
+	}
+	if cfg.FlightRecorder.Dir == "" {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Detail:     "flight_recorder is enabled but dir is unset; no receipts will be written",
+			Next:       "set flight_recorder.dir to a writable directory so receipts are persisted",
+		}
+	}
+	if _, err := os.Stat(filepath.Clean(cfg.FlightRecorder.Dir)); errors.Is(err, os.ErrNotExist) && pathProbablyCreatableDir(cfg.FlightRecorder.Dir) {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Detail:     "flight_recorder.dir does not exist; parent permission bits suggest it may be creatable, but persistence is not verified",
+			Next:       "create the directory as the service user, then rerun doctor to verify receipt persistence",
+		}
+	}
+	readable := pathReadable(cfg.FlightRecorder.Dir)
+	writable := pathWritableDir(cfg.FlightRecorder.Dir)
+	if !readable || !writable {
+		detail, next := flightRecorderAccessDetail(readable, writable)
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Reachable:  readable,
+			Enforcing:  false,
+			Detail:     detail,
+			Next:       next,
+		}
+	}
+	health, err := recorder.EvidenceDirectoryHealthForDir(cfg.FlightRecorder.Dir, cfg.FlightRecorder.RetentionDays)
+	if err != nil {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Reachable:  true,
+			Detail:     "flight_recorder.dir is reachable but evidence file-count health could not be measured: " + err.Error(),
+			Next:       "inspect the directory permissions and rerun doctor as the service user",
+		}
+	}
+	if health.OverSessionFileLimit {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Reachable:  true,
+			Enforcing:  false,
+			Detail:     health.FileCountVerdict(),
+			Next:       "archive and verify older JSONL shards before explicit pruning; automatic expiry preserves JSONL chain shards",
+		}
+	}
+	if health.NearSessionFileLimit {
+		return doctorReportCheck{
+			Name:       "flight_recorder",
+			Surface:    doctorSurfaceConfig,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Reachable:  true,
+			Enforcing:  true,
+			Detail:     health.FileCountVerdict(),
+			Next:       "run pipelock evidence doctor on the recorder directory, then archive older JSONL shards; verify the archive independently, and do not assume one linear chain if the doctor reports a fork",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "flight_recorder",
+		Surface:    doctorSurfaceConfig,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "flight_recorder is enabled with a configured directory",
+	}
+}
+
+func flightRecorderAccessDetail(readable, writable bool) (detail, next string) {
+	switch {
+	case !readable && !writable:
+		return "flight_recorder.dir is configured but is not readable or writable; receipts will not persist reliably",
+			"create the directory and grant the pipelock service user read/write/execute access"
+	case !readable:
+		return "flight_recorder.dir is configured but is not readable; existing receipts cannot be inspected reliably",
+			"grant the pipelock service user read/execute access to flight_recorder.dir"
+	default:
+		return "flight_recorder.dir is configured but is not writable; new receipts will not persist",
+			"grant the pipelock service user write/execute access to flight_recorder.dir"
+	}
+}
+
+func checkDoctorSentry(cfg *config.Config) doctorReportCheck {
+	dsnConfigured := cfg.Sentry.DSN != "" || os.Getenv("SENTRY_DSN") != ""
+	if !cfg.Sentry.IsEnabled() {
+		return doctorReportCheck{
+			Name:    "sentry",
+			Surface: doctorSurfaceHost,
+			Status:  doctorStatusInfo,
+			Detail:  "disabled (default)",
+			Next:    "optional: set sentry.enabled: true and provide your own DSN via YAML or SENTRY_DSN to receive minimized crash reports, or use equivalent alerting",
+		}
+	}
+	if !dsnConfigured {
+		return doctorReportCheck{
+			Name:       "sentry",
+			Surface:    doctorSurfaceHost,
+			Status:     doctorStatusWarn,
+			Configured: true,
+			Detail:     "enabled but no DSN is configured via YAML or SENTRY_DSN",
+			Next:       "configure DSN without printing it in logs/docs, then emit a scrubbed test event",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "sentry",
+		Surface:    doctorSurfaceHost,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "enabled and DSN is present (value redacted)",
+		Next:       "verify one scrubbed breadcrumb/error path",
+	}
+}
+
+func checkDoctorStartup(cfg *config.Config) []doctorReportCheck {
+	return []doctorReportCheck{
+		checkDoctorStartupDLPSecretsFile(cfg),
+		checkDoctorStartupTLSCA(cfg),
+	}
+}
+
+func checkDoctorStartupDLPSecretsFile(cfg *config.Config) doctorReportCheck {
+	if cfg.DLP.SecretsFile == "" {
+		return doctorReportCheck{
+			Name:    "startup_dlp_secrets_file",
+			Surface: doctorSurfaceHost,
+			Status:  doctorStatusInfo,
+			Detail:  "dlp.secrets_file is not configured",
+		}
+	}
+	minLen := cfg.DLP.MinEnvSecretLength
+	if minLen <= 0 {
+		minLen = 16
+	}
+	_, err := scanner.LoadSecretsFile(filepath.Clean(cfg.DLP.SecretsFile), minLen)
+	if err != nil {
+		return doctorReportCheck{
+			Name:       "startup_dlp_secrets_file",
+			Surface:    doctorSurfaceHost,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     "configured secrets file cannot be loaded: " + err.Error(),
+			Next:       "fix dlp.secrets_file ownership, path, or mode for the service user",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "startup_dlp_secrets_file",
+		Surface:    doctorSurfaceHost,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "configured secrets file is loadable",
+	}
+}
+
+func checkDoctorStartupTLSCA(cfg *config.Config) doctorReportCheck {
+	if !cfg.TLSInterception.Enabled {
+		return doctorReportCheck{
+			Name:    "startup_tls_ca",
+			Surface: doctorSurfaceHost,
+			Status:  doctorStatusInfo,
+			Detail:  "TLS interception is disabled",
+		}
+	}
+	if _, _, err := certgen.LoadCA(cfg.TLSInterception.CACertPath, cfg.TLSInterception.CAKeyPath); err != nil {
+		return doctorReportCheck{
+			Name:       "startup_tls_ca",
+			Surface:    doctorSurfaceHost,
+			Status:     doctorStatusFail,
+			Configured: true,
+			Detail:     "configured TLS CA material cannot be parsed: " + err.Error(),
+			Next:       "fix tls_interception.ca_cert and ca_key or regenerate the CA",
+		}
+	}
+	return doctorReportCheck{
+		Name:       "startup_tls_ca",
+		Surface:    doctorSurfaceHost,
+		Status:     doctorStatusOK,
+		Configured: true,
+		Reachable:  true,
+		Enforcing:  true,
+		Detail:     "configured TLS CA material parses successfully",
+	}
+}
+
+func checkDoctorDeploymentBoundary(_ *config.Config) doctorReportCheck {
+	return doctorReportCheck{
+		Name:    "direct_egress_boundary",
+		Surface: doctorSurfaceHost,
+		Status:  doctorStatusInfo,
+		Detail:  "proxy env vars only steer cooperative clients; launch agents through plk/containment or cluster network policy so raw egress is blocked",
+		Next:    "run contain verify or cluster topology smoke tests; agents launched outside that boundary can still use the operator's normal network",
+	}
+}
+
+func missingReadablePaths(paths ...string) []string {
+	return missingByPredicate(pathReadable, paths...)
+}
+
+func missingReadableFiles(paths ...string) []string {
+	return missingByPredicate(pathReadableFile, paths...)
+}
+
+func missingByPredicate(pred func(string) bool, paths ...string) []string {
+	missing := []string{}
+	for _, path := range paths {
+		if path == "" {
+			missing = append(missing, "<empty>")
+			continue
+		}
+		if !pred(path) {
+			missing = append(missing, path)
+		}
+	}
+	return missing
+}
+
+func pathReadableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	return openReadable(path)
+}
+
+func pathReadable(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if !info.Mode().IsRegular() && !info.IsDir() {
+		return false
+	}
+	return openReadable(path)
+}
+
+func pathWritableDir(path string) bool {
+	info, err := os.Stat(filepath.Clean(path))
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	probe, err := os.CreateTemp(filepath.Clean(path), ".pipelock-doctor-writability-*") //nolint:gosec // doctor checks operator-visible config paths from local configuration.
+	if err != nil {
+		return false
+	}
+	probePath := probe.Name()
+	_ = probe.Close()
+	_ = os.Remove(probePath)
+	return true
+}
+
+func pathProbablyCreatableDir(path string) bool {
+	for candidate := filepath.Clean(path); ; candidate = filepath.Dir(candidate) {
+		info, err := os.Stat(candidate)
+		if err == nil {
+			return info.IsDir() && dirWritableExecutableByCurrentUser(info)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		if parent := filepath.Dir(candidate); parent == candidate {
+			return false
+		}
+	}
+}
+
+func openReadable(path string) bool {
+	f, err := os.Open(filepath.Clean(path)) //nolint:gosec // doctor checks operator-visible config paths from local configuration.
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
+func doctorGlobalEnforce(cfg *config.Config) bool {
+	return cfg.Enforce == nil || *cfg.Enforce
+}
+
+// doctorRootBannerMessage returns a non-empty advisory string when the
+// process is running with euid 0. Doctor's readability checks reflect the
+// caller's view, and root bypasses DAC, so paths that pipelock-proxy cannot
+// read still look readable. Surfacing this in both human and JSON output
+// keeps "configured ≠ enforcing" honest in the most common invocation.
+func doctorRootBannerMessage() string {
+	if os.Geteuid() != 0 {
+		return ""
+	}
+	return doctorRootBannerText
+}
+
+func printDoctorReport(cmd *cobra.Command, report doctorReport, color bool) {
+	w := cmd.OutOrStdout()
+	_, _ = fmt.Fprintln(w, "Pipelock Enforcement Doctor")
+	_, _ = fmt.Fprintln(w, "===========================")
+	_, _ = fmt.Fprintf(w, "Config: %s\n", report.ConfigFile)
+	_, _ = fmt.Fprintf(w, "Mode:   %s\n", report.Mode)
+	if banner := doctorRootBannerMessage(); banner != "" {
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintf(w, "%s %s\n", doctorStatusTag(doctorStatusWarn, color), banner)
+	}
+	_, _ = fmt.Fprintln(w)
+	for _, check := range report.Checks {
+		_, _ = fmt.Fprintf(w, "%s %-24s [%s]\n", doctorStatusTag(check.Status, color), check.Name, check.Surface)
+		if check.Detail != "" {
+			_, _ = fmt.Fprintf(w, "  %s\n", check.Detail)
+		}
+		if check.Next != "" {
+			_, _ = fmt.Fprintf(w, "  next: %s\n", check.Next)
+		}
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintf(w, "Summary: %d ok, %d warning, %d failure, %d info\n",
+		report.Summary.OK, report.Summary.Warnings, report.Summary.Failures, report.Summary.Info)
+}
+
+func doctorStatusTag(status string, color bool) string {
+	if !color {
+		return "[" + strings.ToUpper(status) + "]"
+	}
+	switch status {
+	case doctorStatusOK:
+		return "\033[32m[OK]\033[0m"
+	case doctorStatusWarn:
+		return "\033[33m[WARN]\033[0m"
+	case doctorStatusFail:
+		return "\033[31m[FAIL]\033[0m"
+	default:
+		return "\033[36m[INFO]\033[0m"
+	}
+}

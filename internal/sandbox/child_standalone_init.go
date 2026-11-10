@@ -1,0 +1,470 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Standalone sandbox child-process entry point. Runs inside a re-exec'd
+// child with network namespace isolation. CI exercises it through an
+// instrumented binary and merges its GOCOVERDIR output with parent coverage.
+
+package sandbox
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	guardruntime "github.com/luckyPipewrench/pipelock/internal/guard"
+)
+
+// RunStandaloneInit is the entry point for standalone sandbox-init mode.
+// Unlike MCP's RunInit (which execs the command), this stays alive to run
+// a bridge proxy that routes the agent's HTTP traffic through pipelock's
+// scanner via a Unix domain socket.
+func RunStandaloneInit() {
+	workspace := os.Getenv("__PIPELOCK_SANDBOX_WORKSPACE")
+	commandStr := os.Getenv("__PIPELOCK_SANDBOX_COMMAND")
+	commandJSON := os.Getenv(standaloneCommandJSONEnv)
+	socketPath := os.Getenv(sandboxSocketEnv)
+	extraEnvStr := os.Getenv("__PIPELOCK_SANDBOX_EXTRA_ENV")
+	developerEnvFDStr := os.Getenv(developerEnvironmentControlEnv)
+	guardDeclarationRaw := os.Getenv(standaloneGuardDeclarationEnv)
+	guardProfile := os.Getenv(standaloneGuardProfileEnv)
+	guardPolicyHash := os.Getenv(standaloneGuardPolicyHashEnv)
+	guardStatusFDStr := os.Getenv(guardStatusControlEnv)
+
+	var guardDeclaration *config.Guard
+	var guardStatus *os.File
+	if guardDeclarationRaw != "" {
+		guardDeclaration = &config.Guard{}
+		if err := json.Unmarshal([]byte(guardDeclarationRaw), guardDeclaration); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] guard declaration: %v\n", err)
+			exitSandboxProcess(1)
+		}
+		if guardPolicyHash == "" {
+			_, _ = fmt.Fprintln(os.Stderr, "[sandbox] guard policy hash is missing")
+			exitSandboxProcess(1)
+		}
+		fd, fdErr := strconv.Atoi(guardStatusFDStr)
+		if fdErr != nil || fd < 3 {
+			_, _ = fmt.Fprintln(os.Stderr, "[sandbox] guard status descriptor is invalid")
+			exitSandboxProcess(1)
+		}
+		guardStatus = os.NewFile(uintptr(fd), "guard-status")
+	}
+
+	if workspace == "" || (commandJSON == "" && commandStr == "") || socketPath == "" {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] missing workspace, command, or socket path\n")
+		exitSandboxProcess(1)
+	}
+
+	command, err := decodeStandaloneCommand(commandJSON, commandStr)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] command transport: %v\n", err)
+		exitSandboxProcess(1)
+	}
+	var extraEnv []string
+	if extraEnvStr != "" {
+		extraEnv = strings.Split(extraEnvStr, "\x1f")
+	}
+
+	var developerEnvironment []string
+	useDeveloperEnvironment := developerEnvFDStr != ""
+	if useDeveloperEnvironment {
+		fd, err := developerEnvironmentFDFromControl(developerEnvFDStr)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] developer env transport: %v\n", err)
+			exitSandboxProcess(1)
+		}
+		developerEnvironment, err = readDeveloperEnvironment(fd)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] developer env transport: %v\n", err)
+			exitSandboxProcess(1)
+		}
+	}
+
+	strict := IsStrictMode()
+
+	// Initialize Go's signal thread before RLIMIT_NPROC is lowered. This keeps
+	// process exhaustion on a shared UID in the controlled command-error path.
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+
+	sandboxDir := standaloneChildTempDir(os.Getpid())
+	var env []string
+	var binary string
+	if useDeveloperEnvironment {
+		// SyntheticEnv normally creates this directory before policy resolution.
+		// The developer path preserves the caller environment instead, but the
+		// Landlock policy still needs its private, non-secret scratch directory.
+		if err := os.MkdirAll(sandboxDir, 0o700); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] developer scratch dir: %v\n", err)
+			exitSandboxProcess(1)
+		}
+		if guardDeclaration != nil {
+			binary, err = ResolveCommandInDir(command[0], developerEnvironment, workspace)
+		} else {
+			binary, err = lookPathIn(command[0], developerEnvironment)
+		}
+	} else {
+		// Build synthetic environment.
+		env, err = SyntheticEnv(sandboxDir, workspace, extraEnv)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] env setup: %v\n", err)
+			exitSandboxProcess(1)
+		}
+		if guardDeclaration != nil {
+			binary, err = ResolveCommandInDir(command[0], env, workspace)
+		} else {
+			binary, err = lookPathIn(command[0], env)
+		}
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] command not found: %s (%v)\n", command[0], err)
+		exitSandboxProcess(127)
+	}
+
+	// Strict mode: mount private /dev/shm BEFORE Landlock.
+	if strict {
+		if err := mountPrivateShm(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] private /dev/shm: %v\n", err)
+			exitSandboxProcess(1)
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] /dev/shm: PRIVATE (strict)\n")
+	}
+
+	noNetNS := IsNoNetNS()
+	applyRlimitsOrExit()
+
+	// Apply Landlock.
+	// Add per-sandbox temp dir and the parent's socket dir to the policy.
+	// Host /tmp is NOT in the default policy to prevent cross-sandbox leakage.
+	policy := resolvePolicy(workspace)
+	policy.AllowRWDirs = append(policy.AllowRWDirs, sandboxDir)
+	// The socket's parent dir must be accessible for the bridge proxy.
+	if socketPath != "" {
+		// Bridge mode grants RW to a fresh 0o700 per-invocation dir so the
+		// child can connect to proxy.sock. The parent owns the bound socket
+		// inode for this session and removes the whole dir on teardown.
+		// A malicious child can create files in the dir, but the parent never
+		// reopens proxy.sock after binding it, so replacement affects no future
+		// parent listener and dies with the per-invocation directory.
+		policy.AllowRWDirs = append(policy.AllowRWDirs, filepath.Dir(socketPath))
+	}
+	resolvedPolicy, err := ResolvePolicyPaths(policy)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] FATAL: resolve policy: %v\n", err)
+		exitSandboxProcess(1)
+	}
+	if err := ValidatePolicy(resolvedPolicy); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] FATAL: validate policy: %v\n", err)
+		exitSandboxProcess(1)
+	}
+	policy = resolvedPolicy
+	llStatus, llErr := ApplyLandlock(policy, socketPath)
+	reportLayer(os.Stderr, llStatus, llErr)
+
+	// ApplySeccomp sets no_new_privs while pinned before installing the filter.
+	// Strict mode blocks clone3.
+	scStatus, scErr := ApplySeccomp(strict)
+	reportLayer(os.Stderr, scStatus, scErr)
+
+	// Network namespace status depends on whether parent created one.
+	if noNetNS {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] network: DEGRADED (no namespace, proxy-based routing only)\n")
+		// Degraded mode enforces proxy routing via HTTP(S)_PROXY env only.
+		// A child process that clears those env vars can open direct
+		// outbound sockets and bypass pipelock entirely (round-4 of the pre-tag gate
+		// finding, reconfirmed in a later round for the standalone sandbox
+		// path that earlier prerelease builds missed). Kernel-enforced isolation requires
+		// a user namespace (CLONE_NEWUSER) or the companion-proxy
+		// topology generated by `pipelock init sidecar`.
+		_, _ = fmt.Fprintf(os.Stderr,
+			"[sandbox] WARNING: best-effort network mode relies on HTTP(S)_PROXY env; a child process that clears those can bypass pipelock. "+
+				"For kernel-enforced isolation, run under a user namespace (CLONE_NEWUSER) or use the companion-proxy topology from `pipelock init sidecar`.\n")
+	} else {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] network: ACTIVE (isolated namespace)\n")
+		// Bring up loopback only in a new network namespace.
+		// In best-effort mode without netns, loopback is already up.
+		if err := bringUpLoopback(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] loopback: %v\n", err)
+			exitSandboxProcess(1)
+		}
+	}
+	if err := waitForParentHardening(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] FATAL: parent hardening gate: %v\n", err)
+		exitSandboxProcess(1)
+	}
+
+	// Start bridge proxy. In best-effort mode without netns, the bridge
+	// still works - HTTP_PROXY routes cooperative agents through pipelock.
+	// Network isolation is not kernel-enforced in this mode.
+	//
+	// Without a network namespace, the default port (8888) may conflict
+	// with a pipelock sidecar already running in the same pod. Use port 0
+	// (OS-assigned) to avoid the conflict - the agent gets the actual
+	// address via HTTP_PROXY env var.
+	var bridgeAddr string
+	if noNetNS {
+		bridgeAddr = "127.0.0.1:0" // dynamic port to avoid sidecar conflict
+	}
+	bridge, err := NewBridgeProxy(socketPath, bridgeAddr)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] bridge proxy: %v\n", err)
+		exitSandboxProcess(1)
+	}
+
+	bridge.SetIdleTimeout(parseBridgeIdleTimeout(os.Getenv(bridgeIdleTimeoutEnv)))
+
+	bridgeErr := make(chan error, 1)
+	go func() { bridgeErr <- bridge.Serve(ctx) }()
+	defer bridge.Close()
+
+	// Report summary.
+	active := countActive(llStatus, scStatus)
+	const totalLayers = 3
+	if !noNetNS {
+		active++ // count netns only when namespace isolation is active
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "[sandbox] containment: %d/%d layers active\n", active, totalLayers)
+
+	outcome, outcomeErr := appliedLaunchOutcome(strict, noNetNS, seccompFilterSupportedByBuild(), llStatus, scStatus)
+	if outcomeErr != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] launch outcome: REFUSED: %v\n", outcomeErr)
+		exitSandboxProcess(1)
+	}
+	reportAppliedLaunchOutcome(os.Stderr, outcome, llStatus.Version)
+	_, _ = fmt.Fprintf(os.Stderr, "[sandbox] bridge proxy: %s → %s\n", bridge.Addr(), socketPath)
+
+	if useDeveloperEnvironment {
+		env, err = DeveloperEnv(developerEnvironment, bridge.Addr())
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] env setup: %v\n", err)
+			exitSandboxProcess(1)
+		}
+		// The caller's environment may point PWD or TMPDIR outside the paths
+		// granted to the final Guard process. Force both to the contained paths
+		// so ordinary tools do not fail merely by honoring inherited metadata.
+		env = forceEnvValue(env, "PWD", workspace)
+		env = forceEnvValue(env, "TMPDIR", sandboxDir)
+	} else {
+		// Add HTTP_PROXY/HTTPS_PROXY to agent's environment.
+		env = appendBridgeProxyEnv(env, bridge.Addr())
+	}
+
+	// Clean sandbox env vars.
+	for _, key := range []string{
+		standaloneInitEnv, initEnvKey,
+		"__PIPELOCK_SANDBOX_WORKSPACE", "__PIPELOCK_SANDBOX_COMMAND",
+		standaloneCommandJSONEnv,
+		sandboxSocketEnv, "__PIPELOCK_SANDBOX_EXTRA_ENV",
+		"__PIPELOCK_SANDBOX_POLICY", noNetNSEnvKey, bridgeIdleTimeoutEnv,
+		developerEnvironmentControlEnv,
+		standaloneGuardDeclarationEnv, standaloneGuardProfileEnv, standaloneGuardPolicyHashEnv,
+		guardStatusControlEnv,
+	} {
+		env = removeEnvKey(env, key)
+	}
+
+	// Run the agent command as a subprocess. Guard adds one final self re-exec:
+	// that helper applies the manifest to its calling thread and immediately
+	// replaces itself with the operator command, leaving this bridge process
+	// outside the workload filesystem restriction.
+	var guardEnvironmentReader, guardEnvironmentWriter *os.File
+	var guardEnvironmentPayload []byte
+	if guardDeclaration != nil {
+		selfExe, readErr := os.Readlink("/proc/self/exe")
+		if readErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] guard helper path: %v\n", readErr)
+			exitSandboxProcess(1)
+		}
+		guardEnvironmentPayload, readErr = json.Marshal(env)
+		if readErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] guard environment: %v\n", readErr)
+			exitSandboxProcess(1)
+		}
+		guardEnvironmentReader, guardEnvironmentWriter, readErr = os.Pipe()
+		if readErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] guard environment pipe: %v\n", readErr)
+			exitSandboxProcess(1)
+		}
+		controls, controlErr := guardruntime.ExecControlEnvironment(guardruntime.ExecControlOptions{
+			Declaration: *guardDeclaration, Profile: guardProfile, PolicyHash: guardPolicyHash,
+			Workspace: workspace, TempDir: sandboxDir, Binary: binary, EnvironmentFD: 3, StatusFD: 4,
+		})
+		if controlErr != nil {
+			_ = guardEnvironmentReader.Close()
+			_ = guardEnvironmentWriter.Close()
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] guard controls: %v\n", controlErr)
+			exitSandboxProcess(1)
+		}
+		// The helper receives no developer-controlled loader or runtime hooks.
+		// It reads the preserved environment as inert JSON over fd 3, applies
+		// Guard, closes the pipe, and gives those values only to the final exec.
+		env = append([]string{
+			"PATH=/usr/bin:/bin",
+			"PWD=" + workspace,
+			"TMPDIR=" + sandboxDir,
+		}, controls...)
+		binary = selfExe
+		command = append([]string{selfExe}, command...)
+	}
+	agentCmd := exec.CommandContext(ctx, binary, command[1:]...) //nolint:gosec // G204: user-specified agent command
+	agentCmd.Stdin = os.Stdin
+	agentCmd.Stdout = os.Stdout
+	agentCmd.Stderr = os.Stderr
+	agentCmd.Env = env
+	agentCmd.Dir = workspace
+	if guardEnvironmentReader != nil {
+		agentCmd.ExtraFiles = []*os.File{guardEnvironmentReader, guardStatus}
+	}
+
+	target, err := startSandboxTarget(agentCmd, llStatus)
+	if err != nil {
+		if guardEnvironmentReader != nil {
+			_ = guardEnvironmentReader.Close()
+			_ = guardEnvironmentWriter.Close()
+			_ = guardStatus.Close()
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] command error: %v\n", err)
+		exitSandboxProcess(1)
+	}
+	defer target.Close()
+	// Start the only Wait before the guard transfer, so every failure path below
+	// shares one exit result and never waits for a command it could not kill.
+	agentDone := make(chan error, 1)
+	go func() { agentDone <- agentCmd.Wait() }()
+	if guardEnvironmentReader != nil {
+		_ = guardEnvironmentReader.Close()
+		_ = guardStatus.Close()
+		written, writeErr := guardEnvironmentWriter.Write(guardEnvironmentPayload)
+		if writeErr == nil && written != len(guardEnvironmentPayload) {
+			writeErr = io.ErrShortWrite
+		}
+		closeErr := guardEnvironmentWriter.Close()
+		if writeErr != nil || closeErr != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] guard environment transport: %v\n", errors.Join(writeErr, closeErr))
+			reportBridgeCleanupFailure(os.Stderr, agentCmd.Process.Pid,
+				stopTargetAfterBridgeFailure(false, target.Signal, target.Close, agentDone))
+			exitSandboxProcess(1)
+		}
+	}
+
+	agentErr, bridgeFailure, agentReaped := waitStandaloneAgentAndBridge(agentDone, bridgeErr, bridge.Close)
+	if bridgeFailure != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] FATAL: bridge proxy: %v\n", bridgeFailure)
+		// The parent only sends SIGTERM to the process group and does not wait,
+		// so a command that ignores SIGTERM could outlive the launch. Stop and
+		// reap it here, as the guard-transport failure path above does.
+		// The bridge failure is the reported cause; the killed command's own exit
+		// status adds nothing. A failed kill is reported, because the command
+		// may then still be running after this process exits.
+		reportBridgeCleanupFailure(os.Stderr, agentCmd.Process.Pid,
+			stopTargetAfterBridgeFailure(agentReaped, target.Signal, target.Close, agentDone))
+		exitSandboxProcess(1)
+	}
+	err = agentErr
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				// ExitCode reports -1 for a signaled process. Passing that to
+				// os.Exit becomes 255 and loses the command's real termination
+				// status. Preserve the shell-visible 128+signal convention across
+				// the standalone init and outer CLI process boundary.
+				exitSandboxProcess(128 + int(status.Signal()))
+			}
+			exitSandboxProcess(exitErr.ExitCode())
+		}
+		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] command error: %v\n", err)
+		exitSandboxProcess(1)
+	}
+}
+
+func decodeStandaloneCommand(encoded, legacy string) ([]string, error) {
+	var command []string
+	if encoded == "" {
+		if legacy == "" {
+			return nil, errors.New("missing command")
+		}
+		command = strings.Split(legacy, "\x1f")
+	} else {
+		if err := json.Unmarshal([]byte(encoded), &command); err != nil {
+			return nil, fmt.Errorf("decoding command JSON: %w", err)
+		}
+	}
+	if len(command) == 0 || command[0] == "" {
+		return nil, errors.New("decoded command is empty")
+	}
+	for _, arg := range command {
+		if strings.IndexByte(arg, 0) >= 0 {
+			return nil, errors.New("decoded command contains NUL")
+		}
+	}
+	return command, nil
+}
+
+// errSandboxKillFailed marks a kill that failed while the command may still
+// be running.
+var errSandboxKillFailed = errors.New("kill sandboxed command")
+
+// reportBridgeCleanupFailure reports a cleanup result only when the kill failed
+// and the command may outlive this process. Any other result is the expected
+// exit of a killed or already exited command and is not reported.
+func reportBridgeCleanupFailure(w io.Writer, pid int, err error) {
+	if errors.Is(err, errSandboxKillFailed) {
+		_, _ = fmt.Fprintf(w, "[sandbox] FATAL: sandboxed command (pid %d) may still be running: %v\n", pid, err)
+	}
+}
+
+// stopTargetAfterBridgeFailure retires the target thread after a fatal bridge
+// or guard-transport error. When the agent is still running it is killed and its result is taken
+// from the existing Wait goroutine; Wait is never called a second time. When
+// waitStandaloneAgentAndBridge already consumed that single result (the agent
+// exited first and the bridge then failed), nothing is left to receive, so it
+// only closes the target. If the kill itself fails for any reason other than
+// the command having already exited, the command may still be running and
+// nothing guarantees it will ever exit, so the helper returns that error
+// rather than waiting.
+func stopTargetAfterBridgeFailure(agentReaped bool, signal func(os.Signal) error, closeTarget func(), agentDone <-chan error) error {
+	if agentReaped {
+		closeTarget()
+		return nil
+	}
+	if err := signal(os.Kill); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		closeTarget()
+		return fmt.Errorf("%w: %w", errSandboxKillFailed, err)
+	}
+	err := <-agentDone
+	closeTarget()
+	return err
+}
+
+// waitStandaloneAgentAndBridge waits for the agent and its required bridge.
+// When the agent exits first, it shuts the bridge down and consumes its
+// terminal result before returning. This preserves a bridge failure that was
+// already in progress instead of allowing a select race to turn it into a
+// successful agent exit. agentReaped reports whether the single agentDone
+// result was consumed here.
+func waitStandaloneAgentAndBridge(agentDone, bridgeErr <-chan error, stopBridge func()) (agentErr, bridgeFailure error, agentReaped bool) {
+	select {
+	case bridgeFailure = <-bridgeErr:
+		if bridgeFailure != nil {
+			return nil, bridgeFailure, false
+		}
+		// A clean bridge return is only possible during cancellation or Close.
+		// Wait for the command so its established exit behavior is preserved.
+		return <-agentDone, nil, true
+	case agentErr = <-agentDone:
+		stopBridge()
+		return agentErr, <-bridgeErr, true
+	}
+}

@@ -1,0 +1,439 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package evidenceview
+
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+)
+
+// RedactedDestination replaces a receipt Destination in the metadata view. A
+// destination URL can carry a capability token or secret in its query string,
+// so it is only shown to a request that authenticated with raw access.
+const RedactedDestination = "[redacted — raw access required]"
+
+// Read/timeline limit defaults.
+const (
+	DashboardReceiptReadLimit = 5000
+	DashboardTimelineLimit    = 500
+)
+
+// SessionSummary is the left-nav row for one recorder session.
+type SessionSummary struct {
+	ID              string
+	Agent           string
+	ReceiptCount    int
+	ReadLimited     bool
+	StartTime       time.Time
+	EndTime         time.Time
+	ReceiptsEnabled bool
+	Pips            []SummaryPip
+	// Verdicts is the sorted, de-duplicated, lower-cased set of decision
+	// verdicts that appear on this session's receipts (e.g. "block", "allow",
+	// "warn", "defer"). It backs the bounded session-level verdict filter so a
+	// "show agents that blocked something" query has real effect instead of
+	// silently matching everything.
+	Verdicts []string
+}
+
+// HasVerdict reports whether at least one receipt in this session carried the
+// given verdict. The comparison is on the normalized (trimmed, lower-cased)
+// verdict, matching how sessionVerdicts records them.
+func (s SessionSummary) HasVerdict(verdict string) bool {
+	want := strings.ToLower(strings.TrimSpace(verdict))
+	if want == "" {
+		return true
+	}
+	for _, v := range s.Verdicts {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionVerdicts returns the sorted, de-duplicated, lower-cased set of
+// verdicts present across the given receipts. Empty verdicts are skipped so an
+// unset field never becomes a spurious filter match.
+func sessionVerdicts(receipts []receipt.Receipt) []string {
+	seen := make(map[string]struct{}, 4)
+	for _, r := range receipts {
+		v := strings.ToLower(strings.TrimSpace(r.ActionRecord.Verdict))
+		if v == "" {
+			continue
+		}
+		seen[v] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(seen))
+	for v := range seen {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SummaryPip is a compact state indicator for one scorecard line.
+type SummaryPip struct {
+	State string
+	Label string
+}
+
+// SessionEvidence is the full Evidence view for one session.
+type SessionEvidence struct {
+	ID string
+
+	// Agent is the label used for internal grouping. It is NOT an
+	// authenticated identity and must not be rendered as one.
+	Agent string
+
+	// RecordedLabels holds the distinct non-lifecycle actor labels seen in
+	// this session, sorted. An ActionReceipt v1 records the label but not how
+	// it was established, so no label here may be presented as the agent's
+	// identity: on a listener without a bound identity, a caller supplies it.
+	// The report therefore states which labels it saw and claims nothing about
+	// who they were. LabelsReadLimited means the list covers only the receipts
+	// that were loaded, not necessarily the whole session.
+	RecordedLabels    []string
+	LabelsReadLimited bool
+
+	ReceiptsEnabled bool
+	ReceiptCount    int
+	Receipts        []receipt.Receipt
+	ReadLimited     bool
+	ReadLimit       int
+	TimelineLimited bool
+	TimelineLimit   int
+	TimelineWindow  string
+	Chain           receipt.ChainResult
+	Scorecard       Scorecard
+	Timeline        []TimelineItem
+	TrustedKeyText  string
+	// RawRedacted is true when this view was rendered without raw access, so the
+	// template shows a "raw access required" note instead of the signed payload.
+	RawRedacted bool
+}
+
+// TimelineItem is one rendered receipt row.
+type TimelineItem struct {
+	Seq          uint64
+	Time         time.Time
+	Verdict      string
+	Reason       string
+	Destination  string
+	PrevShort    string
+	HashShort    string
+	Unverifiable bool
+	RawJSON      string
+}
+
+// SessionSummaryOf computes a SessionSummary for one session's receipts.
+func SessionSummaryOf(id string, receipts []receipt.Receipt, trustedKeys map[string]TrustedKey, readLimited bool, readLimit int) SessionSummary {
+	if len(receipts) == 0 {
+		return SessionSummary{
+			ID:              id,
+			Agent:           id,
+			ReceiptsEnabled: false,
+			Pips:            ScorecardPips(AbsentScorecard()),
+		}
+	}
+
+	var scorecard Scorecard
+	if readLimited {
+		scorecard = ReadLimitedScorecard(len(receipts), readLimit)
+	} else {
+		scorecard = ComputeScorecard(receipts, trustedKeys, id).Scorecard
+	}
+	return SessionSummary{
+		ID:              id,
+		Agent:           agentLabel(id, receipts),
+		ReceiptCount:    len(receipts),
+		ReadLimited:     readLimited,
+		StartTime:       receipts[0].ActionRecord.Timestamp,
+		EndTime:         receipts[len(receipts)-1].ActionRecord.Timestamp,
+		ReceiptsEnabled: true,
+		Pips:            ScorecardPips(scorecard),
+		Verdicts:        sessionVerdicts(receipts),
+	}
+}
+
+// SessionEvidenceOf computes the full SessionEvidence for one session's receipts.
+func SessionEvidenceOf(id string, receipts []receipt.Receipt, trustedKeys map[string]TrustedKey, readLimited bool, readLimit, timelineLimit int) SessionEvidence {
+	if len(receipts) == 0 {
+		return SessionEvidence{
+			ID:              id,
+			Agent:           id,
+			ReceiptsEnabled: false,
+			Scorecard:       AbsentScorecard(),
+			TrustedKeyText:  "none",
+		}
+	}
+
+	recordedLabels := RecordedActorLabels(receipts)
+
+	result := ComputeScorecard(receipts, trustedKeys, id)
+	scorecard := result.Scorecard
+	if readLimited {
+		scorecard = ReadLimitedScorecard(len(receipts), readLimit)
+	}
+	timelineReceipts, timelineStartIndex, timelineLimited, timelineWindow := selectTimelineReceipts(receipts, readLimited, timelineLimit)
+	return SessionEvidence{
+		ID:                id,
+		Agent:             agentLabel(id, receipts),
+		RecordedLabels:    recordedLabels,
+		LabelsReadLimited: readLimited,
+		ReceiptsEnabled:   true,
+		ReceiptCount:      len(receipts),
+		Receipts:          append([]receipt.Receipt(nil), receipts...),
+		ReadLimited:       readLimited,
+		ReadLimit:         readLimit,
+		TimelineLimited:   timelineLimited,
+		TimelineLimit:     timelineLimit,
+		TimelineWindow:    timelineWindow,
+		Chain:             result.Chain,
+		Scorecard:         scorecard,
+		Timeline:          buildTimeline(timelineReceipts, timelineStartIndex, result.Chain),
+		TrustedKeyText:    FormatKeyList(TrustedKeysForSession(SignerKeys(receipts), trustedKeys)),
+	}
+}
+
+// ScorecardPips returns the compact pip indicators for the four scorecard lines.
+func ScorecardPips(scorecard Scorecard) []SummaryPip {
+	return []SummaryPip{
+		{State: scorecard.Authentic.State, Label: "A"},
+		{State: scorecard.Untampered.State, Label: "U"},
+		{State: scorecard.Anchored.State, Label: "N"},
+		{State: scorecard.Completeness.State, Label: "C"},
+	}
+}
+
+// RecordedActorLabels returns the distinct actor labels carried by a session's
+// non-lifecycle receipts, sorted.
+//
+// Lifecycle records are excluded for the same reason agentLabel excludes them:
+// the proxy opens a session under its own identity, so counting that record
+// would report an ordinary single-agent session as carrying two labels.
+func RecordedActorLabels(receipts []receipt.Receipt) []string {
+	seen := make(map[string]bool, 2)
+	for _, r := range receipts {
+		if r.ActionRecord.SessionControl != nil {
+			continue
+		}
+		if actor := strings.TrimSpace(r.ActionRecord.Actor); actor != "" {
+			seen[actor] = true
+		}
+	}
+	labels := make([]string, 0, len(seen))
+	for label := range seen {
+		labels = append(labels, label)
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+// actorKey reduces a recorded label to the key the single-agent guard counts
+// distinct agents by. It trims surrounding whitespace and nothing else.
+//
+// It deliberately does NOT fold case or collapse internal whitespace. An
+// earlier version did, to stop a case-variant label from reading as a second
+// agent, and that was the wrong trade at this boundary: two genuinely distinct
+// labels that differ only in case or spacing would collide into one key, the
+// guard would see a single agent, and the report would disclose both agents'
+// target URLs, which can carry capability tokens. A recorded label is not an
+// identity and can be caller-supplied, so case-insensitive equality is not a
+// safe statement that two labels name the same agent.
+//
+// The availability problem that motivated folding is real but narrower than it
+// looked, and it is solved at the sentinel instead: see isAnonymousLabel.
+func actorKey(s string) string {
+	return strings.TrimSpace(s)
+}
+
+// isAnonymousLabel reports whether a recorded label is the anonymous sentinel.
+//
+// This comparison IS case-insensitive, and that is safe where actorKey's is
+// not: "anonymous" is a constant this codebase writes when no agent resolved,
+// not a name anyone claims. Treating "Anonymous" as a second agent denied
+// ordinary single-agent sessions with no attacker and no second agent present.
+func isAnonymousLabel(key, anonymous string) bool {
+	return strings.EqualFold(strings.TrimSpace(key), anonymous)
+}
+
+// IsAnonymousActorLabel reports whether a recorded actor label is the caller's
+// anonymous sentinel, compared case-insensitively. Callers pass their own
+// sentinel so this package does not have to know the CLI's constant.
+func IsAnonymousActorLabel(key, anonymous string) bool {
+	return isAnonymousLabel(key, anonymous)
+}
+
+// DistinctActorKeys returns the distinct identity keys a session's
+// non-lifecycle receipts resolve to, for the guard that refuses to render a
+// session spanning two agents.
+//
+// This is SEPARATE from RecordedActorLabels on purpose. Display shows the
+// labels that were actually recorded; the guard must decide whether two
+// different agents are present, and an empty Actor does not mean "no agent".
+// It preserves the fallback the guard has always had: Actor, then the
+// receipt's own SessionID, then the session being rendered. Dropping that
+// fallback would let a receipt with an empty Actor go uncounted, so a session
+// mixing two agents could render and disclose the other agent's target URLs,
+// which can carry capability tokens.
+//
+// Lifecycle records are excluded for the same reason agentLabel excludes them:
+// the proxy opens every session under its own identity.
+func DistinctActorKeys(sessionID string, receipts []receipt.Receipt) []string {
+	seen := make(map[string]bool, 2)
+	for _, r := range receipts {
+		if r.ActionRecord.SessionControl != nil {
+			continue
+		}
+		key := actorKey(r.ActionRecord.Actor)
+		if key == "" {
+			key = actorKey(r.ActionRecord.SessionID)
+		}
+		if key == "" {
+			key = actorKey(sessionID)
+		}
+		if key == "" {
+			continue
+		}
+		seen[key] = true
+	}
+	keys := make([]string, 0, len(seen))
+	for key := range seen {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func agentLabel(id string, receipts []receipt.Receipt) string {
+	if len(receipts) == 0 {
+		return id
+	}
+	// Prefer the first NON-lifecycle receipt's actor. A session that opens with a
+	// session-control record (open/heartbeat/close) carries the opener's actor
+	// (e.g. the proxy identity, "pipelock"), not the agent that produced the
+	// mediated actions -- labeling by receipts[0] would collapse the whole session
+	// under that opener. Skip lifecycle records when choosing the label.
+	for _, r := range receipts {
+		if r.ActionRecord.SessionControl != nil {
+			continue
+		}
+		if actor := strings.TrimSpace(r.ActionRecord.Actor); actor != "" {
+			return actor
+		}
+	}
+	first := receipts[0].ActionRecord
+	if actor := strings.TrimSpace(first.Actor); actor != "" {
+		return actor
+	}
+	if sessionID := strings.TrimSpace(first.SessionID); sessionID != "" {
+		return sessionID
+	}
+	return id
+}
+
+func buildTimeline(receipts []receipt.Receipt, startIndex int, chain receipt.ChainResult) []TimelineItem {
+	items := make([]TimelineItem, 0, len(receipts))
+	for i, r := range receipts {
+		ar := r.ActionRecord
+		hash, err := receipt.ReceiptHash(r)
+		if err != nil {
+			hash = "hash-error"
+		}
+		raw, err := json.MarshalIndent(r, "", "  ")
+		if err != nil {
+			raw = []byte(`{"error":"receipt marshal failed"}`)
+		}
+		items = append(items, TimelineItem{
+			Seq:          ar.ChainSeq,
+			Time:         ar.Timestamp,
+			Verdict:      ar.Verdict,
+			Reason:       reasonLabel(ar.Layer, ar.Pattern, ar.ActionType),
+			Destination:  ar.Target,
+			PrevShort:    shortHash(ar.ChainPrevHash),
+			HashShort:    shortHash(hash),
+			Unverifiable: !chain.Valid && startIndex+i >= chain.BrokenAtIndex,
+			RawJSON:      string(raw),
+		})
+	}
+	return items
+}
+
+func selectTimelineReceipts(receipts []receipt.Receipt, readLimited bool, timelineLimit int) ([]receipt.Receipt, int, bool, string) {
+	if timelineLimit <= 0 {
+		timelineLimit = DashboardTimelineLimit
+	}
+	if len(receipts) <= timelineLimit {
+		return receipts, 0, false, "all"
+	}
+	if readLimited {
+		return receipts[:timelineLimit], 0, true, "first"
+	}
+	start := len(receipts) - timelineLimit
+	return receipts[start:], start, true, "latest"
+}
+
+func reasonLabel(layer, pattern string, actionType receipt.ActionType) string {
+	switch {
+	case layer != "" && pattern != "":
+		return layer + " / " + pattern
+	case layer != "":
+		return layer
+	case pattern != "":
+		return pattern
+	case actionType != "":
+		return string(actionType)
+	default:
+		return "policy decision"
+	}
+}
+
+func shortHash(hash string) string {
+	if len(hash) <= 12 {
+		return hash
+	}
+	return hash[:12]
+}
+
+// RedactRaw strips the raw exfil surface from an evidence view: every receipt's
+// destination and full signed payload. It operates on the freshly built value,
+// so callers hand the redacted copy to the template and the raw bytes never
+// reach the response. Idempotent and safe on a zero value.
+func RedactRaw(ev SessionEvidence) SessionEvidence {
+	ev.RawRedacted = true
+	ev.Receipts = nil
+	// ev is passed by value, but ev.Timeline shares its backing array with the
+	// caller's slice. Copy it before redacting so this never mutates the
+	// caller's (possibly raw) evidence in place.
+	if len(ev.Timeline) > 0 {
+		timeline := make([]TimelineItem, len(ev.Timeline))
+		copy(timeline, ev.Timeline)
+		for i := range timeline {
+			timeline[i].Destination = RedactedDestination
+			timeline[i].RawJSON = ""
+		}
+		ev.Timeline = timeline
+	}
+	return ev
+}
+
+// CloneTrustedKeys returns a shallow copy of the trusted key map.
+func CloneTrustedKeys(in map[string]TrustedKey) map[string]TrustedKey {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]TrustedKey, len(in))
+	for key, trusted := range in {
+		out[key] = trusted
+	}
+	return out
+}

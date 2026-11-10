@@ -1,0 +1,598 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"path"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+const (
+	mcpTaintSourceKind  = "mcp_response"
+	taintReasonDisabled = "taint_disabled"
+	taintScopeAction    = "action"
+	taintScopeSource    = "source"
+	taintScopeTask      = "task"
+)
+
+var errMCPReceiptIdentityUnavailable = errors.New("MCP method has no receipt identity")
+
+const (
+	mcpReceiptLayerA2A           = "mcp_a2a_scanning"
+	mcpReceiptLayerAirlock       = "mcp_airlock"
+	mcpReceiptLayerChain         = "mcp_chain_detection"
+	mcpReceiptLayerDoW           = "mcp_denial_of_wallet"
+	mcpReceiptLayerInput         = "mcp_input_scanning"
+	mcpReceiptLayerPolicy        = "mcp_tool_policy"
+	mcpReceiptLayerResponse      = "mcp_response_scanning"
+	mcpReceiptLayerRedaction     = "mcp_input_redaction"
+	mcpReceiptLayerSessionBind   = "mcp_session_binding"
+	mcpReceiptLayerTaint         = "mcp_tool_taint"
+	mcpReceiptLayerToolInventory = "mcp_tool_inventory"
+
+	// mcpReceiptPatternPolicyDefault is the fallback Pattern emitted on
+	// receipts when policy matched but the rule list is empty or
+	// whitespace. Concrete rule names override this. Extracted as a const
+	// so production and tests share the same string (goconst).
+	mcpReceiptPatternPolicyDefault = "policy"
+
+	// mcpReceiptA2AHeaderPattern is the fallback Pattern for an A2A
+	// header-scan block receipt when the scan result carries no reason.
+	mcpReceiptA2AHeaderPattern = "a2a_header"
+
+	// mcpReceiptA2AHeaderTarget is the receipt Target for an A2A header
+	// block. The block is on the A2A-Extensions header surface rather than a
+	// named tool or body method, so a stable label stands in for the target
+	// the receipt record requires.
+	mcpReceiptA2AHeaderTarget = "a2a:extensions-header"
+)
+
+type taintDecision struct {
+	Risk                session.SessionRisk
+	Task                session.TaskContext
+	ActionClass         session.ActionClass
+	Sensitivity         session.ActionSensitivity
+	Authority           session.AuthorityKind
+	Result              session.PolicyDecisionResult
+	ActionRef           string
+	OverrideRefs        []string
+	RequiresReauth      bool
+	TaskOverrideApplied bool
+}
+
+func observeMCPResponseTaint(opts MCPProxyOpts, promptHit bool) {
+	var kinds []session.HostileFindingKind
+	if promptHit {
+		kinds = []session.HostileFindingKind{session.FindingUnattributed}
+	}
+	observeMCPResponseFindings(opts, kinds)
+}
+
+func observeMCPResponseFindings(opts MCPProxyOpts, kinds []session.HostileFindingKind) {
+	// Private header-contract discovery reads a tool list the agent never
+	// receives, so it is not exposure. Scanning, refusals, audit and adaptive
+	// signals still run; only the session's exposure history is left alone.
+	if opts.toolContractDiscovery {
+		return
+	}
+	taintCfg := opts.taintCfg()
+	if taintCfg == nil || !taintCfg.Enabled {
+		return
+	}
+	rs, ok := opts.Rec.(session.RiskState)
+	if !ok {
+		return
+	}
+	observation := session.ClassifyMCPResponseFindings(mcpTaintSourceKind, opts.mcpResponseTaintExternal(), kinds)
+	observation.MaxSources = taintCfg.RecentSources
+	rs.ObserveRisk(observation)
+}
+
+func evaluateMCPTaint(opts MCPProxyOpts, toolName, argsJSON string) taintDecision {
+	decision := taintDecision{
+		ActionClass: session.ActionClassRead,
+		Sensitivity: session.SensitivityNormal,
+		Authority:   session.AuthorityUserBroad,
+		Result:      session.PolicyDecisionResult{Decision: session.PolicyAllow, Reason: taintReasonDisabled},
+	}
+	taintCfg := opts.taintCfg()
+	if taintCfg == nil || !taintCfg.Enabled {
+		return decision
+	}
+	if rs, ok := opts.Rec.(session.RiskState); ok {
+		decision.Risk = rs.RiskSnapshot()
+	}
+	classified := session.ClassifyMCPToolCallWithOptions(
+		toolName,
+		argsJSON,
+		taintCfg.ProtectedPaths,
+		taintCfg.ElevatedPaths,
+		session.ClassificationOptions{FailSafe: taintCfg.FailSafeClassification},
+	)
+	decision.ActionClass = classified.Class
+	decision.Sensitivity = classified.Sensitivity
+	decision.ActionRef = classified.ActionRef
+	decision.ActionRef = mcpActionRef(toolName, decision.ActionRef)
+	decision.OverrideRefs = mcpOverrideRefs(toolName, classified.OverrideRefs, decision.ActionRef)
+	decision.ActionRef = mcpReportedActionRef(decision.OverrideRefs, decision.ActionRef)
+	if tp, ok := opts.Rec.(session.TaskContextProvider); ok {
+		decision.Task = tp.TaskSnapshot()
+		if taintRuntimeTrustOverrideApplies(tp.RuntimeTrustOverrides(), decision.Task, decision.Risk, decision.OverrideRefs) {
+			decision.Result = session.PolicyDecisionResult{
+				Decision: session.PolicyAllow,
+				Reason:   "taint_runtime_task_override",
+			}
+			decision.TaskOverrideApplied = true
+			return decision
+		}
+	}
+	decision.Result = session.PolicyMatrix{Profile: taintCfg.Policy}.EvaluateWithOptions(
+		decision.Risk.Level,
+		decision.ActionClass,
+		decision.Sensitivity,
+		decision.Authority,
+		session.PolicyEvaluateOptions{
+			FailSafeClassification:  taintCfg.FailSafeClassification,
+			ClassificationConfident: classified.Confident,
+		},
+	)
+	if taintTrustOverrideApplies(taintCfg.TrustOverrides, decision.Risk, decision.OverrideRefs) {
+		decision.Result = session.PolicyDecisionResult{
+			Decision: session.PolicyAllow,
+			Reason:   "taint_trust_override",
+		}
+	}
+	return decision
+}
+
+func taintDecisionRequiresApproval(opts MCPProxyOpts, toolName, reason, preview string) (bool, bool) {
+	if opts.Approver == nil {
+		return false, false
+	}
+	decision := opts.Approver.Ask(buildHITLRequestForTaint(toolName, reason, preview))
+	return decision == hitl.DecisionAllow, true
+}
+
+func approveTaintDecision(decision *taintDecision) {
+	if decision == nil {
+		return
+	}
+	decision.Authority = session.AuthorityOperatorOverride
+	decision.RequiresReauth = true
+}
+
+func buildHITLRequestForTaint(toolName, reason, preview string) *hitl.Request {
+	target := toolName
+	if target == "" {
+		target = "mcp-tools-call"
+	}
+	return &hitl.Request{
+		URL:     target,
+		Reason:  reason,
+		Preview: preview,
+	}
+}
+
+func mcpActionRef(toolName, target string) string {
+	parts := []string{"mcp", strings.ToLower(strings.TrimSpace(toolName))}
+	if strings.TrimSpace(target) != "" {
+		parts = append(parts, strings.ToLower(strings.TrimSpace(target)))
+	}
+	return strings.Join(parts, ":")
+}
+
+func mcpOverrideRefs(toolName string, targets []string, primary string) []string {
+	if len(targets) == 0 {
+		return []string{primary}
+	}
+	refs := make([]string, 0, len(targets))
+	for _, target := range targets {
+		ref := mcpActionRef(toolName, target)
+		if !slices.Contains(refs, ref) {
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
+// mcpReportedActionRef is a reporting value. Override matching uses
+// OverrideRefs, so a multi-target call cannot make one lexical candidate look
+// like the entire action to an audit reader or approver.
+func mcpReportedActionRef(refs []string, primary string) string {
+	if len(refs) <= 1 {
+		return primary
+	}
+	return strings.Join(refs, ", ")
+}
+
+func taintTrustOverrideApplies(overrides []config.TaintTrustOverride, risk session.SessionRisk, actionRefs []string) bool {
+	for _, override := range overrides {
+		if !override.ExpiresAt.IsZero() && override.ExpiresAt.Before(time.Now().UTC()) {
+			continue
+		}
+		if !taintOverrideMatches(override, risk, actionRefs) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func taintOverrideMatches(override config.TaintTrustOverride, risk session.SessionRisk, actionRefs []string) bool {
+	switch override.Scope {
+	case taintScopeAction:
+		if override.ActionMatch == "" || !allTaintActionRefsMatch(actionRefs, override.ActionMatch) {
+			return false
+		}
+		if override.SourceMatch != "" && !taintRiskSourceMatches(risk, override.SourceMatch) {
+			return false
+		}
+		return true
+	case taintScopeSource:
+		if override.SourceMatch == "" || !taintRiskSourceMatches(risk, override.SourceMatch) {
+			return false
+		}
+		if override.ActionMatch != "" && !allTaintActionRefsMatch(actionRefs, override.ActionMatch) {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func taintRuntimeTrustOverrideApplies(overrides []session.TrustOverride, task session.TaskContext, risk session.SessionRisk, actionRefs []string) bool {
+	now := time.Now().UTC()
+	for _, override := range overrides {
+		if override.Scope != taintScopeTask {
+			continue
+		}
+		if override.TaskID == "" || override.TaskID != task.CurrentTaskID {
+			continue
+		}
+		if !override.ExpiresAt.IsZero() && override.ExpiresAt.Before(now) {
+			continue
+		}
+		if override.ActionMatch != "" && !allTaintActionRefsMatch(actionRefs, override.ActionMatch) {
+			continue
+		}
+		if override.SourceMatch != "" && !taintRiskSourceMatches(risk, override.SourceMatch) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func allTaintActionRefsMatch(actionRefs []string, pattern string) bool {
+	if len(actionRefs) == 0 {
+		return false
+	}
+	for _, actionRef := range actionRefs {
+		if !taintWildcardMatch(actionRef, pattern) {
+			return false
+		}
+	}
+	return true
+}
+
+func taintRiskSourceMatches(risk session.SessionRisk, pattern string) bool {
+	return taintWildcardMatch(risk.SecurityOriginURL(), pattern)
+}
+
+func taintWildcardMatch(value, pattern string) bool {
+	if value == "" || pattern == "" {
+		return false
+	}
+	if matched, err := path.Match(pattern, value); err == nil && matched {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return value == pattern
+	}
+	parts := strings.Split(pattern, "*")
+	pos := 0
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(value[pos:], part)
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && !strings.HasPrefix(pattern, "*") && idx != 0 {
+			return false
+		}
+		pos += idx + len(part)
+	}
+	if !strings.HasSuffix(pattern, "*") && parts[len(parts)-1] != "" && !strings.HasSuffix(value, parts[len(parts)-1]) {
+		return false
+	}
+	return true
+}
+
+func taintApprovalReason(decision taintDecision) string {
+	return fmt.Sprintf("%s after %s", decision.ActionClass.String(), decision.Result.Reason)
+}
+
+type mcpToolReceiptOpts struct {
+	// ProxyOpts carries the scanner and policy snapshot that made this decision.
+	ProxyOpts        MCPProxyOpts
+	Shard            receipt.EmitOpts
+	Log              io.Writer
+	Transport        string
+	RedactionProfile string
+	ActionID         string
+	ParentActionID   string
+	MCPMethod        string
+	ToolName         string
+	Target           string
+	Verdict          string
+	Layer            string
+	Pattern          string
+	Severity         string
+	Decision         taintDecision
+	Report           *redact.Report
+	ContractGate     *mcpContractGateOutput
+	RequireReceipts  bool
+	RequireReceipt   bool
+	// Durable writes the receipt fsync-confirmed regardless of verdict.
+	Durable           bool
+	DecisionPhase     string
+	DeferID           string
+	ResolutionPolicy  string
+	ResolutionSource  string
+	SessionID         string
+	SessionIDOriginal string
+}
+
+// emitMCPToolReceipt emits the post-decision tool receipt for an MCP
+// tools/call message. The receipt payload bundles redaction context,
+// transport, scanner attribution, and the full taint snapshot. Routed
+// through EmitMCPDecision so every tool receipt in the MCP inbound
+// pipeline goes through a single emission entry point.
+func emitMCPToolReceipt(opts mcpToolReceiptOpts) error {
+	if opts.ActionID == "" {
+		if opts.RequireReceipt {
+			err := fmt.Errorf("%w for %q: %w", errMCPReceiptIdentityUnavailable, opts.MCPMethod, ErrReceiptRequired)
+			logReceiptEmitFailure(opts.Log, err, opts.RequireReceipts, opts.Verdict)
+			return err
+		}
+		return nil
+	}
+	target := opts.Target
+	if target == "" {
+		target = opts.ToolName
+	}
+	emitOpts := receipt.EmitOpts{
+		ActionID:            opts.ActionID,
+		ParentActionID:      opts.ParentActionID,
+		Verdict:             opts.Verdict,
+		Layer:               opts.Layer,
+		Pattern:             opts.Pattern,
+		Severity:            opts.Severity,
+		RedactionProfile:    opts.RedactionProfile,
+		RedactionReport:     opts.Report,
+		Transport:           opts.Transport,
+		Target:              target,
+		MCPMethod:           opts.MCPMethod,
+		ToolName:            opts.ToolName,
+		SessionTaintLevel:   opts.Decision.Risk.Level.String(),
+		SessionContaminated: opts.Decision.Risk.Contaminated,
+		RecentTaintSources:  opts.Decision.Risk.Sources,
+		SessionTaskID:       opts.Decision.Task.CurrentTaskID,
+		SessionTaskLabel:    opts.Decision.Task.CurrentTaskLabel,
+		AuthorityKind:       opts.Decision.Authority.String(),
+		TaintDecision:       opts.Decision.Result.Decision.String(),
+		TaintDecisionReason: opts.Decision.Result.Reason,
+		TaskOverrideApplied: opts.Decision.TaskOverrideApplied,
+
+		DecisionPhase:     opts.DecisionPhase,
+		DeferID:           opts.DeferID,
+		ResolutionPolicy:  opts.ResolutionPolicy,
+		ResolutionSource:  opts.ResolutionSource,
+		SessionID:         opts.SessionID,
+		SessionIDOriginal: opts.SessionIDOriginal,
+	}
+	emitOpts.ShardIndex = opts.Shard.ShardIndex
+	emitOpts.ShardSelected = opts.Shard.ShardSelected
+	if opts.ContractGate != nil {
+		emitOpts = mcpWithContractReceipt(emitOpts, *opts.ContractGate)
+	}
+	if _, err := opts.ProxyOpts.emitAdmittedReceiptDecision(MCPDecision{
+		Receipt:        emitOpts,
+		RequireReceipt: opts.RequireReceipt || (opts.ProxyOpts.ReceiptGroup != nil && opts.RequireReceipts),
+		RequiredMode:   opts.RequireReceipts,
+		Durable:        opts.Durable,
+	}); err != nil {
+		logReceiptEmitFailure(opts.Log, err, opts.RequireReceipts, opts.Verdict)
+		// RequireReceipt escalates v1 or v2 decision-receipt failures to a
+		// block (ErrReceiptRequired). A best-effort emit failure with require
+		// off stays non-blocking, preserving the default warn-and-forward
+		// posture.
+		if errors.Is(err, ErrReceiptRequired) {
+			return err
+		}
+	}
+	return nil
+}
+
+func requiredReceiptFailureMessage(err error) string {
+	if errors.Is(err, errMCPReceiptIdentityUnavailable) {
+		return "pipelock: required receipt identity is not defined for this MCP method"
+	}
+	return "pipelock: receipt emission failed"
+}
+
+func logReceiptEmitFailure(logW io.Writer, err error, requireReceipts bool, verdict string) {
+	if logW == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: receipt emission failed: %v\n", err)
+	if requireReceipts && (verdict == config.ActionBlock || errors.Is(err, ErrReceiptRequired)) {
+		logBlockReceiptAuditGap(logW, err)
+	}
+}
+
+func logBlockReceiptAuditGap(logW io.Writer, err error) {
+	if logW == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: warning event=block_receipt_emit_failed audit_gap=true %v\n", err)
+}
+
+// logHoldFailureReceiptGap records the audit gap when a hold-failure resolution
+// receipt cannot be emitted. The denial itself stays fail-closed; this makes a
+// journaled resolution without its receipt detectable across both transports.
+func logHoldFailureReceiptGap(logW io.Writer, deferID string, err error) {
+	if logW == nil || err == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: warning event=hold_failure_receipt_emit_failed audit_gap=true defer_id=%s: %v\n", deferID, err)
+}
+
+// pickAttribution derives the receipt Layer / Pattern / Severity for a
+// block verdict, based on which gate inside MCPInputEvaluation fired.
+//
+// Maintenance contract: every value the gate-evaluation code assigns to
+// eval.BlockingGate (see internal/mcp/pipeline_gates.go) must have a
+// matching case in the switch below. The fall-through if-chain covers
+// gates that produce signal on eval fields without setting BlockingGate
+// (currently policy, binding, taint-allow-with-reason, dow-fallback,
+// a2a-fallback, content-scan). When you add a new gate, extend the
+// switch in the same change - otherwise the new gate's block receipts
+// will emit empty Layer / Pattern / Severity from the final fallback.
+func pickAttribution(eval MCPInputEvaluation) (layer, pattern, severity string) {
+	switch eval.BlockingGate {
+	case blockingGateA2ABody:
+		return mcpReceiptLayerA2A, firstNonEmpty(eval.A2AResult.Reason, blockingGateA2ABody), config.SeverityHigh
+	case blockingGateAirlockHard, blockingGateAirlockMissing:
+		return mcpReceiptLayerAirlock, firstNonEmpty(eval.AirlockReason, mcpAirlockHardReason), config.SeverityHigh
+	case blockingGateDoW:
+		return mcpReceiptLayerDoW, firstNonEmpty(eval.DoWReason, blockingGateDoW), config.SeverityHigh
+	case blockingGateFrozenTool:
+		return mcpReceiptLayerToolInventory, firstNonEmpty(eval.FrozenToolName, blockingGateFrozenTool), config.SeverityHigh
+	case blockingGateChain:
+		return mcpReceiptLayerChain, firstNonEmpty(eval.ChainPatternName, eval.ChainReason), firstNonEmpty(eval.ChainSeverity, config.SeverityHigh)
+	case blockingGateParseError:
+		return mcpReceiptLayerInput, firstNonEmpty(eval.ContentVerdict.Error, blockingGateParseError), config.SeverityHigh
+	case blockingGateTaintBlock, blockingGateTaintAskDenied:
+		return mcpReceiptLayerTaint, firstNonEmpty(eval.TaintDecision.Result.Reason, eval.BlockingGate), taintReceiptSeverity(eval.TaintDecision)
+	}
+
+	if eval.ChainMatched || eval.ChainReason != "" {
+		return mcpReceiptLayerChain, firstNonEmpty(eval.ChainPatternName, eval.ChainReason), firstNonEmpty(eval.ChainSeverity, config.SeverityHigh)
+	}
+	if eval.PolicyVerdict.Matched {
+		return mcpReceiptLayerPolicy, firstPolicyRule(eval.PolicyVerdict.Rules), config.SeverityHigh
+	}
+	if eval.BindingReason != "" {
+		return mcpReceiptLayerSessionBind, eval.BindingReason, config.SeverityHigh
+	}
+	if eval.TaintDecision.Result.Decision != session.PolicyAllow && eval.TaintDecision.Result.Reason != "" {
+		return mcpReceiptLayerTaint, eval.TaintDecision.Result.Reason, taintReceiptSeverity(eval.TaintDecision)
+	}
+	if eval.DoWAction != "" && !eval.DoWAllowed {
+		return mcpReceiptLayerDoW, firstNonEmpty(eval.DoWReason, eval.DoWAction), config.SeverityHigh
+	}
+	if !eval.A2AResult.Clean && eval.A2AResult.Reason != "" {
+		return mcpReceiptLayerA2A, eval.A2AResult.Reason, config.SeverityHigh
+	}
+	if layer, pattern, severity := contentScanAttribution(eval.ContentVerdict); layer != "" {
+		return layer, pattern, severity
+	}
+	return "", "", ""
+}
+
+func contentScanAttribution(verdict InputVerdict) (layer, pattern, severity string) {
+	if len(verdict.Matches) > 0 {
+		m := verdict.Matches[0]
+		return mcpReceiptLayerInput, m.PatternName, firstNonEmpty(m.Severity, config.SeverityHigh)
+	}
+	if len(verdict.Inject) > 0 {
+		return mcpReceiptLayerInput, verdict.Inject[0].PatternName, config.SeverityHigh
+	}
+	if len(verdict.URLFindings) > 0 {
+		return mcpReceiptLayerInput, "url:" + verdict.URLFindings[0].Scanner, config.SeverityHigh
+	}
+	if len(verdict.AddressFindings) > 0 {
+		return mcpReceiptLayerInput, "address:" + verdict.AddressFindings[0].Explanation, config.SeverityHigh
+	}
+	if verdict.Error != "" {
+		return mcpReceiptLayerInput, verdict.Error, config.SeverityHigh
+	}
+	return "", "", ""
+}
+
+func firstPolicyRule(rules []string) string {
+	if len(rules) == 0 || strings.TrimSpace(rules[0]) == "" {
+		return mcpReceiptPatternPolicyDefault
+	}
+	return rules[0]
+}
+
+func taintReceiptSeverity(decision taintDecision) string {
+	switch decision.Result.Decision {
+	case session.PolicyBlock:
+		return config.SeverityCritical
+	case session.PolicyAsk:
+		return config.SeverityHigh
+	default:
+		return config.SeverityMedium
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func redactionBlockAttribution(err error) (layer, pattern, severity string) {
+	pattern = string(redact.ReasonInternalError)
+	var blockErr *redact.BlockError
+	if errors.As(err, &blockErr) && blockErr.Reason != "" {
+		pattern = string(blockErr.Reason)
+	}
+	return mcpReceiptLayerRedaction, pattern, config.SeverityHigh
+}
+
+// decorateMCPToolMessage injects the mediation envelope for a clean or
+// warn-mode tools/call that is about to be forwarded upstream. Routed
+// through EmitMCPDecision so envelope injection shares the same
+// emission entry point as receipt emission.
+func decorateMCPToolMessage(msg []byte, emitter *envelope.Emitter, actionID, mcpMethod, toolName, receiptVerdict string, decision taintDecision) ([]byte, error) {
+	if actionID == "" {
+		return msg, nil
+	}
+	buildOpts := envelope.BuildOpts{
+		ActionID:       actionID,
+		Action:         string(receipt.ClassifyMCPTool(toolName, mcpMethod)),
+		Verdict:        receiptVerdict,
+		SessionTaint:   decision.Risk.Level.String(),
+		TaskID:         decision.Task.CurrentTaskID,
+		AuthorityKind:  decision.Authority.String(),
+		RequiresReauth: decision.RequiresReauth,
+	}
+	out, err := emitMCPEnvelopeDecision(emitter, MCPDecision{
+		Envelope:   &buildOpts,
+		InboundMsg: msg,
+	})
+	return out, err
+}

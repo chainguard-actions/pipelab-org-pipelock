@@ -1,0 +1,262 @@
+{
+  "key": "49131515e58f653ad8e2f5972b8be9efbbcb943af2c7ed4c6e41ff23b0c11f52",
+  "cases": [
+    {
+      "name": "truncated",
+      "file": "truncated.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "allow-prefix",
+      "file": "truncated.jsonl",
+      "flags": [
+        "--allow-prefix"
+      ],
+      "exit": 0,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "closed",
+      "file": "closed.jsonl",
+      "flags": [],
+      "exit": 0,
+      "status": "CHAIN VALID",
+      "proven": true
+    },
+    {
+      "name": "middle-gap",
+      "file": "middle-gap.jsonl",
+      "flags": [],
+      "exit": 1,
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "pin-head-match",
+      "file": "truncated.jsonl",
+      "flags": [
+        "--expect-head",
+        "dfb38cc075ef59e2904db149f9d3f9e3f06af49945f005e59c9a9f7347ad6316"
+      ],
+      "exit": 0,
+      "status": "CHAIN VALID",
+      "proven": true
+    },
+    {
+      "name": "pin-head-mismatch",
+      "file": "truncated.jsonl",
+      "flags": [
+        "--expect-head",
+        "132c6eb28384224ca8d3956be56075b12cc84e9a317bb38f08cffd654099d5a8"
+      ],
+      "exit": 1,
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "pin-seq-match",
+      "file": "truncated.jsonl",
+      "flags": [
+        "--expect-seq",
+        "3"
+      ],
+      "exit": 0,
+      "status": "CHAIN VALID",
+      "proven": true
+    },
+    {
+      "name": "pin-seq-mismatch",
+      "file": "truncated.jsonl",
+      "flags": [
+        "--expect-seq",
+        "4"
+      ],
+      "exit": 1,
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "allow-prefix-invalid",
+      "file": "middle-gap.jsonl",
+      "flags": [
+        "--allow-prefix"
+      ],
+      "exit": 1,
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "pin-mismatch-allow-prefix",
+      "file": "truncated.jsonl",
+      "flags": [
+        "--expect-head",
+        "132c6eb28384224ca8d3956be56075b12cc84e9a317bb38f08cffd654099d5a8",
+        "--allow-prefix"
+      ],
+      "exit": 1,
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "legacy-close",
+      "file": "legacy-close.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "legacy-close-pinned",
+      "file": "legacy-close.jsonl",
+      "flags": [
+        "--expect-head",
+        "703bd2116d314094c2fd006e879a168c29b262149210e65b851a70f55e8d2e40"
+      ],
+      "exit": 0,
+      "status": "CHAIN VALID",
+      "proven": true
+    },
+    {
+      "name": "run-empty-suffix",
+      "file": "run-empty-suffix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-short-suffix",
+      "file": "run-short-suffix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-nonhex-suffix",
+      "file": "run-nonhex-suffix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-upperhex-suffix",
+      "file": "run-upperhex-suffix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-extra-infix",
+      "file": "run-extra-infix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-case-infix",
+      "file": "run-case-infix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-encoded-infix",
+      "file": "run-encoded-infix.jsonl",
+      "flags": [],
+      "exit": 3,
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "run-unicode-base",
+      "file": "run-unicode-base.jsonl",
+      "flags": [],
+      "exit": 0,
+      "status": "CHAIN VALID",
+      "proven": true
+    }
+  ],
+  "audit_packet": [
+    {
+      "name": "closed",
+      "file": "closed.jsonl",
+      "exit": 0,
+      "integrity": "valid",
+      "status": "CHAIN VALID",
+      "proven": true
+    },
+    {
+      "name": "truncated-tail",
+      "file": "truncated.jsonl",
+      "exit": 3,
+      "integrity": "valid",
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "head-cut",
+      "file": "head-cut.jsonl",
+      "exit": 1,
+      "integrity": "invalid",
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "v2-closed",
+      "file": "v2-closed.jsonl",
+      "exit": 0,
+      "integrity": "valid",
+      "status": "CHAIN VALID",
+      "proven": true
+    },
+    {
+      "name": "v2-tail-cut",
+      "file": "v2-tail-cut.jsonl",
+      "exit": 3,
+      "integrity": "valid",
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "v2-no-checkpoint",
+      "file": "v2-no-checkpoint.jsonl",
+      "exit": 3,
+      "integrity": "valid",
+      "status": "VALID PREFIX, END UNPROVEN",
+      "proven": false
+    },
+    {
+      "name": "v2-bad-seal",
+      "file": "v2-bad-seal.jsonl",
+      "exit": 1,
+      "integrity": "invalid",
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "v2-stripped-seal",
+      "file": "v2-stripped-seal.jsonl",
+      "exit": 1,
+      "integrity": "invalid",
+      "status": "CHAIN BROKEN",
+      "proven": false
+    },
+    {
+      "name": "v2-legacy-unsealed",
+      "file": "v2-legacy-unsealed.jsonl",
+      "exit": 1,
+      "integrity": "invalid",
+      "status": "CHAIN BROKEN",
+      "proven": false
+    }
+  ]
+}

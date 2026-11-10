@@ -1,0 +1,1757 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"reflect"
+	"strings"
+	"sync"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/contententropy"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+// ErrA2AStreamFinding is returned by ScanA2AStream when a scanning finding
+// (injection, DLP) is detected in an SSE event. Callers can distinguish this
+// from internal/IO errors via errors.Is to decide whether warn mode should
+// allow the stream to continue.
+var ErrA2AStreamFinding = errors.New("a2a stream finding")
+
+// ErrCardBaselineCapacity reports that a card baseline cannot accept a new
+// card without losing another trusted baseline.
+var ErrCardBaselineCapacity = errors.New("agent card baseline capacity exhausted")
+
+// A2AScanResult describes the outcome of scanning A2A protocol traffic.
+type A2AScanResult struct {
+	Clean                bool
+	Action               string
+	Reason               string
+	ScanError            string
+	URLFindings          []scanner.Result        // SSRF/URL scanner findings
+	DLPFindings          []scanner.TextDLPMatch  // DLP pattern matches
+	InjectFindings       []scanner.ResponseMatch // injection pattern matches
+	EntropyFinding       *contententropy.Finding // opaque high-entropy string leaf
+	BudgetExceeded       bool                    // true if walker hit node budget
+	InspectionIncomplete bool                    // parser or depth bound prevented complete inspection
+}
+
+// A2AContentEntropyOptions carries the request-body entropy policy into A2A
+// scans when the caller has a concrete upstream destination host.
+type A2AContentEntropyOptions = contententropy.Options
+
+// rollingTailSize is the number of bytes kept across SSE events for
+// cross-event scanning. A2A and generic SSE use it for response injection and
+// DLP detection.
+const rollingTailSize = 4096
+
+// ScanA2ARequestBody runs field-aware scanning on an A2A request body.
+// Classifies JSON leaves by field name, routes URLs through SSRF scanner,
+// every string and key through injection, and text/opaque/secret through DLP.
+// Falls back to raw DLP for split-secret detection when the walker completes
+// within budget.
+func ScanA2ARequestBody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning, entropyOpts ...A2AContentEntropyOptions) A2AScanResult {
+	if cfg == nil || !cfg.Enabled {
+		return A2AScanResult{Clean: true}
+	}
+	return scanA2ABody(ctx, body, sc, cfg, firstA2AContentEntropyOptions(entropyOpts))
+}
+
+// ScanA2AResponseBody runs field-aware scanning on an A2A response body.
+func ScanA2AResponseBody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning) A2AScanResult {
+	if cfg == nil || !cfg.Enabled {
+		return A2AScanResult{Clean: true}
+	}
+	return scanA2ABody(scanner.WithInboundDirection(ctx), body, sc, cfg, nil)
+}
+
+// a2aMaxScanBytes caps the body bytes one A2A scan inspects. It matches the
+// largest message the MCP transports frame.
+const a2aMaxScanBytes = transport.MaxLineSize
+
+// scanA2ABody is the shared implementation for request and response scanning.
+func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning, entropyOpts *A2AContentEntropyOptions) A2AScanResult {
+	if err := ctx.Err(); err != nil {
+		return A2AScanResult{Action: config.ActionBlock, ScanError: err.Error(), Reason: "a2a: response scan incomplete: " + err.Error()}
+	}
+	result := A2AScanResult{Clean: true}
+	budgetExceeded := false
+	injectionTexts := make(map[string]struct{})
+	var entropyTexts []string
+	var entropyKeys []string
+	action := ""
+	defaultFindingAction := a2aDefaultAction(cfg)
+
+	// Reject unparseable JSON and duplicate JSON object keys before WalkA2AJSON
+	// decodes the body into a map[string]interface{}, which silently keeps only
+	// the last value for a repeated key. A malicious peer can hide an injection,
+	// secret, or exfil URL in the first occurrence - which a first-wins consumer
+	// acts on - behind a benign duplicate, evading every walker pass (Pass 2 is
+	// DLP-only). Parser-integrity failures hard-block, matching the MCP response
+	// scan guard in ScanResponseOpts and the existing inspect-depth hard block.
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return A2AScanResult{
+			Clean:                false,
+			Action:               config.ActionBlock,
+			Reason:               "a2a: invalid JSON: empty body",
+			InspectionIncomplete: true,
+		}
+	}
+	// Every pass below scans a view derived from the body, so the body size
+	// bounds total scan work. A body beyond the cap is not inspected at all.
+	if len(trimmed) > a2aMaxScanBytes {
+		return A2AScanResult{
+			Clean:                false,
+			Action:               config.ActionBlock,
+			Reason:               "a2a: input exceeds maximum inspectable size",
+			InspectionIncomplete: true,
+		}
+	}
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil {
+		reason := fmt.Sprintf("a2a: invalid JSON: %v", err)
+		if redact.IsDuplicateKeyBlock(err) {
+			reason = fmt.Sprintf("a2a: duplicate JSON object key: %v", err)
+		}
+		return A2AScanResult{
+			Clean:                false,
+			Action:               config.ActionBlock,
+			Reason:               reason,
+			InspectionIncomplete: true,
+		}
+	}
+
+	// The depth bound is independent of the classified walk's node budget.
+	// JSON has already been validated, so this pass needs no decoded values.
+	if a2aJSONExceedsDepth(trimmed) {
+		return A2AScanResult{
+			Action:               config.ActionBlock,
+			Reason:               "a2a: input exceeds maximum inspectable nesting depth",
+			InspectionIncomplete: true,
+		}
+	}
+
+	// Pass 1: field-aware walker - classifies and routes each leaf.
+	walkErr := WalkA2AJSON(json.RawMessage(body), func(path, value string, class FieldClass) {
+		if class == FieldBudgetExceeded {
+			budgetExceeded = true
+			return
+		}
+		if value == "" {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			result.Clean = false
+			result.ScanError = ctx.Err().Error()
+			return
+		default:
+		}
+
+		// Content in every string value and key receives injection scanning,
+		// independently of the field-aware URL, DLP, and entropy checks.
+		// Identical content shares its completed inspection within this body;
+		// field-aware checks still run for each leaf and no state survives a scan.
+		if _, scanned := injectionTexts[value]; !scanned {
+			injectResult := sc.ScanResponse(ctx, value)
+			if injectResult.Failed() {
+				result.Clean = false
+				result.ScanError = injectResult.ScanError
+				return
+			}
+			injectionTexts[value] = struct{}{}
+			if !injectResult.Clean {
+				result.Clean = false
+				result.InjectFindings = appendUniqueResponseViewMatches(result.InjectFindings, injectResult.Matches)
+				action = config.StrongestAction(action, defaultFindingAction)
+			}
+		}
+
+		switch class {
+		case FieldURL:
+			urlResult := sc.Scan(ctx, value)
+			if !urlResult.Allowed {
+				result.Clean = false
+				result.URLFindings = append(result.URLFindings, urlResult)
+				if a2aURLResultForcesBlock(urlResult) {
+					action = config.StrongestAction(action, config.ActionBlock)
+				} else {
+					action = config.StrongestAction(action, defaultFindingAction)
+				}
+				if core, ok := a2aHiddenCoreFloor(ctx, sc, value, urlResult); ok {
+					result.URLFindings = append(result.URLFindings, core)
+					action = config.StrongestAction(action, config.ActionBlock)
+				}
+			}
+
+		case FieldText, FieldOpaque, FieldSecret:
+			if entropyOpts != nil {
+				entropyTexts = append(entropyTexts, value)
+			}
+			// DLP scanning
+			dlpResult := sc.ScanTextForDLP(ctx, value)
+			if len(dlpResult.Matches) > 0 {
+				result.Clean = false
+				result.DLPFindings = append(result.DLPFindings, dlpResult.Matches...)
+				if a2aDLPForcesBlock(dlpResult.Matches) {
+					action = config.StrongestAction(action, config.ActionBlock)
+				} else {
+					action = config.StrongestAction(action, scanner.CardRunAction(dlpResult.Matches, defaultFindingAction))
+				}
+			}
+
+		case FieldKeyEntropy:
+			if entropyOpts != nil {
+				entropyKeys = append(entropyKeys, value)
+			}
+		}
+	})
+	if walkErr != nil {
+		// Defense in depth: the empty-body and duplicate-key checks above
+		// already reject every body the walk's decoder would refuse, so no
+		// request reaches this branch. If one ever does, nothing was walked
+		// and nothing was inspected, so it blocks as incomplete.
+		return A2AScanResult{
+			Clean:                false,
+			Action:               config.ActionBlock,
+			Reason:               "a2a: invalid JSON: " + walkErr.Error(),
+			InspectionIncomplete: true,
+		}
+	}
+
+	if entropyOpts != nil {
+		if finding := contententropy.ScanTexts(entropyTexts, *entropyOpts); finding != nil && result.EntropyFinding == nil {
+			result.Clean = false
+			result.EntropyFinding = finding
+			action = config.StrongestAction(action, entropyOpts.Action)
+		}
+		if !budgetExceeded {
+			if finding := contententropy.ScanTexts(entropyKeys, *entropyOpts); finding != nil && result.EntropyFinding == nil {
+				result.Clean = false
+				result.EntropyFinding = finding
+				action = config.StrongestAction(action, entropyOpts.Action)
+			}
+		}
+	}
+
+	// Text parts form one message to the consumer. Inspect their joined values
+	// without inserting field names between them; per-leaf scanning above still
+	// owns keys and field-aware URL checks. This bounded pass also covers values
+	// beyond the classified walk's node allowance.
+	joinedValues := jsonrpc.ExtractStringsFromJSONResult(body)
+	if joinedValues.Truncated {
+		return A2AScanResult{Action: config.ActionBlock, InspectionIncomplete: true, Reason: "a2a: input exceeds maximum inspectable nesting depth"}
+	}
+	joinedViews := a2aPartTextViews(body)
+	if len(joinedValues.Strings) > 0 {
+		joinedViews = append(joinedViews, strings.Join(joinedValues.Strings, "\n"))
+	}
+	for _, view := range joinedViews {
+		injectResult := sc.ScanResponse(ctx, view)
+		if injectResult.Failed() {
+			result.Clean = false
+			result.ScanError = injectResult.ScanError
+		} else if !injectResult.Clean {
+			result.Clean = false
+			result.InjectFindings = appendUniqueResponseViewMatches(result.InjectFindings, injectResult.Matches)
+			findingAction := defaultFindingAction
+			if budgetExceeded {
+				findingAction = config.ActionBlock
+			}
+			action = config.StrongestAction(action, findingAction)
+		}
+		// Non-card credentials split across adjacent text parts are contiguous
+		// only in these views. Pass 2 owns card classification from the original
+		// document; a text join must not erase its scalar boundaries.
+		if dlpResult := sc.ScanTextForDLPWithTypedCardView(ctx, view, ""); !dlpResult.Clean {
+			result.Clean = false
+			result.DLPFindings = appendUniqueA2ADLPFindings(result.DLPFindings, dlpResult.Matches)
+			findingAction := defaultFindingAction
+			if budgetExceeded || a2aDLPForcesBlock(dlpResult.Matches) {
+				findingAction = config.ActionBlock
+			}
+			action = config.StrongestAction(action, findingAction)
+		}
+	}
+
+	// Budget exceeded participates in the same strongest-action resolution as
+	// scanner findings. The field-aware walk stopped early, so the leaves it
+	// never visited get one bounded pass over the whole body: injection and
+	// credential findings there block regardless of the configured action, and
+	// a pass that cannot complete blocks. A clean pass keeps the configured
+	// overflow action.
+	if budgetExceeded {
+		result.Clean = false
+		result.BudgetExceeded = true
+		action = config.StrongestAction(action, defaultFindingAction)
+		if a2aOverflowPass(ctx, trimmed, sc, &result) {
+			action = config.StrongestAction(action, config.ActionBlock)
+		}
+	}
+
+	// Pass 2: raw DLP fallback for split-secret detection. It runs whenever the
+	// walker completed within budget, even when an earlier leaf already produced
+	// a finding: a core credential split across JSON values must still reach the
+	// immutable floor, and a prior non-core warn finding must not shadow it.
+	// When the result was already dirty, fold in every new match and deduplicate
+	// it against the per-leaf findings. Raw-pass evidence must not disappear just
+	// because an earlier leaf was already dirty.
+	if !budgetExceeded {
+		if matches := sc.ScanJSONCardRuns(ctx, string(body)); len(matches) > 0 {
+			result.Clean = false
+			result.DLPFindings = appendUniqueA2ADLPFindings(result.DLPFindings, matches)
+			if a2aDLPForcesBlock(matches) {
+				action = config.StrongestAction(action, config.ActionBlock)
+			} else {
+				action = config.StrongestAction(action, scanner.CardRunAction(matches, defaultFindingAction))
+			}
+		}
+		extracted := extract.AllStringsFromJSONResult(json.RawMessage(body))
+		if extracted.Truncated {
+			return A2AScanResult{
+				Clean:                false,
+				Action:               config.ActionBlock,
+				Reason:               "a2a: input exceeds maximum inspectable nesting depth",
+				InspectionIncomplete: true,
+			}
+		}
+		texts := extracted.Strings
+		if len(texts) > 0 {
+			joined := strings.Join(texts, "\n")
+			dlpResult := sc.ScanTextForDLPWithTypedCardView(ctx, joined, extract.JoinCardAtoms(extracted.Atoms, " "))
+			keyMatches, _ := a2aKeyCardMatches(ctx, sc, extracted.Atoms, nil)
+			dlpResult.Matches = append(dlpResult.Matches, keyMatches...)
+			if dlpResult.Incomplete {
+				result.Clean = false
+				result.ScanError = "a2a: credential inspection incomplete: " + context.Cause(ctx).Error()
+			}
+			if len(dlpResult.Matches) > 0 {
+				result.Clean = false
+				result.DLPFindings = appendUniqueA2ADLPFindings(result.DLPFindings, dlpResult.Matches)
+				if a2aDLPForcesBlock(dlpResult.Matches) {
+					action = config.StrongestAction(action, config.ActionBlock)
+				} else {
+					action = config.StrongestAction(action, scanner.CardRunAction(dlpResult.Matches, defaultFindingAction))
+				}
+			}
+		}
+	}
+
+	if scanner.HasInspectionLimit(result.DLPFindings) {
+		result.Clean = false
+		result.InspectionIncomplete = true
+		action = config.ActionBlock
+	}
+	if err := ctx.Err(); err != nil {
+		result.Clean = false
+		result.ScanError = err.Error()
+	}
+	if !result.Clean {
+		if result.ScanError != "" {
+			result.Action = config.ActionBlock
+			result.Reason = "a2a: response scan incomplete: " + result.ScanError
+		} else {
+			result.Action = action
+			if result.Action == "" {
+				result.Action = defaultFindingAction
+			}
+			result.Reason = buildA2AReason(result)
+		}
+	}
+
+	return result
+}
+
+// a2aPartTextViews preserves the text sequence of each message or artifact's
+// parts array. Discriminators and other metadata remain in the all-values view
+// but cannot interrupt this view. Separate arrays never share a text sequence.
+// The caller validates JSON and its shared depth bound before this traversal.
+func a2aPartTextViews(body []byte) []string {
+	var parsed any
+	if err := extract.DecodeJSON(body, &parsed); err != nil {
+		return nil
+	}
+	var views []string
+	var walk func(any, int)
+	walk = func(value any, depth int) {
+		if depth > maxWalkDepth {
+			return
+		}
+		switch v := value.(type) {
+		case []any:
+			for _, child := range v {
+				walk(child, depth+1)
+			}
+		case map[string]any:
+			if parts, ok := v["parts"].([]any); ok {
+				var texts []string
+				for _, part := range parts {
+					if fields, ok := part.(map[string]any); ok {
+						if text, ok := fields["text"].(string); ok && text != "" {
+							texts = append(texts, text)
+						}
+					}
+				}
+				if len(texts) > 1 {
+					views = append(views, strings.Join(texts, "\n"))
+				}
+			}
+			for _, key := range jsonrpc.SortedKeys(v) {
+				walk(v[key], depth+1)
+			}
+		}
+	}
+	walk(parsed, 0)
+	return views
+}
+
+// a2aOverflowPass inspects a body whose field-aware walk ran out of budget.
+// It extracts every string and key once, in time linear in the size-capped
+// body, and runs response injection and DLP over the joined text. It reports
+// whether a finding must block; an incomplete pass sets result.ScanError,
+// which the caller resolves to block.
+func a2aOverflowPass(ctx context.Context, body []byte, sc *scanner.Scanner, result *A2AScanResult) bool {
+	forceBlock := false
+	if matches := sc.ScanJSONCardRuns(ctx, string(body)); len(matches) > 0 {
+		result.DLPFindings = appendUniqueA2ADLPFindings(result.DLPFindings, matches)
+		forceBlock = a2aDLPForcesBlock(matches)
+	}
+	extracted := extract.AllStringsFromJSONResult(json.RawMessage(body))
+	if extracted.Truncated {
+		result.ScanError = "a2a: overflow inspection exceeds maximum nesting depth"
+		return true
+	}
+	if len(extracted.Strings) == 0 {
+		if err := ctx.Err(); err != nil {
+			result.ScanError = "a2a: overflow inspection incomplete: " + err.Error()
+			return true
+		}
+		return forceBlock
+	}
+	joined := strings.Join(extracted.Strings, "\n")
+	injectResult := sc.ScanResponse(ctx, joined)
+	if injectResult.Failed() {
+		result.ScanError = injectResult.ScanError
+		return true
+	}
+	if !injectResult.Clean {
+		result.InjectFindings = appendUniqueResponseViewMatches(result.InjectFindings, injectResult.Matches)
+		forceBlock = true
+	}
+	// The joined view catches a credential split across leaves. Each leaf
+	// also gets the same per-string DLP scan the field-aware walk gives it,
+	// so a leaf decodes past the budget exactly as it would within it.
+	dlpResult := sc.ScanTextForDLPWithTypedCardView(ctx, joined, extract.JoinCardAtoms(extracted.Atoms, " "))
+	// The field walk already stopped at maxWalkNodes. Key and leaf scans past
+	// that same budget are incomplete and fail closed, rather than running
+	// one DLP pass per remaining value.
+	scansLeft := maxWalkNodes
+	keyMatches, keyLimited := a2aKeyCardMatches(ctx, sc, extracted.Atoms, &scansLeft)
+	dlpResult.Matches = append(dlpResult.Matches, keyMatches...)
+	if a2aOverflowRecordDLP(result, dlpResult) {
+		forceBlock = true
+	}
+	if dlpResult.Incomplete {
+		result.ScanError = "a2a: overflow credential inspection incomplete: " + context.Cause(ctx).Error()
+		return true
+	}
+	if keyLimited {
+		result.ScanError = "a2a: overflow inspection exceeds maximum distinct leaf count"
+		return true
+	}
+	scanned := make(map[string]struct{}, len(extracted.Strings))
+	for _, leaf := range extracted.Strings {
+		if forceBlock {
+			break
+		}
+		if _, seen := scanned[leaf]; seen || leaf == "" {
+			continue
+		}
+		if scansLeft <= 0 {
+			result.ScanError = "a2a: overflow inspection exceeds maximum distinct leaf count"
+			return true
+		}
+		scansLeft--
+		scanned[leaf] = struct{}{}
+		leafResult := sc.ScanTextForDLPWithCardView(ctx, leaf, "")
+		if a2aOverflowRecordDLP(result, leafResult) {
+			forceBlock = true
+		}
+		if leafResult.Incomplete {
+			result.ScanError = "a2a: overflow credential inspection incomplete: " + context.Cause(ctx).Error()
+			return true
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		result.ScanError = "a2a: overflow inspection incomplete: " + err.Error()
+		return true
+	}
+	return forceBlock
+}
+
+// a2aKeyCardMatches scans each object key on its own. Card joins omit keys,
+// and the per-leaf walk uses no card view, so a whole-key card needs this pass.
+// limit is the number of key scans still allowed. A nil limit does not apply
+// a cap. Repeated copies of one key text and card view count once, the same
+// way the leaf pass counts one string once. A different card view is a
+// different scan. The boolean reports that another distinct key view remained
+// after the cap.
+func a2aKeyCardMatches(ctx context.Context, sc *scanner.Scanner, atoms []extract.DLPAtom, limit *int) ([]scanner.TextDLPMatch, bool) {
+	var matches []scanner.TextDLPMatch
+	seen := make(map[struct{ text, card string }]struct{})
+	for _, atom := range atoms {
+		if !atom.Key || atom.Text == "" {
+			continue
+		}
+		view := struct{ text, card string }{atom.Text, atom.Card}
+		if _, ok := seen[view]; ok {
+			continue
+		}
+		if limit != nil && *limit <= 0 {
+			return matches, true
+		}
+		if limit != nil {
+			*limit--
+		}
+		seen[view] = struct{}{}
+		matches = append(matches, sc.ScanTextForDLPWithCardView(ctx, atom.Text, atom.Card).Matches...)
+	}
+	return matches, false
+}
+
+// a2aOverflowRecordDLP adds DLP findings from the overflow pass and reports
+// whether they must block.
+func a2aOverflowRecordDLP(result *A2AScanResult, dlpResult scanner.TextDLPResult) bool {
+	if len(dlpResult.Matches) == 0 {
+		return false
+	}
+	result.DLPFindings = appendUniqueA2ADLPFindings(result.DLPFindings, dlpResult.Matches)
+	return a2aDLPForcesBlock(dlpResult.Matches)
+}
+
+func firstA2AContentEntropyOptions(opts []A2AContentEntropyOptions) *A2AContentEntropyOptions {
+	if len(opts) == 0 {
+		return nil
+	}
+	return &opts[0]
+}
+
+// a2aDLPForcesBlock reports whether a set of DLP matches must hard-block the
+// A2A body regardless of the configured a2a_scanning.action. It elevates both
+// structural hostname-exfil matches and the immutable core credential floor,
+// so a core credential in an A2A body blocks even when body scanning is
+// disabled and the A2A branch alone carries the floor. Fail direction: a match
+// the core predicate cannot classify falls through to the configured action;
+// a positive core match only ever raises the action to block.
+func a2aDLPForcesBlock(matches []scanner.TextDLPMatch) bool {
+	if scanner.HasInspectionLimit(matches) || scanner.ContainsHostnameExfilMatch(matches) || scanner.ContainsCoreCriticalMatch(matches) {
+		return true
+	}
+	return false
+}
+
+// appendUniqueA2ADLPFindings mirrors the scanner's match identity at the A2A
+// cross-pass boundary. The scanner deduplicates within one scan; A2A also has
+// to deduplicate across its per-leaf and joined-raw scans.
+func appendUniqueA2ADLPFindings(existing, incoming []scanner.TextDLPMatch) []scanner.TextDLPMatch {
+	type matchKey struct {
+		name          string
+		encoded       string
+		informational bool
+	}
+
+	seen := make(map[matchKey]struct{}, len(existing)+len(incoming))
+	result := make([]scanner.TextDLPMatch, 0, len(existing)+len(incoming))
+	for _, match := range append(existing, incoming...) {
+		key := matchKey{name: match.PatternName, encoded: match.Encoded, informational: match.IsInformational()}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, match)
+	}
+	return result
+}
+
+// a2aURLResultForcesBlock reports whether a blocked URL-leaf scan result must
+// hard-block the A2A body or header regardless of the configured
+// a2a_scanning.action. It is the URL analog of a2aDLPForcesBlock: a structural
+// hostname-exfil URL and the immutable core credential floor both elevate to
+// block, so a core credential carried inside a URL field (query, path) blocks
+// even under warn, matching the text-DLP leaves. Fail direction: a blocked URL
+// the predicate cannot classify as core or hostname-exfil keeps following the
+// configured action; a positive match only ever raises the action to block.
+func a2aURLResultForcesBlock(r scanner.Result) bool {
+	return scanner.IsHostnameExfilResult(r) || scanner.IsCoreCriticalResult(r)
+}
+
+// a2aHiddenCoreFloor returns the core credential finding a URL carries when
+// its scan stopped at an earlier stage, such as the blocklist, and so never
+// reached the core floor.
+func a2aHiddenCoreFloor(ctx context.Context, sc *scanner.Scanner, uri string, urlResult scanner.Result) (scanner.Result, bool) {
+	if urlResult.Allowed || scanner.IsCoreCriticalResult(urlResult) {
+		return scanner.Result{}, false
+	}
+	core := sc.ScanURLCoreFloorWithContext(ctx, uri)
+	return core, !core.Allowed
+}
+
+func a2aDefaultAction(cfg *config.A2AScanning) string {
+	if cfg == nil || cfg.Action == "" {
+		return config.ActionWarn
+	}
+	return cfg.Action
+}
+
+// ScanA2AHeaders scans A2A service parameter headers.
+// A2A-Extensions: comma-separated URIs → SSRF-scan each.
+// A2A-Version: passed through without scanning.
+func ScanA2AHeaders(ctx context.Context, headers http.Header, sc *scanner.Scanner, cfg *config.A2AScanning) A2AScanResult {
+	if cfg == nil || !cfg.Enabled {
+		return A2AScanResult{Clean: true}
+	}
+
+	// Scan every field line. A repeated field is one comma-joined list
+	// (RFC 9110 section 5.3), and Get would return only the first line.
+	lines := headers.Values("A2A-Extensions")
+	if len(lines) == 0 {
+		return A2AScanResult{Clean: true}
+	}
+
+	result := A2AScanResult{Clean: true}
+	forceBlock := false
+	for _, uri := range strings.Split(strings.Join(lines, ","), ",") {
+		uri = strings.TrimSpace(uri)
+		if uri == "" {
+			continue
+		}
+		urlResult := sc.Scan(ctx, uri)
+		if !urlResult.Allowed {
+			result.Clean = false
+			result.URLFindings = append(result.URLFindings, urlResult)
+			// Immutable floor: a core credential or structural hostname-exfil
+			// carried in a header URI must hard-block regardless of the
+			// configured a2a_scanning.action, matching the body URL leaves.
+			if a2aURLResultForcesBlock(urlResult) {
+				forceBlock = true
+			}
+			if core, ok := a2aHiddenCoreFloor(ctx, sc, uri, urlResult); ok {
+				result.URLFindings = append(result.URLFindings, core)
+				forceBlock = true
+			}
+		}
+	}
+
+	if !result.Clean {
+		result.Action = cfg.Action
+		if forceBlock {
+			result.Action = config.ActionBlock
+		}
+		result.Reason = "a2a: A2A-Extensions header contains blocked URI"
+	}
+
+	return result
+}
+
+// --- Agent Card Scanning ---
+
+// cardCacheKey identifies a unique Agent Card baseline.
+type cardCacheKey struct {
+	cardURL         string // full URL including tenant path
+	authFingerprint string // SHA256(Authorization)[:16], "" for unauthenticated
+}
+
+// CardCacheKeyFromRequest builds a card cache key from the request URL and auth.
+func CardCacheKeyFromRequest(cardURL string, authHeader string) cardCacheKey {
+	fp := ""
+	if authHeader != "" {
+		h := sha256.Sum256([]byte(authHeader))
+		fp = hex.EncodeToString(h[:8]) // 16 hex chars
+	}
+	return cardCacheKey{cardURL: cardURL, authFingerprint: fp}
+}
+
+// cardEntry stores a single Agent Card baseline as two views: the
+// endpoint/structural digest (any change blocks) and the descriptive free text
+// (a change is adopted when it introduces no cue class). Splitting the record is
+// what lets a benign description edit update the baseline while an endpoint or
+// auth change still fails closed.
+type cardEntry struct {
+	// descriptiveDigest is the EQUALITY identity (framed, unambiguous);
+	// descriptive is the flattened text cue detection diffs against. They are
+	// separate because a delimiter-joined string cannot serve as an identity.
+	descriptiveDigest string
+	structuralDigest  string
+	descriptive       string
+	skillNames        []string
+}
+
+// cardDriftOutcome reports how a card compares to its baseline. changed drives
+// observability (DriftDetected); block is the enforcement decision. When block
+// is set, exactly one of structuralChange or introducedCues explains it; when
+// adopted is set, a benign descriptive change updated the baseline in place.
+type cardDriftOutcome struct {
+	firstSeen        bool
+	capacityExceeded bool
+	changed          bool
+	block            bool
+	adopted          bool
+	structuralChange bool
+	introducedCues   []string
+	receiptFailed    bool
+}
+
+// CardBaseline tracks Agent Card hashes by origin, for drift detection.
+// Thread-safe. A trusted baseline is a security ledger, not a disposable
+// cache: capacity preserves existing entries and refuses a new one.
+type CardBaseline struct {
+	mu      sync.Mutex
+	entries map[cardCacheKey]*cardEntry
+	order   []cardCacheKey // LRU order, most recent at end
+	maxSize int
+}
+
+// NewCardBaseline creates a card baseline cache with the given capacity.
+func NewCardBaseline(maxSize int) *CardBaseline {
+	if maxSize <= 0 {
+		maxSize = 1000
+	}
+	return &CardBaseline{
+		entries: make(map[cardCacheKey]*cardEntry, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// Evaluate decides what a card's digests mean against the baseline WITHOUT
+// changing it. Trusting a card is a decision the drift check alone cannot make:
+// the same scan also runs field scanning and signature verification, and a card
+// those reject must not leave its text behind as the trusted baseline. So the
+// mutation is split out into Commit, which the caller runs only once the whole
+// verdict is clean. Splitting it this way is what stops a rejected card - an
+// unsigned one under require_signed_agent_cards, one with an invalid signature,
+// or one carrying a scanner finding - from replacing the baseline that every
+// later comparison is measured against.
+//
+// The LRU position IS updated here, on purpose and for every card including a
+// blocked one: a card under repeated attack must stay resident so it keeps
+// blocking instead of aging out and being re-accepted as first-seen.
+func (cb *CardBaseline) Evaluate(key cardCacheKey, structuralDigest, descriptiveDigest, descriptive string, skillNames []string) cardDriftOutcome {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	existing, ok := cb.entries[key]
+	if !ok {
+		if len(cb.entries) >= cb.maxSize {
+			return cardDriftOutcome{capacityExceeded: true}
+		}
+		return cardDriftOutcome{firstSeen: true}
+	}
+
+	cb.touchLocked(key)
+
+	if existing.structuralDigest != structuralDigest {
+		// Endpoint/structural change: fail closed, preserve baseline.
+		return cardDriftOutcome{changed: true, block: true, structuralChange: true}
+	}
+	// Compare the framed digest, not the flattened text: the text is ambiguous
+	// across field boundaries and would report "unchanged" for a changed card.
+	if existing.descriptiveDigest == descriptiveDigest {
+		return cardDriftOutcome{}
+	}
+
+	// Structure unchanged, descriptive text changed: block only if the change
+	// introduced a cue class; otherwise the caller may adopt the new text.
+	introduced := tools.IntroducedDescriptionCues(existing.descriptive, descriptive)
+	if len(introduced) > 0 {
+		return cardDriftOutcome{changed: true, block: true, introducedCues: introduced}
+	}
+	return cardDriftOutcome{changed: true, adopted: true}
+}
+
+// Commit writes the baseline change a preceding Evaluate found acceptable, and
+// is called only after the card's full verdict came back clean. It re-derives
+// the decision under the lock rather than trusting the caller's outcome, so a
+// concurrent fetch that moved the entry in between cannot be overwritten on the
+// strength of a stale read: a first-seen insert happens only while the key is
+// still absent and there is still room, and a descriptive adoption happens only
+// while the structure still matches and the change still introduces no cue.
+func (cb *CardBaseline) Commit(key cardCacheKey, structuralDigest, descriptiveDigest, descriptive string, skillNames []string) bool {
+	applied, _ := cb.CommitOrReevaluate(key, structuralDigest, descriptiveDigest, descriptive, skillNames)
+	return applied
+}
+
+type cardCommitOptions struct {
+	// confirm runs under the baseline lock, immediately before accepting the
+	// current outcome. It must not call back into this baseline.
+	confirm func(cardDriftOutcome) error
+}
+
+// CommitOrReevaluate decides, confirms, and writes under one lock hold.
+// Its outcome describes the current baseline, including changes since Evaluate.
+// A failed confirmation leaves the trusted entry unchanged.
+func (cb *CardBaseline) CommitOrReevaluate(key cardCacheKey, structuralDigest, descriptiveDigest, descriptive string, skillNames []string, options ...cardCommitOptions) (applied bool, outcome cardDriftOutcome) {
+	confirm := func(candidate cardDriftOutcome) bool {
+		return len(options) == 0 || options[0].confirm == nil || options[0].confirm(candidate) == nil
+	}
+
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	existing, ok := cb.entries[key]
+	if !ok {
+		if len(cb.entries) >= cb.maxSize {
+			return false, cardDriftOutcome{capacityExceeded: true}
+		}
+		if !confirm(cardDriftOutcome{firstSeen: true}) {
+			return false, cardDriftOutcome{receiptFailed: true}
+		}
+		cb.entries[key] = &cardEntry{
+			structuralDigest:  structuralDigest,
+			descriptiveDigest: descriptiveDigest,
+			descriptive:       descriptive,
+			skillNames:        skillNames,
+		}
+		cb.touchLocked(key)
+		return true, cardDriftOutcome{firstSeen: true}
+	}
+
+	cb.touchLocked(key)
+
+	if existing.structuralDigest != structuralDigest {
+		return false, cardDriftOutcome{changed: true, block: true, structuralChange: true}
+	}
+	if existing.descriptiveDigest == descriptiveDigest {
+		if !confirm(cardDriftOutcome{}) {
+			return false, cardDriftOutcome{receiptFailed: true}
+		}
+		return false, cardDriftOutcome{}
+	}
+	if introduced := tools.IntroducedDescriptionCues(existing.descriptive, descriptive); len(introduced) > 0 {
+		return false, cardDriftOutcome{changed: true, block: true, introducedCues: introduced}
+	}
+	if !confirm(cardDriftOutcome{changed: true, adopted: true}) {
+		return false, cardDriftOutcome{receiptFailed: true}
+	}
+	existing.descriptiveDigest = descriptiveDigest
+	existing.descriptive = descriptive
+	existing.skillNames = skillNames
+	return true, cardDriftOutcome{changed: true, adopted: true}
+}
+
+// ResetBaseline explicitly updates the stored baseline for a key.
+// Use after reviewing and accepting a drifted Agent Card. This is the operator
+// path that promotes a change Check refused (a structural/endpoint change or a
+// cue-introducing descriptive change). Resetting a missing entry at capacity is
+// refused so an operator action cannot discard a different trusted baseline.
+// The caller supplies the canonical descriptive digest for the same reason Check
+// does: a reviewed baseline stored under a differently-derived digest reports
+// drift on the very card the operator just accepted.
+func (cb *CardBaseline) ResetBaseline(key cardCacheKey, structuralDigest, descriptiveDigest, descriptive string, skillNames []string) error {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	existing, ok := cb.entries[key]
+	if ok {
+		existing.structuralDigest = structuralDigest
+		existing.descriptiveDigest = descriptiveDigest
+		existing.descriptive = descriptive
+		existing.skillNames = skillNames
+		cb.touchLocked(key)
+		return nil
+	}
+
+	if len(cb.entries) >= cb.maxSize {
+		return ErrCardBaselineCapacity
+	}
+	// Key not present: insert as a reviewed baseline.
+	cb.entries[key] = &cardEntry{
+		structuralDigest:  structuralDigest,
+		descriptiveDigest: descriptiveDigest,
+		descriptive:       descriptive,
+		skillNames:        skillNames,
+	}
+	cb.touchLocked(key)
+	return nil
+}
+
+// touchLocked moves a key to the end of the LRU order. Must hold mu.
+func (cb *CardBaseline) touchLocked(key cardCacheKey) {
+	// Remove existing position.
+	for i, k := range cb.order {
+		if k == key {
+			cb.order = append(cb.order[:i], cb.order[i+1:]...)
+			break
+		}
+	}
+	cb.order = append(cb.order, key)
+}
+
+// AgentCardScanResult describes the outcome of scanning an Agent Card.
+type AgentCardScanResult struct {
+	Clean         bool
+	Action        string
+	Reason        string
+	DriftDetected bool
+	// DriftAdopted is true when a benign descriptive change was adopted as the
+	// new baseline without blocking. DriftDetected is still set (the card
+	// changed, which observability records), but the change did not enforce.
+	// Distinguishes an adopted change from a blocked one for downstream audit.
+	DriftAdopted bool
+	FirstSeen    bool
+	// BaselineCapacityExceeded reports that this card could not be safely
+	// verified without replacing a different trusted baseline.
+	BaselineCapacityExceeded bool
+	Findings                 A2AScanResult // field-level scan findings
+
+	// SignatureVerified is true when the card carried a signature that verified
+	// against a trusted key scoped to the card's origin. SignatureKeyID is the
+	// verifying key_id, for the positive attestation receipt. A signature that
+	// failed to verify is reported via Clean=false + Reason, not these fields.
+	SignatureVerified bool
+	SignatureKeyID    string
+}
+
+// ScanAgentCard parses and scans an Agent Card response for skill poisoning
+// and drift detection. Reuses the field walker for URL and injection scanning.
+func ScanAgentCard(ctx context.Context, body []byte, sc *scanner.Scanner, baseline *CardBaseline, key cardCacheKey, cfg *config.A2AScanning) AgentCardScanResult {
+	return scanAgentCard(ctx, body, sc, baseline, key, agentCardScanOptions{cfg: cfg, commitBaseline: true})
+}
+
+// ScanAgentCardWithOptions scans an HTTP card with the same pre-commit
+// confirmation hook used by MCP card responses.
+func ScanAgentCardWithOptions(ctx context.Context, body []byte, sc *scanner.Scanner, opts A2AResponseOpts) AgentCardScanResult {
+	return scanAgentCard(ctx, body, sc, opts.Baseline, opts.CardKey, agentCardScanOptions{cfg: opts.Cfg, commitBaseline: true, confirmAcceptance: opts.ConfirmCardAcceptance})
+}
+
+type agentCardScanOptions struct {
+	cfg               *config.A2AScanning
+	commitBaseline    bool
+	confirmAcceptance func(AgentCardScanResult) error
+}
+
+func scanAgentCard(ctx context.Context, body []byte, sc *scanner.Scanner, baseline *CardBaseline, key cardCacheKey, opts agentCardScanOptions) AgentCardScanResult {
+	ctx = scanner.WithInboundDirection(ctx)
+	cfg := opts.cfg
+	if cfg == nil || !cfg.Enabled {
+		return AgentCardScanResult{Clean: true}
+	}
+
+	// Card structure feeds drift and signature checks even when content scanning
+	// is disabled. Refuse ambiguous input before any typed decode or baseline use.
+	if err := redact.NoSchemaKeyAliases(body, reflect.TypeFor[A2AAgentCard]()); err != nil {
+		reason := fmt.Sprintf("a2a: invalid Agent Card JSON: %v", err)
+		if redact.IsDuplicateKeyBlock(err) {
+			reason = fmt.Sprintf("a2a: duplicate JSON object key: %v", err)
+		}
+		return AgentCardScanResult{
+			Clean: false, Action: config.ActionBlock,
+			Reason:   reason,
+			Findings: A2AScanResult{Clean: false, Action: config.ActionBlock, InspectionIncomplete: true},
+		}
+	}
+
+	// Verify before scanning. A signature that verified against a trusted,
+	// origin-scoped key is a stamp, not content: only that one string, found by
+	// its position in the card, is left out of the text the credential rules
+	// read. With no trusted key, a wrong origin, or any verification failure
+	// nothing is left out and the card is scanned exactly as it arrived.
+	var sig CardSignatureResult
+	scanBody := body
+	if CardSignatureVerificationActive(cfg) {
+		sig = VerifyAgentCardSignatures(body, CardOriginFromURL(key.cardURL), cfg)
+		scanBody = cardBodyWithoutVerifiedSignature(body, nil, sig)
+	}
+
+	var card A2AAgentCard
+	if err := json.Unmarshal(body, &card); err != nil {
+		// Unparseable card: fail closed for card-specific checks,
+		// but still run generic field scanning.
+		findings := scanA2ABody(ctx, scanBody, sc, cfg, nil)
+		unparseable := AgentCardScanResult{
+			Clean:    findings.Clean,
+			Action:   findings.Action,
+			Reason:   "a2a: unparseable Agent Card",
+			Findings: findings,
+		}
+		// Still enforce signature policy: an unparseable body is not a validly
+		// signed card, so require_signed_agent_cards (and any claimed-but-
+		// invalid signature) must fail closed here too, not be skipped by the
+		// early return.
+		applyCardSignatureVerification(&unparseable, sig, cfg)
+		return unparseable
+	}
+
+	result := AgentCardScanResult{Clean: true}
+
+	// driftCommit writes the baseline change the drift evaluation found
+	// acceptable. It runs only after the FULL verdict is known, so a card the
+	// scanner or the signature check rejects leaves the trusted baseline alone.
+	driftCommit := func(bool) {}
+	confirmed := false
+	confirmAcceptance := func(candidate AgentCardScanResult) error {
+		if opts.confirmAcceptance == nil || (!candidate.FirstSeen && !candidate.DriftAdopted && !candidate.SignatureVerified) {
+			return nil
+		}
+		confirmed = true
+		return opts.confirmAcceptance(candidate)
+	}
+	var driftOutcome cardDriftOutcome
+
+	// Card content scanning via field walker.
+	if cfg.ScanAgentCards {
+		result.Findings = scanA2ABody(ctx, scanBody, sc, cfg, nil)
+		if !result.Findings.Clean {
+			result.Clean = false
+			result.Action = result.Findings.Action
+			result.Reason = result.Findings.Reason
+		}
+	}
+
+	// Drift detection. A change to an endpoint/structural field always blocks;
+	// a descriptive change blocks only when it introduces a cue class, and is
+	// otherwise adopted as the new baseline (the false positive this removes).
+	if cfg.DetectCardDrift && baseline != nil {
+		var skillNames []string
+		for _, s := range card.Skills {
+			skillNames = append(skillNames, s.Name)
+		}
+		structural := cardStructuralDigest(card)
+		descriptive := cardDescriptiveText(card)
+		descriptiveDigest := cardDescriptiveDigest(card)
+		// Evaluate now, commit at the end: the baseline must not learn a card
+		// that field scanning or signature verification is about to reject.
+		outcome := baseline.Evaluate(key, structural, descriptiveDigest, descriptive, skillNames)
+		driftCommit = func(accepted bool) {
+			if !accepted {
+				return
+			}
+			// One atomic decide-and-write. Whatever it returns either WAS
+			// applied or needed no write, so the result can publish it without
+			// a further round trip. When it differs from the pre-verdict
+			// evaluation the baseline moved in between, and the response must
+			// carry the state that actually holds, including a block.
+			applied, final := baseline.CommitOrReevaluate(key, structural, descriptiveDigest, descriptive, skillNames, cardCommitOptions{
+				confirm: func(fresh cardDriftOutcome) error {
+					candidate := result
+					applyFreshDriftOutcome(&candidate, fresh, cfg)
+					return confirmAcceptance(candidate)
+				},
+			})
+			if final.receiptFailed {
+				clearAgentCardAcceptance(&result)
+				return
+			}
+			// Publish the pre-verdict outcome only when the write applied AND
+			// the decision did not change underneath it.
+			if applied && final.firstSeen == outcome.firstSeen && final.adopted == outcome.adopted && !final.block && !final.capacityExceeded {
+				return
+			}
+			applyFreshDriftOutcome(&result, final, cfg)
+		}
+		driftOutcome = outcome
+		result.DriftDetected = outcome.changed
+		result.DriftAdopted = outcome.adopted
+		result.FirstSeen = outcome.firstSeen
+		result.BaselineCapacityExceeded = outcome.capacityExceeded
+		if outcome.capacityExceeded {
+			result.Clean = false
+			result.Action = config.ActionBlock
+			result.Reason = "a2a: Agent Card baseline capacity exhausted; card cannot be safely verified"
+		}
+		if outcome.block {
+			result.Clean = false
+			if result.Action == "" {
+				result.Action = cfg.Action
+			}
+			if outcome.structuralChange {
+				// Name the axis (endpoint/structural), not the specific field, so
+				// the reason does not map the card's configuration surface.
+				result.Reason = "a2a: Agent Card drift introduced: endpoint or structural change"
+			} else {
+				result.Reason = "a2a: Agent Card drift introduced: " + strings.Join(outcome.introducedCues, ", ")
+			}
+		}
+	}
+
+	// Independent attestation: cryptographically verify the card's signature
+	// against the operator's trusted, origin-scoped keys. This runs in addition
+	// to (not instead of) content scanning and drift detection.
+	applyCardSignatureVerification(&result, sig, cfg)
+
+	// The verdict is final here. Learn the card only if nothing rejected it;
+	// otherwise the baseline keeps what it already trusted, and the result must
+	// not claim an adoption that never happened (the audit event and the
+	// OnCardDriftAdopted callback both read DriftAdopted).
+	if result.Clean && opts.commitBaseline {
+		driftCommit(true)
+		if result.Clean && !confirmed {
+			if err := confirmAcceptance(result); err != nil {
+				clearAgentCardAcceptance(&result)
+			}
+		}
+	} else if driftOutcome.adopted || driftOutcome.firstSeen {
+		result.DriftAdopted = false
+		result.FirstSeen = false
+	}
+
+	return result
+}
+
+func clearAgentCardAcceptance(result *AgentCardScanResult) {
+	result.Clean, result.FirstSeen, result.DriftAdopted = false, false, false
+	result.SignatureVerified, result.SignatureKeyID = false, ""
+	result.Action, result.Reason = config.ActionBlock, "receipt emission failed"
+}
+
+// applyFreshDriftOutcome rewrites a scan result from a re-evaluation performed
+// after Commit declined, which happens when the baseline moved between Evaluate
+// and Commit. It is a named function rather than an inline block so the
+// capacity branch below is reachable from a test without a sleep or a race.
+func applyFreshDriftOutcome(result *AgentCardScanResult, fresh cardDriftOutcome, cfg *config.A2AScanning) {
+	result.DriftDetected = fresh.changed
+	result.DriftAdopted = fresh.adopted
+	result.FirstSeen = fresh.firstSeen
+	result.BaselineCapacityExceeded = fresh.capacityExceeded
+	if !fresh.block && !fresh.capacityExceeded {
+		return
+	}
+	result.Clean = false
+	if result.Action == "" {
+		result.Action = cfg.Action
+	}
+	switch {
+	case fresh.capacityExceeded:
+		// Capacity exhaustion FORCES block, overriding cfg.Action, exactly as
+		// the first-pass capacity branch does. The card could not be verified
+		// against any baseline at all, so a configured `warn` must not forward
+		// it. An earlier version of this branch fell back to cfg.Action, which
+		// was a fail-open reachable only on the rarer race path.
+		result.Action = config.ActionBlock
+		result.Reason = "a2a: Agent Card baseline capacity exhausted; card cannot be safely verified"
+	case fresh.structuralChange:
+		result.Reason = "a2a: Agent Card drift introduced: endpoint or structural change"
+	default:
+		result.Reason = "a2a: Agent Card drift introduced: " + strings.Join(fresh.introducedCues, ", ")
+	}
+}
+
+// applyCardSignatureVerification applies the card's signature outcome (computed
+// by the caller, which verifies before it scans) to result in place when
+// verification is active. It is fail-closed: a claimed-but-
+// invalid signature blocks; an unsigned card blocks only when
+// require_signed_agent_cards is set; a verified signature records the attesting
+// key_id. Called from both the normal and unparseable-card paths so the
+// require-signed invariant cannot be skipped by an early return.
+func applyCardSignatureVerification(result *AgentCardScanResult, sig CardSignatureResult, cfg *config.A2AScanning) {
+	if !CardSignatureVerificationActive(cfg) {
+		return
+	}
+	switch sig.Outcome {
+	case SigOutcomeVerified:
+		result.SignatureVerified = true
+		result.SignatureKeyID = sig.KeyID
+	case SigOutcomeFailed:
+		result.Clean = false
+		if result.Action == "" {
+			result.Action = cfg.Action
+		}
+		if result.Reason == "" {
+			result.Reason = sig.Reason
+		}
+	case SigOutcomeUnsigned:
+		if cfg.RequireSignedAgentCards {
+			result.Clean = false
+			if result.Action == "" {
+				result.Action = cfg.Action
+			}
+			if result.Reason == "" {
+				result.Reason = "a2a: unsigned Agent Card rejected (require_signed_agent_cards)"
+			}
+		}
+	}
+}
+
+// --- Context Tracking (Session Smuggling Detection) ---
+
+// ContextTracker maintains A2A context sessions for smuggling detection.
+// Thread-safe.
+type ContextTracker struct {
+	mu       sync.Mutex
+	contexts map[string]*contextSession
+	taskMap  map[string]string // taskID → contextID
+	cfg      *config.A2AScanning
+}
+
+// contextSession tracks accumulated text within a single A2A context.
+type contextSession struct {
+	texts   []string
+	tainted bool // true if message cap was hit
+}
+
+// NewContextTracker creates a context tracker with the given config.
+func NewContextTracker(cfg *config.A2AScanning) *ContextTracker {
+	return &ContextTracker{
+		contexts: make(map[string]*contextSession),
+		taskMap:  make(map[string]string),
+		cfg:      cfg,
+	}
+}
+
+// TrackAndScan adds message text to the context and runs accumulated
+// injection scanning. Returns a non-empty reason if smuggling is detected.
+func (ct *ContextTracker) TrackAndScan(ctx context.Context, contextID, taskID string, texts []string, sc *scanner.Scanner) (smuggling bool, reason string) {
+	if ct.cfg == nil || !ct.cfg.SessionSmugglingDetection {
+		return false, ""
+	}
+
+	ct.mu.Lock()
+	canonicalID := ct.resolveContextLocked(contextID, taskID)
+	if taskID != "" {
+		if _, known := ct.taskMap[taskID]; !known && len(ct.taskMap) >= ct.maxContextsLocked() {
+			ct.mu.Unlock()
+			return true, "a2a: task alias capacity exceeded"
+		}
+	}
+	sess, admitted := ct.getOrCreateLocked(canonicalID)
+	if !admitted {
+		ct.mu.Unlock()
+		return true, "a2a: context capacity exceeded"
+	}
+
+	// Track task → context mapping.
+	if taskID != "" {
+		ct.taskMap[taskID] = canonicalID
+	}
+
+	// Add texts to session.
+	sess.texts = append(sess.texts, texts...)
+
+	// Check message cap - taint on overflow.
+	maxMsgs := ct.cfg.MaxContextMessages
+	if maxMsgs <= 0 {
+		maxMsgs = 100
+	}
+	if len(sess.texts) > maxMsgs {
+		sess.texts = sess.texts[len(sess.texts)-maxMsgs:]
+		sess.tainted = true
+	}
+
+	// Copy texts for scanning outside the lock.
+	accumulated := make([]string, len(sess.texts))
+	copy(accumulated, sess.texts)
+	tainted := sess.tainted
+	ct.mu.Unlock()
+
+	// Scan individual texts first - if any single message has injection,
+	// that's not smuggling, it's direct injection (handled by per-message scanning).
+	// Smuggling = injection visible ONLY in concatenation.
+	joined := strings.Join(accumulated, " ")
+	concatResult := sc.ScanResponse(ctx, joined)
+	if !concatResult.Clean {
+		if concatResult.Failed() {
+			return true, "a2a: response scan incomplete: " + concatResult.ScanError
+		}
+		// Check if any individual text also triggers.
+		individualHit := false
+		for _, t := range texts {
+			r := sc.ScanResponse(ctx, t)
+			if r.Failed() {
+				return true, "a2a: response scan incomplete: " + r.ScanError
+			}
+			if !r.Clean {
+				individualHit = true
+				break
+			}
+		}
+		if !individualHit {
+			reason = "a2a: session smuggling detected — injection visible only in accumulated context"
+			if tainted {
+				reason += " (context tainted: message limit reached)"
+			}
+			return true, reason
+		}
+	}
+
+	return false, ""
+}
+
+// resolveContextLocked resolves the canonical context ID.
+// Must hold ct.mu.
+func (ct *ContextTracker) resolveContextLocked(contextID, taskID string) string {
+	if contextID != "" {
+		return contextID
+	}
+	if taskID != "" {
+		if cid, ok := ct.taskMap[taskID]; ok {
+			return cid
+		}
+		return "task:" + taskID
+	}
+	return "anon:" + fmt.Sprintf("%d", len(ct.contexts))
+}
+
+// getOrCreateLocked gets or creates a context session. Must hold ct.mu.
+func (ct *ContextTracker) getOrCreateLocked(id string) (*contextSession, bool) {
+	sess, ok := ct.contexts[id]
+	if ok {
+		return sess, true
+	}
+
+	// Existing context state is security evidence. Admission pressure must not
+	// discard it and let an old identifier re-enter as a fresh session.
+	if len(ct.contexts) >= ct.maxContextsLocked() {
+		return nil, false
+	}
+
+	sess = &contextSession{}
+	ct.contexts[id] = sess
+	return sess, true
+}
+
+func (ct *ContextTracker) maxContextsLocked() int {
+	if ct.cfg.MaxContexts > 0 {
+		return ct.cfg.MaxContexts
+	}
+	return 1000
+}
+
+// --- SSE Stream Scanning ---
+
+// ScanA2AStream handles SSE streaming responses with per-event field-aware
+// scanning and rolling tails for cross-event injection and DLP detection.
+//
+// Contract:
+// - Caller copies response headers to w BEFORE calling this function.
+// - Clean events are flushed immediately via flusher.
+// - On detection: returns error (caller should close the connection).
+// - Compressed responses must be rejected BEFORE calling this function.
+func ScanA2AStream(ctx context.Context, body io.Reader, w io.Writer, flusher http.Flusher, sc *scanner.Scanner, cfg *config.A2AScanning) error {
+	return ScanA2AStreamWithOptions(ctx, body, w, flusher, sc, A2AStreamOptions{Config: cfg})
+}
+
+// A2AStreamOptions reuses the stream warning audit and receipt callbacks.
+type A2AStreamOptions struct {
+	Config  *config.A2AScanning
+	Warning GenericSSEScanOptions
+}
+
+// ScanA2AStreamWithOptions records number-only warnings before forwarding.
+func ScanA2AStreamWithOptions(ctx context.Context, body io.Reader, w io.Writer, flusher http.Flusher, sc *scanner.Scanner, opts A2AStreamOptions) error {
+	ctx = scanner.WithInboundDirection(ctx)
+	cfg := opts.Config
+	if cfg == nil || !cfg.Enabled {
+		// A2A scanning disabled: share the generic-SSE chunked
+		// passthrough so per-read flushing preserves SSE TTFB. After the
+		// SSE-streaming activation gate was decoupled from
+		// response_scanning.enabled, this branch is now reachable for
+		// disabled-A2A SSE responses; bare io.Copy would let the server's
+		// bufio.Writer batch chunks and reintroduce the TTFB stall the
+		// decoupling was meant to fix.
+		return passthroughSSE(ctx, body, w, flusher)
+	}
+
+	reader := transport.NewSSEReader(body)
+	var injectionTail sseInjectionTail
+	var dlpTail string
+	var cardTail string
+	var numberTail string
+	var numberCardTail string
+	var previousLastNumber bool
+	// The tails above join every string of an event, keys included, so a
+	// field name always sits between two halves of a split artifact text.
+	// The field tails join each JSON field only with its own earlier content.
+	fieldTail := extract.NewFieldTails("")
+	fieldInjectionTail := extract.NewFieldTails("")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		event, err := reader.ReadMessage()
+		if errors.Is(err, io.EOF) {
+			// EOF can race with cancellation while the read is in flight.
+			return ctx.Err()
+		}
+		if err != nil {
+			return fmt.Errorf("a2a stream read: %w", err)
+		}
+
+		var warnedFinding error
+		recordNumberOnly := func(matches []scanner.TextDLPMatch) bool {
+			if !scanner.OnlyInformational(matches) {
+				return false
+			}
+			if warnedFinding == nil {
+				warnedFinding = fmt.Errorf("%w: informational JSON card run (action=warn)", sseFindingCause(ErrA2AStreamFinding, session.FindingDLP))
+				sc.EmitTextDLPWarnMatches(ctx, matches)
+				if opts.Warning.OnFinding != nil {
+					opts.Warning.OnFinding(warnedFinding)
+				}
+			}
+			return true
+		}
+
+		// Field-walk the event data payload.
+		eventResult := scanA2ABody(ctx, event, sc, cfg, nil)
+		if !eventResult.Clean {
+			if eventResult.InspectionIncomplete {
+				return fmt.Errorf("%w: %s", ErrSSEStreamScanError, eventResult.Reason)
+			}
+			if eventResult.ScanError != "" {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, eventResult.ScanError)
+			}
+			if len(eventResult.InjectFindings) > 0 || len(eventResult.URLFindings) > 0 || eventResult.EntropyFinding != nil || eventResult.BudgetExceeded || !recordNumberOnly(eventResult.DLPFindings) {
+				return fmt.Errorf("%w: %s", sseFindingCause(ErrA2AStreamFinding, A2ATaintFindingKinds(eventResult)...), eventResult.Reason)
+			}
+		}
+
+		// Scan the canonical full-event text (event:/id:/retry: plus the
+		// data: payload). scanA2ABody only inspects the JSON data payload,
+		// so metadata-field injection (prompt-injection in id:, DLP in
+		// event:) would otherwise slip through - same class of bypass as
+		// external review finding #2 on the generic SSE path.
+		canonical := canonicalSSEEventText(event, reader)
+		cardCanonical := canonicalSSEEventText([]byte(jsonnumber.CardView(string(event), extract.MaxExtractDepth)), reader)
+		// SSE metadata is string-valued (WHATWG server-sent events). Inspect
+		// each value before envelope joins can remove a credential boundary.
+		for _, metadata := range []string{reader.LastEventID(), reader.LastEventType(), reader.LastRetry()} {
+			dlpResult := sc.ScanTextForDLP(ctx, metadata)
+			if err := dlpResult.Err(); err != nil {
+				return fmt.Errorf("%w: %w", ErrSSEStreamScanError, err)
+			}
+			if !dlpResult.Clean {
+				return fmt.Errorf("%w: dlp in sse metadata: %s", sseFindingCause(ErrA2AStreamFinding, session.FindingDLP), sseDLPMatchNames(dlpResult.Matches))
+			}
+		}
+		if injResult := sc.ScanResponse(ctx, canonical); !injResult.Clean {
+			if injResult.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, injResult.ScanError)
+			}
+			return fmt.Errorf("%w: injection in sse metadata: %s",
+				sseFindingCause(ErrA2AStreamFinding, session.FindingWording), sseInjectionNames(injResult.Matches))
+		}
+		dlpResult := sc.ScanTextForDLPWithCardView(ctx, canonical, cardCanonical)
+		if err := dlpResult.Err(); err != nil {
+			return fmt.Errorf("%w: %w", ErrSSEStreamScanError, err)
+		}
+		if len(dlpResult.Matches) > 0 && !recordNumberOnly(dlpResult.Matches) {
+			return fmt.Errorf("%w: dlp in sse metadata: %s",
+				sseFindingCause(ErrA2AStreamFinding, session.FindingDLP), sseDLPMatchNames(dlpResult.Matches))
+		}
+
+		// Rolling injection tails inspect both word-separated and adjacent
+		// event text. DLP text joins without a separator. The card
+		// view separates a seam only when it touches a JSON number.
+		currentText, currentCardText, currentFirstNumber, currentLastNumber, currentTruncated := extractTextViewsFromEvent(event)
+		if currentTruncated {
+			return fmt.Errorf("%w: input exceeds maximum inspectable nesting depth", ErrSSEStreamScanError)
+		}
+		var crossInjectionMatches []scanner.ResponseMatch
+		if currentText != "" {
+			for _, view := range injectionTail.views(currentText) {
+				tailResult := sc.ScanResponse(ctx, view)
+				if tailResult.Failed() {
+					return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, tailResult.ScanError)
+				}
+				crossInjectionMatches = appendUniqueResponseViewMatches(crossInjectionMatches, tailResult.Matches)
+			}
+		}
+		frame := extract.ParseFieldTailFrame(event)
+		for _, view := range fieldInjectionTail.Views(frame) {
+			tailResult := sc.ScanResponse(ctx, view.Joined)
+			if tailResult.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, tailResult.ScanError)
+			}
+			crossInjectionMatches = appendUniqueResponseViewMatches(crossInjectionMatches, tailResult.Matches)
+		}
+		if len(crossInjectionMatches) > 0 {
+			return fmt.Errorf("%w: cross-event injection detected: %s", sseFindingCause(ErrA2AStreamFinding, session.FindingWording), sseInjectionNames(crossInjectionMatches))
+		}
+		if dlpTail != "" && currentText != "" {
+			combined := dlpTail + currentText
+			cardBoundary := jsonnumber.CardBoundary(previousLastNumber, currentFirstNumber)
+			dlpResult := sc.ScanTextForDLPWithTypedCardView(ctx, combined, cardTail+cardBoundary+currentCardText)
+			if err := dlpResult.Err(); err != nil {
+				return fmt.Errorf("%w: %w", ErrSSEStreamScanError, err)
+			}
+			if len(dlpResult.Matches) > 0 && !recordNumberOnly(dlpResult.Matches) {
+				if scanner.HasInspectionLimit(dlpResult.Matches) {
+					return sseDLPFindingError(dlpResult.Matches, "cross-event dlp")
+				}
+				return fmt.Errorf("%w: cross-event dlp detected: %s",
+					sseFindingCause(ErrA2AStreamFinding, session.FindingDLP), sseDLPMatchNames(dlpResult.Matches))
+			}
+		}
+		// A2A status and part wrappers put string metadata before each numeric
+		// value. Carry the typed numeric leaves across the event seam so that
+		// those wrapper fields cannot hide a split card.
+		numberText, numberCard := extract.JSONNumberStreamViews(event)
+		if numberTail != "" && numberText != "" {
+			result := sc.ScanTextForDLPWithTypedCardView(ctx, numberTail+numberText, numberCardTail+jsonnumber.NumberBoundary+numberCard)
+			if err := result.Err(); err != nil {
+				return fmt.Errorf("%w: %w", ErrSSEStreamScanError, err)
+			}
+			if len(result.Matches) > 0 && !recordNumberOnly(result.Matches) {
+				if scanner.HasInspectionLimit(result.Matches) {
+					return sseDLPFindingError(result.Matches, "cross-event dlp")
+				}
+				return fmt.Errorf("%w: cross-event dlp detected: %s", sseFindingCause(ErrA2AStreamFinding, session.FindingDLP), sseDLPMatchNames(result.Matches))
+			}
+		}
+		if numberText == "" {
+			numberTail, numberCardTail = "", ""
+		} else {
+			numberTail = advanceSSERollingTail(numberTail, []byte(numberText), false, "")
+			numberCardTail = advanceSSERollingTail(numberCardTail, []byte(numberCard), false, jsonnumber.NumberBoundary)
+		}
+
+		for _, view := range fieldTail.Views(frame) {
+			dlpResult := sc.ScanTextForDLP(ctx, view.Joined)
+			if dlpResult.Incomplete {
+				return fmt.Errorf("%w: cross-event dlp scan incomplete: %s", ErrSSEStreamScanError, context.Cause(ctx).Error())
+			}
+			if !dlpResult.Clean {
+				if scanner.HasInspectionLimit(dlpResult.Matches) {
+					return sseDLPFindingError(dlpResult.Matches, "cross-event dlp")
+				}
+				return fmt.Errorf("%w: cross-event dlp detected: %s",
+					sseFindingCause(ErrA2AStreamFinding, session.FindingDLP), sseDLPMatchNames(dlpResult.Matches))
+			}
+		}
+		if fieldTail.Incomplete(frame) || fieldInjectionTail.Incomplete(frame) {
+			return fmt.Errorf("%w: cross-event inspection incomplete: event exceeds JSON field limits", ErrSSEStreamScanError)
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: cross-event inspection incomplete: %s", ErrSSEStreamScanError, err.Error())
+		}
+		fieldTail.Advance(frame, false)
+		fieldInjectionTail.Advance(frame, false)
+
+		// Update rolling tails.
+		if currentText != "" {
+			current := []byte(currentText)
+			injectionTail.advance(current, false)
+			dlpTail = advanceSSERollingTail(dlpTail, current, false, "")
+			cardTail = advanceSSERollingTail(cardTail, []byte(currentCardText), false, "")
+			previousLastNumber = currentLastNumber
+		}
+
+		if warnedFinding != nil && opts.Warning.ConfirmFinding != nil {
+			if err := opts.Warning.ConfirmFinding(warnedFinding); err != nil {
+				return fmt.Errorf("a2a finding confirmation: %w", err)
+			}
+		}
+
+		// Forward inspected event. Preserve id, event, and retry fields from the
+		// SSE reader so downstream consumers can correlate events, handle
+		// typed dispatching, and respect reconnection timing.
+		if werr := writeSSEEvent(w, event, reader.LastEventID(), reader.LastEventType(), reader.LastRetry()); werr != nil {
+			return fmt.Errorf("a2a stream write: %w", werr)
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+}
+
+func extractTextViewsFromEvent(event []byte) (string, string, bool, bool, bool) {
+	if len(event) == 0 {
+		return "", "", false, false, false
+	}
+	extracted := extract.AllStringsFromJSONResult(json.RawMessage(event))
+	texts := extracted.Strings
+	if len(texts) == 0 {
+		return "", "", false, false, extracted.Truncated
+	}
+	atoms := extracted.Atoms
+	var firstNumber, lastNumber, haveValue bool
+	for _, atom := range atoms {
+		if atom.Key {
+			continue
+		}
+		if !haveValue {
+			firstNumber = atom.Number
+			haveValue = true
+		}
+		lastNumber = atom.Number
+	}
+	return strings.Join(texts, " "), extract.JoinCardAtoms(atoms, " "), firstNumber, lastNumber, extracted.Truncated
+}
+
+// writeSSEEvent writes a single SSE event to the writer, preserving the
+// id, event type, and retry fields for downstream correlation, typed
+// dispatching, and reconnection support. Returns the first write error
+// so callers can break their event loops promptly when the downstream
+// consumer goes away (e.g. an io.Pipe closed by the client).
+func writeSSEEvent(w io.Writer, data []byte, eventID, eventType, retry string) error {
+	if eventType != "" {
+		if _, err := fmt.Fprintf(w, "event: %s\n", eventType); err != nil {
+			return err
+		}
+	}
+	if eventID != "" {
+		if _, err := fmt.Fprintf(w, "id: %s\n", eventID); err != nil {
+			return err
+		}
+	}
+	if retry != "" {
+		if _, err := fmt.Fprintf(w, "retry: %s\n", retry); err != nil {
+			return err
+		}
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if _, err := fmt.Fprintf(w, "data: %s\n", line); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(w, "\n"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// IsConfigMismatch reports whether every finding in this A2A scan result is a
+// config-mismatch SSRF block (domain in api_allowlist but not trusted_domains).
+// Returns false when clean, when non-URL findings exist, or when any URL
+// finding is a real threat.
+func (r A2AScanResult) IsConfigMismatch() bool {
+	if r.Clean {
+		return false
+	}
+	if len(r.DLPFindings) > 0 || len(r.InjectFindings) > 0 {
+		return false
+	}
+	if len(r.URLFindings) == 0 {
+		return false
+	}
+	for _, f := range r.URLFindings {
+		if !f.IsConfigMismatch() {
+			return false
+		}
+	}
+	return true
+}
+
+// IsInfrastructureError reports whether every finding in this A2A scan result
+// is an infrastructure error (e.g., DNS resolver timeout on an embedded URL).
+// Returns false when clean, when non-URL findings exist, or when any URL
+// finding is a real threat or config mismatch. When true, callers should treat
+// the block as score-neutral for adaptive enforcement - resolver wobble from
+// embedded URL fields is not evidence of agent misbehavior.
+func (r A2AScanResult) IsInfrastructureError() bool {
+	if r.Clean {
+		return false
+	}
+	if len(r.DLPFindings) > 0 || len(r.InjectFindings) > 0 {
+		return false
+	}
+	if len(r.URLFindings) == 0 {
+		return false
+	}
+	for _, f := range r.URLFindings {
+		if !f.IsInfrastructureError() {
+			return false
+		}
+	}
+	return true
+}
+
+// IsAdaptiveNeutral reports whether this A2A result should be score-neutral
+// for adaptive enforcement. It covers heuristic findings, protective
+// enforcement and infrastructure errors, but NOT config mismatch
+// (which remains a bounded NearMiss signal).
+func (r A2AScanResult) IsAdaptiveNeutral() bool {
+	if r.Clean {
+		return false
+	}
+	if r.IsEntropyOnly() || r.IsInformationalCardRuns() {
+		return true
+	}
+	if len(r.DLPFindings) > 0 || len(r.InjectFindings) > 0 {
+		return false
+	}
+	if len(r.URLFindings) == 0 {
+		return false
+	}
+	for _, f := range r.URLFindings {
+		if !f.IsAdaptiveNeutral() {
+			return false
+		}
+	}
+	return true
+}
+
+// IsInformationalCardRuns excludes other evidence and incomplete inspection.
+func (r A2AScanResult) IsInformationalCardRuns() bool {
+	return scanner.OnlyInformational(r.DLPFindings) && len(r.InjectFindings) == 0 && len(r.URLFindings) == 0 && r.EntropyFinding == nil && !r.BudgetExceeded && !r.InspectionIncomplete && r.ScanError == ""
+}
+
+// IsEntropyOnly distinguishes opaque content from concrete A2A findings even
+// when both are reported under the same transport label.
+func (r A2AScanResult) IsEntropyOnly() bool {
+	if r.EntropyFinding == nil || len(r.DLPFindings) > 0 || len(r.InjectFindings) > 0 ||
+		r.BudgetExceeded || r.ScanError != "" {
+		return false
+	}
+	for _, finding := range r.URLFindings {
+		if !finding.IsEntropyOnly() {
+			return false
+		}
+	}
+	return true
+}
+
+// --- Helpers ---
+
+// buildA2AReason constructs a human-readable reason string from scan findings.
+func buildA2AReason(result A2AScanResult) string {
+	var parts []string
+	if len(result.URLFindings) > 0 {
+		parts = append(parts, fmt.Sprintf("%d URL/SSRF finding(s)", len(result.URLFindings)))
+	}
+	if len(result.InjectFindings) > 0 {
+		names := make([]string, 0, len(result.InjectFindings))
+		for _, m := range result.InjectFindings {
+			names = append(names, m.PatternName)
+		}
+		parts = append(parts, "injection: "+strings.Join(names, ", "))
+	}
+	if len(result.DLPFindings) > 0 {
+		names := make([]string, 0, len(result.DLPFindings))
+		for _, m := range result.DLPFindings {
+			names = append(names, m.PatternName)
+		}
+		parts = append(parts, "DLP: "+strings.Join(names, ", "))
+	}
+	if result.EntropyFinding != nil {
+		parts = append(parts, contententropy.Reason(result.EntropyFinding))
+	}
+	if result.BudgetExceeded {
+		parts = append(parts, "payload exceeded node budget")
+	}
+	if len(parts) == 0 {
+		return "a2a: finding detected"
+	}
+	return "a2a: " + strings.Join(parts, "; ")
+}

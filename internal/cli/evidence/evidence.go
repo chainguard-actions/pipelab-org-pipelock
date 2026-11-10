@@ -1,0 +1,547 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package evidence implements the free single-agent evidence viewer CLI
+// command. It renders one agent's decision receipts as a static,
+// self-contained, offline HTML report. No server, no persistence, no
+// license check, single-agent only.
+package evidence
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/coveragecertverify"
+	"github.com/luckyPipewrench/pipelock/internal/evidenceview"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/signingflag"
+)
+
+// Cmd returns the `pipelock evidence` command tree (Free tier).
+func Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "evidence",
+		Short: "Offline evidence viewer for a single agent (Free)",
+	}
+	cmd.AddCommand(viewCmd())
+	cmd.AddCommand(serveCmd())
+	cmd.AddCommand(expireCmd())
+	cmd.AddCommand(compactCmd())
+	cmd.AddCommand(inspectEpochsCmd())
+	cmd.AddCommand(verifyEpochPinCmd())
+	cmd.AddCommand(inventoryLegacyEpochsCmd())
+	cmd.AddCommand(verifyLegacyEpochInventoryCmd())
+	cmd.AddCommand(doctorCmd())
+	cmd.AddCommand(verifyCertCmd())
+	return cmd
+}
+
+const (
+	defaultEvidenceServeListen     = "127.0.0.1:0"
+	evidenceServeCSP               = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'none'"
+	evidenceServeReadHeaderTimeout = 5 * time.Second
+	evidenceServeReadTimeout       = 30 * time.Second
+	evidenceServeWriteTimeout      = 30 * time.Second
+	evidenceServeShutdownTimeout   = 5 * time.Second
+)
+
+type viewOptions struct {
+	receiptDir     string
+	sessionID      string
+	locationID     string
+	trustedSigners []string
+	outFile        string
+	title          string
+}
+
+func viewCmd() *cobra.Command {
+	opts := viewOptions{}
+	cmd := &cobra.Command{
+		Use:   "view",
+		Short: "Render a single agent's evidence as a self-contained HTML report",
+		Long: `Read one agent's decision receipts from a flight-recorder evidence
+directory and render a static, self-contained HTML report. The report
+includes the four-line bounded scorecard, a receipt timeline, and
+per-receipt decision explanations.
+
+No server, no persistence, no license required. For the multi-agent
+cross-agent evidence console, see the Pro/Enterprise dashboard.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runView(cmd, opts)
+		},
+	}
+	cmd.Flags().StringVar(&opts.receiptDir, "receipt-dir", "",
+		"flight-recorder evidence directory holding action receipts")
+	cmd.Flags().StringVar(&opts.sessionID, "session", "",
+		"session ID to render; if omitted, uses the single or first session")
+	cmd.Flags().StringVar(&opts.locationID, "location", "", "location path relative to the evidence directory")
+	cmd.Flags().StringArrayVar(&opts.trustedSigners, "trusted-signer", nil,
+		"trusted receipt signing key as comma-separated kv pairs: "+
+			"'(inline=HEX_OR_VERSIONED_PUBLIC_KEY|file=/path)[,source=LABEL]'; repeatable")
+	cmd.Flags().StringVar(&opts.outFile, "out", "",
+		"output file path; defaults to stdout")
+	cmd.Flags().StringVar(&opts.title, "title", "Pipelock Evidence Report",
+		"report title shown in the HTML output")
+	_ = cmd.MarkFlagRequired("receipt-dir")
+	return cmd
+}
+
+func runView(cmd *cobra.Command, opts viewOptions) error {
+	_, err := validateReceiptDir(opts.receiptDir)
+	if err != nil {
+		return err
+	}
+	location, locationErr := recorder.ResolveEvidenceLocation(opts.receiptDir, opts.locationID)
+	if locationErr != nil {
+		return fmt.Errorf("resolve evidence location: %w", locationErr)
+	}
+	trusted, err := signingflag.ParseTrustedSigners(opts.trustedSigners)
+	if err != nil {
+		return err
+	}
+	sessionID, err := resolveSession(cmd, location, opts.sessionID)
+	if err != nil {
+		return err
+	}
+	html, err := renderSessionHTML(location, sessionID, trusted, opts.title)
+	if err != nil {
+		return err
+	}
+	w := cmd.OutOrStdout()
+	if opts.outFile != "" {
+		cleanOut := filepath.Clean(opts.outFile)
+		f, createErr := os.OpenFile(cleanOut, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if createErr != nil {
+			return fmt.Errorf("--out: %w", createErr)
+		}
+		defer func() { _ = f.Close() }()
+		w = f
+	}
+
+	_, err = w.Write(html)
+	return err
+}
+
+type serveOptions struct {
+	receiptDir string
+	sessionID  string
+	locationID string
+	listen     string
+}
+
+type expireOptions struct {
+	configFile    string
+	receiptDir    string
+	retentionDays int
+}
+
+func expireCmd() *cobra.Command {
+	opts := expireOptions{}
+	cmd := &cobra.Command{
+		Use:   "expire",
+		Short: "Expire old flight-recorder evidence files",
+		Long: `Remove raw-escrow sidecars older than retention_days.
+JSONL receipt-chain shards are preserved because deleting a shard can break
+full-history offline verification and published anchor replay.
+
+Use --config to apply flight_recorder.dir and flight_recorder.retention_days
+from the runtime config, or pass --receipt-dir and --retention-days directly.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			retentionChanged := cmd.Flags().Changed("retention-days")
+			return runExpire(cmd, opts, retentionChanged)
+		},
+	}
+	cmd.Flags().StringVarP(&opts.configFile, "config", "c", "", "config file with flight_recorder settings")
+	cmd.Flags().StringVar(&opts.receiptDir, "receipt-dir", "", "flight-recorder evidence directory")
+	cmd.Flags().IntVar(&opts.retentionDays, "retention-days", 0, "retention window in days; 0 keeps evidence forever")
+	return cmd
+}
+
+func runExpire(cmd *cobra.Command, opts expireOptions, retentionChanged bool) error {
+	dir := opts.receiptDir
+	retentionDays := opts.retentionDays
+	if opts.configFile != "" {
+		cfg, err := config.Load(opts.configFile)
+		if err != nil {
+			return fmt.Errorf("load config: %w", err)
+		}
+		if dir == "" {
+			dir = cfg.FlightRecorder.Dir
+		}
+		if !retentionChanged {
+			retentionDays = cfg.FlightRecorder.RetentionDays
+		}
+	}
+	if dir == "" {
+		return errors.New("set --config with flight_recorder.dir or pass --receipt-dir")
+	}
+	if retentionDays < 0 {
+		return errors.New("--retention-days must be non-negative")
+	}
+	if retentionDays == 0 {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "retention disabled for %s; expired 0 old raw escrow sidecar(s)\n", filepath.Clean(dir))
+		return nil
+	}
+	rec, err := recorder.New(recorder.Config{
+		Enabled:       true,
+		Dir:           dir,
+		RetentionDays: retentionDays,
+	}, nil, nil)
+	if err != nil {
+		return fmt.Errorf("open flight recorder: %w", err)
+	}
+	defer func() { _ = rec.Close() }()
+	removed, err := rec.ExpireOldFiles()
+	if err != nil {
+		return fmt.Errorf("expire evidence files: %w", err)
+	}
+	_, _ = fmt.Fprintf(
+		cmd.OutOrStdout(),
+		"expired %d old raw escrow sidecar(s) from %s using retention_days=%d\n",
+		removed,
+		filepath.Clean(dir),
+		retentionDays,
+	)
+	return nil
+}
+
+func serveCmd() *cobra.Command {
+	opts := serveOptions{listen: defaultEvidenceServeListen}
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Serve one agent's evidence as a read-only HTML report",
+		Long: `Read one agent's decision receipts from a flight-recorder evidence
+directory and serve a single-session, read-only HTML report at GET /.
+
+No license required. The server binds exactly one session at startup and
+does not expose any route or query parameter that can select another session.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runServe(cmd, opts)
+		},
+	}
+	cmd.Flags().StringVar(&opts.receiptDir, "receipt-dir", "",
+		"flight-recorder evidence directory holding action receipts")
+	cmd.Flags().StringVar(&opts.sessionID, "session", "",
+		"session ID to serve; required when the receipt directory contains multiple sessions")
+	cmd.Flags().StringVar(&opts.locationID, "location", "", "location path relative to the evidence directory")
+	cmd.Flags().StringVar(&opts.listen, "listen", defaultEvidenceServeListen,
+		"TCP listen address for the read-only evidence server")
+	_ = cmd.MarkFlagRequired("receipt-dir")
+	return cmd
+}
+
+func runServe(cmd *cobra.Command, opts serveOptions) error {
+	_, err := validateReceiptDir(opts.receiptDir)
+	if err != nil {
+		return err
+	}
+	location, locationErr := recorder.ResolveEvidenceLocation(opts.receiptDir, opts.locationID)
+	if locationErr != nil {
+		return fmt.Errorf("resolve evidence location: %w", locationErr)
+	}
+	sessionID, err := resolveServeSessionResolved(location, opts.sessionID)
+	if err != nil {
+		return err
+	}
+	ln, err := (&net.ListenConfig{}).Listen(cmd.Context(), "tcp", opts.listen)
+	if err != nil {
+		return fmt.Errorf("--listen %q: %w", opts.listen, err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	srv := &http.Server{
+		Handler:           evidenceServeHandler(location, sessionID),
+		ReadHeaderTimeout: evidenceServeReadHeaderTimeout,
+		ReadTimeout:       evidenceServeReadTimeout,
+		WriteTimeout:      evidenceServeWriteTimeout,
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "pipelock evidence serve listening on http://%s\n", ln.Addr().String())
+
+	select {
+	case err := <-errCh:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-cmd.Context().Done():
+		ctx, cancel := context.WithTimeout(context.Background(), evidenceServeShutdownTimeout)
+		defer cancel()
+		if shutdownErr := srv.Shutdown(ctx); shutdownErr != nil {
+			return shutdownErr
+		}
+		err := <-errCh
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return cmd.Context().Err()
+		}
+		return err
+	}
+}
+
+func evidenceServeHandler(location recorder.EvidenceLocation, sessionID string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", evidenceServeCSP)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		html, err := renderSessionHTML(location, sessionID, nil, "Pipelock Evidence Report")
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "evidence serve: render evidence report: %v\n", err)
+			http.Error(w, "render evidence report", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		_, _ = w.Write(html)
+	})
+}
+
+func renderSessionHTML(
+	location recorder.EvidenceLocation,
+	sessionID string,
+	trusted map[string]evidenceview.TrustedKey,
+	title string,
+) ([]byte, error) {
+	receipts, readLimited, err := receipt.ExtractReceiptsFromResolvedSessionDirBounded(
+		location, sessionID, evidenceview.DashboardReceiptReadLimit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("reading receipts for session %q: %w", sessionID, err)
+	}
+	if err := validateSingleActorReceipts(sessionID, receipts); err != nil {
+		return nil, err
+	}
+
+	ev := evidenceview.SessionEvidenceOf(
+		sessionID, receipts, trusted,
+		readLimited,
+		evidenceview.DashboardReceiptReadLimit,
+		evidenceview.DashboardTimelineLimit,
+	)
+
+	// Build a seq-to-receipt index so explanations match the timeline window.
+	seqIndex := make(map[uint64]int, len(receipts))
+	for i, r := range receipts {
+		seqIndex[r.ActionRecord.ChainSeq] = i
+	}
+	explanations := make([]evidenceview.DecisionExplanation, len(ev.Timeline))
+	for i, ti := range ev.Timeline {
+		if idx, ok := seqIndex[ti.Seq]; ok {
+			explanations[i] = evidenceview.ExplainReceipt(receipts[idx])
+		}
+	}
+
+	var buf bytes.Buffer
+	renderOpts := evidenceview.RenderOptions{
+		Title:       title,
+		GeneratedAt: time.Now(),
+	}
+	if err := evidenceview.RenderSingleAgentHTML(&buf, ev, explanations, renderOpts); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// anonymousActor is pipelock's default actor for unattributed requests (no agent
+// identity supplied). It is not a distinct agent, so it must not trip the
+// single-agent guard: a normal single-agent session routinely mixes its named
+// agent's receipts with unattributed ("anonymous") traffic, and rejecting that
+// would break the free view on legitimate real data. The guard rejects only when
+// two or more DISTINCT NAMED actors appear (the real cross-agent leak).
+const anonymousActor = "anonymous"
+
+// validateSingleActorReceipts refuses to render a session whose receipts carry
+// two or more distinct NAMED agent labels.
+//
+// The refusal is a CONFIDENTIALITY control, not a tier gate: one agent's report
+// would disclose another agent's target URLs, and those can carry capability
+// tokens. TestServeCmd_MixedActorSessionFailsClosed pins that property.
+//
+// It previously counted LIFECYCLE records too. The proxy opens every session
+// under its own identity while the mediated actions carry the resolved request
+// agent, so an ordinary single-agent session held two labels and was refused
+// with no attacker and no second agent involved. Counting only non-lifecycle
+// labels fixes that, and matches what agentLabel already did one function away.
+//
+// Residual, accepted deliberately: on a listener without a bound identity the
+// label is caller-supplied, so a caller who injects a distinct NAMED label can
+// still deny the operator this view. Rendering anyway would trade that
+// availability loss for disclosure of another agent's capability URLs, which is
+// the worse direction. Closing it properly needs receipt-carried provenance so
+// the guard can ignore unbound labels, which a v1 receipt cannot express.
+func validateSingleActorReceipts(sessionID string, receipts []receipt.Receipt) error {
+	named := make([]string, 0, 2)
+	for _, key := range evidenceview.DistinctActorKeys(sessionID, receipts) {
+		if !evidenceview.IsAnonymousActorLabel(key, anonymousActor) {
+			named = append(named, key)
+		}
+	}
+	if len(named) < 2 {
+		return nil
+	}
+	return fmt.Errorf(
+		"session %q contains receipts under %d different agent labels (%s). the single-agent "+
+			"view refuses these because one agent's report would disclose another's target URLs, "+
+			"which can carry capability tokens. note that a v1 receipt records the label but not "+
+			"how it was established, so if this session should have only one agent, a caller may "+
+			"have supplied the extra label: set bind_default_agent_identity to make the label "+
+			"infrastructure-bound. for evidence that really does span agents, use the multi-agent "+
+			"evidence console",
+		sessionID, len(named), strings.Join(named, ", "))
+}
+
+func validateReceiptDir(dir string) (string, error) {
+	cleanDir := filepath.Clean(dir)
+	info, err := os.Stat(cleanDir)
+	if err != nil {
+		return "", fmt.Errorf("--receipt-dir: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("--receipt-dir %q is not a directory", dir)
+	}
+	return cleanDir, nil
+}
+
+// resolveSession picks the single session to render. If --session is set,
+// use it. Otherwise list sessions: if exactly one, use it; if multiple,
+// pick the first alphabetically and print a note that multi-agent console
+// is available in Pro.
+func resolveSession(cmd *cobra.Command, location recorder.EvidenceLocation, explicit string) (string, error) {
+	sessionsResult, err := recorder.ListSessionsBoundedResultResolved(location, 0)
+	if err != nil {
+		return "", fmt.Errorf("listing sessions: %w", err)
+	}
+	sessions := sessionsResult.Sessions
+	if explicit != "" {
+		// Verify the requested session actually exists rather than silently
+		// rendering an empty report for a typo'd or nonexistent session ID.
+		for _, s := range sessions {
+			if s == explicit {
+				return explicit, nil
+			}
+		}
+		return "", fmt.Errorf("session %q not found in %q", explicit, location.Dir)
+	}
+	if len(sessions) == 0 {
+		return "", fmt.Errorf("no sessions found in %q", location.Dir)
+	}
+	if len(sessions) == 1 {
+		return sessions[0], nil
+	}
+	// Multiple sessions: pick the first, note multi-agent is Pro.
+	_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+		"pipelock: note: %d sessions found in the evidence directory; "+
+			"rendering only session %q. The multi-agent cross-agent console "+
+			"is available in Pipelock Pro.\n",
+		len(sessions), sessions[0])
+	return sessions[0], nil
+}
+
+func resolveServeSession(dir, explicit string) (string, error) {
+	location, err := recorder.ResolveEvidenceLocation(dir, "")
+	if err != nil {
+		return "", fmt.Errorf("resolve evidence location: %w", err)
+	}
+	return resolveServeSessionResolved(location, explicit)
+}
+
+func resolveServeSessionResolved(location recorder.EvidenceLocation, explicit string) (string, error) {
+	sessionsResult, err := recorder.ListSessionsBoundedResultResolved(location, 0)
+	if err != nil {
+		return "", fmt.Errorf("listing sessions: %w", err)
+	}
+	sessions := sessionsResult.Sessions
+	if explicit != "" {
+		for _, s := range sessions {
+			if s == explicit {
+				return explicit, nil
+			}
+		}
+		return "", fmt.Errorf("session %q not found in %q", explicit, location.Dir)
+	}
+	if len(sessions) == 0 {
+		return "", fmt.Errorf("no sessions found in %q", location.Dir)
+	}
+	if len(sessions) == 1 {
+		return sessions[0], nil
+	}
+	return "", fmt.Errorf(
+		"%d sessions found in %q; pass --session <id> to bind exactly one session",
+		len(sessions), location.Dir,
+	)
+}
+
+// verify-cert subcommand: free offline verification of coverage certificates.
+
+type verifyCertOptions struct {
+	certFile       string
+	trustedSigners []string
+	allowUnpinned  bool
+}
+
+func verifyCertCmd() *cobra.Command {
+	opts := verifyCertOptions{}
+	cmd := &cobra.Command{
+		Use:   "verify-cert",
+		Short: "Verify a coverage certificate offline (Free)",
+		Long: `Verify a coverage certificate's Ed25519 signature and check the signer
+against the trusted-signer set. Re-derives aggregate counts from the
+per-session data and flags any mismatch with the signed aggregates.
+
+Fully offline: no license, no server, no network. The Free viewer
+VERIFIES a Pro-issued certificate; only Pro issues one.
+
+Fails closed with a non-zero exit if the signature is invalid, the
+aggregate counts do not match, the certificate signer is not in the trusted-
+signer set, or no trusted-signer set is supplied. Pass
+--allow-unpinned only for an explicit structural-only check whose
+signer is not trusted. The signer status is always reported.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runVerifyCert(cmd, opts)
+		},
+	}
+	cmd.Flags().StringVar(&opts.certFile, "cert", "", "coverage certificate JSON file")
+	cmd.Flags().StringArrayVar(&opts.trustedSigners, "trusted-signer", nil,
+		"trusted signing key as comma-separated kv pairs: "+
+			"'(inline=HEX_OR_VERSIONED_PUBLIC_KEY|file=/path)[,source=LABEL]'; repeatable")
+	cmd.Flags().BoolVar(&opts.allowUnpinned, "allow-unpinned", false,
+		"allow structural-only verification when no trusted-signer set is supplied")
+	_ = cmd.MarkFlagRequired("cert")
+	return cmd
+}
+
+func runVerifyCert(cmd *cobra.Command, opts verifyCertOptions) error {
+	return coveragecertverify.Run(coveragecertverify.Options{
+		CertFile:       opts.certFile,
+		TrustedSigners: opts.trustedSigners,
+		AllowUnpinned:  opts.allowUnpinned,
+		Out:            cmd.OutOrStdout(),
+	})
+}

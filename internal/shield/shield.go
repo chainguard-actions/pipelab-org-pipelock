@@ -1,0 +1,882 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// Package shield implements structural HTML and SVG rewriting that strips
+// fingerprinting, extension probing, tracking elements, and agent traps from
+// response bodies before the browser renders them. JavaScript responses and
+// existing inline HTML scripts are never edited.
+//
+// The engine compiles all detection patterns once at construction and reuses
+// them across requests. Four pipelines are supported:
+//
+//   - PipelineHTML: structural stripping outside scripts, plus optional shim injection
+//   - PipelineXHTML: XML-compatible structural stripping outside scripts
+//   - PipelineJS:   pass-through; scanning is owned by the response scanner
+//   - PipelineSVG:  whole-element active-content removal
+package shield
+
+import (
+	"bytes"
+	"mime"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/media"
+	"golang.org/x/net/html"
+)
+
+// PipelineType determines which rewriting pipeline applies to a response.
+type PipelineType int
+
+const (
+	// PipelineNone means the content type is not rewritable (images, JSON, etc.).
+	PipelineNone PipelineType = iota
+	// PipelineHTML applies structural stripping outside existing script elements,
+	// optional shim injection, and element removal.
+	PipelineHTML
+	// PipelineJS identifies JavaScript for shield reporting but never edits it.
+	PipelineJS
+	// PipelineSVG removes active-content elements rather than editing script bodies.
+	PipelineSVG
+	// PipelineXHTML applies HTML rewriting with XML self-closing-element rules.
+	// It is distinct from PipelineHTML because <script/> is a script start tag in
+	// text/html but an empty script element in application/xhtml+xml.
+	PipelineXHTML
+)
+
+// Result holds the outcome of a shield rewrite.
+type Result struct {
+	Rewritten     bool         // true if any content was modified
+	Original      string       // original content preserved for dual-scan comparison
+	Content       string       // rewritten content (identical to Original when Rewritten is false)
+	ExtensionHits int          // chrome-extension:// / moz-extension:// patterns stripped
+	TrackingHits  int          // tracking pixels and prefetch links removed
+	TrapHits      int          // hidden DOM traps and comment traps removed
+	ShimInjected  bool         // true if the opt-in fingerprint shim was prepended
+	PipelineUsed  PipelineType // which pipeline was applied
+
+	// SVG active content strip counts. SVGForeignObjectHits counts elided
+	// <foreignObject> blocks (HTML-in-SVG embedding). SVGEventHandlerHits
+	// counts onXxx attribute removals across all SVG elements.
+	// SVGXlinkExternalHits counts external xlink:href references rewritten
+	// away from absolute URLs. SVGHiddenTextHits counts hidden <text>
+	// blocks removed (opacity:0 / display:none / visibility:hidden).
+	SVGForeignObjectHits      int
+	SVGScriptHits             int
+	SVGEventHandlerHits       int
+	SVGXlinkExternalHits      int
+	SVGHiddenTextHits         int
+	SVGAnimationInjectionHits int
+}
+
+// Engine compiles detection patterns once and reuses them across requests.
+type Engine struct {
+	extensionRe     *regexp.Regexp
+	trackingPixelRe *regexp.Regexp
+	hiddenTrapRe    *regexp.Regexp
+	commentTrapRe   *regexp.Regexp
+	functionStripRe *regexp.Regexp
+	htmlScriptOpen  *regexp.Regexp // locates inline scripts that HTML passes must preserve
+	htmlScriptClose *regexp.Regexp
+	// XML element names are case sensitive, so <SCRIPT> in an XHTML document is
+	// an ordinary unknown element whose child markup must still be rewritten.
+	// Matching it case-insensitively masked that child markup out of every pass.
+	xmlScriptOpen  *regexp.Regexp
+	xmlScriptClose *regexp.Regexp
+	svgScriptRe    *regexp.Regexp // removes whole <script> elements inside SVG
+
+	// SVG active content regexes. Kept separate from the HTML/JS set so
+	// a future SVG-only engine variant can initialize only the patterns
+	// it needs, and so the SVG pipeline doesn't touch the hot HTML path.
+	// External URL refs are split into xlink:href and plain href matchers
+	// so each can be rewritten to its own attribute name (rewriting plain
+	// href to xlink:href in SVG2 without the xmlns:xlink declaration
+	// produces an unbound-prefix XML parse error).
+	svgForeignObjectRe      *regexp.Regexp
+	svgEventHandlerRe       *regexp.Regexp
+	svgXlinkExternalRe      *regexp.Regexp
+	svgHrefExternalRe       *regexp.Regexp
+	svgHiddenTextStyle      *regexp.Regexp
+	svgHiddenTextAttrRe     *regexp.Regexp
+	svgAnimationInjectionRe *regexp.Regexp
+}
+
+// NewEngine compiles all shield patterns and returns a ready-to-use engine.
+// extraTrackingDomains are operator-supplied domains that are merged into
+// the tracking pixel regex. Panics if any pattern is invalid.
+func NewEngine(extraTrackingDomains []string) *Engine {
+	extRe, trackRe, trapRe, commentRe, funcRe := compilePatterns()
+	// Merge operator-supplied tracking domains into the compiled regex.
+	if len(extraTrackingDomains) > 0 {
+		extra := make([]string, 0, len(extraTrackingDomains))
+		for _, d := range extraTrackingDomains {
+			extra = append(extra, regexp.QuoteMeta(d))
+		}
+		merged := trackRe.String() + `|(?i)` + strings.Join(extra, "|")
+		trackRe = regexp.MustCompile(merged)
+	}
+	svgForeignRe, svgEventRe, svgXlinkRe, svgHrefRe, svgHiddenStyleRe, svgHiddenAttrRe, svgAnimRe := compileSVGActivePatterns()
+	return &Engine{
+		extensionRe:     extRe,
+		trackingPixelRe: trackRe,
+		hiddenTrapRe:    trapRe,
+		commentTrapRe:   commentRe,
+		functionStripRe: funcRe,
+		// `\b` also matches before `-` and `:`, so `<script-proxy>` read as a
+		// script start, no `</script>` was found, and the rest of the document
+		// was masked out of every rewrite pass. Require a real element-name
+		// boundary: whitespace, `>`, `/`, or end of input.
+		htmlScriptOpen:  regexp.MustCompile(`(?i)<script(?:[\s/>]|$)`),
+		htmlScriptClose: regexp.MustCompile(`(?is)</script\s*>`),
+		// A namespace-qualified script still executes, so an unprefixed-only
+		// matcher left <h:script> unmasked and its body was rewritten, which
+		// corrupts JavaScript. Accepting any prefix errs toward preserving
+		// bytes. The precise rule is to resolve the expanded name and mask only
+		// {http://www.w3.org/1999/xhtml}script, which needs the XML parsing
+		// tracked separately; until then a prefixed non-script element has its
+		// content preserved rather than rewritten, which is the safer direction
+		// of the two available here.
+		xmlScriptOpen:  regexp.MustCompile(`<(?:[\w.-]+:)?script(?:[\s/>]|$)`),
+		xmlScriptClose: regexp.MustCompile(`(?s)</(?:[\w.-]+:)?script\s*>`),
+		// Attribute values may contain `>`, so `[^>]*` ended the tag early and a
+		// self-closing script element survived. Consume quoted values whole, and
+		// require the same element-name boundary as above.
+		svgScriptRe:             regexp.MustCompile(`(?is)<(?:[\w.-]+:)?script(?:\s(?:"[^"]*"|'[^']*'|[^>"'])*)?>.*?</(?:[\w.-]+:)?script\s*>|<(?:[\w.-]+:)?script(?:\s(?:"[^"]*"|'[^']*'|[^>"'])*)?/\s*>`),
+		svgForeignObjectRe:      svgForeignRe,
+		svgEventHandlerRe:       svgEventRe,
+		svgXlinkExternalRe:      svgXlinkRe,
+		svgHrefExternalRe:       svgHrefRe,
+		svgHiddenTextStyle:      svgHiddenStyleRe,
+		svgHiddenTextAttrRe:     svgHiddenAttrRe,
+		svgAnimationInjectionRe: svgAnimRe,
+	}
+}
+
+// DetectPipeline determines the shield pipeline from a Content-Type header
+// value and the first bytes of the response body.  When the Content-Type is
+// missing or generic (application/octet-stream), net/http.DetectContentType
+// is used as a fallback.
+func DetectPipeline(contentType string, bodyPrefix []byte) PipelineType {
+	if contentType != "" {
+		// Parse media type, ignoring parameters (charset, boundary, etc.).
+		mediaType, _, _ := mime.ParseMediaType(contentType)
+		if p := mediaTypeToPipeline(mediaType); p != PipelineNone {
+			return p
+		}
+		// If the declared type is specific and unrecognised, trust it.
+		if mediaType != "" && mediaType != "application/octet-stream" {
+			return PipelineNone
+		}
+	}
+
+	// Fallback: content sniffing.
+	if len(bodyPrefix) > 0 {
+		sniffed := http.DetectContentType(bodyPrefix)
+		mediaType, _, _ := mime.ParseMediaType(sniffed)
+		return mediaTypeToPipeline(mediaType)
+	}
+
+	return PipelineNone
+}
+
+// mediaTypeToPipeline maps a parsed media type string to a pipeline.
+func mediaTypeToPipeline(mt string) PipelineType {
+	switch {
+	case mt == "text/html":
+		return PipelineHTML
+	case mt == "application/xhtml+xml":
+		return PipelineXHTML
+	// RFC 9239 section 6: historical JavaScript registrations are aliases
+	// with equivalent processing requirements. The table is shared with
+	// internal/config's unscannable-passthrough classifier so the two
+	// cannot drift apart; see internal/media.JavaScriptMediaTypes.
+	case media.IsJavaScriptMediaType(mt):
+		return PipelineJS
+	case mt == "image/svg+xml":
+		return PipelineSVG
+	default:
+		return PipelineNone
+	}
+}
+
+// Rewrite applies the shield pipeline to content.
+// cfg controls which categories are active. A nil cfg disables all rewriting.
+func (e *Engine) Rewrite(content string, pipeline PipelineType, cfg *config.BrowserShield) Result {
+	return e.RewriteWithNonce(content, pipeline, cfg, "")
+}
+
+// RewriteWithNonce applies the shield pipeline with an optional CSP nonce
+// extracted from response headers. When headerNonce is non-empty, the injected
+// shim <script> tag uses it instead of scanning the document body for a nonce.
+func (e *Engine) RewriteWithNonce(content string, pipeline PipelineType, cfg *config.BrowserShield, headerNonce string) Result {
+	res := Result{
+		Original:     content,
+		Content:      content,
+		PipelineUsed: pipeline,
+	}
+
+	if cfg == nil || pipeline == PipelineNone {
+		return res
+	}
+
+	switch pipeline {
+	case PipelineHTML:
+		e.rewriteHTML(&res, cfg, headerNonce, false)
+	case PipelineXHTML:
+		e.rewriteHTML(&res, cfg, headerNonce, true)
+	case PipelineSVG:
+		e.rewriteSVG(&res, cfg)
+	}
+
+	res.Rewritten = res.Content != res.Original
+	return res
+}
+
+// rewriteHTML applies the full pipeline: regex stripping, trap removal, and
+// optional shim injection. headerNonce overrides body-extracted nonce when
+// non-empty (from CSP response header).
+func (e *Engine) rewriteHTML(res *Result, cfg *config.BrowserShield, headerNonce string, allowSelfClosingScripts bool) {
+	originalDoc := res.Content
+	doc, scripts := e.maskHTMLScriptsWithSelfClosing(res.Content, allowSelfClosingScripts)
+
+	// Extension probing.
+	if cfg.StripExtensionProbing {
+		doc, res.ExtensionHits = e.stripExtensions(doc)
+	}
+
+	// Tracking elements.
+	if cfg.StripTrackingPixels {
+		doc, res.TrackingHits = e.stripTracking(doc)
+	}
+
+	// Hidden traps (elements + comments).
+	if cfg.StripHiddenTraps {
+		doc, res.TrapHits = e.stripTraps(doc, cfg.Strictness, allowSelfClosingScripts)
+	}
+
+	// Shim injection.
+	shims := e.buildShimList(cfg)
+	if len(shims) > 0 {
+		block := buildShimBlockWithNonce(shims, originalDoc, headerNonce)
+		if allowSelfClosingScripts {
+			// XHTML is parsed as XML, so the injected code needs CDATA guards.
+			block = buildShimBlockXML(shims, originalDoc, headerNonce)
+		}
+		doc = injectShim(doc, block)
+		res.ShimInjected = true
+	}
+
+	res.Content = restoreHTMLScripts(doc, scripts)
+}
+
+// rewriteSVG removes whole <script> elements, then applies SVG-specific active
+// content stripping: foreignObject elements, event handler attributes, external
+// xlink:href references, and hidden <text> elements. Removing a complete SVG
+// element cannot leave a partially rewritten JavaScript expression behind.
+//
+// Active content stripping always runs when the SVG pipeline is used - the
+// browser shield is a fail-closed defensive layer, and SVG active content
+// has no legitimate use in agent-visible responses. The strip passes are
+// not gated behind StripHiddenTraps (which is an HTML concept) because
+// they are SVG-specific and the config knob doesn't map cleanly.
+func (e *Engine) rewriteSVG(res *Result, cfg *config.BrowserShield) {
+	doc := res.Content
+	// Remove script elements by parsing the document. A pattern cannot decide
+	// this: the namespace prefix is an XML Name rather than an ASCII word, the
+	// element name is case sensitive, and a closing-tag sequence inside CDATA
+	// is character data. Each of those defeated the pattern separately. The
+	// pattern remains as the fallback for a document XML cannot parse, which a
+	// browser rendering SVG as XML also refuses.
+	if spans, ok := xmlScriptSpans(doc); ok {
+		var out strings.Builder
+		prev := 0
+		for _, span := range spans {
+			out.WriteString(doc[prev:span.start])
+			prev = span.end
+		}
+		out.WriteString(doc[prev:])
+		doc, res.SVGScriptHits = out.String(), len(spans)
+	} else {
+		doc, res.SVGScriptHits = countReplace(e.svgScriptRe, doc)
+	}
+
+	// SVG active content stripping: foreignObject, event handlers, external
+	// xlink:href / href references, and hidden text (both style= and
+	// presentation-attribute forms). Each pass counts its own stat so the
+	// caller can see exactly which vector fired.
+	doc, res.SVGForeignObjectHits = countReplace(e.svgForeignObjectRe, doc)
+	doc, res.SVGEventHandlerHits = countReplace(e.svgEventHandlerRe, doc)
+	doc, res.SVGAnimationInjectionHits = countReplace(e.svgAnimationInjectionRe, doc)
+
+	// Rewrite each external ref form back to its own attribute name so the
+	// output stays well-formed XML. Without the split, plain href in an
+	// SVG2 document (with no xmlns:xlink) would be rewritten to xlink:href
+	// and fail to parse under a strict XML parser.
+	var xlinkHits, hrefHits int
+	doc, xlinkHits = countReplaceFunc(e.svgXlinkExternalRe, doc, func(_ string) string {
+		return ` xlink:href="#_stripped"`
+	})
+	doc, hrefHits = countReplaceFunc(e.svgHrefExternalRe, doc, func(_ string) string {
+		return ` href="#_stripped"`
+	})
+	res.SVGXlinkExternalHits = xlinkHits + hrefHits
+
+	// Hidden <text>: both inline style= form and SVG presentation
+	// attributes (display="none", visibility="hidden", opacity="0").
+	var hiddenStyleHits, hiddenAttrHits int
+	doc, hiddenStyleHits = replaceVerified(e.svgHiddenTextStyle, doc, styleHides)
+	doc, hiddenAttrHits = countReplace(e.svgHiddenTextAttrRe, doc)
+	res.SVGHiddenTextHits = hiddenStyleHits + hiddenAttrHits
+
+	// Strip hidden traps in the SVG XML body outside scripts.
+	if cfg.StripHiddenTraps {
+		var trapHits int
+		doc, trapHits = e.stripTraps(doc, cfg.Strictness, true)
+		res.TrapHits += trapHits
+	}
+
+	res.Content = doc
+}
+
+// stripExtensions removes extension-probing URLs and function names.
+func (e *Engine) stripExtensions(s string) (string, int) {
+	total := 0
+	s, n := countReplace(e.extensionRe, s)
+	total += n
+	s, n = countReplace(e.functionStripRe, s)
+	total += n
+	return s, total
+}
+
+// stripTracking removes tracking pixels and prefetch links.
+func (e *Engine) stripTracking(s string) (string, int) {
+	return countReplace(e.trackingPixelRe, s)
+}
+
+// maskedHTMLScript records an existing HTML script block under a collision-free
+// placeholder. Masking keeps every HTML regex pass away from JavaScript while
+// still allowing a containing hidden HTML element to be removed as a unit.
+type maskedHTMLScript struct {
+	placeholder string
+	content     string
+}
+
+// uniqueScriptPlaceholderPrefix returns a prefix the document does not already
+// contain. The previous form appended one character per collision and rescanned
+// the whole document each time, so a body carrying the prefix followed by a long
+// run of the pad character cost time quadratic in its own length, on the request
+// path. Counting the longest existing run finds a free prefix in one scan.
+func uniqueScriptPlaceholderPrefix(doc string) string {
+	const base = "\x00pipelock-inline-script-"
+	longest := 0
+	for i := 0; ; {
+		j := strings.Index(doc[i:], base)
+		if j < 0 {
+			break
+		}
+		i += j + len(base)
+		run := 0
+		for i+run < len(doc) && doc[i+run] == 'x' {
+			run++
+		}
+		if run+1 > longest {
+			longest = run + 1
+		}
+	}
+	return base + strings.Repeat("x", longest)
+}
+
+func (e *Engine) maskHTMLScripts(doc string) (string, []maskedHTMLScript) {
+	prefix := uniqueScriptPlaceholderPrefix(doc)
+
+	var masked, script strings.Builder
+	var scripts []maskedHTMLScript
+	inScript := false
+	z := html.NewTokenizer(strings.NewReader(doc))
+	for {
+		tokenType := z.Next()
+		raw := string(z.Raw())
+		if tokenType == html.ErrorToken {
+			if inScript {
+				script.WriteString(raw)
+				placeholder := prefix + strconv.Itoa(len(scripts)) + "\x00"
+				scripts = append(scripts, maskedHTMLScript{placeholder: placeholder, content: script.String()})
+				masked.WriteString(placeholder)
+			} else {
+				masked.WriteString(raw)
+			}
+			break
+		}
+
+		isScript := false
+		if tokenType == html.StartTagToken || tokenType == html.SelfClosingTagToken || tokenType == html.EndTagToken {
+			name, _ := z.TagName()
+			isScript = bytes.EqualFold(name, []byte("script"))
+		}
+
+		if inScript {
+			if tokenType == html.EndTagToken && isScript {
+				placeholder := prefix + strconv.Itoa(len(scripts)) + "\x00"
+				scripts = append(scripts, maskedHTMLScript{placeholder: placeholder, content: script.String()})
+				masked.WriteString(placeholder)
+				// The closing tag is markup, so it stays in the document for the
+				// HTML passes to see, exactly like the opening tag.
+				masked.WriteString(raw)
+				script.Reset()
+				inScript = false
+				continue
+			}
+			script.WriteString(raw)
+			continue
+		}
+
+		if (tokenType == html.StartTagToken || tokenType == html.SelfClosingTagToken) && isScript {
+			// Only the SCRIPT CONTENT is masked. The opening tag is markup, not
+			// JavaScript, so it stays visible: masking it hid attributes from
+			// every HTML pass, and an extension probe written as
+			// <script src="chrome-extension://..."> survived because
+			// StripExtensionProbing never saw the tag.
+			masked.WriteString(raw)
+			inScript = true
+			continue
+		}
+		masked.WriteString(raw)
+	}
+
+	return masked.String(), scripts
+}
+
+// scriptCloseIndex returns the offset of the closing script tag, skipping over
+// complete CDATA sections and comments. A raw search stops at a `</script>`
+// written inside CDATA, which is legal script content; masking then ended
+// early, the remaining script bytes became visible to every rewrite pass, and
+// an extension URL after that point was stripped out of the JavaScript.
+func scriptCloseIndex(re *regexp.Regexp, body string) int {
+	for i := 0; i < len(body); {
+		rest := body[i:]
+		if strings.HasPrefix(rest, "<![CDATA[") {
+			if end := strings.Index(rest, "]]>"); end >= 0 {
+				i += end + len("]]>")
+				continue
+			}
+			return -1 // Unterminated: no closing tag is reachable.
+		}
+		if strings.HasPrefix(rest, "<!--") {
+			if end := strings.Index(rest, "-->"); end >= 0 {
+				i += end + len("-->")
+				continue
+			}
+			return -1
+		}
+		next := strings.IndexAny(rest, "<")
+		if next < 0 {
+			return -1
+		}
+		if loc := re.FindStringIndex(rest[next:]); loc != nil && loc[0] == 0 {
+			return i + next
+		}
+		i += next + 1
+	}
+	return -1
+}
+
+func (e *Engine) maskHTMLScriptsWithSelfClosing(doc string, allowSelfClosingScripts bool) (string, []maskedHTMLScript) {
+	if !allowSelfClosingScripts {
+		return e.maskHTMLScripts(doc)
+	}
+
+	prefix := uniqueScriptPlaceholderPrefix(doc)
+
+	// Prefer the parsed answer. XHTML is XML, so the namespace prefix, the case
+	// of the element name and CDATA content all decide what is a script, and
+	// none of them can be settled by scanning text. The scan below stays as the
+	// fallback for a document XML cannot parse, which a browser parsing XHTML
+	// as XML also refuses.
+	if spans, ok := xmlScriptSpans(doc); ok {
+		var out strings.Builder
+		var parsed []maskedHTMLScript
+		prev := 0
+		for _, span := range spans {
+			out.WriteString(doc[prev:span.content])
+			placeholder := prefix + strconv.Itoa(len(parsed)) + "\x00"
+			parsed = append(parsed, maskedHTMLScript{placeholder: placeholder, content: doc[span.content:span.closing]})
+			out.WriteString(placeholder)
+			out.WriteString(doc[span.closing:span.end])
+			prev = span.end
+		}
+		out.WriteString(doc[prev:])
+		return out.String(), parsed
+	}
+
+	var masked strings.Builder
+	var scripts []maskedHTMLScript
+	remaining := doc
+	for {
+		open := e.findHTMLScriptOpenWithCDATA(remaining, allowSelfClosingScripts)
+		if open < 0 {
+			masked.WriteString(remaining)
+			break
+		}
+
+		masked.WriteString(remaining[:open])
+		fromOpen := remaining[open:]
+		end := len(fromOpen)
+		if openTagEnd := htmlTagEnd(fromOpen); openTagEnd >= 0 {
+			openTag := strings.TrimSpace(fromOpen[:openTagEnd-1])
+			if allowSelfClosingScripts && strings.HasSuffix(openTag, "/") {
+				end = openTagEnd
+			} else if closeAt := scriptCloseIndex(e.xmlScriptClose, fromOpen[openTagEnd:]); closeAt >= 0 {
+				closeTag := e.xmlScriptClose.FindStringIndex(fromOpen[openTagEnd+closeAt:])
+				end = openTagEnd + closeAt + closeTag[1]
+			}
+		}
+
+		// Keep the opening and closing tags in the document. They are markup, and
+		// masking the opening tag hid script attributes from extension stripping
+		// on this path exactly as it did on the HTML path: a probe written as a
+		// script src survived. Only the character data between them is masked,
+		// byte for byte, and this mirrors maskHTMLScripts so the two paths cannot
+		// drift apart again.
+		contentStart, contentEnd := 0, end
+		if openTagEnd := htmlTagEnd(fromOpen); openTagEnd >= 0 && openTagEnd <= end {
+			contentStart = openTagEnd
+			if closeAt := scriptCloseIndex(e.xmlScriptClose, fromOpen[openTagEnd:end]); closeAt >= 0 {
+				contentEnd = openTagEnd + closeAt
+			}
+		}
+		masked.WriteString(fromOpen[:contentStart])
+		placeholder := prefix + strconv.Itoa(len(scripts)) + "\x00"
+		scripts = append(scripts, maskedHTMLScript{placeholder: placeholder, content: fromOpen[contentStart:contentEnd]})
+		masked.WriteString(placeholder)
+		masked.WriteString(fromOpen[contentEnd:end])
+		remaining = fromOpen[end:]
+	}
+
+	return masked.String(), scripts
+}
+
+func (e *Engine) findHTMLScriptOpen(doc string) int {
+	return e.findHTMLScriptOpenWithCDATA(doc, false)
+}
+
+func (e *Engine) findHTMLScriptOpenWithCDATA(doc string, allowCDATA bool) int {
+	for offset := 0; offset < len(doc); {
+		relative := strings.IndexByte(doc[offset:], '<')
+		if relative < 0 {
+			return -1
+		}
+		candidate := offset + relative
+		rest := doc[candidate:]
+		switch {
+		case strings.HasPrefix(rest, "<!--"):
+			end := strings.Index(rest[4:], "-->")
+			if end < 0 {
+				return -1
+			}
+			offset = candidate + 4 + end + len("-->")
+			continue
+		case allowCDATA && strings.HasPrefix(rest, "<![CDATA["):
+			end := strings.Index(rest[9:], "]]>")
+			if end < 0 {
+				return -1
+			}
+			offset = candidate + 9 + end + len("]]>")
+			continue
+		}
+
+		// allowCDATA marks the XHTML caller, where element names are case
+		// sensitive: <SCRIPT> there is an ordinary element, not a script.
+		opener := e.htmlScriptOpen
+		if allowCDATA {
+			opener = e.xmlScriptOpen
+		}
+		if match := opener.FindStringIndex(rest); match != nil && match[0] == 0 {
+			return candidate
+		}
+		end := htmlTagEnd(rest)
+		if end < 0 {
+			return -1
+		}
+		offset = candidate + end
+	}
+	return -1
+}
+
+func htmlTagEnd(tag string) int {
+	var quote byte
+	for i := 1; i < len(tag); i++ {
+		switch {
+		case quote != 0 && tag[i] == quote:
+			quote = 0
+		case quote == 0 && (tag[i] == '\'' || tag[i] == '"'):
+			quote = tag[i]
+		case quote == 0 && tag[i] == '>':
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func restoreHTMLScripts(doc string, scripts []maskedHTMLScript) string {
+	if len(scripts) == 0 {
+		return doc
+	}
+	// One pass over the document rather than one per script. Replacing in a
+	// loop costs document size times script count, which a response full of
+	// tiny scripts can turn into real proxy CPU while staying under the
+	// shield's size limit.
+	replacements := make([]string, 0, len(scripts)*2)
+	for _, script := range scripts {
+		replacements = append(replacements, script.placeholder, script.content)
+	}
+	return strings.NewReplacer(replacements...).Replace(doc)
+}
+
+// stripTraps removes hidden DOM traps and comment traps.
+// Under aggressive strictness, comment traps are always stripped.
+// Under minimal strictness, only hidden-element traps are stripped.
+func (e *Engine) stripTraps(s string, strictness string, xml bool) (string, int) {
+	total := 0
+
+	// Hidden elements are stripped at all strictness levels.
+	s, n := stripHiddenElementTraps(s, xml)
+	total += n
+	s, n = replaceVerified(e.hiddenTrapRe, s, ariaHiddenTrue)
+	total += n
+
+	// Comment traps are stripped at standard and aggressive.
+	if strictness != config.ShieldStrictnessMinimal {
+		s, n = e.stripCommentTraps(s, xml)
+		total += n
+	}
+
+	return s, total
+}
+
+// stripCommentTraps bounds each match to one parsed comment so markup between
+// separate comments cannot become part of a removal. Raw token bytes preserve
+// the document's serialization, including malformed or incomplete input.
+func (e *Engine) stripCommentTraps(doc string, xml bool) (string, int) {
+	if !strings.Contains(doc, "<!--") {
+		return doc, 0
+	}
+	z := html.NewTokenizer(strings.NewReader(doc))
+	z.AllowCDATA(xml)
+	var out strings.Builder
+	out.Grow(len(doc))
+	hits := 0
+	offset := 0
+	missingPITerminator := false
+	// Track foreign-content and integration boundaries from the HTML standard.
+	// https://html.spec.whatwg.org/multipage/parsing.html#parsing-main-inforeign
+	var boundaries []commentBoundary
+	boundaryIndexes := make(map[string]int)
+	popBoundary := func() {
+		boundary := boundaries[len(boundaries)-1]
+		if boundary.previous < 0 {
+			delete(boundaryIndexes, boundary.tag)
+		} else {
+			boundaryIndexes[boundary.tag] = boundary.previous
+		}
+		boundaries = boundaries[:len(boundaries)-1]
+	}
+	for {
+		typ := z.Next()
+		raw := z.Raw()
+		if xml && bytes.HasPrefix(raw, []byte("<?")) {
+			// The HTML tokenizer ends bogus comments at >, but XML processing
+			// instructions end at ?> and their contents are not comment markup.
+			end := -1
+			if !missingPITerminator {
+				end = strings.Index(doc[offset:], "?>")
+				missingPITerminator = end < 0
+			}
+			if end >= 0 {
+				end += offset + 2
+				out.WriteString(doc[offset:end])
+				offset = end
+				z = html.NewTokenizer(strings.NewReader(doc[offset:]))
+				z.AllowCDATA(true)
+				continue
+			}
+			// Preserve this malformed PI span, but keep filtering subsequent
+			// tokens instead of granting the rest of the document a bypass.
+			typ = html.TextToken
+		}
+		offset += len(raw)
+		if xml && (typ == html.StartTagToken || typ == html.SelfClosingTagToken) {
+			// XML has no HTML raw-text elements; literal comments remain markup
+			// inside style/title/textarea as well as after self-closing tags.
+			z.NextIsNotRawText()
+		}
+		if !xml && (typ == html.StartTagToken || typ == html.SelfClosingTagToken || typ == html.EndTagToken) {
+			token := z.Token()
+			tag := token.Data
+			parent := commentBoundary{}
+			if len(boundaries) > 0 {
+				parent = boundaries[len(boundaries)-1]
+			}
+			foreign := parent.foreign || (parent.mathText && (tag == "mglyph" || tag == "malignmark"))
+			if foreign && commentForeignBreakout(token) {
+				for len(boundaries) > 0 && boundaries[len(boundaries)-1].foreign {
+					popBoundary()
+				}
+				foreign = false
+			}
+			if typ == html.EndTagToken {
+				// Unmatched closes must not repeatedly search a deep stack.
+				if index, ok := boundaryIndexes[tag]; ok {
+					for len(boundaries) > index {
+						popBoundary()
+					}
+				}
+			} else {
+				if foreign {
+					z.NextIsNotRawText()
+				}
+				ns := ""
+				if foreign {
+					ns = parent.namespace
+				} else if tag == "svg" || tag == "math" {
+					ns = tag
+				}
+				boundary := commentBoundary{tag: tag, namespace: ns, foreign: ns != ""}
+				if ns == "svg" && (tag == "title" || tag == "desc" || tag == "foreignobject") {
+					boundary.foreign = false
+				}
+				if ns == "math" {
+					switch tag {
+					case "mi", "mo", "mn", "ms", "mtext":
+						boundary.foreign, boundary.mathText = false, true
+					case "annotation-xml":
+						for _, attr := range token.Attr {
+							if attr.Key == "encoding" && (strings.EqualFold(attr.Val, "text/html") || strings.EqualFold(attr.Val, "application/xhtml+xml")) {
+								boundary.foreign = false
+							}
+						}
+					}
+				}
+				// HTML descendants mask integration-point state until their close.
+				// HTML ignores a trailing slash on non-void start tags.
+				trackHTML := ns == "" && !commentHTMLVoid(tag) && (len(boundaries) > 0 || rawTextElements[tag])
+				if (ns != "" && typ == html.StartTagToken) || trackHTML {
+					boundary.previous = -1
+					if index, ok := boundaryIndexes[tag]; ok {
+						boundary.previous = index
+					}
+					boundaryIndexes[tag] = len(boundaries)
+					boundaries = append(boundaries, boundary)
+				}
+			}
+		}
+		match := raw
+		if typ == html.CommentToken && bytes.HasSuffix(raw, []byte("--!>")) {
+			// HTML accepts this alternate closing delimiter. Normalize only the
+			// matching view, retaining raw serialization for ordinary comments.
+			match = append(append([]byte(nil), raw[:len(raw)-4]...), []byte("-->")...)
+		}
+		if typ == html.CommentToken && e.commentTrapRe.Match(match) {
+			hits++
+		} else {
+			out.Write(raw)
+		}
+		if typ == html.ErrorToken {
+			return out.String(), hits
+		}
+	}
+}
+
+type commentBoundary struct {
+	tag, namespace    string
+	foreign, mathText bool
+	previous          int
+}
+
+// commentHTMLVoid identifies HTML elements that do not enter the open-element
+// stack. Foreign elements with the same names are not HTML void elements.
+func commentHTMLVoid(tag string) bool {
+	switch tag {
+	case "area", "base", "basefont", "bgsound", "br", "col", "embed", "hr", "img", "input", "keygen", "link", "meta", "param", "source", "track", "wbr":
+		return true
+	}
+	return false
+}
+
+// commentForeignBreakout identifies the standard tokens that leave foreign
+// content, so later HTML title/style text is not filtered as XML markup.
+func commentForeignBreakout(token html.Token) bool {
+	if token.Type == html.EndTagToken {
+		return token.Data == "br" || token.Data == "p"
+	}
+	switch token.Data {
+	case "b", "big", "blockquote", "body", "br", "center", "code", "dd", "div", "dl", "dt", "em", "embed", "h1", "h2", "h3", "h4", "h5", "h6", "head", "hr", "i", "img", "li", "listing", "menu", "meta", "nobr", "ol", "p", "pre", "ruby", "s", "small", "span", "strong", "strike", "sub", "sup", "table", "tt", "u", "ul", "var":
+		return true
+	case "font":
+		for _, attr := range token.Attr {
+			if attr.Key == "color" || attr.Key == "face" || attr.Key == "size" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// buildShimList assembles the ordered list of shim scripts to inject.
+func (e *Engine) buildShimList(cfg *config.BrowserShield) []string {
+	var shims []string
+	// Extension probing is handled by stripping extension URLs from the
+	// document. The runtime shim that replaced fetch and XMLHttpRequest.open
+	// is no longer injected: replacing native browser functions on every page
+	// is what bot-verification services test for, so a shielded browser was
+	// flagged as tampered and challenged on ordinary navigation. The shield
+	// modifies a page only to remove content it detected.
+	if cfg.InjectFingerprintShims {
+		shims = append(shims, FingerprintShim)
+	}
+	return shims
+}
+
+// cspNonceRe extracts 'nonce-xxx' from Content-Security-Policy headers.
+// Compiled once at package level rather than per-call.
+var cspNonceRe = regexp.MustCompile(`'nonce-([A-Za-z0-9+/=]+)'`)
+
+// ExtractCSPNonce extracts a CSP nonce value from the Content-Security-Policy
+// response header. Returns the first nonce found in any script-src directive,
+// or "" if none is present. This allows the shield shim injection to reuse the
+// page's existing CSP nonce instead of being blocked by the policy.
+func ExtractCSPNonce(headers http.Header) string {
+	csp := headers.Get("Content-Security-Policy")
+	if csp == "" {
+		return ""
+	}
+	if m := cspNonceRe.FindStringSubmatch(csp); len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+// countReplace replaces all matches with empty string and returns the
+// modified string and the number of replacements made.
+func countReplace(re *regexp.Regexp, s string) (string, int) {
+	matches := re.FindAllStringIndex(s, -1)
+	n := len(matches)
+	if n == 0 {
+		return s, 0
+	}
+	return re.ReplaceAllString(s, ""), n
+}
+
+// countReplaceFunc is the callback variant of countReplace. Used for SVG
+// xlink:href rewriting where the replacement is a fixed safe attribute
+// rather than an empty string, so the element tag structure stays valid.
+func countReplaceFunc(re *regexp.Regexp, s string, repl func(match string) string) (string, int) {
+	matches := re.FindAllStringIndex(s, -1)
+	n := len(matches)
+	if n == 0 {
+		return s, 0
+	}
+	return re.ReplaceAllStringFunc(s, repl), n
+}

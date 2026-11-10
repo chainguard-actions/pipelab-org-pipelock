@@ -1,0 +1,348 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package broker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
+)
+
+// ErrAtCapacity is returned when the concurrency cap (the number of live
+// per-visitor machines) is reached. The broker maps it to a 503 + queue message.
+var ErrAtCapacity = errors.New("broker: at machine capacity")
+
+// ErrDuplicateLease is returned when a lease already exists for the session key.
+// The broker generates unique keys, so this is a guard against a double-lease
+// minting a second machine for one session.
+var ErrDuplicateLease = errors.New("broker: lease already exists for session")
+
+// LeaseConfig configures the LeaseManager.
+type LeaseConfig struct {
+	// Provider leases the actual microVMs.
+	Provider MachineProvider
+	// Concurrency caps the number of simultaneously live machines. Required: a
+	// nil limiter means an unbounded machine pool, which is a cost/abuse hole, so
+	// NewLeaseManager rejects it.
+	Concurrency *livechat.ConcurrencyLimiter
+	// Image is the playground image every leased VM boots.
+	Image string
+	// Region / MemoryMB / CPUs / InternalPort size and place each VM.
+	Region       string
+	MemoryMB     int
+	CPUs         int
+	InternalPort int
+	// BaseEnv is the environment common to every VM (PLAYGROUND_* config and the
+	// shared secrets). Per-session values are layered on top at Lease time and
+	// override BaseEnv. Never logged.
+	BaseEnv map[string]string
+	// Log receives teardown failures. Nil uses stderr.
+	Log io.Writer
+}
+
+// Lease is one active per-visitor VM held by the broker.
+type Lease struct {
+	// SessionKey is the broker's identifier for the visitor session this VM
+	// serves.
+	SessionKey string
+	// Machine is the leased VM (its ID for teardown, PrivateIP for routing).
+	Machine *Machine
+	release func()
+}
+
+// LeaseManager owns the lifecycle of per-visitor VMs and the concurrency cap. It
+// is safe for concurrent use.
+type LeaseManager struct {
+	cfg             LeaseConfig
+	mu              sync.Mutex
+	leases          map[string]*Lease
+	quarantine      map[string]*Lease
+	destroying      map[string]struct{}
+	nextRetry       time.Time
+	lastReaperRetry string
+	log             io.Writer
+	logMu           sync.Mutex
+	destroyTimeout  time.Duration
+}
+
+// leaseDestroyTimeout matches the warm-pool teardown deadline. A timed-out
+// deletion remains quarantined and keeps its capacity slot until a retry succeeds.
+const leaseDestroyTimeout = 30 * time.Second
+
+// NewLeaseManager validates cfg and returns a LeaseManager. It rejects a missing
+// provider, concurrency limiter, or image: each is a fail-open hole if absent.
+func NewLeaseManager(cfg LeaseConfig) (*LeaseManager, error) {
+	if cfg.Provider == nil {
+		return nil, errors.New("broker: LeaseConfig.Provider is required")
+	}
+	if cfg.Concurrency == nil {
+		return nil, errors.New("broker: LeaseConfig.Concurrency is required (an unbounded machine pool is an abuse hole)")
+	}
+	if cfg.Image == "" {
+		return nil, errors.New("broker: LeaseConfig.Image is required")
+	}
+	// BaseEnv reaches every visitor VM. Retain a broker-owned copy so a caller
+	// cannot change the configuration after validation and construction.
+	cfg.BaseEnv = maps.Clone(cfg.BaseEnv)
+	log := cfg.Log
+	if log == nil {
+		log = os.Stderr
+	}
+	return &LeaseManager{cfg: cfg, leases: make(map[string]*Lease), quarantine: make(map[string]*Lease), destroying: make(map[string]struct{}), log: log, destroyTimeout: leaseDestroyTimeout}, nil
+}
+
+// Lease provisions one VM for sessionKey. It acquires a concurrency slot, creates
+// the machine, waits for it to be ready, and registers the lease. It is
+// fail-closed: if creation or readiness fails, the slot is released and any
+// created machine is destroyed before returning the error, so a failed lease
+// never leaks a machine or a slot. sessionEnv is layered over BaseEnv (overriding
+// it) — used for the per-session invite code, model key, and orchestrator key.
+func (lm *LeaseManager) Lease(ctx context.Context, sessionKey string, sessionEnv map[string]string) (*Lease, error) {
+	if sessionKey == "" {
+		return nil, errors.New("broker: empty session key")
+	}
+	lm.retryFailedDestroysIfDue(context.WithoutCancel(ctx))
+
+	lm.mu.Lock()
+	if _, exists := lm.leases[sessionKey]; exists {
+		lm.mu.Unlock()
+		return nil, ErrDuplicateLease
+	}
+	lm.mu.Unlock()
+
+	release, ok := lm.cfg.Concurrency.Acquire()
+	if !ok {
+		return nil, ErrAtCapacity
+	}
+
+	spec := MachineSpec{
+		Image:        lm.cfg.Image,
+		Env:          mergeEnv(lm.cfg.BaseEnv, sessionEnv),
+		Region:       lm.cfg.Region,
+		MemoryMB:     lm.cfg.MemoryMB,
+		CPUs:         lm.cfg.CPUs,
+		InternalPort: lm.cfg.InternalPort,
+	}
+
+	m, err := lm.cfg.Provider.CreateMachine(ctx, spec)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("broker: create machine: %w", err)
+	}
+
+	if werr := lm.cfg.Provider.WaitReady(ctx, m.ID); werr != nil {
+		lm.destroyOrQuarantine(context.WithoutCancel(ctx), &Lease{Machine: m, release: release})
+		return nil, fmt.Errorf("broker: machine %s not ready: %w", m.ID, werr)
+	}
+
+	lease := &Lease{SessionKey: sessionKey, Machine: m, release: release}
+
+	lm.mu.Lock()
+	if _, exists := lm.leases[sessionKey]; exists {
+		// Lost a race to another Lease(sessionKey): destroy ours before freeing the slot.
+		lm.mu.Unlock()
+		lm.destroyOrQuarantine(context.WithoutCancel(ctx), &Lease{Machine: m, release: release})
+		return nil, ErrDuplicateLease
+	}
+	lm.leases[sessionKey] = lease
+	lm.mu.Unlock()
+	return lease, nil
+}
+
+// Release stops routing the session and frees its slot only after VM deletion.
+// Failed deletes remain counted in quarantine for retry.
+func (lm *LeaseManager) Release(ctx context.Context, sessionKey string) {
+	lm.mu.Lock()
+	lease, ok := lm.leases[sessionKey]
+	if ok {
+		delete(lm.leases, sessionKey)
+		lm.quarantine[lease.Machine.ID] = lease
+		lm.destroying[lease.Machine.ID] = struct{}{}
+	}
+	lm.mu.Unlock()
+	if ok {
+		lm.destroyQuarantined(context.WithoutCancel(ctx), lease)
+	}
+}
+
+func (lm *LeaseManager) destroyOrQuarantine(ctx context.Context, lease *Lease) {
+	lm.mu.Lock()
+	lm.quarantine[lease.Machine.ID] = lease
+	lm.destroying[lease.Machine.ID] = struct{}{}
+	lm.mu.Unlock()
+	lm.destroyQuarantined(ctx, lease)
+}
+
+// destroyQuarantined honors ctx cancellation. Callers whose cleanup must outlive
+// the request (Release and failed Lease) detach it with context.WithoutCancel.
+func (lm *LeaseManager) destroyQuarantined(ctx context.Context, lease *Lease) {
+	destroyCtx, cancel := context.WithTimeout(ctx, lm.destroyTimeout)
+	err := lm.cfg.Provider.DestroyMachine(destroyCtx, lease.Machine.ID)
+	cancel()
+	lm.mu.Lock()
+	delete(lm.destroying, lease.Machine.ID)
+	if err == nil {
+		delete(lm.quarantine, lease.Machine.ID)
+	}
+	lm.mu.Unlock()
+	if err == nil {
+		lease.release()
+	}
+	if err != nil {
+		lm.logMu.Lock()
+		_, _ = fmt.Fprintf(lm.log, "broker: destroy machine %s failed: %v\n", lease.Machine.ID, err)
+		lm.logMu.Unlock()
+	}
+}
+
+const reaperDestroyRetryBatchSize = 2
+
+// RetryFailedDestroys retries quarantined VMs and returns capacity only after
+// confirmed deletion. The reaper calls this periodically.
+func (lm *LeaseManager) RetryFailedDestroys(ctx context.Context) {
+	lm.mu.Lock()
+	var pending []*Lease
+	ids := make([]string, 0, len(lm.quarantine))
+	for id := range lm.quarantine {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	start, _ := slices.BinarySearch(ids, lm.lastReaperRetry)
+	if start < len(ids) && ids[start] == lm.lastReaperRetry {
+		start++
+	}
+	for offset := range ids {
+		if len(pending) == reaperDestroyRetryBatchSize {
+			break
+		}
+		id := ids[(start+offset)%len(ids)]
+		if _, busy := lm.destroying[id]; busy {
+			continue
+		}
+		lm.destroying[id] = struct{}{}
+		pending = append(pending, lm.quarantine[id])
+		lm.lastReaperRetry = id
+	}
+	lm.mu.Unlock()
+	for i, lease := range pending {
+		if ctx.Err() != nil {
+			// Canceled: hand the unstarted reservations back so a later retry
+			// can claim them. The machines stay quarantined and counted.
+			lm.mu.Lock()
+			for _, rest := range pending[i:] {
+				delete(lm.destroying, rest.Machine.ID)
+			}
+			lm.mu.Unlock()
+			return
+		}
+		lm.destroyQuarantined(ctx, lease)
+	}
+}
+
+const leaseDestroyRetryInterval = 30 * time.Second
+
+// One lease request per interval may prompt recovery. The reaper remains the
+// regular retry path; requests during an outage do not each call the provider.
+func (lm *LeaseManager) retryFailedDestroysIfDue(ctx context.Context) {
+	lm.mu.Lock()
+	if len(lm.quarantine) == 0 || time.Now().Before(lm.nextRetry) {
+		lm.mu.Unlock()
+		return
+	}
+	var retry *Lease
+	for _, lease := range lm.quarantine {
+		if _, busy := lm.destroying[lease.Machine.ID]; !busy {
+			retry = lease
+			lm.destroying[lease.Machine.ID] = struct{}{}
+			break
+		}
+	}
+	if retry == nil {
+		lm.mu.Unlock()
+		return
+	}
+	lm.nextRetry = time.Now().Add(leaseDestroyRetryInterval)
+	lm.mu.Unlock()
+	lm.destroyQuarantined(ctx, retry)
+}
+
+// LeaseFor returns the active lease for sessionKey, if any. The broker uses it to
+// route a visitor's request to their VM.
+func (lm *LeaseManager) LeaseFor(sessionKey string) (*Lease, bool) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	lease, ok := lm.leases[sessionKey]
+	return lease, ok
+}
+
+// ActiveLeases reports the number of live leased machines.
+func (lm *LeaseManager) ActiveLeases() int {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	return len(lm.leases)
+}
+
+// AdoptWarm registers an already-created warm-pool VM as an active lease for
+// sessionKey, without creating a new machine or acquiring a concurrency slot
+// (the pool already holds the slot and transfers it via release). This is the
+// handout path that skips the cold-start cost.
+func (lm *LeaseManager) AdoptWarm(sessionKey string, machine *Machine, release func()) (*Lease, error) {
+	if sessionKey == "" {
+		return nil, errors.New("broker: empty session key")
+	}
+	if machine == nil {
+		return nil, errors.New("broker: nil machine for AdoptWarm")
+	}
+	lease := &Lease{SessionKey: sessionKey, Machine: machine, release: release}
+	lm.mu.Lock()
+	if _, exists := lm.leases[sessionKey]; exists {
+		lm.mu.Unlock()
+		return nil, ErrDuplicateLease
+	}
+	lm.leases[sessionKey] = lease
+	lm.mu.Unlock()
+	return lease, nil
+}
+
+// ActiveMachineIDs returns a snapshot of machine IDs currently held in active
+// leases. The reaper uses this to distinguish machines that are in use from
+// orphans.
+func (lm *LeaseManager) ActiveMachineIDs() map[string]struct{} {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	ids := make(map[string]struct{}, len(lm.leases)+len(lm.quarantine))
+	for _, lease := range lm.leases {
+		if lease.Machine != nil {
+			ids[lease.Machine.ID] = struct{}{}
+		}
+	}
+	for id := range lm.quarantine {
+		ids[id] = struct{}{}
+	}
+	return ids
+}
+
+// mergeEnv returns base overlaid with over (over wins). Neither input is
+// mutated. A nil result is fine for the provider (no env).
+func mergeEnv(base, over map[string]string) map[string]string {
+	if len(base) == 0 && len(over) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(base)+len(over))
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range over {
+		out[k] = v
+	}
+	return out
+}

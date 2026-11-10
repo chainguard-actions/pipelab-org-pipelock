@@ -1,0 +1,196 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux
+
+package contain
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"syscall"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+func isRoot() bool {
+	return os.Geteuid() == 0
+}
+
+func containRunSupported() bool {
+	return true
+}
+
+var runContainedAgentCommand = func(cmd *exec.Cmd) error {
+	return cmd.Run()
+}
+
+var runContainedAgentLifecycleCommand = launchContainedAgentLifecycle
+
+var (
+	containedAgentSystemdStatus = func(ctx context.Context, unit string) (string, error) {
+		cmd := exec.CommandContext(ctx, "/usr/bin/systemctl")
+		cmd.Args = []string{"/usr/bin/systemctl", "show", unit, "--property=ExecMainCode", "--property=ExecMainStatus", "--value"}
+		out, err := cmd.Output()
+		return string(out), err
+	}
+	containedAgentSystemdCleanup = func(ctx context.Context, unit string) {
+		cmd := exec.CommandContext(ctx, "/usr/bin/systemctl")
+		cmd.Args = []string{"/usr/bin/systemctl", "reset-failed", unit}
+		_ = cmd.Run()
+	}
+)
+
+func launchContainedAgent(
+	ctx context.Context,
+	env *probeEnv,
+	args []string,
+	stdin io.Reader,
+	stdout io.Writer,
+	stderr io.Writer,
+) error {
+	u, err := env.lookupUser(env.agentUserName)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("lookup %s: %w", env.agentUserName, err))
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("parse uid for %s: %w", env.agentUserName, err))
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("parse gid for %s: %w", env.agentUserName, err))
+	}
+	if uid == 0 || gid == 0 {
+		// A launcher whose whole job is containment must never drop into the
+		// root uid/gid. If the agent account is misconfigured as root, refuse
+		// fail-closed instead of launching the tool unconstrained.
+		return cliutil.ExitCodeError(cliutil.ExitConfig,
+			fmt.Errorf("%s resolves to uid %d gid %d; refusing to launch a contained tool as root", env.agentUserName, uid, gid))
+	}
+	homeDir, err := cleanContainedAgentHomeDir(env.agentUserName, u.HomeDir)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+	}
+	if filepath.Clean(env.launchPath) != defaultLaunchScript {
+		return cliutil.ExitCodeError(cliutil.ExitConfig,
+			fmt.Errorf("contain run launcher path %q does not match expected %s", env.launchPath, defaultLaunchScript))
+	}
+	// Resolve the agent's own group set so the child matches what
+	// `sudo -u <agent>` grants via initgroups. Without an explicit setgroups
+	// the child would inherit the launcher's (root's) supplementary groups.
+	groupIDs, err := groupIDsForEnv(env, u)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve groups for %s: %w", env.agentUserName, err))
+	}
+	groups, err := parseAgentGIDs(groupIDs, uint32(gid))
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("group ids for %s: %w", env.agentUserName, err))
+	}
+
+	profile := env.filesystem
+	if profile.Mode == "" {
+		// A launch env with no config path and no reader has not selected a
+		// profile. Do not open the host default: contain run always sets both,
+		// and preflight records the mode before it reaches here. Reading the
+		// host file from a zero env would make unit tests depend on /etc.
+		if env.configPath == "" && env.readFile == nil {
+			profile = filesystemProfile{Mode: config.ContainmentFilesystemModeOff}
+		} else {
+			var profileErr error
+			profile, profileErr = filesystemProfileForProbe(env, homeDir)
+			if profileErr != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, profileErr)
+			}
+		}
+	}
+	commandOpts := containedAgentCommandOptions{
+		ctx:              ctx,
+		agentUserName:    env.agentUserName,
+		homeDir:          homeDir,
+		proxyPort:        env.port,
+		postureProofPath: env.postureProofPath,
+		display:          env.display,
+		uid:              uint32(uid),
+		gid:              uint32(gid),
+		groups:           groups,
+		args:             args,
+		stdin:            stdin,
+		stdout:           stdout,
+		stderr:           stderr,
+		filesystem:       profile,
+	}
+	var runErr error
+	var systemdUnit string
+	if env.lifecycle != nil {
+		runErr = runContainedAgentLifecycleCommand(commandOpts, env.lifecycle)
+		systemdUnit = env.lifecycle.record.Unit
+	} else {
+		var cmd *exec.Cmd
+		cmd, systemdUnit = containedAgentCommand(commandOpts)
+		runErr = runContainedAgentCommand(cmd)
+		defer containedAgentSystemdCleanup(context.WithoutCancel(ctx), systemdUnit)
+	}
+	var systemdExitErr *exec.ExitError
+	if env.lifecycle == nil && errors.As(runErr, &systemdExitErr) && systemdExitErr.ExitCode() == 255 {
+		status, statusErr := containedAgentSystemdStatus(context.WithoutCancel(ctx), systemdUnit)
+		if statusErr != nil {
+			return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("inspect contained agent status: %w", statusErr))
+		}
+		if signal, ok := systemdMainSignal(status); ok {
+			return cliutil.ExitCodeError(128+int(signal), fmt.Errorf("contained agent terminated by signal %s", signal))
+		}
+	}
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+				signal := status.Signal()
+				if env.lifecycle != nil {
+					return cliutil.ExitCodeError(128+int(signal), fmt.Errorf("contained agent terminated by signal %s: %w", signal, runErr))
+				}
+				return cliutil.ExitCodeError(128+int(signal), fmt.Errorf("contained agent terminated by signal %s", signal))
+			}
+			exitCode := exitErr.ExitCode()
+			if exitCode < 0 {
+				return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("contained agent exited without status: %w", runErr))
+			}
+			if env.lifecycle != nil {
+				return cliutil.ExitCodeError(exitCode, fmt.Errorf("contained agent exited with status %d: %w", exitCode, runErr))
+			}
+			return cliutil.ExitCodeError(exitCode, fmt.Errorf("contained agent exited with status %d", exitCode))
+		}
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("launch contained agent via %s: %w", defaultLaunchScript, runErr))
+	}
+	return nil
+}
+
+type containedAgentCommandOptions struct {
+	ctx              context.Context
+	agentUserName    string
+	homeDir          string
+	proxyPort        int
+	postureProofPath string
+	display          string
+	uid              uint32
+	gid              uint32
+	groups           []uint32
+	args             []string
+	stdin            io.Reader
+	stdout           io.Writer
+	stderr           io.Writer
+	lifecycleUnit    string
+	lifecycleRunID   string
+	filesystem       filesystemProfile
+}
+
+func containedAgentCommand(opts containedAgentCommandOptions) (*exec.Cmd, string) {
+	return containedAgentPrivateTmpCommand(opts)
+}

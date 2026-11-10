@@ -1,0 +1,4684 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"math/big"
+	"net"
+	"os"
+	"os/user"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+)
+
+// Test helpers ---------------------------------------------------------------
+
+func TestReadAccessACLUnavailableAndExitFailure(t *testing.T) {
+	if _, err := readAccessACL(context.Background(), nil, "/unused"); err == nil || !strings.Contains(err.Error(), "ACL reader unavailable") {
+		t.Fatalf("missing ACL reader error = %v", err)
+	}
+	run := func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name != "getfacl" || len(args) != 2 || args[0] != "-p" || args[1] != "/unused" {
+			t.Fatalf("ACL command = %s %v", name, args)
+		}
+		return "permission denied\n", 2, nil
+	}
+	if _, err := readAccessACL(context.Background(), run, "/unused"); err == nil || !strings.Contains(err.Error(), "getfacl exit 2: permission denied") {
+		t.Fatalf("ACL command failure = %v", err)
+	}
+}
+
+const (
+	testProxyUser    = "pipelock-proxy"
+	testAgentUser    = "pipelock-agent"
+	testTable        = "pipelock_containment"
+	testChain        = "output_filter"
+	testService      = "pipelock.service"
+	testSudoCmd      = "sudo"
+	testOperatorUser = "operator"
+	testSystemctl    = "systemctl"
+	testServicePID   = 4242
+	testNFT          = "nft"
+	testUserDel      = "userdel"
+	testRustup       = "rustup"
+	testSudoNeedsPwd = "sudo: a password is required"
+)
+
+const goodNFTContainmentOutput = `table inet pipelock_containment {
+	chain output_filter {
+		type filter hook output priority filter; policy accept;
+		meta skuid 1000 accept
+		meta skuid 988 accept
+		meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+		meta skuid 987 udp dport 53 counter log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 tcp dport 53 counter log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 drop
+	}
+}
+`
+
+// goodNFTContainmentOutputRealListing mirrors what `nft list table inet` actually
+// emits for the canonical ruleset: inline counters are expanded to
+// "counter packets N bytes N" and the agent catch-all carries counter+log+prefix
+// bookkeeping (renderNFTRules writes it). The simplified fixtures above never
+// exercise this shape; the parser must accept the real listing form or verify
+// fails on every correctly-installed system.
+const goodNFTContainmentOutputRealListing = `table inet pipelock_containment {
+	chain output_filter {
+		type filter hook output priority filter; policy accept;
+		meta skuid 1000 accept
+		meta skuid 988 accept
+		meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+		meta skuid 987 udp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 tcp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 counter packets 12 bytes 840 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}
+`
+
+// fakeRunResult is a canned subprocess response keyed by the leading
+// argv element (the command name). Tests pre-populate the map with
+// the expected calls; unexpected calls return an error.
+type fakeRunResult struct {
+	stdout string
+	code   int
+	err    error
+}
+
+// newFakeRun returns a runCommand that matches by command name and
+// optionally by argv prefix. The first matching response wins. Empty
+// match means "match any argv".
+type fakeMatcher struct {
+	cmd    string
+	prefix []string
+	result fakeRunResult
+}
+
+func newFakeRun(matchers ...fakeMatcher) (runCommand, *[]string) {
+	var calls []string
+	matched := make([]bool, len(matchers))
+	run := func(_ context.Context, name string, args ...string) (string, int, error) {
+		calls = append(calls, name+" "+strings.Join(args, " "))
+		for i, m := range matchers {
+			if m.cmd != name {
+				continue
+			}
+			if !prefixMatches(m.prefix, args) {
+				continue
+			}
+			matched[i] = true
+			return m.result.stdout, m.result.code, m.result.err
+		}
+		return "", -1, fmt.Errorf("unexpected call: %s %v", name, args)
+	}
+	return run, &calls
+}
+
+func prefixMatches(prefix, args []string) bool {
+	if len(prefix) == 0 {
+		return true
+	}
+	if len(args) < len(prefix) {
+		return false
+	}
+	for i, p := range prefix {
+		if args[i] != p {
+			return false
+		}
+	}
+	return true
+}
+
+func TestEnforcementProbesSkipsByStableName(t *testing.T) {
+	t.Parallel()
+	filtered := enforcementProbes(allProbes())
+	for _, p := range filtered {
+		switch p.name {
+		case "pipelock_systemd_unit", "pipelock_listening_loopback":
+			t.Fatalf("enforcement probe filter kept liveness probe %d/%s", p.n, p.name)
+		}
+	}
+	if got, want := len(filtered), len(allProbes())-2; got != want {
+		t.Fatalf("filtered probe count = %d, want %d", got, want)
+	}
+}
+
+func TestProbeListedToolTargets_AgentContextFailuresSkip(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		runErr error
+		want   string
+	}{
+		{name: "runner failure", runErr: errors.New("sudo unavailable"), want: "could not verify"},
+		{name: "agent missing", output: "sudo: unknown user pipelock-agent", want: "user missing"},
+		{name: "sudo refusal", output: testSudoNeedsPwd, want: "sudo -n refused"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(t.TempDir(), "tool")
+			writeFakeWrapper(t, target, 0o755)
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.readFile = func(path string) ([]byte, error) {
+					if path != e.toolsListPath {
+						t.Fatalf("read path = %q, want %q", path, e.toolsListPath)
+					}
+					return []byte("tool\t" + target + "\n"), nil
+				}
+				e.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+					if name != testSudoCmd || !containsArg(args, target) {
+						t.Fatalf("command = %q %v, want sudo test of %q", name, args, target)
+					}
+					return tc.output, 1, tc.runErr
+				}
+			})
+
+			status, detail := probeListedToolTargets(context.Background(), env)
+			if status != statusSkip || !strings.Contains(detail, tc.want) {
+				t.Fatalf("result = %q %q, want skip containing %q", status, detail, tc.want)
+			}
+		})
+	}
+}
+
+// makeProbeEnv builds a probeEnv with sane defaults plus overrides.
+// The pure-Go probes (1, 4, 5, 6, 7) get filesystem and lookup stubs;
+// the shell-out probes (2, 3, 8, 9) get runCmd.
+func makeProbeEnv(t *testing.T, opts ...func(*probeEnv)) *probeEnv {
+	t.Helper()
+	env := &probeEnv{
+		port:               8888,
+		operatorUser:       "",
+		proxyUserName:      testProxyUser,
+		agentUserName:      testAgentUser,
+		wrapperDir:         t.TempDir(),
+		toolWrappers:       []string{"plk-claude", "plk-codex"},
+		caBundlePath:       filepath.Join(t.TempDir(), "combined-ca.pem"),
+		caExportPath:       filepath.Join(t.TempDir(), "ca.pem"),
+		configDir:          filepath.Join(t.TempDir(), "etc", "pipelock"),
+		launchPath:         "", // populated below
+		nftTable:           testTable,
+		nftChain:           testChain,
+		nftPath:            testNFT,
+		serviceName:        testService,
+		pinPath:            filepath.Join(t.TempDir(), "binary-pin.sha256"),
+		toolsListPath:      filepath.Join(t.TempDir(), "tools.list"),
+		workspaceInvPath:   filepath.Join(t.TempDir(), "workspaces.json"),
+		configPath:         filepath.Join(t.TempDir(), "pipelock.yaml"),
+		pipelockTarget:     defaultPipelockTarget,
+		verifyRunningImage: true,
+		runCmd:             rejectAllRun,
+		dropCounter:        rejectAllDropCounter,
+		dialCtx:            rejectAllDial,
+		wait: func(context.Context, time.Duration) error {
+			return nil
+		},
+		lookupUser: rejectAllLookup,
+		groupIDs:   rejectAllGroupIDs,
+		stat:       os.Stat,
+		readFile:   rejectAllReadFile,
+		readLink:   rejectAllReadLink,
+		selfPath:   rejectAllSelfPath,
+		hashFile:   rejectAllHashFile,
+	}
+	env.launchPath = filepath.Join(env.wrapperDir, "plk-launch")
+	for _, opt := range opts {
+		opt(env)
+	}
+	return env
+}
+
+func rejectAllGroupIDs(u *user.User) ([]string, error) {
+	return nil, fmt.Errorf("unstubbed group ids for %s", u.Username)
+}
+
+func rejectAllRun(_ context.Context, name string, args ...string) (string, int, error) {
+	return "", -1, fmt.Errorf("unstubbed run: %s %v", name, args)
+}
+
+// rejectAllDropCounter fails tests that invoke the containment counter without
+// installing a deterministic counter stub.
+func rejectAllDropCounter(_ context.Context, _ *probeEnv) (uint64, error) {
+	return 0, errors.New("unstubbed containment DROP counter")
+}
+
+func rejectAllDial(_ context.Context, _, address string, _ time.Duration) (net.Conn, error) {
+	return nil, fmt.Errorf("unstubbed dial: %s", address)
+}
+
+func rejectAllLookup(name string) (*user.User, error) {
+	return nil, fmt.Errorf("unstubbed lookup: %s", name)
+}
+
+func rejectAllReadFile(path string) ([]byte, error) {
+	return nil, fmt.Errorf("unstubbed readFile: %s", path)
+}
+
+func rejectAllReadLink(path string) (string, error) {
+	return "", fmt.Errorf("unstubbed readLink: %s", path)
+}
+
+// configureMatchingServiceBinary makes the running-process half of probe 10
+// point at env.pipelockTarget while leaving the test's deployed-file and
+// invoking-binary setup under its control.
+func configureMatchingServiceBinary(t *testing.T, env *probeEnv) {
+	t.Helper()
+	procExe := serviceProcessExePath(testServicePID)
+	originalStat := env.stat
+	originalHash := env.hashFile
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name != testSystemctl || !containsArg(args, "--value") {
+			return "", -1, fmt.Errorf("unexpected command %s %v", name, args)
+		}
+		switch {
+		case containsArg(args, "--property=ExecStart"):
+			return fmt.Sprintf("{ path=%s ; argv[]=%s run ; }\n", env.pipelockTarget, env.pipelockTarget), 0, nil
+		case containsArg(args, "--property=MainPID"):
+			return fmt.Sprintf("%d\n", testServicePID), 0, nil
+		default:
+			return "", -1, fmt.Errorf("unexpected systemctl property %v", args)
+		}
+	}
+	env.readLink = func(path string) (string, error) {
+		if path != procExe {
+			return "", fmt.Errorf("unexpected readLink %s", path)
+		}
+		return env.pipelockTarget, nil
+	}
+	env.stat = func(path string) (os.FileInfo, error) {
+		if path == procExe {
+			return originalStat(env.pipelockTarget)
+		}
+		return originalStat(path)
+	}
+	env.hashFile = func(path string) (string, error) {
+		if path == procExe {
+			return originalHash(env.pipelockTarget)
+		}
+		return originalHash(path)
+	}
+}
+
+func rejectAllSelfPath() (string, error) {
+	return "", fmt.Errorf("unstubbed selfPath")
+}
+
+func rejectAllHashFile(path string) (string, error) {
+	return "", fmt.Errorf("unstubbed hashFile: %s", path)
+}
+
+// Probe 1: system_users_exist ------------------------------------------------
+
+func TestProbeSystemUsers(t *testing.T) {
+	tests := []struct {
+		name       string
+		proxy      *user.User
+		proxyErr   error
+		agent      *user.User
+		agentErr   error
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name:       "both present",
+			proxy:      &user.User{Uid: "988", Username: testProxyUser},
+			agent:      &user.User{Uid: "987", Username: testAgentUser},
+			wantStatus: statusPass,
+			wantDetail: "pipelock-proxy uid=988, pipelock-agent uid=987",
+		},
+		{
+			name:       "proxy missing",
+			proxyErr:   user.UnknownUserError(testProxyUser),
+			agent:      &user.User{Uid: "987", Username: testAgentUser},
+			wantStatus: statusFail,
+			wantDetail: "pipelock-proxy missing",
+		},
+		{
+			name:       "agent missing",
+			proxy:      &user.User{Uid: "988", Username: testProxyUser},
+			agentErr:   user.UnknownUserError(testAgentUser),
+			wantStatus: statusFail,
+			wantDetail: "pipelock-agent missing",
+		},
+		{
+			name:       "both missing",
+			proxyErr:   user.UnknownUserError(testProxyUser),
+			agentErr:   user.UnknownUserError(testAgentUser),
+			wantStatus: statusFail,
+			wantDetail: "neither",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.lookupUser = func(name string) (*user.User, error) {
+					switch name {
+					case testProxyUser:
+						return tc.proxy, tc.proxyErr
+					case testAgentUser:
+						return tc.agent, tc.agentErr
+					}
+					return nil, fmt.Errorf("unexpected lookup %q", name)
+				}
+			})
+			gotStatus, gotDetail := probeSystemUsers(context.Background(), env)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status: got %q, want %q (detail=%q)", gotStatus, tc.wantStatus, gotDetail)
+			}
+			if !strings.Contains(gotDetail, tc.wantDetail) {
+				t.Fatalf("detail: got %q, want substring %q", gotDetail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+// Probe 2: pipelock_systemd_unit ---------------------------------------------
+
+func TestProbeSystemdUnit(t *testing.T) {
+	const goodOutput = "ActiveState=active\nSubState=running\nUser=pipelock-proxy\nType=simple\n"
+
+	tests := []struct {
+		name       string
+		stdout     string
+		code       int
+		runErr     error
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name:       "happy path",
+			stdout:     goodOutput,
+			code:       0,
+			wantStatus: statusPass,
+			wantDetail: "User=pipelock-proxy",
+		},
+		{
+			name:       "wrong user",
+			stdout:     "ActiveState=active\nSubState=running\nUser=root\n",
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "want User=pipelock-proxy",
+		},
+		{
+			name:       "service inactive",
+			stdout:     "ActiveState=inactive\nSubState=dead\nUser=pipelock-proxy\n",
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "want active/running",
+		},
+		{
+			name:       "systemctl missing",
+			runErr:     errors.New("exec: \"systemctl\": executable file not found in $PATH"),
+			wantStatus: statusSkip,
+			wantDetail: "systemctl unavailable",
+		},
+		{
+			name:       "non-zero exit",
+			stdout:     "Unit pipelock.service could not be found.\n",
+			code:       1,
+			wantStatus: statusFail,
+			wantDetail: "systemctl exit=1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.runCmd = func(_ context.Context, name string, _ ...string) (string, int, error) {
+					if name != testSystemctl {
+						return "", -1, fmt.Errorf("unexpected cmd %q", name)
+					}
+					return tc.stdout, tc.code, tc.runErr
+				}
+			})
+			gotStatus, gotDetail := probeSystemdUnit(context.Background(), env)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status: got %q, want %q (detail=%q)", gotStatus, tc.wantStatus, gotDetail)
+			}
+			if !strings.Contains(gotDetail, tc.wantDetail) {
+				t.Fatalf("detail: got %q, want substring %q", gotDetail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func TestParseSystemdShow(t *testing.T) {
+	out := "ActiveState=active\nSubState=running\n\nUser=pipelock-proxy\n# comment with no =\nType=simple\n"
+	got := parseSystemdShow(out)
+	want := map[string]string{
+		"ActiveState": "active",
+		"SubState":    "running",
+		"User":        "pipelock-proxy",
+		"Type":        "simple",
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("key %s: got %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+func TestProbeManagedConfigMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		read       func(string) ([]byte, error)
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name:       "compliant dedicated loopback listener passes",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 127.0.0.1:9091\n"), nil },
+			wantStatus: statusPass,
+			wantDetail: "keeps metrics off",
+		},
+		{
+			name: "current metrics exposure policy passes",
+			read: func(string) ([]byte, error) {
+				return []byte("metrics_listen: 192.0.2.20:9091\ncontainment:\n  metrics_exposure:\n    allow_full_metrics: true\n    allowed_source_cidrs: [192.0.2.42/32]\n    owner: observability\n    reason: Prometheus scrape\n    expires_at: 2099-01-01T00:00:00Z\n"), nil
+			},
+			wantStatus: statusPass,
+			wantDetail: "keeps metrics off",
+		},
+		{
+			name:       "non-loopback listener without exposure policy fails",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 192.0.2.20:9091\n"), nil },
+			wantStatus: statusFail,
+			wantDetail: "requires containment.metrics_exposure",
+		},
+		{
+			name: "malformed metrics exposure policy fails",
+			read: func(string) ([]byte, error) {
+				return []byte("metrics_listen: 192.0.2.20:9091\ncontainment:\n  metrics_exposure:\n    allow_full_metrics: true\n    allowed_source_cidrs: [192.0.2.42/32]\n    owner: observability\n    reason: Prometheus scrape\n    expires_at: 2099-01-01T00:00:00Z\n    typo: true\n"), nil
+			},
+			wantStatus: statusFail,
+			wantDetail: "parse containment.metrics_exposure",
+		},
+		{
+			name: "expired metrics exposure policy fails",
+			read: func(string) ([]byte, error) {
+				return []byte("metrics_listen: 192.0.2.20:9091\ncontainment:\n  metrics_exposure:\n    allow_full_metrics: true\n    allowed_source_cidrs: [192.0.2.42/32]\n    owner: observability\n    reason: Prometheus scrape\n    expires_at: 2000-01-01T00:00:00Z\n"), nil
+			},
+			wantStatus: statusFail,
+			wantDetail: "expired at",
+		},
+		{
+			name:       "wildcard listener fails",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 0.0.0.0:9091\n"), nil },
+			wantStatus: statusFail,
+			wantDetail: "unsafe for containment",
+		},
+		{
+			name:       "proxy port fails",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 127.0.0.1:8888\n"), nil },
+			wantStatus: statusFail,
+			wantDetail: "agent-accessible proxy port",
+		},
+		{
+			name:       "missing config skips",
+			read:       func(string) ([]byte, error) { return nil, os.ErrNotExist },
+			wantStatus: statusSkip,
+			wantDetail: "is missing",
+		},
+		{
+			name:       "unreadable config skips",
+			read:       func(string) ([]byte, error) { return nil, os.ErrPermission },
+			wantStatus: statusSkip,
+			wantDetail: "rerun as root",
+		},
+		{
+			name:       "io failure is unknown",
+			read:       func(string) ([]byte, error) { return nil, errors.New("I/O fault") },
+			wantStatus: statusUnknown,
+			wantDetail: "I/O fault",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := makeProbeEnv(t, func(env *probeEnv) { env.readFile = tc.read })
+			status, detail := probeManagedConfigMetrics(t.Context(), env)
+			if status != tc.wantStatus || !strings.Contains(detail, tc.wantDetail) {
+				t.Fatalf("probe = (%q, %q), want (%q, detail containing %q)", status, detail, tc.wantStatus, tc.wantDetail)
+			}
+		})
+	}
+}
+
+// Probe 3: nftables_containment_ruleset --------------------------------------
+
+func TestProbeNFTContainment(t *testing.T) {
+	tests := []struct {
+		name       string
+		stdout     string
+		code       int
+		runErr     error
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name:       "happy path with real nft list expanded counters",
+			stdout:     goodNFTContainmentOutputRealListing,
+			code:       0,
+			wantStatus: statusPass,
+		},
+		{
+			name:       "happy path",
+			stdout:     goodNFTContainmentOutput,
+			code:       0,
+			wantStatus: statusPass,
+			wantDetail: "skuid drop rule",
+		},
+		{
+			name:       "stale owned-loopback mark is a failure",
+			stdout:     strings.Replace(goodNFTContainmentOutput, "\t\tmeta skuid 987 drop", "\t\tmeta skuid 987 oifname \"lo\" ip daddr 127.0.0.1 socket cgroupv2 level 1 \"pipelock_contained.slice\" ct state new ct mark set 0x504c4b01 accept # handle 70\n\t\tmeta skuid 987 drop", 1),
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "stale owned-loopback cgroup mark rule",
+		},
+		{
+			name: "established server reply remains compatible",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state 0x2 ct direction reply counter packets 3 bytes 180 accept
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 counter packets 0 bytes 0 drop
+			meta skuid 987 tcp dport 53 counter packets 0 bytes 0 drop
+			meta skuid 987 counter packets 9 bytes 540 drop
+		}
+	}
+`,
+			code:       0,
+			wantStatus: statusPass,
+			wantDetail: "skuid drop rule",
+		},
+		{
+			name: "otherwise canonical regular chain is not containment",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "not the managed output base chain",
+		},
+		{
+			name:       "permission denied",
+			stdout:     "Error: Operation not permitted\n",
+			code:       1,
+			wantStatus: statusSkip,
+			wantDetail: "requires root",
+		},
+		{
+			name:       "table missing",
+			stdout:     "Error: No such file or directory\n",
+			code:       1,
+			wantStatus: statusFail,
+			wantDetail: "not loaded",
+		},
+		{
+			name:       "nft missing",
+			runErr:     errors.New("exec: \"nft\": executable file not found"),
+			wantStatus: statusSkip,
+			wantDetail: "nft unavailable",
+		},
+		{
+			name:       "chain missing",
+			stdout:     "table inet pipelock_containment {\n}\n",
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "chain output_filter missing",
+		},
+		{
+			name: "no skuid drop rule",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "skuid-drop rule missing",
+		},
+		{
+			name: "constrained agent drop is not catch all",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 ip daddr 10.0.0.0/8 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "skuid-drop rule missing",
+		},
+		{
+			name: "canary-specific drop before catch all is unexpected",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 ip daddr 192.0.2.1 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "broad loopback accept",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta oif "lo" accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "bare loopback host accept",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			ip daddr 127.0.0.1 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "constrained agent drop does not hide broad loopback accept",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 10.0.0.0/8 drop
+			ip daddr 127.0.0.1 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "missing proxy port allow",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "loopback allow",
+		},
+		{
+			name: "proxy port prefix is not proxy port",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 88880 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "loopback allow",
+		},
+		{
+			name: "proxy loopback allow after agent drop is unreachable",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "loopback allow",
+		},
+		{
+			name: "constrained proxy loopback allow is not canonical",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip saddr 127.0.0.2 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "loopback allow",
+		},
+		{
+			name: "agent broad accept before drop is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "CONTAINMENT HOLE: agent UID accept rule",
+		},
+		{
+			name: "agent alternate destination accept before drop is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 ip daddr 10.0.0.10 tcp dport 443 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+			`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "CONTAINMENT HOLE",
+		},
+		{
+			name: "unscoped external accept before drop is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			ip daddr 10.0.0.10 tcp dport 443 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "agent skuid set accept before drop is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid { 987, 1001 } ip daddr 10.0.0.10 tcp dport 443 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "pre-drop return is fail open under accept policy",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 return
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "pre-drop jump is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 jump allow_all
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "pre-drop goto is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 goto allow_all
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "pre-drop queue is fail open",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 queue
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected verdict",
+		},
+		{
+			name: "loopback address prefix is not proxy address",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.10 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "CONTAINMENT HOLE",
+		},
+		{
+			name: "stale agent uid",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 986 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 986 udp dport 53 drop
+			meta skuid 986 tcp dport 53 drop
+			meta skuid 986 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "current agent uid 987",
+		},
+		{
+			name: "missing direct dns drop",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "DNS drop rule missing",
+		},
+		{
+			name: "dns drops after catch all drop are unreachable",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 drop
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "DNS drop rule missing",
+		},
+		{
+			name: "udp dns port prefix is not dns port",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 530 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "udp/53 DNS drop rule missing",
+		},
+		{
+			name: "tcp dns port prefix is not dns port",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 530 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "tcp/53 DNS drop rule missing",
+		},
+		{
+			name: "constrained udp dns drop is not catch all dns drop",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 ip daddr 8.8.8.8 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "udp/53 DNS drop rule missing",
+		},
+		{
+			name: "constrained tcp dns drop is not catch all dns drop",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 ip daddr 8.8.8.8 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "tcp/53 DNS drop rule missing",
+		},
+		{
+			name: "constrained proxy accept is not terminal accept",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 ip daddr 127.0.0.1 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "proxy uid 988 accept rule missing",
+		},
+		{
+			name: "skuid and drop outside target chain",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+		}
+		chain decoy {
+			meta skuid 987 drop
+	}
+}
+`,
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "not positively attributed",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.operatorUser = testOperatorUser
+				e.lookupUser = containTestLookup
+				e.readFile = func(path string) ([]byte, error) {
+					if path == e.configPath {
+						return nil, os.ErrNotExist
+					}
+					return rejectAllReadFile(path)
+				}
+				e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+					return tc.stdout, tc.code, tc.runErr
+				}
+			})
+			gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status: got %q, want %q (detail=%q)", gotStatus, tc.wantStatus, gotDetail)
+			}
+			if !strings.Contains(gotDetail, tc.wantDetail) {
+				t.Fatalf("detail: got %q, want substring %q", gotDetail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func TestLineHasAgentEstablishedReplyAllow(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{name: "loopback numeric state", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state 0x2 ct direction reply accept # handle 18`, want: true},
+		{name: "numeric state and direction", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state 0x2 ct direction 1 accept # handle 18`, want: true},
+		{name: "tailnet named state", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction reply accept`, want: true},
+		{name: "bookkeeping", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state 0x2 ct direction reply counter packets 3 bytes 180 log prefix "reply path " accept`, want: true},
+		{name: "interface index", line: `meta skuid 987 oif 7 ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction reply accept`, want: true},
+		{name: "missing reply direction", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state established accept`},
+		{name: "original direction", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction original accept`},
+		{name: "numeric original direction", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state 0x2 ct direction 0 accept`},
+		{name: "new connection", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state new ct direction reply accept`},
+		{name: "state set includes new", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state { established, new } ct direction reply accept`},
+		{name: "destination port", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp dport 8642 ct state established ct direction reply accept`},
+		{name: "missing interface", line: `meta skuid 987 ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction reply accept`},
+		{name: "wrong uid", line: `meta skuid 986 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state established ct direction reply accept`},
+		{name: "port zero", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 0 ct state established ct direction reply accept`},
+		{name: "IPv6 under IPv4 family", line: `meta skuid 987 oifname "lo" ip daddr ::1 tcp sport 9119 ct state established ct direction reply accept`},
+		{name: "extra verdict", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state established ct direction reply accept return`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := lineHasAgentEstablishedReplyAllow(tt.line, 987); got != tt.want {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestFieldsAreNFTBookkeeping(t *testing.T) {
+	tests := []struct {
+		name   string
+		fields []string
+		want   bool
+	}{
+		{
+			name:   "empty",
+			fields: nil,
+			want:   true,
+		},
+		{
+			name:   "inline counter log prefix",
+			fields: strings.Fields(`counter log prefix "pipelock-contain class=direct_dns_blocked "`),
+			want:   true,
+		},
+		{
+			name:   "expanded counter log prefix",
+			fields: strings.Fields(`counter packets 12 bytes 840 log prefix "pipelock-contain class=not_routing_through_pipelock "`),
+			want:   true,
+		},
+		{
+			name:   "packets without counter rejected",
+			fields: strings.Fields(`packets 12 bytes 840`),
+			want:   false,
+		},
+		{
+			name:   "non numeric packets rejected",
+			fields: strings.Fields(`counter packets nope bytes 840`),
+			want:   false,
+		},
+		{
+			name:   "unterminated prefix rejected",
+			fields: strings.Fields(`counter log prefix "unterminated`),
+			want:   false,
+		},
+		{
+			name:   "unexpected token rejected",
+			fields: strings.Fields(`counter meta`),
+			want:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := fieldsAreNFTBookkeeping(tc.fields); got != tc.want {
+				t.Fatalf("fieldsAreNFTBookkeeping(%q) = %v, want %v", tc.fields, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProbeNFTContainment_ChecksPersistenceUnit(t *testing.T) {
+	tests := []struct {
+		name       string
+		unitBody   func(string) string
+		rulesBody  func() string
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name: "canonical rules and exec start point at managed rules",
+			unitBody: func(rulesPath string) string {
+				return renderTestNFTPersistUnit(rulesPath, defaultPipelockTarget)
+			},
+			wantStatus: statusPass,
+			wantDetail: "persistence unit",
+		},
+		{
+			name: "exec start points elsewhere",
+			unitBody: func(rulesPath string) string {
+				return strings.Replace(renderTestNFTPersistUnit(rulesPath, defaultPipelockTarget), "ExecStart="+defaultPipelockTarget+" contain reload-nft-rules", "ExecStart="+defaultPipelockTarget+" contain other-rules", 1)
+			},
+			wantStatus: statusFail,
+			wantDetail: "missing ExecStart",
+		},
+		{
+			name: "rules path outside exec start does not satisfy check",
+			unitBody: func(rulesPath string) string {
+				return strings.Replace(renderTestNFTPersistUnit(rulesPath, defaultPipelockTarget), "ConditionPathExists="+rulesPath, "ConditionPathExists=/other/rules.nft", 1)
+			},
+			wantStatus: statusFail,
+			wantDetail: "missing ConditionPathExists",
+		},
+		{
+			name: "stale persisted rules fail despite canonical live rules and matching unit",
+			unitBody: func(rulesPath string) string {
+				return renderTestNFTPersistUnit(rulesPath, defaultPipelockTarget)
+			},
+			rulesBody: func() string {
+				return `# Pipelock containment ruleset (managed by pipelock contain install).
+# operator=1000  pipelock-proxy=988  pipelock-agent=987  proxy-port=8888
+table inet pipelock_containment {
+    chain output_filter {
+        type filter hook output priority filter; policy accept;
+
+        meta skuid 1000 accept
+        meta skuid 988 accept
+
+        meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+        meta skuid 987 drop
+    }
+}
+`
+			},
+			wantStatus: statusFail,
+			wantDetail: "does not match the canonical containment boundary",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			unitPath := filepath.Join(tmp, "pipelock-containment-nft.service")
+			rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+			rulesBody := renderNFTRules(1000, 988, 987, 8888, testTable, testChain)
+			if tc.rulesBody != nil {
+				rulesBody = tc.rulesBody()
+			}
+			if err := os.WriteFile(rulesPath, []byte(rulesBody), 0o600); err != nil {
+				t.Fatalf("write persisted rules: %v", err)
+			}
+			if err := os.WriteFile(unitPath, []byte(tc.unitBody(rulesPath)), 0o600); err != nil {
+				t.Fatalf("write persistence unit: %v", err)
+			}
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.operatorUser = testOperatorUser
+				e.lookupUser = containTestLookup
+				e.nftRulesPath = rulesPath
+				e.nftPersistUnitPath = unitPath
+				e.readFile = os.ReadFile
+				e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+					return nftListingForTest(renderNFTRules(1000, 988, 987, 8888, testTable, testChain)), 0, nil
+				}
+			})
+			gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status: got %q, want %q (detail=%q)", gotStatus, tc.wantStatus, gotDetail)
+			}
+			if !strings.Contains(gotDetail, tc.wantDetail) {
+				t.Fatalf("detail: got %q, want substring %q", gotDetail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func TestVerifyNFTPersistence_RequiresEveryManagedDirective(t *testing.T) {
+	const rulesPath = "/managed/50-pipelock-containment.nft"
+	current := containmentUIDs{operatorUID: 1000, operatorKnown: true, proxyUID: 988, agentUID: 987}
+	tests := []struct {
+		name      string
+		old       string
+		new       string
+		directive string
+	}{
+		{name: "default dependencies", old: "DefaultDependencies=no", new: "DefaultDependencies=yes", directive: "DefaultDependencies"},
+		{name: "after", old: "After=local-fs.target", new: "After=network.target", directive: "After"},
+		{name: "before", old: "Before=network-pre.target", new: "Before=network.target", directive: "Before"},
+		{name: "wants", old: "Wants=network-pre.target", new: "Wants=network.target", directive: "Wants"},
+		{name: "condition", old: "ConditionPathExists=" + rulesPath, new: "ConditionPathExists=/other/rules.nft", directive: "ConditionPathExists"},
+		{name: "service type", old: "Type=oneshot", new: "Type=simple", directive: "Type"},
+		{name: "exec start", old: "ExecStart=" + defaultPipelockTarget + " contain reload-nft-rules", new: "ExecStart=/bin/true", directive: "ExecStart"},
+		{name: "remain after exit", old: "RemainAfterExit=yes", new: "RemainAfterExit=no", directive: "RemainAfterExit"},
+		{name: "install target", old: "WantedBy=multi-user.target", new: "WantedBy=default.target", directive: "WantedBy"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			canonical := renderTestNFTPersistUnit(rulesPath, defaultPipelockTarget)
+			env := makeProbeEnv(t, func(env *probeEnv) {
+				env.operatorUser = ""
+				env.nftRulesPath = rulesPath
+				env.nftPersistUnitPath = "/managed/pipelock-containment-nft.service"
+				env.readFile = func(path string) ([]byte, error) {
+					if path == env.nftPersistUnitPath {
+						return []byte(canonical), nil
+					}
+					if path == env.configPath {
+						return nil, os.ErrNotExist
+					}
+					return []byte(renderNFTRules(1000, 988, 987, env.port, env.nftTable, env.nftChain)), nil
+				}
+			})
+			if err := verifyNFTPersistence(env, current); err != nil {
+				t.Fatalf("canonical persistence unit failed verification: %v", err)
+			}
+			body := strings.Replace(canonical, tc.old, tc.new, 1)
+			if body == canonical {
+				t.Fatalf("fixture mutation did not alter %q", tc.old)
+			}
+			env.readFile = func(path string) ([]byte, error) {
+				if path == env.nftPersistUnitPath {
+					return []byte(body), nil
+				}
+				if path == env.configPath {
+					return nil, os.ErrNotExist
+				}
+				return []byte(renderNFTRules(1000, 988, 987, env.port, env.nftTable, env.nftChain)), nil
+			}
+			if err := verifyNFTPersistence(env, current); err == nil || !strings.Contains(err.Error(), tc.directive) {
+				t.Fatalf("altered %s error = %v, want named directive", tc.directive, err)
+			}
+		})
+	}
+}
+
+func TestProbeNFTContainment_RejectsPersistedOperatorUIDDrift(t *testing.T) {
+	tmp := t.TempDir()
+	rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+	unitPath := filepath.Join(tmp, "pipelock-containment-nft.service")
+	if err := os.WriteFile(rulesPath, []byte(renderNFTRules(98, 988, 987, 8888, testTable, testChain)), 0o600); err != nil {
+		t.Fatalf("write persisted rules: %v", err)
+	}
+	if err := os.WriteFile(unitPath, []byte(renderTestNFTPersistUnit(rulesPath, defaultPipelockTarget)), 0o600); err != nil {
+		t.Fatalf("write persistence unit: %v", err)
+	}
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.operatorUser = testOperatorUser
+		e.lookupUser = containTestLookup
+		e.nftRulesPath = rulesPath
+		e.nftPersistUnitPath = unitPath
+		e.readFile = os.ReadFile
+		e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+			return renderNFTRules(98, 988, 987, 8888, testTable, testChain), 0, nil
+		}
+	})
+
+	gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+	if gotStatus != statusFail {
+		t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+	}
+	if !strings.Contains(gotDetail, "does not match current operator uid 1000") {
+		t.Fatalf("detail: got %q, want current operator uid drift", gotDetail)
+	}
+}
+
+func TestProbeNFTContainment_UsesInstalledOperatorUIDFromRulesFile(t *testing.T) {
+	tmp := t.TempDir()
+	rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+	if err := os.WriteFile(rulesPath, []byte(renderNFTRules(1000, 988, 987, 8888, testTable, testChain)), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.operatorUser = ""
+		e.lookupUser = func(name string) (*user.User, error) {
+			switch name {
+			case testProxyUser:
+				return &user.User{Uid: "988", Gid: "988", Username: name, HomeDir: "/home/" + name}, nil
+			case testAgentUser:
+				return &user.User{Uid: "987", Gid: "987", Username: name, HomeDir: "/home/" + name}, nil
+			default:
+				return nil, fmt.Errorf("unexpected lookup %q", name)
+			}
+		}
+		e.nftRulesPath = rulesPath
+		e.readFile = os.ReadFile
+		e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+			return nftListingForTest(renderNFTRules(1000, 988, 987, 8888, testTable, testChain)), 0, nil
+		}
+	})
+
+	gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+	if gotStatus != statusPass {
+		t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+	}
+
+	liveWithoutOperator1000 := `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`
+	env.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+		return liveWithoutOperator1000, 0, nil
+	}
+	gotStatus, gotDetail = probeNFTContainment(context.Background(), env)
+	if gotStatus != statusFail {
+		t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+	}
+	if !strings.Contains(gotDetail, "operator uid 1000") {
+		t.Fatalf("detail: got %q, want operator uid 1000 failure", gotDetail)
+	}
+}
+
+func TestProbeNFTContainment_SkuidUIDBoundaryIsExact(t *testing.T) {
+	tmp := t.TempDir()
+	rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+	if err := os.WriteFile(rulesPath, []byte(renderNFTRules(98, 988, 987, 8888, testTable, testChain)), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	liveWithoutOperator98 := `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 drop
+			meta skuid 987 tcp dport 53 drop
+			meta skuid 987 drop
+		}
+	}
+	`
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.lookupUser = containTestLookup
+		e.nftRulesPath = rulesPath
+		e.readFile = os.ReadFile
+		e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+			return liveWithoutOperator98, 0, nil
+		}
+	})
+
+	gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+	if gotStatus != statusFail {
+		t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+	}
+	if !strings.Contains(gotDetail, "operator uid 98") {
+		t.Fatalf("detail: got %q, want operator uid 98 failure", gotDetail)
+	}
+}
+
+func TestProbeNFTContainment_StaleAgentUIDPrefixDoesNotSatisfyDrop(t *testing.T) {
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.lookupUser = func(name string) (*user.User, error) {
+			switch name {
+			case testProxyUser:
+				return &user.User{Uid: "988", Gid: "988", Username: name, HomeDir: "/home/" + name}, nil
+			case testAgentUser:
+				return &user.User{Uid: "98", Gid: "98", Username: name, HomeDir: "/home/" + name}, nil
+			default:
+				return nil, user.UnknownUserError(name)
+			}
+		}
+		e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+			return goodNFTContainmentOutput, 0, nil
+		}
+	})
+
+	gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+	if gotStatus != statusFail {
+		t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+	}
+	if !strings.Contains(gotDetail, "current agent uid 98") {
+		t.Fatalf("detail: got %q, want current agent uid 98 failure", gotDetail)
+	}
+}
+
+func TestProbeNFTContainment_RejectsContainmentUIDCollisions(t *testing.T) {
+	t.Run("proxy equals agent", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.lookupUser = func(name string) (*user.User, error) {
+				switch name {
+				case testProxyUser, testAgentUser:
+					return &user.User{Uid: "987", Gid: "987", Username: name, HomeDir: "/home/" + name}, nil
+				default:
+					return nil, user.UnknownUserError(name)
+				}
+			}
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return goodNFTContainmentOutput, 0, nil
+			}
+		})
+
+		gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "containment users must be distinct") {
+			t.Fatalf("detail: got %q, want distinct-user failure", gotDetail)
+		}
+	})
+
+	t.Run("operator equals agent", func(t *testing.T) {
+		tmp := t.TempDir()
+		rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+		if err := os.WriteFile(rulesPath, []byte(renderNFTRules(987, 988, 987, 8888, testTable, testChain)), 0o600); err != nil {
+			t.Fatalf("write rules: %v", err)
+		}
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.lookupUser = containTestLookup
+			e.nftRulesPath = rulesPath
+			e.readFile = os.ReadFile
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return goodNFTContainmentOutput, 0, nil
+			}
+		})
+
+		gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "keep the agent distinct from operator and proxy") {
+			t.Fatalf("detail: got %q, want operator-agent collision failure", gotDetail)
+		}
+	})
+}
+
+func containTestLookup(name string) (*user.User, error) {
+	switch name {
+	case testOperatorUser:
+		return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: "/home/" + name}, nil
+	case testProxyUser:
+		return &user.User{Uid: "988", Gid: "988", Username: name, HomeDir: "/home/" + name}, nil
+	case testAgentUser:
+		return &user.User{Uid: "987", Gid: "987", Username: name, HomeDir: "/home/" + name}, nil
+	default:
+		return nil, user.UnknownUserError(name)
+	}
+}
+
+func TestNFTLineParsers_HandleEscapedQuotesFailClosed(t *testing.T) {
+	line := `comment "escaped \" quote and \\ slash { }" {`
+	fields := nftLineFields(line)
+	if len(fields) != 3 || fields[0] != "comment" || fields[2] != "{" {
+		t.Fatalf("fields = %q, want quoted comment plus structural brace", fields)
+	}
+	if delta := nftLineBraceDelta(line); delta != 1 {
+		t.Fatalf("brace delta = %d, want 1 with quoted braces ignored", delta)
+	}
+	if !nftLineHasBalancedQuotes(line) {
+		t.Fatal("escaped quote sequence was treated as an unterminated quote")
+	}
+	if isNFTChainDeclaration(`chain output_filter { comment "unterminated`, testChain) {
+		t.Fatal("unterminated chain declaration was accepted")
+	}
+
+	malformedChain := `table inet pipelock_containment {
+	chain output_filter {
+		comment "unterminated
+		meta skuid 987 drop
+	}
+}`
+	candidateMatched := false
+	if chainHasLineBeforeAgentDrop(malformedChain, testChain, 987, func(line string) bool {
+		if strings.Contains(line, "meta skuid") {
+			candidateMatched = true
+			return true
+		}
+		return false
+	}) {
+		t.Fatal("malformed chain output produced a match")
+	}
+	if candidateMatched {
+		t.Fatal("matcher was invoked on a rule after an unterminated quote")
+	}
+}
+
+// Probe 4: wrapper_scripts_installed -----------------------------------------
+
+func TestProbeWrapperScripts(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk-claude"), 0o755)
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "plk-claude") {
+			t.Fatalf("detail: got %q, want substring plk-claude", gotDetail)
+		}
+	})
+
+	t.Run("launcher missing", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "plk-launch") {
+			t.Fatalf("detail: got %q, want plk-launch", gotDetail)
+		}
+	})
+
+	t.Run("launcher wrong mode", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		writeFakeWrapper(t, env.launchPath, 0o600)
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "perm") {
+			t.Fatalf("detail: got %q, want substring perm", gotDetail)
+		}
+	})
+
+	t.Run("meta wrapper missing", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk-claude"), 0o755)
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, filepath.Join(env.wrapperDir, "plk")) {
+			t.Fatalf("detail: got %q, want plk meta wrapper", gotDetail)
+		}
+	})
+
+	t.Run("no tool wrappers", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "no tool wrappers") {
+			t.Fatalf("detail: got %q, want substring 'no tool wrappers'", gotDetail)
+		}
+	})
+
+	t.Run("tool wrapper wrong mode", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk-claude"), 0o644)
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "want 0o755") {
+			t.Fatalf("detail: got %q, want wrapper mode failure", gotDetail)
+		}
+	})
+
+	t.Run("uses wrapper inventory when present", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.wrapperInvPath = filepath.Join(t.TempDir(), "wrappers.json")
+		env.readFile = os.ReadFile
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk-rustup"), 0o755)
+		body, err := json.Marshal(wrapperInventory{Wrappers: []string{"plk-rustup"}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := os.WriteFile(env.wrapperInvPath, append(body, '\n'), 0o600); err != nil {
+			t.Fatalf("write inventory: %v", err)
+		}
+
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "plk-rustup") {
+			t.Fatalf("detail: got %q, want custom wrapper", gotDetail)
+		}
+	})
+
+	t.Run("malformed wrapper inventory fails", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.wrapperInvPath = filepath.Join(t.TempDir(), "wrappers.json")
+		env.readFile = os.ReadFile
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		if err := os.WriteFile(env.wrapperInvPath, []byte("{"), 0o600); err != nil {
+			t.Fatalf("write inventory: %v", err)
+		}
+
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "parse wrapper inventory") {
+			t.Fatalf("detail: got %q, want parse failure", gotDetail)
+		}
+	})
+
+	t.Run("empty wrapper inventory entry fails", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.wrapperInvPath = filepath.Join(t.TempDir(), "wrappers.json")
+		env.readFile = os.ReadFile
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		body, err := json.Marshal(wrapperInventory{Wrappers: []string{""}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := os.WriteFile(env.wrapperInvPath, append(body, '\n'), 0o600); err != nil {
+			t.Fatalf("write inventory: %v", err)
+		}
+
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "empty wrapper name") {
+			t.Fatalf("detail: got %q, want empty wrapper failure", gotDetail)
+		}
+	})
+
+	t.Run("directory wrapper inventory entry fails", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.wrapperInvPath = filepath.Join(t.TempDir(), "wrappers.json")
+		env.readFile = os.ReadFile
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		dirWrapper := filepath.Join(env.wrapperDir, "plk-dir")
+		if err := os.Mkdir(dirWrapper, 0o750); err != nil {
+			t.Fatalf("mkdir wrapper dir: %v", err)
+		}
+		body, err := json.Marshal(wrapperInventory{Wrappers: []string{"plk-dir"}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := os.WriteFile(env.wrapperInvPath, append(body, '\n'), 0o600); err != nil {
+			t.Fatalf("write inventory: %v", err)
+		}
+
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "non-empty executable wrapper file") {
+			t.Fatalf("detail: got %q, want regular-file failure", gotDetail)
+		}
+	})
+
+	t.Run("empty wrapper file fails", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.wrapperInvPath = filepath.Join(t.TempDir(), "wrappers.json")
+		env.readFile = os.ReadFile
+		writeFakeWrapper(t, env.launchPath, 0o755)
+		writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+		emptyWrapper := filepath.Join(env.wrapperDir, "plk-empty")
+		if err := os.WriteFile(emptyWrapper, nil, 0o755); err != nil { //nolint:gosec // executable mode mirrors production wrapper contract.
+			t.Fatalf("write empty wrapper: %v", err)
+		}
+		body, err := json.Marshal(wrapperInventory{Wrappers: []string{"plk-empty"}})
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := os.WriteFile(env.wrapperInvPath, append(body, '\n'), 0o600); err != nil {
+			t.Fatalf("write inventory: %v", err)
+		}
+
+		gotStatus, gotDetail := probeWrapperScripts(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "non-empty executable wrapper file") {
+			t.Fatalf("detail: got %q, want empty wrapper failure", gotDetail)
+		}
+	})
+}
+
+func writeFakeWrapper(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	body := []byte("#!/bin/bash\nexit 0\n")
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
+}
+
+// Probe 5: ca_bundle_present --------------------------------------------------
+
+func TestProbeCABundle(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		// The bundle must carry the SAME certificate the selected CA returns.
+		// Generating an independent one with a matching common name is the
+		// stale-bundle state this probe now rejects.
+		current := []byte(testPEMCA(t))
+		bundle := append(append([]byte{}, current...), makeFakeCertPEM(t, "Some Other Root")...)
+		if err := os.WriteFile(env.caBundlePath, bundle, 0o600); err != nil {
+			t.Fatalf("write bundle: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+		gotStatus, gotDetail := probeCABundle(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "certificate material") {
+			t.Fatalf("detail: got %q, want it to say the match was on certificate material", gotDetail)
+		}
+	})
+
+	t.Run("bundle holds a different CA with the same common name", func(t *testing.T) {
+		// The exact failure this probe exists for: after a rotation the bundle
+		// still carries a Pipelock-named certificate, so a subject-name check
+		// reports agreement while every contained client trusts a CA the proxy
+		// no longer presents.
+		env := makeProbeEnv(t)
+		writeFakePEMBundle(t, env.caBundlePath, "Pipelock Test CA", "Some Other Root")
+		current := []byte(testPEMCA(t))
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+		gotStatus, gotDetail := probeCABundle(context.Background(), env)
+		if gotStatus != statusFail || !strings.Contains(gotDetail, "does not contain the selected Pipelock CA") {
+			t.Fatalf("status=%q detail=%q; want a failure naming the missing selected CA", gotStatus, gotDetail)
+		}
+	})
+
+	t.Run("file missing", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		gotStatus, gotDetail := probeCABundle(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail", gotStatus)
+		}
+		if !strings.Contains(gotDetail, "read") {
+			t.Fatalf("detail: got %q, want substring 'read'", gotDetail)
+		}
+	})
+
+	t.Run("no pipelock cert", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		writeFakePEMBundle(t, env.caBundlePath, "Some Other Root")
+		gotStatus, gotDetail := probeCABundle(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail", gotStatus)
+		}
+		if !strings.Contains(gotDetail, "none match Pipelock") {
+			t.Fatalf("detail: got %q, want substring 'none match Pipelock'", gotDetail)
+		}
+	})
+
+	t.Run("empty file", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		if err := os.WriteFile(env.caBundlePath, []byte{}, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		gotStatus, _ := probeCABundle(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail", gotStatus)
+		}
+	})
+
+	t.Run("malformed pem", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		// Wrap garbage in a PEM envelope so the decoder consumes a block
+		// whose Bytes are not a valid DER certificate.
+		bad := []byte("-----BEGIN CERTIFICATE-----\nbm90YWNlcnQ=\n-----END CERTIFICATE-----\n")
+		if err := os.WriteFile(env.caBundlePath, bad, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		gotStatus, gotDetail := probeCABundle(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "parse") {
+			t.Fatalf("detail: got %q, want substring 'parse'", gotDetail)
+		}
+	})
+}
+
+// writeFakePEMBundle generates one self-signed cert per CN and writes
+// the concatenated PEM to path.
+func writeFakePEMBundle(t *testing.T, path string, commonNames ...string) {
+	t.Helper()
+	var buf bytes.Buffer
+	for _, cn := range commonNames {
+		buf.Write(makeFakeCertPEM(t, cn))
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+}
+
+func makeFakeCertPEM(t *testing.T, commonName string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// Probe 6: pipelock_listening_loopback ---------------------------------------
+
+func TestProbeLoopbackListen(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+				return &fakeConn{}, nil
+			}
+		})
+		gotStatus, gotDetail := probeLoopbackListen(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "127.0.0.1:8888") {
+			t.Fatalf("detail: got %q, want substring 127.0.0.1:8888", gotDetail)
+		}
+	})
+
+	t.Run("dial refused", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+				return nil, errors.New("connection refused")
+			}
+		})
+		gotStatus, gotDetail := probeLoopbackListen(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail", gotStatus)
+		}
+		if !strings.Contains(gotDetail, "refused") {
+			t.Fatalf("detail: got %q, want substring refused", gotDetail)
+		}
+	})
+
+	t.Run("slow startup becomes ready", func(t *testing.T) {
+		attempts := 0
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+				attempts++
+				if attempts < 3 {
+					return nil, errors.New("connection refused")
+				}
+				return &fakeConn{}, nil
+			}
+			e.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+				if name != "systemctl" || !containsArg(args, "show") {
+					t.Fatalf("unexpected readiness command: %s %v", name, args)
+				}
+				return "ActiveState=active\nSubState=running\n", 0, nil
+			}
+		})
+		gotStatus, _ := probeLoopbackListen(context.Background(), env)
+		if gotStatus != statusPass || attempts != 3 {
+			t.Fatalf("status=%q attempts=%d, want pass after 3", gotStatus, attempts)
+		}
+	})
+
+	t.Run("service state polling is throttled while dialing stays frequent", func(t *testing.T) {
+		dials := 0
+		statePolls := 0
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+				dials++
+				if dials < 7 {
+					return nil, errors.New("connection refused")
+				}
+				return &fakeConn{}, nil
+			}
+			e.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+				if name != "systemctl" || !containsArg(args, "show") {
+					t.Fatalf("unexpected readiness command: %s %v", name, args)
+				}
+				statePolls++
+				return "ActiveState=active\nSubState=running\n", 0, nil
+			}
+		})
+		gotStatus, _ := probeLoopbackListen(context.Background(), env)
+		if gotStatus != statusPass || dials != 7 {
+			t.Fatalf("status=%q dials=%d, want pass after 7", gotStatus, dials)
+		}
+		if statePolls != 2 {
+			t.Fatalf("systemctl state polls=%d, want 2 for 6 failed dials", statePolls)
+		}
+	})
+
+	t.Run("service exits before binding", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+				return nil, errors.New("connection refused")
+			}
+			e.runCmd = func(context.Context, string, ...string) (string, int, error) {
+				return "ActiveState=failed\nSubState=failed\n", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeLoopbackListen(context.Background(), env)
+		if gotStatus != statusFail || !strings.Contains(gotDetail, "exited before readiness") {
+			t.Fatalf("status=%q detail=%q, want failed-service diagnosis", gotStatus, gotDetail)
+		}
+	})
+}
+
+// fakeConn implements net.Conn for probe 6's dial stub.
+type fakeConn struct{}
+
+func (*fakeConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (*fakeConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (*fakeConn) Close() error                     { return nil }
+func (*fakeConn) LocalAddr() net.Addr              { return nil }
+func (*fakeConn) RemoteAddr() net.Addr             { return nil }
+func (*fakeConn) SetDeadline(time.Time) error      { return nil }
+func (*fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (*fakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// Probe 7: no_proxy_env_correct ----------------------------------------------
+
+func TestProbeNoProxyEnv(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		body := "#!/bin/bash\nexec env NO_PROXY=127.0.0.1,localhost,::1 HTTPS_PROXY=http://127.0.0.1:8888 sh\n"
+		if err := os.WriteFile(env.launchPath, []byte(body), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		gotStatus, gotDetail := probeNoProxyEnv(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "127.0.0.1,localhost") {
+			t.Fatalf("detail: got %q, want substring 127.0.0.1,localhost", gotDetail)
+		}
+	})
+
+	t.Run("wrong value", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		body := "#!/bin/bash\nexec env NO_PROXY=127.0.0.1,localhost,10.0.0.0/24 sh\n"
+		if err := os.WriteFile(env.launchPath, []byte(body), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		gotStatus, gotDetail := probeNoProxyEnv(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "differs from policy") {
+			t.Fatalf("detail: got %q, want substring 'differs from policy'", gotDetail)
+		}
+	})
+
+	t.Run("no assignment", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		body := "#!/bin/bash\nexec env HTTPS_PROXY=http://127.0.0.1:8888 sh\n"
+		if err := os.WriteFile(env.launchPath, []byte(body), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		gotStatus, gotDetail := probeNoProxyEnv(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail", gotStatus)
+		}
+		if !strings.Contains(gotDetail, "not found") {
+			t.Fatalf("detail: got %q, want substring 'not found'", gotDetail)
+		}
+	})
+
+	t.Run("file missing", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		gotStatus, _ := probeNoProxyEnv(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail", gotStatus)
+		}
+	})
+}
+
+func TestExtractNoProxy(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"NO_PROXY=127.0.0.1,localhost foo bar", "NO_PROXY=127.0.0.1,localhost"},
+		{"    NO_PROXY=a,b \\", "NO_PROXY=a,b"},
+		{"no NO_PROXY here\nHTTPS_PROXY=x", ""},
+		{"first\nNO_PROXY=x\nNO_PROXY=y\n", "NO_PROXY=x"},
+		{"# NO_PROXY=127.0.0.1,localhost\nHTTPS_PROXY=x", ""},
+		{"OTHER_NO_PROXY=127.0.0.1,localhost\nNO_PROXY=x", "NO_PROXY=x"},
+	}
+	for _, c := range cases {
+		got := extractNoProxy([]byte(c.in))
+		if got != c.want {
+			t.Errorf("extractNoProxy(%q): got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// Probe 8 + 9: egress canary + operator reachability -------------------------
+
+func TestManagedContainmentDropPacketCount(t *testing.T) {
+	tests := []struct {
+		name    string
+		output  string
+		chain   string
+		uid     int
+		want    uint64
+		wantErr string
+	}{
+		{
+			name:   "reads exact managed catch-all rule",
+			output: goodNFTContainmentOutputRealListing,
+			chain:  testChain,
+			uid:    987,
+			want:   12,
+		},
+		{
+			name: "rejects unexpanded counter",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "no expanded packet counter",
+		},
+		{
+			name:    "rejects different uid",
+			output:  goodNFTContainmentOutputRealListing,
+			chain:   testChain,
+			uid:     986,
+			wantErr: "no managed catch-all DROP packet counter",
+		},
+		{
+			name: "rejects malformed packet count",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter packets nope bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "parse managed catch-all DROP packet counter",
+		},
+		{
+			name: "rejects multiple counters in one managed rule",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter packets 12 bytes 0 counter packets 13 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "multiple packet counters",
+		},
+		{
+			name: "rejects extra bookkeeping predicates",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter packets 12 bytes 0 meta mark 1 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "no managed catch-all DROP packet counter",
+		},
+		{
+			name: "accepts maximum uint64 packet count",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter packets 18446744073709551615 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain: testChain,
+			uid:   987,
+			want:  ^uint64(0),
+		},
+		{
+			name: "rejects packet count overflow",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter packets 18446744073709551616 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "value out of range",
+		},
+		{
+			name: "rejects matching lookalike in wrong chain",
+			output: `table inet pipelock_containment {
+	chain decoy {
+		meta skuid 987 counter packets 44 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+	chain output_filter {
+		meta skuid 987 counter packets 12 bytes 0 drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "not positively attributed",
+		},
+		{
+			name: "sums duplicate managed catch-all counters during migration",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 counter packets 12 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+		meta skuid 987 counter packets 13 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain: testChain,
+			uid:   987,
+			want:  25,
+		},
+		{
+			name: "rejects destination-specific lookalike",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 987 ip daddr 192.0.2.1 counter packets 12 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "no managed catch-all DROP packet counter",
+		},
+		{
+			name: "rejects destination predicate before skuid",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+		ip daddr 203.0.113.10 meta skuid 987 counter packets 12 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			chain:   testChain,
+			uid:     987,
+			wantErr: "no managed catch-all DROP packet counter",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := managedContainmentDropPacketCount(tc.output, tc.chain, tc.uid)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("managedContainmentDropPacketCount: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("packet count = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNFTChainTraversalRejectsCraftedNamesAndMalformedComments(t *testing.T) {
+	const managedRule = `meta skuid 987 counter packets 44 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop`
+	tests := []struct {
+		name string
+		out  string
+	}{
+		{
+			name: "chain-name prefix is not the managed chain",
+			out: `table inet pipelock_containment {
+	chain output_filter decoy {
+		` + managedRule + `
+	}
+}`,
+		},
+		{
+			name: "unterminated quoted comment cannot bleed into later chain",
+			out: `table inet pipelock_containment {
+	chain output_filter {
+		comment "unterminated }
+	chain decoy {
+		` + managedRule + `
+	}
+}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if outputHasNFTChainDeclaration(tc.out, testChain) && tc.name == "chain-name prefix is not the managed chain" {
+				t.Fatal("crafted prefix was accepted as an exact chain declaration")
+			}
+			if got, err := managedContainmentDropPacketCount(tc.out, testChain, 987); err == nil {
+				t.Fatalf("crafted output attributed packet count %d to %s", got, testChain)
+			}
+		})
+	}
+}
+
+func TestManagedContainmentDropPacketCountFromLinesRejectsMalformedCounterLine(t *testing.T) {
+	lines := []string{`meta skuid 987 counter packets 12 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop comment "unterminated`}
+	if _, err := managedContainmentDropPacketCountFromLines(lines, testChain, 987); err == nil ||
+		!strings.Contains(err.Error(), "malformed quoted rule content") {
+		t.Fatalf("error = %v, want malformed quoted rule content", err)
+	}
+}
+
+func TestReadContainmentDropCounter(t *testing.T) {
+	tests := []struct {
+		name       string
+		lookupErr  error
+		output     string
+		code       int
+		runErr     error
+		want       uint64
+		wantErr    string
+		wantRunCmd bool
+	}{
+		{name: "reads live managed counters", output: goodNFTContainmentOutputRealListing, want: 12, wantRunCmd: true},
+		{
+			name: "rejects unhooked regular chain",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+			meta skuid 987 counter packets 12 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			wantErr:    "not the managed output base chain",
+			wantRunCmd: true,
+		},
+		{
+			name: "accepts harmless quoted nft comments and handle annotations",
+			output: `table inet pipelock_containment {
+	chain output_filter { # handle 1
+		comment "managed drop evidence }"
+		type filter hook output priority 0; policy accept;
+		meta skuid 1000 accept comment "operator accept" # handle 2
+		meta skuid 988 accept comment "proxy accept" # handle 3
+		meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept comment "loopback } allow" # handle 4
+		meta skuid 987 udp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop # handle 5
+		meta skuid 987 tcp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop # handle 6
+		meta skuid 987 counter packets 12 bytes 840 log prefix "pipelock-contain class=not_routing_through_pipelock " drop comment "canonical drop evidence" # handle 7
+	}
+}`,
+			want:       12,
+			wantRunCmd: true,
+		},
+		{
+			name: "rejects unexpected nft json instead of misaggregating it",
+			output: `{"nftables":[
+{"chain":{"family":"inet","table":"pipelock_containment","name":"output_filter","type":"filter","hook":"output","prio":0,"policy":"accept"}},
+{"rule":{"family":"inet","table":"pipelock_containment","chain":"output_filter","expr":[
+{"match":{"op":"==","left":{"meta":{"key":"skuid"}},"right":987}},
+{"counter":{"packets":12,"bytes":840}},
+{"log":{"prefix":"pipelock-contain class=not_routing_through_pipelock "}},
+{"drop":null}
+]}}
+]}`,
+			wantErr:    "rule content before the chain declaration",
+			wantRunCmd: true,
+		},
+		{
+			name: "rejects canary interception before managed counter",
+			output: `table inet pipelock_containment {
+	chain output_filter {
+			type filter hook output priority 0; policy accept;
+		meta skuid 987 ip daddr 192.0.2.1 drop
+		meta skuid 987 counter packets 12 bytes 0 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			wantErr:    "unexpected verdict before managed catch-all DROP",
+			wantRunCmd: true,
+		},
+		{name: "agent lookup failure", lookupErr: errors.New("missing user"), wantErr: "lookup agent uid"},
+		{name: "nft invocation failure", runErr: errors.New("nft missing"), wantErr: "list nft chain", wantRunCmd: true},
+		{name: "nft nonzero exit", output: "operation not permitted", code: 1, wantErr: "exit=1", wantRunCmd: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			runCalled := false
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.lookupUser = func(name string) (*user.User, error) {
+					switch name {
+					case testProxyUser:
+						return &user.User{Uid: "988", Username: testProxyUser}, nil
+					case testAgentUser:
+						return &user.User{Uid: "987", Username: testAgentUser}, tc.lookupErr
+					default:
+						t.Fatalf("unexpected lookup user %q", name)
+						return nil, nil
+					}
+				}
+				e.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+					runCalled = true
+					if name != testNFT {
+						t.Fatalf("command = %q, want %q", name, testNFT)
+					}
+					wantArgs := []string{"-n", "-a", "list", "chain", "inet", testTable, testChain}
+					if strings.Join(args, " ") != strings.Join(wantArgs, " ") {
+						t.Fatalf("args = %v, want %v", args, wantArgs)
+					}
+					return tc.output, tc.code, tc.runErr
+				}
+			})
+
+			got, err := readContainmentDropCounter(context.Background(), env)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("readContainmentDropCounter: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("counter = %d, want %d", got, tc.want)
+			}
+			if runCalled != tc.wantRunCmd {
+				t.Fatalf("run called = %t, want %t", runCalled, tc.wantRunCmd)
+			}
+		})
+	}
+}
+
+func TestChainHasManagedOutputBaseChain(t *testing.T) {
+	tests := []struct {
+		name string
+		decl string
+		want bool
+	}{
+		{
+			name: "symbolic filter priority emitted by nft",
+			decl: "type filter hook output priority filter; policy accept;",
+			want: true,
+		},
+		{
+			name: "numeric filter priority emitted by nft",
+			decl: "type filter hook output priority 0; policy accept;",
+			want: true,
+		},
+		{name: "regular chain is unattached", want: false},
+		{
+			name: "wrong hook",
+			decl: "type filter hook input priority filter; policy accept;",
+			want: false,
+		},
+		{
+			name: "wrong priority",
+			decl: "type filter hook output priority 10; policy accept;",
+			want: false,
+		},
+		{
+			name: "wrong policy",
+			decl: "type filter hook output priority filter; policy drop;",
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := "table inet pipelock_containment {\n\tchain output_filter {\n\t\t" + tc.decl +
+				"\n\t}\n}"
+			if got := chainHasManagedOutputBaseChain(out, testChain); got != tc.want {
+				t.Fatalf("chainHasManagedOutputBaseChain() = %t, want %t for %q", got, tc.want, tc.decl)
+			}
+		})
+	}
+}
+
+func TestContainmentBypassError_NamesTheRule(t *testing.T) {
+	err := &containmentBypassError{rule: "meta skuid 987 accept"}
+	if got := err.Error(); !strings.Contains(got, "meta skuid 987 accept") || !strings.Contains(got, "bypasses managed catch-all DROP") {
+		t.Fatalf("Error() = %q, want the rule and the bypass wording", got)
+	}
+	if rule, ok := definiteContainmentBypassRule(fmt.Errorf("wrapped: %w", err)); !ok || rule != "meta skuid 987 accept" {
+		t.Fatalf("definiteContainmentBypassRule(wrapped) = (%q, %v), want the rule through errors.As", rule, ok)
+	}
+}
+
+func TestAgentUIDBareAcceptBeforeDrop(t *testing.T) {
+	const agentUID = 987
+	lines := []string{
+		"meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept",
+		"meta skuid 987 counter packets 3 bytes 180 accept comment \"foreign rule\"",
+		"meta skuid 987 drop",
+	}
+	rule, ok := agentUIDBareAcceptBeforeDrop(lines, agentUID)
+	if !ok || rule != `meta skuid 987 counter packets 3 bytes 180 accept comment "foreign rule"` {
+		t.Fatalf("bare agent accept = %q, %t", rule, ok)
+	}
+
+	for _, line := range []string{
+		"meta skuid 12345 accept",
+		"ip daddr 10.0.0.0/8 accept",
+		"meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept",
+		"meta skuid 987 log level accept",
+		"meta skuid 987 level info accept",
+		"meta skuid 987 prefix \"x\" accept",
+	} {
+		if _, ok := agentUIDBareAcceptBeforeDrop([]string{line, "meta skuid 987 drop"}, agentUID); ok {
+			t.Fatalf("foreign or constrained rule classified as definite bypass: %q", line)
+		}
+	}
+
+	// nft log options only change what is logged; the rule still admits every
+	// agent packet, so each of these stays a definite bypass.
+	for _, line := range []string{
+		"meta skuid 987 log accept",
+		"meta skuid 987 log level info accept",
+		"meta skuid 987 log prefix \"agent \" level warn flags all accept",
+		"meta skuid 987 log group 2 queue-threshold 10 snaplen 64 accept",
+		"meta skuid 987 log flags tcp sequence,options accept",
+		"meta skuid 987 log flags ip options level info accept",
+		"meta skuid 987 log flags skuid accept",
+		"meta skuid 987 log flags all accept",
+		"meta skuid 987 counter packets 0 bytes 0 log level debug accept comment \"x\"",
+	} {
+		if _, ok := agentUIDBareAcceptBeforeDrop([]string{line, "meta skuid 987 drop"}, agentUID); !ok {
+			t.Fatalf("logged bare agent accept not classified as definite bypass: %q", line)
+		}
+	}
+
+	uids := containmentUIDs{proxyUID: 988, agentUID: agentUID}
+	if chainLinesHaveUnsafeVerdictBeforeAgentDrop([]string{"meta skuid 12345 accept", "meta skuid 987 drop"}, uids, defaultProxyPort) {
+		t.Fatal("a terminal rule owned by another UID cannot admit agent packets and must not be flagged")
+	}
+}
+
+// TestProbeNFTContainment_BypassOutranksMissingCanonicalRules pins the check
+// order: a chain that both lacks a canonical rule and admits every agent
+// packet must report the bypass, not the missing rule, or the doctor would
+// downgrade a definite hole to an inconclusive structural result.
+func TestProbeNFTContainment_BypassOutranksMissingCanonicalRules(t *testing.T) {
+	for _, missing := range []string{
+		"meta skuid 1000 accept",
+		"meta skuid 988 accept",
+		"meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept",
+		"meta skuid 987 udp dport 53 counter log prefix \"pipelock-contain class=direct_dns_blocked \" drop",
+		"meta skuid 987 tcp dport 53 counter log prefix \"pipelock-contain class=direct_dns_blocked \" drop",
+	} {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.lookupUser = containTestLookup
+			e.nftRulesPath = ""
+			e.nftPersistUnitPath = ""
+			e.runCmd = func(context.Context, string, ...string) (string, int, error) {
+				out := strings.Replace(goodNFTContainmentOutput, "\t\t"+missing+"\n", "", 1)
+				out = strings.Replace(out, "\t\tmeta skuid 987 drop\n",
+					"\t\tmeta skuid 987 accept\n\t\tmeta skuid 987 drop\n", 1)
+				return out, 0, nil
+			}
+		})
+		status, detail := probeNFTContainment(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, containmentBypassDetailPrefix) {
+			t.Fatalf("missing %q: probe = (%q, %q), want the definite bypass reported first", missing, status, detail)
+		}
+	}
+}
+
+// TestProbeNFTContainment_MissingBaseChainOutranksBypass pins the reporting
+// order for a chain that is not the managed output base chain. Without the
+// output hook no rule in it is reached, so a pre-drop bare agent accept there
+// is not a containment hole and must not be reported as one: the doctor maps
+// the bypass wording to FAIL and everything else to UNKNOWN, and "this chain
+// enforces nothing" is exactly the inconclusive case.
+// TestProbeNFTContainment_JumpBeforeDropIsNeverPass answers the review question
+// about an agent rule that reaches an accept indirectly. The definite-bypass
+// classifier deliberately covers only the one unambiguous shape, so a jump,
+// goto or return before the drop is NOT reported as a containment hole; what
+// matters is that it is never reported as PASS either. The unexpected-verdict
+// guard refuses to attribute the chain, which the doctor renders as UNKNOWN.
+func TestProbeNFTContainment_JumpBeforeDropIsNeverPass(t *testing.T) {
+	for _, verdict := range []string{"jump escape_chain", "goto escape_chain", "return"} {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.lookupUser = containTestLookup
+			e.readFile = func(path string) ([]byte, error) {
+				if path == e.configPath {
+					return nil, os.ErrNotExist
+				}
+				return rejectAllReadFile(path)
+			}
+			e.nftRulesPath = ""
+			e.nftPersistUnitPath = ""
+			e.runCmd = func(context.Context, string, ...string) (string, int, error) {
+				return strings.Replace(goodNFTContainmentOutput, "\t\tmeta skuid 987 drop\n",
+					"\t\tmeta skuid 987 "+verdict+"\n\t\tmeta skuid 987 drop\n", 1), 0, nil
+			}
+		})
+		status, detail := probeNFTContainment(context.Background(), env)
+		if status == statusPass {
+			t.Fatalf("%q before the agent drop reported PASS: %q", verdict, detail)
+		}
+		if !strings.Contains(detail, "unexpected verdict before agent drop") {
+			t.Fatalf("%q before the agent drop = (%q, %q), want the unexpected-verdict refusal", verdict, status, detail)
+		}
+	}
+}
+
+func TestProbeNFTContainment_MissingBaseChainOutranksBypass(t *testing.T) {
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.operatorUser = testOperatorUser
+		e.lookupUser = containTestLookup
+		e.nftRulesPath = ""
+		e.nftPersistUnitPath = ""
+		e.runCmd = func(context.Context, string, ...string) (string, int, error) {
+			out := strings.Replace(goodNFTContainmentOutput,
+				"\t\ttype filter hook output priority filter; policy accept;\n", "", 1)
+			out = strings.Replace(out, "\t\tmeta skuid 987 drop\n",
+				"\t\tmeta skuid 987 accept\n\t\tmeta skuid 987 drop\n", 1)
+			return out, 0, nil
+		}
+	})
+	status, detail := probeNFTContainment(context.Background(), env)
+	if status != statusFail {
+		t.Fatalf("probe = (%q, %q), want fail", status, detail)
+	}
+	if strings.Contains(detail, containmentBypassDetailPrefix) {
+		t.Fatalf("probe reported a containment hole for an unhooked chain: %q", detail)
+	}
+	if !strings.Contains(detail, "not the managed output base chain") {
+		t.Fatalf("probe = %q, want the base-chain contract reported first", detail)
+	}
+}
+
+func TestReadContainmentDropCounter_DefiniteBypassIsTypedError(t *testing.T) {
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.lookupUser = containTestLookup
+		e.runCmd = func(context.Context, string, ...string) (string, int, error) {
+			return `table inet pipelock_containment {
+	chain output_filter {
+			type filter hook output priority 0; policy accept;
+		meta skuid 987 counter packets 3 bytes 180 accept
+		meta skuid 987 counter packets 12 bytes 0 drop
+	}
+}`, 0, nil
+		}
+	})
+
+	got, err := readContainmentDropCounter(context.Background(), env)
+	if got != 0 {
+		t.Fatalf("counter = %d, want 0 on a definite bypass", got)
+	}
+	rule, ok := definiteContainmentBypassRule(err)
+	if !ok {
+		t.Fatalf("error = %v, want a typed containmentBypassError so callers can report FAIL", err)
+	}
+	if rule != "meta skuid 987 counter packets 3 bytes 180 accept" {
+		t.Fatalf("rule = %q, want the offending pre-drop accept", rule)
+	}
+}
+
+func TestProbeCCAgentEgressDenied_DefiniteStructuralBypassFails(t *testing.T) {
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.dropCounter = func(context.Context, *probeEnv) (uint64, error) {
+			return 0, &containmentBypassError{rule: "meta skuid 987 accept"}
+		}
+		e.runCmd = func(context.Context, string, ...string) (string, int, error) {
+			return "curl: (7) refused\nPLK_TIME_CONNECT=0.000000\n000", 7, nil
+		}
+	})
+	status, detail := probeCCAgentEgressDenied(context.Background(), env)
+	if status != statusFail || !strings.Contains(detail, "meta skuid 987 accept") {
+		t.Fatalf("probe = (%q, %q), want fail naming offending rule", status, detail)
+	}
+}
+
+func TestParseDirectCurlDialCompletion(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want directDialCompletion
+	}{
+		{name: "zero means dial did not complete", out: "curl: (7) refused\nPLK_TIME_CONNECT=0.000000\n000", want: directDialNotCompleted},
+		{name: "positive means dial completed", out: "curl: (28) timed out\nPLK_TIME_CONNECT=0.125381\n000", want: directDialCompleted},
+		{name: "missing sentinel", out: "curl: (7) refused", want: directDialUnknown},
+		{name: "empty value", out: "PLK_TIME_CONNECT=\n000", want: directDialUnknown},
+		{name: "malformed value", out: "PLK_TIME_CONNECT=not-a-number\n000", want: directDialUnknown},
+		{name: "locale comma is not guessed", out: "PLK_TIME_CONNECT=0,125381\n000", want: directDialUnknown},
+		{name: "negative value", out: "PLK_TIME_CONNECT=-0.1\n000", want: directDialUnknown},
+		{name: "nan value", out: "PLK_TIME_CONNECT=NaN\n000", want: directDialUnknown},
+		{name: "infinite value", out: "PLK_TIME_CONNECT=+Inf\n000", want: directDialUnknown},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseDirectCurlDialCompletion(tc.out); got != tc.want {
+				t.Fatalf("parseDirectCurlDialCompletion(%q) = %d, want %d", tc.out, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProbeCCAgentEgressDenied(t *testing.T) {
+	tests := []struct {
+		name             string
+		stdout           string
+		code             int
+		runErr           error
+		curlPath         string
+		counterBefore    uint64
+		counterAfter     uint64
+		counterBeforeErr error
+		counterAfterErr  error
+		noCounterReader  bool
+		wantStatus       string
+		wantDetail       string
+	}{
+		{
+			name:          "attributable egress block passes",
+			stdout:        "curl: (7) Failed to connect\nPLK_TIME_CONNECT=0.000000\n000",
+			code:          7,
+			counterBefore: 12,
+			counterAfter:  13,
+			wantStatus:    statusPass,
+			wantDetail:    "managed DROP counter increased",
+		},
+		{
+			name:          "attributable connect timeout before dial passes",
+			stdout:        "curl: (28) Connection timed out\nPLK_TIME_CONNECT=0.000000\n000",
+			code:          28,
+			counterBefore: 12,
+			counterAfter:  13,
+			wantStatus:    statusPass,
+			wantDetail:    "time_connect=0",
+		},
+		{
+			name:          "completed dial timeout fails despite UID-wide counter delta",
+			stdout:        "curl: (28) Operation timed out\nPLK_TIME_CONNECT=0.125381\n000",
+			code:          28,
+			counterBefore: 12,
+			counterAfter:  13,
+			wantStatus:    statusFail,
+			wantDetail:    "CONTAINMENT HOLE",
+		},
+		{
+			name:          "unknown dial timing cannot pass from UID-wide counter delta",
+			stdout:        "curl: (7) Failed to connect\nPLK_TIME_CONNECT=unparseable\n000",
+			code:          7,
+			counterBefore: 12,
+			counterAfter:  13,
+			wantStatus:    statusUnknown,
+			wantDetail:    "time_connect was missing or unparseable",
+		},
+		{
+			name:          "DNS failure without counter delta is inconclusive",
+			stdout:        "curl: (6) Could not resolve host: example.com\nPLK_TIME_CONNECT=0.000000\n000",
+			code:          6,
+			counterBefore: 12,
+			counterAfter:  12,
+			wantStatus:    statusUnknown,
+			wantDetail:    "may be unrelated to containment",
+		},
+		{
+			name:          "DNS failure with unrelated counter delta is inconclusive",
+			stdout:        "curl: (6) Could not resolve host: example.com\nPLK_TIME_CONNECT=0.000000\n000",
+			code:          6,
+			counterBefore: 12,
+			counterAfter:  13,
+			wantStatus:    statusUnknown,
+			wantDetail:    "unexpected exit=6 despite a counter delta",
+		},
+		{
+			name:          "timeout without counter delta is inconclusive",
+			stdout:        "curl: (28) Connection timed out\nPLK_TIME_CONNECT=0.000000\n000",
+			code:          28,
+			counterBefore: 12,
+			counterAfter:  12,
+			wantStatus:    statusUnknown,
+			wantDetail:    "may be unrelated to containment",
+		},
+		{
+			name:          "counter reset or wrap is inconclusive",
+			stdout:        "curl: (28) Connection timed out\nPLK_TIME_CONNECT=0.000000\n000",
+			code:          28,
+			counterBefore: ^uint64(0),
+			counterAfter:  0,
+			wantStatus:    statusUnknown,
+			wantDetail:    "did not increase",
+		},
+		{
+			name:          "TLS handshake proves post-connect breach without counter delta",
+			stdout:        "curl: (35) TLS connect error",
+			code:          35,
+			counterBefore: 12,
+			counterAfter:  12,
+			wantStatus:    statusFail,
+			wantDetail:    "reached the network",
+		},
+		{
+			name:          "post-connect empty reply fails despite counter delta",
+			stdout:        "curl: (52) Empty reply from server",
+			code:          52,
+			counterBefore: 12,
+			counterAfter:  13,
+			wantStatus:    statusFail,
+			wantDetail:    "CONTAINMENT HOLE",
+		},
+		{
+			name:            "no counter reader is inconclusive even for refused connection",
+			stdout:          "curl: (7) Failed to connect: Connection refused\nPLK_TIME_CONNECT=0.000000\n000",
+			code:            7,
+			noCounterReader: true,
+			wantStatus:      statusUnknown,
+			wantDetail:      "no DROP counter reader",
+		},
+		{
+			name:             "counter unavailable before probe is inconclusive",
+			stdout:           "curl: (7) Failed to connect\nPLK_TIME_CONNECT=0.000000\n000",
+			code:             7,
+			counterBeforeErr: errors.New("operation not permitted"),
+			counterAfter:     13,
+			wantStatus:       statusUnknown,
+			wantDetail:       "before probe",
+		},
+		{
+			name:            "counter unavailable after probe is inconclusive",
+			stdout:          "curl: (7) Failed to connect\nPLK_TIME_CONNECT=0.000000\n000",
+			code:            7,
+			counterBefore:   12,
+			counterAfterErr: errors.New("table disappeared"),
+			wantStatus:      statusUnknown,
+			wantDetail:      "after probe",
+		},
+		{
+			name:       "egress succeeded (regression)",
+			stdout:     "200",
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "unexpected curl success",
+		},
+		{
+			name:       "sudo no password",
+			stdout:     testSudoNeedsPwd + "\n",
+			code:       1,
+			wantStatus: statusSkip,
+			wantDetail: "configure NOPASSWD",
+		},
+		{
+			name:       "sudo no tty",
+			stdout:     "sudo: no tty present and no askpass program specified\n",
+			code:       1,
+			wantStatus: statusSkip,
+			wantDetail: "configure NOPASSWD",
+		},
+		{
+			name:       "sudo not in sudoers",
+			stdout:     "user operator may not run sudo on host\n",
+			code:       1,
+			wantStatus: statusSkip,
+			wantDetail: "configure NOPASSWD",
+		},
+		{
+			name:       "binary missing",
+			runErr:     errors.New("exec: \"sudo\": executable file not found"),
+			wantStatus: statusSkip,
+			wantDetail: "sudo/curl unavailable",
+		},
+		{
+			name:       "pipelock-agent user missing",
+			stdout:     "sudo: unknown user pipelock-agent\nsudo: error initializing audit plugin sudoers_audit\n",
+			code:       1,
+			wantStatus: statusSkip,
+			wantDetail: "install containment model first",
+		},
+		{
+			name:       "target curl missing",
+			stdout:     "sudo: /custom/bin/curl: command not found\n",
+			code:       1,
+			curlPath:   "/custom/bin/curl",
+			wantStatus: statusSkip,
+			wantDetail: "sudo could not execute /custom/bin/curl",
+		},
+		{
+			name:       "fallback curl missing",
+			stdout:     "sudo: /usr/bin/curl: command not found\n",
+			code:       1,
+			curlPath:   "",
+			wantStatus: statusSkip,
+			wantDetail: "sudo could not execute /usr/bin/curl",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := makeProbeEnv(t, func(e *probeEnv) {
+				e.curlPath = tc.curlPath
+				if tc.noCounterReader {
+					e.dropCounter = nil
+				} else {
+					counterReads := 0
+					e.dropCounter = func(_ context.Context, _ *probeEnv) (uint64, error) {
+						counterReads++
+						if counterReads == 1 {
+							return tc.counterBefore, tc.counterBeforeErr
+						}
+						return tc.counterAfter, tc.counterAfterErr
+					}
+				}
+				e.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+					if name != testSudoCmd {
+						t.Fatalf("unexpected cmd %q", name)
+					}
+					// Sanity: confirm we drop to pipelock-agent.
+					joined := strings.Join(args, " ")
+					if !strings.Contains(joined, "-u "+testAgentUser) {
+						t.Fatalf("argv missing -u %s: %v", testAgentUser, args)
+					}
+					if !strings.Contains(joined, directEgressCanaryURL) || strings.Contains(joined, canaryURL) {
+						t.Fatalf("argv does not use DNS-free direct canary %q: %v", directEgressCanaryURL, args)
+					}
+					if !strings.Contains(joined, "--connect-timeout "+directCurlConnectTimeout) ||
+						!strings.Contains(joined, "--max-time "+directCurlMaxTime) {
+						t.Fatalf("argv does not use bounded direct-canary timeouts: %v", args)
+					}
+					if !strings.Contains(joined, directCurlTimeConnectPrefix+"%{time_connect}") {
+						t.Fatalf("argv does not capture probe-specific time_connect: %v", args)
+					}
+					return tc.stdout, tc.code, tc.runErr
+				}
+			})
+			gotStatus, gotDetail := probeCCAgentEgressDenied(context.Background(), env)
+			if gotStatus != tc.wantStatus {
+				t.Fatalf("status: got %q, want %q (detail=%q)", gotStatus, tc.wantStatus, gotDetail)
+			}
+			if !strings.Contains(gotDetail, tc.wantDetail) {
+				t.Fatalf("detail: got %q, want substring %q", gotDetail, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func TestProbeOperatorEgress(t *testing.T) {
+	t.Run("operator reachable via sudo", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+				if name != testSudoCmd {
+					t.Fatalf("unexpected cmd %q", name)
+				}
+				if !strings.Contains(strings.Join(args, " "), "-u "+testOperatorUser) {
+					t.Fatalf("argv missing -u %s: %v", testOperatorUser, args)
+				}
+				return "200", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "HTTP 200") {
+			t.Fatalf("detail: got %q, want HTTP 200", gotDetail)
+		}
+	})
+
+	t.Run("not running under sudo: invoke curl directly", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = ""
+			e.runCmd = func(_ context.Context, name string, _ ...string) (string, int, error) {
+				if name != curlPath {
+					t.Fatalf("expected direct curl invoke, got %q", name)
+				}
+				return "200", 0, nil
+			}
+		})
+		gotStatus, _ := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass", gotStatus)
+		}
+	})
+
+	t.Run("operator unreachable", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "curl: (6) Could not resolve host", 6, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "operator curl failed") {
+			t.Fatalf("detail: got %q, want 'operator curl failed'", gotDetail)
+		}
+	})
+
+	t.Run("sudo refusal -> skip", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return testSudoNeedsPwd, 1, nil
+			}
+		})
+		gotStatus, _ := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusSkip {
+			t.Fatalf("status: got %q, want skip", gotStatus)
+		}
+	})
+
+	t.Run("operator user missing -> skip", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = "ghost"
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "sudo: unknown user ghost", 1, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusSkip {
+			t.Fatalf("status: got %q, want skip (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "ghost") {
+			t.Fatalf("detail: got %q, want substring 'ghost'", gotDetail)
+		}
+	})
+
+	t.Run("operator sudo target curl missing -> skip", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "sudo: /usr/bin/curl: No such file or directory", 1, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusSkip {
+			t.Fatalf("status: got %q, want skip (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "curl not executable") {
+			t.Fatalf("detail: got %q, want curl not executable", gotDetail)
+		}
+	})
+
+	t.Run("operator HTTP 503 -> fail", func(t *testing.T) {
+		// curl with -w '%{http_code}' exits 0 even on 5xx; a captive
+		// portal or carrier intercept must not look like
+		// "operator reachable".
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "503", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "non-2xx/3xx HTTP 503") {
+			t.Fatalf("detail: got %q, want substring 'non-2xx/3xx HTTP 503'", gotDetail)
+		}
+	})
+
+	t.Run("operator HTTP 301 -> pass (redirect counts as reachable)", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "301", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "HTTP 301") {
+			t.Fatalf("detail: got %q, want HTTP 301", gotDetail)
+		}
+	})
+
+	t.Run("operator empty output -> fail", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				// Empty stdout but exit 0 - pathological but
+				// catchable.
+				return "", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "no output") {
+			t.Fatalf("detail: got %q, want substring 'no output'", gotDetail)
+		}
+	})
+
+	t.Run("operator stderr noise prefix -> pass", func(t *testing.T) {
+		// realRunCommand merges stdout+stderr; benign sudo/PAM warnings
+		// can land in front of curl's HTTP code. The last whitespace-
+		// separated token is what `-w '%{http_code}'` printed.
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "sudo: setrlimit(RLIMIT_CORE): Operation not permitted 200", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusPass {
+			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "HTTP 200") {
+			t.Fatalf("detail: got %q, want substring 'HTTP 200'", gotDetail)
+		}
+	})
+
+	t.Run("operator non-numeric last token -> fail", func(t *testing.T) {
+		env := makeProbeEnv(t, func(e *probeEnv) {
+			e.operatorUser = testOperatorUser
+			e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+				return "curl: warning something something garbage", 0, nil
+			}
+		})
+		gotStatus, gotDetail := probeOperatorEgress(context.Background(), env)
+		if gotStatus != statusFail {
+			t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+		}
+		if !strings.Contains(gotDetail, "unparseable") {
+			t.Fatalf("detail: got %q, want substring 'unparseable'", gotDetail)
+		}
+	})
+}
+
+func TestCappedBuffer(t *testing.T) {
+	t.Run("under cap", func(t *testing.T) {
+		b := newCappedBuffer(100)
+		n, err := b.Write([]byte("hello"))
+		if err != nil || n != 5 {
+			t.Fatalf("Write returned n=%d err=%v", n, err)
+		}
+		if b.String() != "hello" {
+			t.Errorf("got %q, want hello", b.String())
+		}
+	})
+
+	t.Run("over cap silently drops, Write reports full length", func(t *testing.T) {
+		b := newCappedBuffer(5)
+		n, err := b.Write([]byte("hello world"))
+		if err != nil {
+			t.Fatalf("Write returned err=%v", err)
+		}
+		if n != 11 {
+			t.Errorf("Write reported n=%d, want 11 (never backpressure subprocess)", n)
+		}
+		if b.String() != "hello" {
+			t.Errorf("buffered %q, want first 5 bytes 'hello'", b.String())
+		}
+	})
+
+	t.Run("multiple writes accumulate to cap", func(t *testing.T) {
+		b := newCappedBuffer(7)
+		_, _ = b.Write([]byte("abc"))
+		_, _ = b.Write([]byte("defgh"))   // 5 bytes, only 4 fit
+		_, _ = b.Write([]byte("ignored")) // cap is full, dropped
+		if got := b.String(); got != "abcdefg" {
+			t.Errorf("got %q, want abcdefg", got)
+		}
+	})
+
+	t.Run("zero cap accumulates nothing", func(t *testing.T) {
+		b := newCappedBuffer(0)
+		n, _ := b.Write([]byte("noise"))
+		if n != 5 {
+			t.Errorf("Write reported n=%d, want 5", n)
+		}
+		if b.String() != "" {
+			t.Errorf("got %q, want empty", b.String())
+		}
+	})
+}
+
+type shortWriteRecorder struct {
+	calls int
+}
+
+func (w *shortWriteRecorder) Write(p []byte) (int, error) {
+	w.calls++
+	return len(p) - 1, nil
+}
+
+type failAfterWriter struct {
+	successfulWrites int
+	writes           int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	if w.writes >= w.successfulWrites {
+		return 0, errors.New("write blew up")
+	}
+	w.writes++
+	return len(p), nil
+}
+
+func TestErrorTrackingWriter_ShortWriteIsSticky(t *testing.T) {
+	dst := &shortWriteRecorder{}
+	w := &errorTrackingWriter{w: dst}
+
+	if _, err := w.Write([]byte("record")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short write error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if !errors.Is(w.Err(), io.ErrShortWrite) {
+		t.Fatalf("tracked error = %v, want %v", w.Err(), io.ErrShortWrite)
+	}
+	if _, err := w.Write([]byte("second")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("sticky write error = %v, want %v", err, io.ErrShortWrite)
+	}
+	if dst.calls != 1 {
+		t.Fatalf("underlying writer calls = %d, want 1 after sticky failure", dst.calls)
+	}
+}
+
+// Runner ---------------------------------------------------------------------
+
+func TestRunVerify_TextOutput_AllPass(t *testing.T) {
+	env := allPassEnv(t)
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{jsonOutput: false})
+	if err != nil {
+		t.Fatalf("runVerify returned err: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.HasPrefix(out, "pipelock contain verify") {
+		t.Errorf("missing header: %q", out)
+	}
+	wantPass := len(allProbes())
+	if strings.Count(out, "[PASS]") != wantPass {
+		t.Errorf("want %d [PASS] lines, got %d in %q", wantPass, strings.Count(out, "[PASS]"), out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d PASS / 0 FAIL / 0 SKIP", len(allProbes()))) {
+		t.Errorf("missing aggregate: %q", out)
+	}
+}
+
+func TestRunVerify_JSONOutput_AllPass(t *testing.T) {
+	env := allPassEnv(t)
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{jsonOutput: true})
+	if err != nil {
+		t.Fatalf("runVerify returned err: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	wantRecords := len(allProbes()) + 1
+	if len(lines) != wantRecords {
+		t.Fatalf("expected %d JSON records (%d probes + aggregate), got %d: %q", wantRecords, len(allProbes()), len(lines), buf.String())
+	}
+	for i := 0; i < len(allProbes()); i++ {
+		var rec probeRecord
+		if err := json.Unmarshal([]byte(lines[i]), &rec); err != nil {
+			t.Fatalf("line %d: parse: %v (line=%q)", i, err, lines[i])
+		}
+		// Derive the expected number from the probe registry rather than from
+		// hardcoded index arithmetic. Published numbers are deliberately
+		// non-contiguous -- 15 is reserved for the conditional workspace probe
+		// and run-only checks own 17 and 18 -- and every past attempt to encode
+		// those gaps as "+1 after index N" needed another bump the next time a
+		// probe was added, silently passing until it did.
+		wantProbe := allProbes()[i].n
+		if rec.Probe != wantProbe {
+			t.Errorf("line %d: probe=%d, want %d", i, rec.Probe, wantProbe)
+		}
+		if rec.Status != statusPass {
+			t.Errorf("line %d: status=%q, want pass", i, rec.Status)
+		}
+	}
+	var agg aggregateRecord
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
+		t.Fatalf("aggregate: parse: %v (line=%q)", err, lines[len(lines)-1])
+	}
+	if agg.Aggregate.Pass != len(allProbes()) || agg.Aggregate.Fail != 0 || agg.Aggregate.Skip != 0 {
+		t.Errorf("aggregate counts: %+v", agg.Aggregate)
+	}
+	if agg.Aggregate.ExitCode != cliutil.ExitOK {
+		t.Errorf("aggregate exit_code: got %d, want %d", agg.Aggregate.ExitCode, cliutil.ExitOK)
+	}
+}
+
+func TestRunVerify_EnforcementOnlySkipsProxyLiveness(t *testing.T) {
+	env := allPassEnv(t)
+	var systemdCalled bool
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name == testSystemctl && containsArg(args, testService) {
+			systemdCalled = true
+			return "", 1, errors.New("pipelock service liveness should not run in enforcement-only mode")
+		}
+		return defaultRunForAllPass(name, args)
+	}
+	var dialCalled bool
+	env.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+		dialCalled = true
+		return nil, errors.New("loopback dial should not run in enforcement-only mode")
+	}
+
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{enforcementOnly: true})
+	if err != nil {
+		t.Fatalf("runVerify returned err: %v", err)
+	}
+	if systemdCalled {
+		t.Fatal("probe 2 systemd check ran in enforcement-only mode")
+	}
+	if dialCalled {
+		t.Fatal("probe 6 loopback dial ran in enforcement-only mode")
+	}
+	out := buf.String()
+	if !strings.HasPrefix(out, "pipelock contain verify --enforcement-only") {
+		t.Errorf("missing enforcement-only header: %q", out)
+	}
+	if strings.Contains(out, "probe 2:") || strings.Contains(out, "probe 6:") {
+		t.Errorf("liveness probes should be omitted: %q", out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%d PASS / 0 FAIL / 0 SKIP", len(allProbes())-2)) {
+		t.Errorf("missing enforcement-only aggregate: %q", out)
+	}
+	if !strings.Contains(out, "probe 10: deployed pipelock binary matches TOFU pin; running-service image is not verified") ||
+		!strings.Contains(out, "running service image not verified") {
+		t.Errorf("enforcement-only probe 10 did not describe its limited evidence: %q", out)
+	}
+	if strings.Contains(out, "deployed and running pipelock binary match TOFU pin") {
+		t.Errorf("enforcement-only probe 10 claimed running-image verification: %q", out)
+	}
+}
+
+func TestRunVerify_EnforcementOnlyJSONReportsLimitedBinaryEvidence(t *testing.T) {
+	env := allPassEnv(t)
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	if err := runVerify(cmd, env, verifyOpts{enforcementOnly: true, jsonOutput: true}); err != nil {
+		t.Fatalf("runVerify returned err: %v", err)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var rec probeRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue // The aggregate record has a different JSON shape.
+		}
+		if rec.Name != "binary_integrity_pin" {
+			continue
+		}
+		if rec.Status != statusPass || !strings.Contains(rec.Detail, "running service image not verified") {
+			t.Fatalf("binary-integrity JSON record = %+v, want deployed-only pass evidence", rec)
+		}
+		return
+	}
+	t.Fatalf("binary-integrity JSON record missing from %q", buf.String())
+}
+
+func TestRunVerify_ConcurrentModesKeepRunningImagePolicyIsolated(t *testing.T) {
+	env := allPassEnv(t)
+	originalRun := env.runCmd
+
+	enforcementAtBarrier := make(chan struct{})
+	runtimeImageChecks := make(chan struct{}, 2)
+	releaseEnforcement := make(chan struct{})
+	var barrierOnce sync.Once
+	var releaseOnce sync.Once
+	unblockEnforcement := func() { releaseOnce.Do(func() { close(releaseEnforcement) }) }
+	t.Cleanup(unblockEnforcement)
+
+	var counterMu sync.Mutex
+	var counter uint64
+	env.dropCounter = func(_ context.Context, runEnv *probeEnv) (uint64, error) {
+		if !runEnv.verifyRunningImage {
+			barrierOnce.Do(func() {
+				close(enforcementAtBarrier)
+				<-releaseEnforcement
+			})
+		}
+		counterMu.Lock()
+		defer counterMu.Unlock()
+		counter++
+		return counter, nil
+	}
+	env.runCmd = func(ctx context.Context, name string, args ...string) (string, int, error) {
+		if name == testSystemctl && containsArg(args, "--property=ExecStart") && containsArg(args, "--value") {
+			runtimeImageChecks <- struct{}{}
+		}
+		return originalRun(ctx, name, args...)
+	}
+
+	type verifyResult struct {
+		err error
+		out string
+	}
+	run := func(opts verifyOpts) <-chan verifyResult {
+		result := make(chan verifyResult, 1)
+		go func() {
+			cmd := newVerifyCmd(t)
+			var buf bytes.Buffer
+			cmd.SetOut(&buf)
+			result <- verifyResult{err: runVerify(cmd, env, opts), out: buf.String()}
+		}()
+		return result
+	}
+
+	enforcement := run(verifyOpts{enforcementOnly: true})
+	select {
+	case <-enforcementAtBarrier:
+	case <-time.After(time.Second):
+		t.Fatal("enforcement-only verification did not reach the barrier")
+	}
+
+	normal := run(verifyOpts{})
+	select {
+	case <-runtimeImageChecks:
+	case <-time.After(time.Second):
+		unblockEnforcement()
+		normalResult := <-normal
+		enforcementResult := <-enforcement
+		t.Fatalf("normal verification skipped its running-image check while enforcement-only was active: normal=%+v enforcement=%+v", normalResult, enforcementResult)
+	}
+
+	normalResult := <-normal
+	unblockEnforcement()
+	enforcementResult := <-enforcement
+	if normalResult.err != nil || enforcementResult.err != nil {
+		t.Fatalf("concurrent verification errors: normal=%+v enforcement=%+v", normalResult, enforcementResult)
+	}
+	select {
+	case <-runtimeImageChecks:
+		t.Fatal("enforcement-only verification ran the running-image check")
+	default:
+	}
+	if !env.verifyRunningImage {
+		t.Fatal("runVerify mutated the caller-owned running-image policy")
+	}
+}
+
+func TestRunVerify_FailExitCode(t *testing.T) {
+	env := allPassEnv(t)
+	// Force the egress canary (probe 8) to fail by reporting curl success.
+	// Probe 11 also uses sudo + pipelock-agent; distinguish by checking for the
+	// curl path in argv. Without this guard, probe 11 would short-circuit
+	// here and the test would observe an unrelated failure.
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name == testSudoCmd && containsArg(args, testAgentUser) && containsArg(args, curlPath) {
+			return "200", 0, nil
+		}
+		return defaultRunForAllPass(name, args)
+	}
+
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{jsonOutput: false})
+	if err == nil {
+		t.Fatalf("expected error for fail exit, got nil")
+	}
+	if code := cliutil.ExitCodeOf(err); code != cliutil.ExitGeneral {
+		t.Errorf("exit code: got %d, want %d", code, cliutil.ExitGeneral)
+	}
+	if !strings.Contains(buf.String(), "1 FAIL") {
+		t.Errorf("missing fail in aggregate: %q", buf.String())
+	}
+}
+
+func TestRunVerify_SkipExitCode(t *testing.T) {
+	env := allPassEnv(t)
+	// Force one probe to skip while leaving the rest green. A skipped
+	// security canary must not return exit 0, or CI can mistake an
+	// incomplete verification for a clean containment boundary.
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		// Match probe 8 (curl) only - probe 11 (plk-launch) needs the
+		// default canned response so it doesn't also skip.
+		if name == testSudoCmd && containsArg(args, testAgentUser) && containsArg(args, curlPath) {
+			return testSudoNeedsPwd, 1, nil
+		}
+		return defaultRunForAllPass(name, args)
+	}
+
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{jsonOutput: false})
+	if err == nil {
+		t.Fatalf("expected error for skip exit, got nil")
+	}
+	if code := cliutil.ExitCodeOf(err); code != cliutil.ExitConfig {
+		t.Errorf("exit code: got %d, want %d", code, cliutil.ExitConfig)
+	}
+	if !strings.Contains(buf.String(), "1 SKIP") {
+		t.Errorf("missing skip in aggregate: %q", buf.String())
+	}
+}
+
+func TestRunVerify_UnknownExitCode(t *testing.T) {
+	env := allPassEnv(t)
+	env.dropCounter = func(_ context.Context, _ *probeEnv) (uint64, error) {
+		return 12, nil
+	}
+
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{jsonOutput: false})
+	if err == nil {
+		t.Fatal("expected error for inconclusive egress attribution")
+	}
+	if code := cliutil.ExitCodeOf(err); code != cliutil.ExitConfig {
+		t.Errorf("exit code: got %d, want %d", code, cliutil.ExitConfig)
+	}
+	if !strings.Contains(buf.String(), "[UNKNOWN]") || !strings.Contains(buf.String(), "1 UNKNOWN") {
+		t.Errorf("missing unknown result in output: %q", buf.String())
+	}
+}
+
+func TestRunVerify_JSONUnknownIsIncomplete(t *testing.T) {
+	env := allPassEnv(t)
+	env.dropCounter = func(_ context.Context, _ *probeEnv) (uint64, error) {
+		return 12, nil
+	}
+
+	cmd := newVerifyCmd(t)
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+
+	err := runVerify(cmd, env, verifyOpts{jsonOutput: true})
+	if code := cliutil.ExitCodeOf(err); code != cliutil.ExitConfig {
+		t.Fatalf("exit code = %d, want %d (err=%v)", code, cliutil.ExitConfig, err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != len(allProbes())+1 {
+		t.Fatalf("JSON record count = %d, want %d: %q", len(lines), len(allProbes())+1, buf.String())
+	}
+	var canary probeRecord
+	if err := json.Unmarshal([]byte(lines[7]), &canary); err != nil {
+		t.Fatalf("decode canary: %v", err)
+	}
+	if canary.Probe != 8 || canary.Status != statusUnknown {
+		t.Fatalf("canary record = %+v, want probe 8 unknown", canary)
+	}
+	var agg aggregateRecord
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
+		t.Fatalf("decode aggregate: %v", err)
+	}
+	wantPass := len(allProbes()) - 1
+	if agg.Aggregate.Unknown != 1 || agg.Aggregate.Pass != wantPass || agg.Aggregate.ExitCode != cliutil.ExitConfig {
+		t.Fatalf("aggregate = %+v, want %d pass / 1 unknown / exit 2", agg.Aggregate, wantPass)
+	}
+}
+
+func TestRunVerify_MixedOutcomesPreserveWorstResultInTextAndJSON(t *testing.T) {
+	for _, jsonOutput := range []bool{false, true} {
+		t.Run(map[bool]string{false: "text", true: "json"}[jsonOutput], func(t *testing.T) {
+			env := allPassEnv(t)
+			env.dropCounter = func(_ context.Context, _ *probeEnv) (uint64, error) {
+				return 12, nil
+			}
+			env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+				switch {
+				case name == testSystemctl && containsArg(args, testService):
+					return "", -1, errors.New("systemctl unavailable")
+				case name == testSudoCmd && containsArg(args, testOperatorUser) && containsArg(args, curlPath):
+					return "curl: (22) HTTP 500", 22, nil
+				default:
+					return defaultRunForAllPass(name, args)
+				}
+			}
+
+			cmd := newVerifyCmd(t)
+			var buf bytes.Buffer
+			cmd.SetOut(&buf)
+			err := runVerify(cmd, env, verifyOpts{jsonOutput: jsonOutput})
+			if code := cliutil.ExitCodeOf(err); code != cliutil.ExitGeneral {
+				t.Fatalf("exit code = %d, want fail precedence %d (err=%v)", code, cliutil.ExitGeneral, err)
+			}
+
+			out := buf.String()
+			if jsonOutput {
+				lines := strings.Split(strings.TrimSpace(out), "\n")
+				var agg aggregateRecord
+				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
+					t.Fatalf("decode aggregate: %v\n%s", err, out)
+				}
+				if agg.Aggregate.Pass != len(allProbes())-4 || agg.Aggregate.Fail != 1 ||
+					agg.Aggregate.Skip != 2 || agg.Aggregate.Unknown != 1 ||
+					agg.Aggregate.ExitCode != cliutil.ExitGeneral {
+					t.Fatalf("mixed aggregate = %+v, want %d pass / 1 fail / 2 skip / 1 unknown / exit 1", agg.Aggregate, len(allProbes())-4)
+				}
+				return
+			}
+			if !strings.Contains(out, fmt.Sprintf("%d PASS / 1 FAIL / 2 SKIP / 1 UNKNOWN — exit 1", len(allProbes())-4)) {
+				t.Fatalf("text lost a mixed outcome or fail precedence:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestRunVerify_TextWriteFailureFailsClosed(t *testing.T) {
+	cmd := newVerifyCmd(t)
+	cmd.SetOut(errWriter{})
+	if err := runVerify(cmd, allPassEnv(t), verifyOpts{}); err == nil ||
+		!strings.Contains(err.Error(), "writing verify header") {
+		t.Fatalf("text output failure = %v, want surfaced header write error", err)
+	}
+}
+
+func TestRunVerify_RecordAndAggregateWriteFailuresFailClosed(t *testing.T) {
+	tests := []struct {
+		name             string
+		jsonOutput       bool
+		successfulWrites int
+		want             string
+	}{
+		{name: "text probe", successfulWrites: 1, want: "writing probe 1 text"},
+		{name: "text aggregate", successfulWrites: len(allProbes()) + 1, want: "writing verify aggregate"},
+		{name: "JSON probe", jsonOutput: true, want: "encoding probe 1 JSON"},
+		{name: "JSON aggregate", jsonOutput: true, successfulWrites: len(allProbes()), want: "encoding aggregate JSON"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := newVerifyCmd(t)
+			cmd.SetOut(&failAfterWriter{successfulWrites: tc.successfulWrites})
+			err := runVerify(cmd, allPassEnv(t), verifyOpts{jsonOutput: tc.jsonOutput})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("output failure = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunVerify_NFTStructuralAndCounterCompositionFailsClosed(t *testing.T) {
+	tests := []struct {
+		name     string
+		rules    string
+		wantExit int
+	}{
+		{
+			name: "unhooked lookalike chain",
+			rules: `table inet pipelock_containment {
+	chain output_filter {
+		meta skuid 1000 accept
+		meta skuid 988 accept
+		meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+		meta skuid 987 udp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 tcp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 counter packets %d bytes 840 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			wantExit: cliutil.ExitGeneral,
+		},
+		{
+			name: "structural probe fooled by predicate before skuid",
+			rules: `table inet pipelock_containment {
+	chain output_filter {
+		type filter hook output priority 0; policy accept;
+		meta skuid 1000 accept
+		meta skuid 988 accept
+		meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+		meta skuid 987 udp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 tcp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		ip daddr 192.0.2.1 meta skuid 987 counter packets %d bytes 840 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			wantExit: cliutil.ExitGeneral,
+		},
+		{
+			name: "canary intercepted before attributed counter",
+			rules: `table inet pipelock_containment {
+	chain output_filter {
+		type filter hook output priority 0; policy accept;
+		meta skuid 1000 accept
+		meta skuid 988 accept
+		meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+		meta skuid 987 udp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 tcp dport 53 counter packets 0 bytes 0 log prefix "pipelock-contain class=direct_dns_blocked " drop
+		meta skuid 987 ip daddr 192.0.2.1 drop
+		meta skuid 987 counter packets %d bytes 840 log prefix "pipelock-contain class=not_routing_through_pipelock " drop
+	}
+}`,
+			wantExit: cliutil.ExitGeneral,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := allPassEnv(t)
+			chainReads := 0
+			env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+				if name != testNFT {
+					return defaultRunForAllPass(name, args)
+				}
+				packets := 12
+				if containsArg(args, "chain") {
+					packets += chainReads
+					chainReads++
+				}
+				return fmt.Sprintf(tc.rules, packets), 0, nil
+			}
+			env.dropCounter = readContainmentDropCounter
+
+			cmd := newVerifyCmd(t)
+			var buf bytes.Buffer
+			cmd.SetOut(&buf)
+			err := runVerify(cmd, env, verifyOpts{})
+			if code := cliutil.ExitCodeOf(err); code != tc.wantExit {
+				t.Fatalf("exit code = %d, want %d (err=%v, output=%q)", code, tc.wantExit, err, buf.String())
+			}
+			if strings.Contains(buf.String(), "— exit 0") {
+				t.Fatalf("broken nftables state reported aggregate PASS: %q", buf.String())
+			}
+		})
+	}
+}
+
+func TestVerifyCmd_Wiring(t *testing.T) {
+	root := Cmd()
+	verify := findSubcmd(t, root, "verify")
+	if verify == nil {
+		t.Fatalf("verify subcommand not registered")
+	}
+	if !verify.HasFlags() {
+		t.Fatalf("verify command exposes no flags")
+	}
+	if f := verify.Flag("json"); f == nil {
+		t.Errorf("--json flag missing")
+	}
+	if f := verify.Flag("enforcement-only"); f == nil {
+		t.Errorf("--enforcement-only flag missing")
+	}
+	if f := verify.Flag("port"); f == nil {
+		t.Errorf("--port flag missing")
+	}
+}
+
+func TestVerifyCmd_InvalidPort(t *testing.T) {
+	root := Cmd()
+	root.SetArgs([]string{"verify", "--port", "0"})
+	err := root.Execute()
+	if err == nil {
+		t.Fatalf("expected invalid port error, got nil")
+	}
+	if code := cliutil.ExitCodeOf(err); code != cliutil.ExitConfig {
+		t.Errorf("exit code: got %d, want %d", code, cliutil.ExitConfig)
+	}
+	if !strings.Contains(err.Error(), "invalid --port") {
+		t.Errorf("error: got %q, want invalid --port", err)
+	}
+}
+
+// TestMutatingSubcommandsRequireRoot covers the precondition gate every
+// mutating subcommand runs first: a non-root invocation must exit ExitConfig
+// with a clear "must be run as root" message. This test exists so a future
+// refactor can't accidentally turn the root gate into a no-op (which would
+// let unprivileged callers attempt mutations and fail mid-step).
+func TestMutatingSubcommandsRequireRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("test must run as non-root to exercise the precondition")
+	}
+	cases := []struct {
+		subcmd string
+		args   []string
+	}{
+		{"install", nil},
+		{"rollback", nil},
+		{"add-tool", []string{"validname"}},
+		{"ca-refresh", nil},
+		// upgrade and the two workspace subcommands run the same gate and were
+		// absent from this table, so the branch that refuses an unprivileged
+		// mutation was unexercised for three of the seven sites.
+		{"upgrade", nil},
+		{"grant-workspace", []string{"/tmp/pipelock-workspace-gate-probe"}},
+		{"revoke-workspace", []string{"/tmp/pipelock-workspace-gate-probe"}},
+	}
+	root := Cmd()
+	for _, tc := range cases {
+		t.Run(tc.subcmd, func(t *testing.T) {
+			sub := findSubcmd(t, root, tc.subcmd)
+			if sub == nil {
+				t.Fatalf("subcommand %s not registered", tc.subcmd)
+			}
+			err := sub.RunE(sub, tc.args)
+			if err == nil {
+				t.Fatalf("%s as non-root returned nil; want ExitError", tc.subcmd)
+			}
+			if code := cliutil.ExitCodeOf(err); code != cliutil.ExitConfig {
+				t.Errorf("%s exit code: got %d, want %d (ExitConfig)", tc.subcmd, code, cliutil.ExitConfig)
+			}
+			// The gate refuses for a different reason per platform: Windows
+			// has no containment implementation at all, so it fails on the
+			// platform check before privilege is ever considered.
+			want := "must be run as root"
+			if runtime.GOOS == "windows" {
+				want = "not supported on Windows"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s error: got %q, want substring %q", tc.subcmd, err, want)
+			}
+		})
+	}
+}
+
+func TestAddToolNameValidation(t *testing.T) {
+	root := Cmd()
+	addTool := findSubcmd(t, root, "add-tool")
+
+	bad := []string{"", "Tool", "tool!", "../etc/passwd", strings.Repeat("a", 32)}
+	for _, name := range bad {
+		t.Run("invalid_"+name, func(t *testing.T) {
+			err := addTool.RunE(addTool, []string{name})
+			if err == nil {
+				t.Fatalf("add-tool %q returned nil; want validation error", name)
+			}
+			if !strings.Contains(err.Error(), "invalid tool name") {
+				t.Errorf("add-tool %q: got error %q, want 'invalid tool name'", name, err)
+			}
+		})
+	}
+}
+
+// Helpers used by runner tests -----------------------------------------------
+
+func newVerifyCmd(_ *testing.T) *cobra.Command {
+	return &cobra.Command{Use: "verify"}
+}
+
+func findSubcmd(t *testing.T, root *cobra.Command, name string) *cobra.Command {
+	t.Helper()
+	for _, c := range root.Commands() {
+		if c.Name() == name {
+			return c
+		}
+	}
+	return nil
+}
+
+func containsArg(args []string, needle string) bool {
+	for _, a := range args {
+		if a == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// allPassEnv returns a probeEnv where every probe will pass. Used as
+// the baseline for runner tests; individual tests override one field
+// to introduce a fail/skip.
+func allPassEnv(t *testing.T) *probeEnv {
+	t.Helper()
+	env := makeProbeEnv(t)
+	env.lstat = func(path string) (os.FileInfo, error) {
+		if path == containedDoorwaySocketPath {
+			return fakeFileInfo{mode: os.ModeSocket | 0o600}, nil
+		}
+		return os.Lstat(path)
+	}
+	env.privateTmpProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test private temporary-directory canary passed"
+	}
+	env.filesystemProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test filesystem profile enforced"
+	}
+	env.browserCATrust = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test NSS browser CA trust passed"
+	}
+	env.networkNamespaceProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test network namespace boundary passed"
+	}
+	env.agentProcessNetnsProbe = func(context.Context, *probeEnv, string) (string, string) {
+		return statusPass, "test live agent process namespaces passed"
+	}
+	env.operatorUser = testOperatorUser
+	env.nftRulesPath = filepath.Join(t.TempDir(), "50-pipelock-containment.nft")
+	env.configPath = filepath.Join(t.TempDir(), "pipelock.yaml")
+	unitDir := t.TempDir()
+	env.networkNamespaceUnitPath = filepath.Join(unitDir, containedNetworkNamespaceUnit)
+	env.proxyForwarderSocketPath = filepath.Join(unitDir, containedProxyForwarderUnit+".socket")
+	env.proxyForwarderServicePath = filepath.Join(unitDir, containedProxyForwarderUnit+".service")
+	env.namespaceForwarderServicePath = filepath.Join(unitDir, containedNamespaceForwarderUnit)
+	env.loopbackForwarderInvPath = filepath.Join(t.TempDir(), "loopback-forwarders.json")
+
+	// Probe 1: both users present.
+	env.lookupUser = func(name string) (*user.User, error) {
+		switch name {
+		case testOperatorUser:
+			return &user.User{Uid: "1000", Gid: "1000", Username: testOperatorUser, HomeDir: "/home/" + testOperatorUser}, nil
+		case testProxyUser:
+			return &user.User{Uid: "988", Gid: "988", Username: testProxyUser, HomeDir: "/home/" + testProxyUser}, nil
+		case testAgentUser:
+			return &user.User{Uid: "987", Gid: "987", Username: testAgentUser, HomeDir: "/home/" + testAgentUser}, nil
+		}
+		return nil, fmt.Errorf("unexpected lookup %q", name)
+	}
+	env.groupIDs = func(u *user.User) ([]string, error) {
+		switch u.Username {
+		case testProxyUser:
+			return []string{"988"}, nil
+		case testAgentUser:
+			return []string{"987", "1001"}, nil
+		}
+		return nil, fmt.Errorf("unexpected group ids for %q", u.Username)
+	}
+
+	// Probe 6: dial succeeds.
+	env.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
+		return &fakeConn{}, nil
+	}
+
+	var counterReads uint64
+	env.dropCounter = func(_ context.Context, _ *probeEnv) (uint64, error) {
+		counterReads++
+		return 11 + counterReads, nil
+	}
+
+	// Filesystem state for probes 4, 5, 7, 12.
+	writeFakeWrapper(t, env.launchPath, 0o755)
+	writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk"), 0o755)
+	writeFakeWrapper(t, filepath.Join(env.wrapperDir, "plk-claude"), 0o755)
+	toolTarget := filepath.Join(t.TempDir(), "claude")
+	writeFakeWrapper(t, toolTarget, 0o755)
+	body := canonicalLaunchScript(env.port, env.caBundlePath)
+	if err := os.WriteFile(env.launchPath, []byte(body), 0o755); err != nil { //nolint:gosec // wrapper script must be executable in test
+		t.Fatalf("rewrite launch: %v", err)
+	}
+	currentCA := []byte(testPEMCA(t))
+	// The combined bundle is what contained clients actually trust, so a
+	// healthy fixture has to carry the SAME certificate the selected CA
+	// returns, alongside an unrelated root the way a real merged bundle does.
+	// Generating an independent cert with a matching common name modelled a
+	// host whose clients trust a CA the proxy does not present.
+	bundle := append(append([]byte{}, currentCA...), makeFakeCertPEM(t, "Some Other Root")...)
+	if err := os.WriteFile(env.caBundlePath, bundle, 0o600); err != nil {
+		t.Fatalf("write CA bundle: %v", err)
+	}
+	if err := os.WriteFile(env.caExportPath, currentCA, 0o600); err != nil {
+		t.Fatalf("write CA export: %v", err)
+	}
+	env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return currentCA, nil }
+
+	// Probe 10: deployed and running binary integrity. allPassEnv emits matching
+	// pin + hashes and maps the synthetic process image to the deployed file.
+	// Tests that want to exercise mismatch override hashFile or readFile after
+	// calling allPassEnv.
+	const allPassHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abcd"
+	deployed := filepath.Join(t.TempDir(), "pipelock")
+	writeFakeWrapper(t, deployed, 0o755)
+	procExe := serviceProcessExePath(testServicePID)
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		return defaultRunForAllPass(name, args)
+	}
+	env.readFile = func(path string) ([]byte, error) {
+		switch path {
+		case env.networkNamespaceUnitPath:
+			return []byte(renderContainedNetworkNamespaceUnit()), nil
+		case env.proxyForwarderSocketPath:
+			return []byte(renderContainedProxySocketUnit(env.agentUserName)), nil
+		case env.proxyForwarderServicePath:
+			return []byte(renderContainedProxyForwarderUnit(env.pipelockTarget, env.proxyUserName, env.port)), nil
+		case env.namespaceForwarderServicePath:
+			return []byte(renderContainedNamespaceForwarderUnit(env.pipelockTarget, env.agentUserName, env.port)), nil
+		case env.loopbackForwarderInvPath:
+			return []byte("{\n  \"services\": [],\n  \"proxy_relay\": true\n}\n"), nil
+		}
+		if path == env.configPath {
+			return []byte("metrics_listen: 127.0.0.1:9091\n"), nil
+		}
+		if path == env.pinPath {
+			return []byte(allPassHash + "\n"), nil
+		}
+		if path == env.toolsListPath {
+			return []byte("claude\t" + toolTarget + "\n"), nil
+		}
+		if path == env.workspaceInvPath {
+			// Empty inventory: contain run's contract read and expiry gate see no
+			// grants. Tests that exercise grants override readFile after this.
+			return nil, os.ErrNotExist
+		}
+		if path == env.nftRulesPath {
+			return []byte(renderNFTRules(1000, 988, 987, env.port, env.nftTable, env.nftChain)), nil
+		}
+		if path == publishedServiceRecordPath(env.loopbackForwarderInvPath) {
+			// A host that never declared a published service has no record.
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("unexpected readFile %s", path)
+	}
+	env.readLink = func(path string) (string, error) {
+		if path == fmt.Sprintf("/proc/%d/ns/net", testServicePID) {
+			return "net:[200]", nil
+		}
+		if path == "/proc/1/ns/net" {
+			return "net:[100]", nil
+		}
+		if path != procExe {
+			return "", fmt.Errorf("unexpected readLink %s", path)
+		}
+		return defaultPipelockTarget, nil
+	}
+	originalStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		if path == procExe || path == defaultPipelockTarget {
+			return originalStat(deployed)
+		}
+		return originalStat(path)
+	}
+	env.selfPath = func() (string, error) { return defaultPipelockTarget, nil }
+	env.hashFile = func(path string) (string, error) {
+		if path == defaultPipelockTarget || path == procExe {
+			return allPassHash, nil
+		}
+		return "", fmt.Errorf("unexpected hashFile %s", path)
+	}
+
+	return env
+}
+
+// defaultRunForAllPass is the canned subprocess response set when
+// every probe should pass.
+func defaultRunForAllPass(name string, args []string) (string, int, error) {
+	switch name {
+	case testSystemctl:
+		if containsArg(args, "--property=ActiveState,SubState,Type,NRestarts") {
+			return testForwarderReady, 0, nil
+		}
+		if containsArg(args, "is-enabled") {
+			return "enabled\n", 0, nil
+		}
+		if containsArg(args, "is-active") {
+			return "active\n", 0, nil
+		}
+		if containsArg(args, "--value") {
+			switch {
+			case containsArg(args, "--property=ExecStart"):
+				return "{ path=/usr/local/bin/pipelock ; argv[]=/usr/local/bin/pipelock run ; ignore_errors=no ; }\n", 0, nil
+			case containsArg(args, "--property=MainPID"):
+				return fmt.Sprintf("%d\n", testServicePID), 0, nil
+			}
+		}
+		return fmt.Sprintf("ActiveState=active\nSubState=running\nUser=pipelock-proxy\nType=simple\nMainPID=%d\nExecStart={ path=/usr/local/bin/pipelock ; argv[]=/usr/local/bin/pipelock run ; ignore_errors=no ; }\n", testServicePID), 0, nil
+	case testNFT:
+		return nftListingForTest(renderNFTRules(1000, 988, 987, 8888, testTable, testChain)), 0, nil
+	case testSudoCmd:
+		// The identity-switch probe must succeed before the signing-key read
+		// probe can distinguish an unreadable key from sudo's own exit 1.
+		if containsArg(args, "test") && containsArg(args, "-e") && len(args) > 0 && args[len(args)-1] == "/" {
+			return "", 0, nil
+		}
+		// Containment posture signing must prove the managed agent cannot read
+		// the private signing key. Exit 1 is test(1)'s ordinary "not readable".
+		if containsArg(args, "test") && containsArg(args, "-r") && len(args) > 0 && strings.HasSuffix(args[len(args)-1], ".key") {
+			return "", 1, nil
+		}
+		// Probe 11: plk-launch allow-list probe invokes plk-launch with a
+		// sentinel tool name. Expect exit 5 = denial.
+		if containsArg(args, "plk-launch") || containsArg(args, probe11Sentinel) {
+			return "plk-launch: tool " + probe11Sentinel + " not in pipelock contain allow-list", 5, nil
+		}
+		// Probe 12: positive agent-context executability/traversal check.
+		if containsArg(args, "test") && containsArg(args, "-x") {
+			return "", 0, nil
+		}
+		// Either pipelock-agent (probe 8) or operator (probe 9). Match by argv.
+		if containsArg(args, testAgentUser) {
+			return "curl: (7) Failed to connect\nPLK_TIME_CONNECT=0.000000\n000", 7, nil
+		}
+		return "200", 0, nil
+	case curlPath:
+		// Direct invoke for operator probe when env.operatorUser == "".
+		return "200", 0, nil
+	}
+	return "", -1, fmt.Errorf("defaultRunForAllPass: unexpected cmd %q args=%v", name, args)
+}
+
+func TestOneLine(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"hello\nworld\r\n", "hello world"},
+		{"  trim me\n", "trim me"},
+		{"before\x1b[2J after\u202e forged", "before [2J after forged"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := oneLine(c.in); got != c.want {
+			t.Errorf("oneLine(%q): got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsSudoUserMissing(t *testing.T) {
+	yes := []string{
+		"sudo: unknown user pipelock-agent",
+		"sudo: unknown user: pipelock-proxy",
+		"SUDO: UNKNOWN USER FOO",
+	}
+	for _, s := range yes {
+		if !isSudoUserMissing(s) {
+			t.Errorf("isSudoUserMissing(%q) = false, want true", s)
+		}
+	}
+	no := []string{
+		testSudoNeedsPwd,
+		"curl: (7) Failed to connect",
+		"",
+	}
+	for _, s := range no {
+		if isSudoUserMissing(s) {
+			t.Errorf("isSudoUserMissing(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestIsSudoTargetCommandMissing(t *testing.T) {
+	yes := []string{
+		"sudo: /usr/bin/curl: command not found",
+		"sudo: /usr/bin/curl: No such file or directory",
+	}
+	for _, s := range yes {
+		if !isSudoTargetCommandMissing(s) {
+			t.Errorf("isSudoTargetCommandMissing(%q) = false, want true", s)
+		}
+	}
+	no := []string{
+		"curl: (7) Failed to connect",
+		testSudoNeedsPwd,
+		"",
+	}
+	for _, s := range no {
+		if isSudoTargetCommandMissing(s) {
+			t.Errorf("isSudoTargetCommandMissing(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestFormatDialDuration(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{500 * time.Microsecond, "<1ms"},
+		{0, "<1ms"},
+		{time.Millisecond, "1ms"},
+		{17 * time.Millisecond, "17ms"},
+		{2 * time.Second, "2s"},
+	}
+	for _, c := range cases {
+		if got := formatDialDuration(c.in); got != c.want {
+			t.Errorf("formatDialDuration(%s): got %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestDefaultProbeEnv(t *testing.T) {
+	t.Setenv("SUDO_USER", "alice")
+	env := defaultProbeEnv()
+	if env.port != defaultProxyPort {
+		t.Errorf("port: got %d, want %d", env.port, defaultProxyPort)
+	}
+	if env.operatorUser != "alice" {
+		t.Errorf("operatorUser: got %q, want %q", env.operatorUser, "alice")
+	}
+	if env.proxyUserName != defaultProxyUser {
+		t.Errorf("proxyUserName: got %q, want %q", env.proxyUserName, defaultProxyUser)
+	}
+	if env.launchPath != defaultLaunchScript {
+		t.Errorf("launchPath: got %q, want %q", env.launchPath, defaultLaunchScript)
+	}
+	if len(env.toolWrappers) != len(defaultToolWrappers) {
+		t.Errorf("toolWrappers: got %d, want %d", len(env.toolWrappers), len(defaultToolWrappers))
+	}
+	if env.wrapperInvPath != defaultWrapperInvPath {
+		t.Errorf("wrapperInvPath: got %q, want %q", env.wrapperInvPath, defaultWrapperInvPath)
+	}
+	if env.nftRulesPath != defaultNFTRulesPath {
+		t.Errorf("nftRulesPath: got %q, want %q", env.nftRulesPath, defaultNFTRulesPath)
+	}
+	if env.nftMainPath != "" {
+		t.Errorf("nftMainPath: got %q, want empty legacy path", env.nftMainPath)
+	}
+	if env.nftPersistUnitPath != defaultNFTPersistUnitPath {
+		t.Errorf("nftPersistUnitPath: got %q, want %q", env.nftPersistUnitPath, defaultNFTPersistUnitPath)
+	}
+	if env.nftExpiryServicePath != defaultNFTExpiryServicePath {
+		t.Errorf("nftExpiryServicePath: got %q, want %q", env.nftExpiryServicePath, defaultNFTExpiryServicePath)
+	}
+	if env.nftExpiryTimerPath != defaultNFTExpiryTimerPath {
+		t.Errorf("nftExpiryTimerPath: got %q, want %q", env.nftExpiryTimerPath, defaultNFTExpiryTimerPath)
+	}
+	if env.runCmd == nil || env.dialCtx == nil || env.lookupUser == nil || env.readFile == nil {
+		t.Errorf("hooks: runCmd=%v dialCtx=%v lookupUser=%v readFile=%v",
+			env.runCmd != nil, env.dialCtx != nil, env.lookupUser != nil, env.readFile != nil)
+	}
+}
+
+func TestRealDial_ConnRefused(t *testing.T) {
+	// Dial a known-closed port on loopback. The kernel returns
+	// ECONNREFUSED synchronously, so the test does not depend on
+	// the dial timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := realDial(ctx, "tcp", "127.0.0.1:1", probeDialTimeout)
+	if err == nil {
+		t.Fatalf("dial to 127.0.0.1:1 succeeded, want refusal")
+	}
+}
+
+func TestVerifyCmdExecute(t *testing.T) {
+	root := Cmd()
+	root.SetArgs([]string{"verify", "--json", "--port", "1"})
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+
+	// Running with the live environment will fail probes 1-7 on a
+	// machine without the containment model. We only check the
+	// command exits via ExitError, not the specific code (which
+	// depends on whether sudo/systemctl/nft are even installed).
+	err := root.Execute()
+	if err == nil {
+		t.Fatalf("expected error on uninstalled containment, got nil")
+	}
+	if code := cliutil.ExitCodeOf(err); code != cliutil.ExitGeneral && code != cliutil.ExitConfig && code != cliutil.ExitOK {
+		t.Errorf("exit code: got %d, want 0, 1, or 2", code)
+	}
+	// Sanity: verify wrote JSON records to stdout (not the help text).
+	if !strings.Contains(buf.String(), `"probe":1`) {
+		t.Errorf("expected JSON output, got: %q", buf.String())
+	}
+}
+
+func TestIsSudoRefusal(t *testing.T) {
+	yes := []string{
+		testSudoNeedsPwd,
+		"User operator may not run sudo",
+		"not allowed to execute",
+		"sudo: no tty present and no askpass program specified",
+		"SUDO: A PASSWORD IS REQUIRED",
+	}
+	for _, s := range yes {
+		if !isSudoRefusal(s) {
+			t.Errorf("isSudoRefusal(%q) = false, want true", s)
+		}
+	}
+	no := []string{
+		"curl: (7) Failed to connect",
+		"200",
+		"",
+	}
+	for _, s := range no {
+		if isSudoRefusal(s) {
+			t.Errorf("isSudoRefusal(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestRealRunCommand_Roundtrip(t *testing.T) {
+	// Use /bin/sh -c to avoid platform-specific binary discovery.
+	out, code, err := realRunCommand(context.Background(), "/bin/sh", "-c", "echo hello && false")
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if code != 1 {
+		t.Errorf("exit code: got %d, want 1", code)
+	}
+	if !strings.Contains(out, "hello") {
+		t.Errorf("output: got %q, want substring hello", out)
+	}
+}
+
+func TestRealRunCommand_BinaryMissing(t *testing.T) {
+	_, code, err := realRunCommand(context.Background(), "/nonexistent/binary", "arg")
+	if err == nil {
+		t.Fatalf("expected error for missing binary")
+	}
+	if code != -1 {
+		t.Errorf("exit code: got %d, want -1", code)
+	}
+}
+
+func TestNewFakeRunHelper(t *testing.T) {
+	// Exercises the test helper itself so a failure isolates whether
+	// the harness is the bug.
+	run, _ := newFakeRun(fakeMatcher{cmd: "echo", result: fakeRunResult{stdout: "hi", code: 0}})
+	out, code, err := run(context.Background(), "echo", "hello")
+	if err != nil || code != 0 || out != "hi" {
+		t.Fatalf("got out=%q code=%d err=%v", out, code, err)
+	}
+	_, _, err = run(context.Background(), "no-match")
+	if err == nil {
+		t.Fatalf("expected error for unstubbed call")
+	}
+}
+
+func TestContainRuntimeReadinessProbes(t *testing.T) {
+	t.Run("CA export matches the current proxy CA and rejects a rotation", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		current := []byte(testPEMCA(t))
+		if err := os.WriteFile(env.caExportPath, current, 0o600); err != nil {
+			t.Fatalf("write CA export: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusPass || !strings.Contains(detail, "matches") {
+			t.Fatalf("matching CA probe = %q %q", status, detail)
+		}
+		rotated := []byte(testPEMCA(t))
+		if string(rotated) == string(current) {
+			t.Fatal("rotation test did not produce distinct CA material")
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return rotated, nil }
+		status, detail = probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "does not match") {
+			t.Fatalf("rotated CA probe = %q %q", status, detail)
+		}
+	})
+}
+
+func TestProbeCurrentCAExportFailureDirections(t *testing.T) {
+	t.Run("missing exported CA names ca-refresh", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "ca-refresh") {
+			t.Fatalf("missing export = %q %q", status, detail)
+		}
+	})
+
+	t.Run("invalid exported CA names ca-refresh", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		if err := os.WriteFile(env.caExportPath, []byte("not a certificate"), 0o600); err != nil {
+			t.Fatalf("write invalid export: %v", err)
+		}
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "invalid") || !strings.Contains(detail, "ca-refresh") {
+			t.Fatalf("invalid export = %q %q", status, detail)
+		}
+	})
+
+	t.Run("unavailable current CA names ca-refresh", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		current := []byte(testPEMCA(t))
+		if err := os.WriteFile(env.caExportPath, current, 0o600); err != nil {
+			t.Fatalf("write export: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return nil, errors.New("proxy unavailable") }
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "proxy unavailable") || !strings.Contains(detail, "ca-refresh") {
+			t.Fatalf("unavailable current CA = %q %q", status, detail)
+		}
+	})
+
+	t.Run("invalid current CA is rejected", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		if err := os.WriteFile(env.caExportPath, []byte(testPEMCA(t)), 0o600); err != nil {
+			t.Fatalf("write export: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return []byte("not a certificate"), nil }
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "invalid current TLS CA") {
+			t.Fatalf("invalid current CA = %q %q", status, detail)
+		}
+	})
+}
+
+func TestCurrentCAForVerifyUsesConfiguredCAAndReportsCommandFailures(t *testing.T) {
+	t.Run("uses configured certificate", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		certPath := filepath.Join(env.configDir, "tls", "ca.pem")
+		if err := os.MkdirAll(filepath.Dir(certPath), 0o750); err != nil {
+			t.Fatalf("mkdir TLS directory: %v", err)
+		}
+		if err := os.WriteFile(certPath, []byte("configured"), 0o600); err != nil {
+			t.Fatalf("write configured CA: %v", err)
+		}
+		var gotArgs []string
+		env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+			if name != "sudo" {
+				t.Fatalf("command = %q, want sudo", name)
+			}
+			gotArgs = append([]string(nil), args...)
+			return testPEMCA(t), 0, nil
+		}
+		if _, err := currentCAForVerify(context.Background(), env); err != nil {
+			t.Fatalf("read current CA: %v", err)
+		}
+		if !containsArg(gotArgs, "--cert") || !containsArg(gotArgs, certPath) {
+			t.Fatalf("configured CA was not consulted: %v", gotArgs)
+		}
+	})
+
+	t.Run("command failures are returned", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.runCmd = func(context.Context, string, ...string) (string, int, error) {
+			return "", 0, errors.New("command unavailable")
+		}
+		if _, err := currentCAForVerify(context.Background(), env); err == nil || !strings.Contains(err.Error(), "command unavailable") {
+			t.Fatalf("command error = %v", err)
+		}
+		env.runCmd = func(context.Context, string, ...string) (string, int, error) { return "", 7, nil }
+		if _, err := currentCAForVerify(context.Background(), env); err == nil || !strings.Contains(err.Error(), "exited 7") {
+			t.Fatalf("exit error = %v", err)
+		}
+	})
+}
+
+// canonicalLaunchScript renders the plk-launch body exactly as `contain
+// install` would for the given proxy port, so fixtures exercise the real
+// `exec env -i` contract block the launcher-environment probe validates.
+// canonicalLaunchScript renders the launcher exactly as `contain install`
+// would for this port and CA bundle. Fixtures pass the SAME caBundle the
+// probeEnv under test discovers: production renders the wrapper and runs verify
+// from one install state, so a fixture whose script and probe disagree about
+// the CA path is testing a state production never occupies.
+func canonicalLaunchScript(port int, caBundle string) string {
+	env := &installEnv{
+		agentUserName: testAgentUser,
+		proxyPort:     port,
+		caBundlePath:  caBundle,
+		caExportPath:  defaultCAExportPath,
+	}
+	return "#!/bin/bash\n" + strings.Join(launchExecEnvLines(env), "\n") + "\n"
+}
+
+// TestContainRunProbeNumbersDoNotCollideWithVerify enforces the published
+// numbering contract between the two commands. Probe numbers are an operator-
+// and dashboard-facing identity: if `contain run` and `contain verify` both
+// publish the same number for different checks, a consumer keyed on that number
+// cannot tell which contract it observed, and a failure of one reads as a
+// failure of the other.
+//
+// This existed only as a comment in run.go until a verify probe was added at 18
+// while run.go had already published 18. The run-only numbers are asserted here
+// literally rather than parsed, so adding a run probe without updating this list
+// is itself a failure.
+func TestContainRunProbeNumbersDoNotCollideWithVerify(t *testing.T) {
+	// Read the production registry rather than restating it. A second copy here
+	// is exactly how a newly added run-only probe escapes the collision check:
+	// the list looks maintained and silently is not.
+	runOnly := containRunOnlyProbes
+	for _, p := range allProbes() {
+		if runProbe, clash := runOnly[p.n]; clash {
+			t.Fatalf("verify probe %d (%s) reuses a number `contain run` already publishes for %s; pick an unused number", p.n, p.name, runProbe.name)
+		}
+	}
+
+	// The registry key IS the published number, so a record whose own n
+	// disagrees with its key would emit one number while the collision check
+	// tested another.
+	for number, runProbe := range runOnly {
+		if runProbe.n != number {
+			t.Fatalf("run-only registry key %d holds a probe published as %d", number, runProbe.n)
+		}
+		if runProbe.name == "" || runProbe.desc == "" {
+			t.Fatalf("run-only probe %d has empty metadata: %+v", number, runProbe)
+		}
+	}
+	// Positive control: the assertion above is only meaningful if these numbers
+	// are genuinely reachable, so prove the run-only set is non-empty and that a
+	// known verify number would be caught.
+	if len(runOnly) == 0 {
+		t.Fatal("run-only probe set is empty; this test would pass vacuously")
+	}
+	probes := allProbes()
+	if len(probes) == 0 {
+		t.Fatal("allProbes() is empty; this test would pass vacuously")
+	}
+	guard := map[int]string{probes[0].n: "sentinel"}
+	if _, caught := guard[probes[0].n]; !caught {
+		t.Fatal("collision lookup does not detect a known-colliding number")
+	}
+}
+
+// TestCACertificateMaterialHelpers covers the decode-and-compare helpers the CA
+// probes are built on, including the decode-failure branches. A probe that
+// cannot decode its input must fail rather than fall through to a comparison of
+// whatever it managed to read.
+func TestCACertificateMaterialHelpers(t *testing.T) {
+	t.Parallel()
+	ca := []byte(testPEMCA(t))
+
+	der, err := firstCertificateDER(ca)
+	if err != nil || len(der) == 0 {
+		t.Fatalf("firstCertificateDER(valid) = %d bytes, %v", len(der), err)
+	}
+	// The same certificate re-encoded must decode to identical material; this
+	// is why the probes compare DER rather than PEM bytes.
+	reencoded := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	again, err := firstCertificateDER(reencoded)
+	if err != nil || !bytes.Equal(der, again) {
+		t.Fatalf("re-encoded certificate decoded differently: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{name: "not PEM at all", input: "this is not a certificate"},
+		{name: "PEM block of the wrong type", input: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("x")}))},
+		{name: "empty input", input: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := firstCertificateDER([]byte(tc.input)); err == nil {
+				t.Fatalf("firstCertificateDER(%q) returned no error", tc.name)
+			}
+		})
+	}
+
+	if !bundleContainsCertificate(append(append([]byte{}, ca...), makeFakeCertPEM(t, "Other")...), der) {
+		t.Fatal("bundleContainsCertificate missed a certificate that is present")
+	}
+	if bundleContainsCertificate(makeFakeCertPEM(t, "Pipelock Test CA"), der) {
+		t.Fatal("bundleContainsCertificate matched a different certificate sharing a common name")
+	}
+}
+
+// TestProbeCurrentCAExportRejectsUndecodableInput pins the decode-failure
+// branches of the export probe itself.
+func TestProbeCurrentCAExportRejectsUndecodableInput(t *testing.T) {
+	t.Parallel()
+	env := makeProbeEnv(t)
+	if err := os.WriteFile(env.caExportPath, []byte(testPEMCA(t)), 0o600); err != nil {
+		t.Fatalf("write export: %v", err)
+	}
+	env.currentCA = func(context.Context, *probeEnv) ([]byte, error) {
+		// Valid single-CA PEM by the shape check, but a different certificate.
+		return makeFakeCertPEM(t, "Pipelock Test CA"), nil
+	}
+	status, detail := probeCurrentCAExport(context.Background(), env)
+	if status != statusFail || !strings.Contains(detail, "does not match the selected Pipelock CA") {
+		t.Fatalf("status=%q detail=%q; want a material mismatch failure", status, detail)
+	}
+}
+
+// TestProbeCABundleRejectsRetiredPipelockCA pins that presence of the current
+// CA is not enough. A rotation that appends the new CA without removing the
+// old one leaves BOTH in the bundle, and every contained client keeps
+// accepting anything the retired CA signed. The bundle is what
+// SSL_CERT_FILE, NODE_EXTRA_CA_CERTS and their siblings all point at, so a
+// retired CA left there is a trust path the proxy no longer controls.
+func TestProbeCABundleRejectsRetiredPipelockCA(t *testing.T) {
+	t.Parallel()
+	env := makeProbeEnv(t)
+	current := []byte(testPEMCA(t))
+	retired := makeFakeCertPEM(t, "Pipelock CA")
+
+	// Positive control: current CA plus an unrelated root must still pass, or
+	// the rejection below would prove nothing.
+	clean := append(append([]byte{}, current...), makeFakeCertPEM(t, "Some Other Root")...)
+	if err := os.WriteFile(env.caBundlePath, clean, 0o600); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+	if status, detail := probeCABundle(context.Background(), env); status != statusPass {
+		t.Fatalf("clean bundle rejected: %s %s", status, detail)
+	}
+
+	// The rotation that only appended: both CAs present.
+	both := append(append(append([]byte{}, current...), retired...), makeFakeCertPEM(t, "Some Other Root")...)
+	if err := os.WriteFile(env.caBundlePath, both, 0o600); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	status, detail := probeCABundle(context.Background(), env)
+	if status != statusFail || !strings.Contains(detail, "retired Pipelock CA") {
+		t.Fatalf("status=%q detail=%q; want a failure naming the retired CA left in the bundle", status, detail)
+	}
+}

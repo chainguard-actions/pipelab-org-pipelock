@@ -1,0 +1,232 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package proxy
+
+import (
+	"fmt"
+	"net/url"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+const (
+	taintScopeAction = "action"
+	taintScopeSource = "source"
+	taintScopeTask   = "task"
+)
+
+type taintDecision struct {
+	Risk                session.SessionRisk
+	Task                session.TaskContext
+	ActionClass         session.ActionClass
+	Sensitivity         session.ActionSensitivity
+	Authority           session.AuthorityKind
+	Result              session.PolicyDecisionResult
+	ActionRef           string
+	TaskOverrideApplied bool
+}
+
+func responseTaintSessionKey(cfg *config.Config, agent, clientIP string, auth envelope.ActorAuth) string {
+	return ceeSessionKey(cfg, agent, clientIP, auth)
+}
+
+func (p *Proxy) resolveTaintAsk(agent, target, method, reason string) (bool, string) {
+	switch {
+	case p.approver == nil:
+		return false, reason + " (no HITL approver)"
+	case !p.approver.IsTerminal():
+		return false, reason + " (HITL stdin is not a terminal)"
+	}
+	decision := p.approver.Ask(&hitl.Request{
+		Agent:   agent,
+		URL:     target,
+		Reason:  reason,
+		Preview: fmt.Sprintf("%s %s", method, target),
+	})
+	return decision == hitl.DecisionAllow, reason
+}
+
+func observeHTTPResponseTaint(rec session.Recorder, cfg *config.Config, rawURL, contentType, kind string, promptHit bool) {
+	var kinds []session.HostileFindingKind
+	if promptHit {
+		kinds = []session.HostileFindingKind{session.FindingUnattributed}
+	}
+	observeHTTPResponseFindings(rec, cfg, rawURL, contentType, kind, kinds)
+}
+
+func observeHTTPResponseFindings(rec session.Recorder, cfg *config.Config, rawURL, contentType, kind string, kinds []session.HostileFindingKind) {
+	rs, ok := rec.(session.RiskState)
+	if !ok || cfg == nil || !cfg.Taint.Enabled {
+		return
+	}
+	observation := session.ClassifyHTTPResponseFindings(rawURL, contentType, cfg.Taint.AllowlistedDomains, kinds)
+	observation.Source.Kind = kind
+	observation.MaxSources = cfg.Taint.RecentSources
+	rs.ObserveRisk(observation)
+}
+
+func evaluateHTTPTaint(cfg *config.Config, rec session.Recorder, method string, parsedURL *url.URL) taintDecision {
+	decision := taintDecision{
+		ActionClass: session.ActionClassRead,
+		Sensitivity: session.SensitivityNormal,
+		Authority:   session.AuthorityUserBroad,
+		Result:      session.PolicyDecisionResult{Decision: session.PolicyAllow, Reason: "taint_disabled"},
+	}
+	if cfg == nil || !cfg.Taint.Enabled || parsedURL == nil {
+		return decision
+	}
+
+	if rs, ok := rec.(session.RiskState); ok {
+		decision.Risk = rs.RiskSnapshot()
+	}
+	classified := session.ClassifyHTTPActionWithOptions(method, parsedURL.Path, cfg.Taint.ProtectedPaths, cfg.Taint.ElevatedPaths, session.ClassificationOptions{
+		FailSafe: cfg.Taint.FailSafeClassification,
+	})
+	decision.ActionClass = classified.Class
+	decision.Sensitivity = classified.Sensitivity
+	decision.ActionRef = httpActionRef(decision.ActionClass, method, parsedURL)
+	if tp, ok := rec.(session.TaskContextProvider); ok {
+		decision.Task = tp.TaskSnapshot()
+		if runtimeTrustOverrideApplies(tp.RuntimeTrustOverrides(), decision.Task, decision.Risk, decision.ActionRef) {
+			decision.Result = session.PolicyDecisionResult{Decision: session.PolicyAllow, Reason: "taint_runtime_task_override"}
+			decision.TaskOverrideApplied = true
+			return decision
+		}
+	}
+	decision.Result = session.PolicyMatrix{Profile: cfg.Taint.Policy}.EvaluateWithOptions(
+		decision.Risk.Level,
+		decision.ActionClass,
+		decision.Sensitivity,
+		decision.Authority,
+		session.PolicyEvaluateOptions{
+			FailSafeClassification:  cfg.Taint.FailSafeClassification,
+			ClassificationConfident: classified.Confident,
+		},
+	)
+	if trustOverrideApplies(cfg.Taint.TrustOverrides, decision.Risk, decision.ActionRef) {
+		decision.Result = session.PolicyDecisionResult{Decision: session.PolicyAllow, Reason: "taint_trust_override"}
+	}
+	return decision
+}
+
+func httpActionRef(action session.ActionClass, method string, parsedURL *url.URL) string {
+	actionName := strings.ToLower(action.String())
+	methodName := strings.ToLower(method)
+	if parsedURL == nil {
+		return fmt.Sprintf("%s:%s", actionName, methodName)
+	}
+	requestURI := parsedURL.RequestURI()
+	if requestURI == "" {
+		requestURI = "/"
+	}
+	return fmt.Sprintf(
+		"%s:%s:%s://%s%s",
+		actionName,
+		methodName,
+		strings.ToLower(parsedURL.Scheme),
+		strings.ToLower(parsedURL.Host),
+		requestURI,
+	)
+}
+
+func trustOverrideApplies(overrides []config.TaintTrustOverride, risk session.SessionRisk, actionRef string) bool {
+	now := time.Now().UTC()
+	for _, override := range overrides {
+		if !override.ExpiresAt.IsZero() && override.ExpiresAt.Before(now) {
+			continue
+		}
+		if !overrideMatches(override, risk, actionRef) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func overrideMatches(override config.TaintTrustOverride, risk session.SessionRisk, actionRef string) bool {
+	switch override.Scope {
+	case taintScopeAction:
+		if override.ActionMatch == "" || !wildcardMatch(actionRef, override.ActionMatch) {
+			return false
+		}
+		if override.SourceMatch != "" && !riskSourceMatches(risk, override.SourceMatch) {
+			return false
+		}
+		return true
+	case taintScopeSource:
+		if override.SourceMatch == "" || !riskSourceMatches(risk, override.SourceMatch) {
+			return false
+		}
+		if override.ActionMatch != "" && !wildcardMatch(actionRef, override.ActionMatch) {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func runtimeTrustOverrideApplies(overrides []session.TrustOverride, task session.TaskContext, risk session.SessionRisk, actionRef string) bool {
+	now := time.Now().UTC()
+	for _, override := range overrides {
+		if override.Scope != taintScopeTask {
+			continue
+		}
+		if override.TaskID == "" || override.TaskID != task.CurrentTaskID {
+			continue
+		}
+		if !override.ExpiresAt.IsZero() && override.ExpiresAt.Before(now) {
+			continue
+		}
+		if override.ActionMatch != "" && !wildcardMatch(actionRef, override.ActionMatch) {
+			continue
+		}
+		if override.SourceMatch != "" && !riskSourceMatches(risk, override.SourceMatch) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func riskSourceMatches(risk session.SessionRisk, pattern string) bool {
+	return wildcardMatch(risk.SecurityOriginURL(), pattern)
+}
+
+func wildcardMatch(value, pattern string) bool {
+	if value == "" || pattern == "" {
+		return false
+	}
+	if matched, err := path.Match(pattern, value); err == nil && matched {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return value == pattern
+	}
+	parts := strings.Split(pattern, "*")
+	pos := 0
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(value[pos:], part)
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && !strings.HasPrefix(pattern, "*") && idx != 0 {
+			return false
+		}
+		pos += idx + len(part)
+	}
+	if !strings.HasSuffix(pattern, "*") && parts[len(parts)-1] != "" && !strings.HasSuffix(value, parts[len(parts)-1]) {
+		return false
+	}
+	return true
+}

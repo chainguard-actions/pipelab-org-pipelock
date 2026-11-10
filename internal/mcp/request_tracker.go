@@ -1,0 +1,271 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"encoding/json"
+	"sync"
+
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+)
+
+// maxTrackedRequests caps the number of pending request IDs to prevent
+// unbounded memory growth from a compromised client sending requests
+// without consuming responses. Same cap pattern as tool baseline (10,000).
+const maxTrackedRequests = 10000
+
+// RequestTracker records outbound JSON-RPC request IDs and validates
+// that inbound response IDs match a previously tracked request. This
+// prevents confused deputy attacks where a malicious MCP server sends
+// unsolicited responses with IDs the client never used.
+//
+// A nil tracker passes all IDs through (feature disabled).
+type RequestTracker struct {
+	mu      sync.Mutex
+	pending map[string]trackedRequest
+	// order preserves insertion order for FIFO eviction when cap is reached.
+	order []string
+	// seeded is true once at least one request ID has been tracked.
+	// Validate only rejects unsolicited IDs after the tracker has been seeded,
+	// so responses arriving before any request tracking (e.g., during MCP
+	// server initialization) pass through instead of being blocked.
+	seeded bool
+	// strict rejects response envelopes whose ID is absent or null. It is used
+	// by HTTP response channels with an exact request set (including an empty
+	// set), while ordinary stdio/WS trackers retain JSON-RPC parse-error parity.
+	strict bool
+}
+
+// TrackedRequestOutcome carries the receipt metadata needed to emit a
+// post-response outcome for a previously admitted MCP request.
+type TrackedRequestOutcome struct {
+	Receipt receipt.EmitOpts
+	// Method is the JSON-RPC method of the matching request, used by
+	// response-side A2A routing (Agent Card vs field-aware body scan).
+	Method string
+}
+
+type trackedRequest struct {
+	outcome                 TrackedRequestOutcome
+	rejectionOutcomeClaimed bool
+}
+
+// PendingRequestOutcome is a drained pending JSON-RPC request ID plus its
+// outcome receipt metadata.
+type PendingRequestOutcome struct {
+	ID      json.RawMessage
+	Outcome TrackedRequestOutcome
+}
+
+// NewRequestTracker creates a tracker with an empty pending set.
+func NewRequestTracker() *RequestTracker {
+	return &RequestTracker{
+		pending: make(map[string]trackedRequest),
+	}
+}
+
+// NewStrictRequestTracker creates a tracker that rejects response IDs even
+// when no request ID is pending. Use it on HTTP response channels where the
+// corresponding client request is already known, or where responses are never
+// valid, so the initialization race exception cannot become a fail-open.
+func NewStrictRequestTracker(ids ...json.RawMessage) *RequestTracker {
+	t := NewRequestTracker()
+	t.seeded = true
+	t.strict = true
+	for _, id := range ids {
+		t.Track(id)
+	}
+	return t
+}
+
+// NewStrictRequestTrackerFor records a single request ID with its JSON-RPC
+// method so the matching response can apply A2A Agent Card controls.
+func NewStrictRequestTrackerFor(id json.RawMessage, method string) *RequestTracker {
+	t := NewRequestTracker()
+	t.seeded = true
+	t.strict = true
+	t.TrackOutcome(id, TrackedRequestOutcome{Method: method})
+	return t
+}
+
+// Track records a request ID as pending. Nil/null IDs are ignored
+// (notifications don't expect responses). If the pending set exceeds
+// maxTrackedRequests, the oldest entry is evicted.
+func (t *RequestTracker) Track(id json.RawMessage) {
+	t.TrackOutcome(id, TrackedRequestOutcome{})
+}
+
+// TrackRequest records a request ID together with its JSON-RPC method so the
+// matching response can route A2A Agent Card checks without shape heuristics.
+func (t *RequestTracker) TrackRequest(id json.RawMessage, method string) {
+	t.TrackOutcome(id, TrackedRequestOutcome{Method: method})
+}
+
+// TrackOutcome records a request ID as pending and associates it with outcome
+// receipt metadata. Nil/null IDs are ignored (notifications don't expect
+// responses). If the pending set exceeds maxTrackedRequests, the oldest entry
+// is evicted.
+func (t *RequestTracker) TrackOutcome(id json.RawMessage, outcome TrackedRequestOutcome) {
+	if t == nil {
+		return
+	}
+	key := canonicalID(id)
+	if key == "" {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, exists := t.pending[key]; exists {
+		return // already tracked
+	}
+
+	// Evict oldest if at capacity.
+	if len(t.pending) >= maxTrackedRequests {
+		oldest := t.order[0]
+		delete(t.pending, oldest)
+		t.order = t.order[1:]
+	}
+
+	t.pending[key] = trackedRequest{outcome: outcome}
+	t.order = append(t.order, key)
+	t.seeded = true
+}
+
+// Validate checks whether id was previously tracked, consuming it on
+// match (one-shot). Returns true if the ID is valid (was tracked or is
+// nil/null). A nil tracker always returns true (feature disabled).
+func (t *RequestTracker) Validate(id json.RawMessage) bool {
+	_, ok := t.Consume(id)
+	return ok
+}
+
+// claimRejectedOutcome reserves at most one rejection receipt per pending
+// request without consuming its correlation or changing trusted metadata.
+// The reservation is retained even if receipt emission fails.
+func (t *RequestTracker) claimRejectedOutcome(id json.RawMessage) (TrackedRequestOutcome, bool) {
+	if t == nil {
+		return TrackedRequestOutcome{}, false
+	}
+	key := canonicalID(id)
+	if key == "" {
+		return TrackedRequestOutcome{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	request, ok := t.pending[key]
+	if !ok || request.rejectionOutcomeClaimed || request.outcome.Receipt.ActionID == "" {
+		return TrackedRequestOutcome{}, false
+	}
+	request.rejectionOutcomeClaimed = true
+	t.pending[key] = request
+	return request.outcome, true
+}
+
+// Consume checks whether id was previously tracked and returns the associated
+// outcome metadata. It consumes matching IDs exactly once.
+func (t *RequestTracker) Consume(id json.RawMessage) (TrackedRequestOutcome, bool) {
+	if t == nil {
+		return TrackedRequestOutcome{}, true
+	}
+	key := canonicalID(id)
+	if key == "" {
+		// Nil/null IDs: notifications and server-initiated requests.
+		return TrackedRequestOutcome{}, !t.strict
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	request, ok := t.pending[key]
+	if !ok {
+		return TrackedRequestOutcome{}, false
+	}
+	delete(t.pending, key)
+	// Remove from order slice. Linear scan is acceptable because n
+	// is bounded by maxTrackedRequests (10,000) and MCP message rates are low.
+	for i, k := range t.order {
+		if k == key {
+			t.order = append(t.order[:i], t.order[i+1:]...)
+			break
+		}
+	}
+	return request.outcome, true
+}
+
+// Seeded reports whether at least one request ID has been tracked.
+// Used by ForwardScanned to skip validation during server initialization
+// (before any client request has been sent). A nil tracker returns false.
+func (t *RequestTracker) Seeded() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.seeded
+}
+
+// HasPending reports whether any tracked request still awaits its response.
+// A nil tracker has nothing pending.
+func (t *RequestTracker) HasPending() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.pending) > 0
+}
+
+// Strict reports whether response envelopes must carry an exact tracked ID.
+func (t *RequestTracker) Strict() bool {
+	return t != nil && t.strict
+}
+
+// DrainPending returns and removes all pending request IDs. Used when a
+// response timeout fires and the proxy needs to emit error responses for
+// every unanswered request before shutting down.
+func (t *RequestTracker) DrainPending() []json.RawMessage {
+	pending := t.DrainPendingOutcomes()
+	if pending == nil {
+		return nil
+	}
+	ids := make([]json.RawMessage, 0, len(pending))
+	for _, item := range pending {
+		ids = append(ids, item.ID)
+	}
+	return ids
+}
+
+// DrainPendingOutcomes returns and removes all pending request IDs with their
+// associated outcome metadata.
+func (t *RequestTracker) DrainPendingOutcomes() []PendingRequestOutcome {
+	if t == nil {
+		return nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	pending := make([]PendingRequestOutcome, 0, len(t.order))
+	for _, key := range t.order {
+		pending = append(pending, PendingRequestOutcome{
+			ID:      json.RawMessage(key),
+			Outcome: t.pending[key].outcome,
+		})
+	}
+	t.pending = make(map[string]trackedRequest)
+	t.order = nil
+	return pending
+}
+
+// canonicalID normalizes a JSON-RPC ID to a canonical string for map
+// lookup. Returns "" for nil, empty, or "null" IDs (notifications).
+// The canonical form preserves the raw JSON representation so numeric
+// IDs (1) and string IDs ("1") remain distinct.
+func canonicalID(id json.RawMessage) string {
+	if len(id) == 0 || string(id) == jsonrpc.Null {
+		return ""
+	}
+	return string(id)
+}

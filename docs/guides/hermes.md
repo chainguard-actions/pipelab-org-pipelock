@@ -1,0 +1,131 @@
+# Using Pipelock with Hermes
+
+[Hermes](https://hermes-agent.nousresearch.com) (Nous Research) is a Python agent with a rich in-process hook API and roughly seventy built-in tools — `terminal`, `browser`, `web_extract`, file read/write, image generation, and MCP servers among them. Unlike an IDE that only speaks MCP, most of Hermes' egress never touches an MCP server, so Pipelock offers two integration modes with deliberately different coverage.
+
+## Why Hermes Needs an Agent Firewall
+
+| Workflow | What Hermes accesses | What could go wrong |
+|---|---|---|
+| `terminal` / `execute_code` | Shell, network, filesystem | Direct exfiltration that never passes through MCP |
+| `web_extract` / `browser` | Arbitrary URLs and page content | Prompt injection in fetched content steering later tool calls |
+| MCP tool execution | Databases, APIs, remote services | Tool poisoning, rug-pull updates, chain attacks |
+| Cross-session memory | `MEMORY.md`, session DB | An injected instruction surviving across resume |
+
+## Two Install Modes
+
+| Mode | Command | What it wires | Coverage |
+|---|---|---|---|
+| **full** (default) | `pipelock hermes install --mode full` | Python plugin (`pre_tool_call`, `transform_tool_result`, `pre_gateway_dispatch`, session lifecycle), enabled in `plugins.enabled`, **plus** proxy env names injected into the terminal backend | Plugin-visible tool surfaces; terminal network egress still requires the proxy env values to be set and honored |
+| **mcp-only** | `pipelock hermes install --mode mcp-only` | Rewrites `mcp_servers` to route each server through `pipelock mcp proxy` | **Partial** — MCP server traffic only |
+
+`--mode full` is the default because the plugin sees every tool's structured arguments before execution and every result before it returns, so Pipelock scans surfaces a network proxy never sees: a terminal command's arguments, a file write's contents, a tool result before the model reads it. The plugin's load → enable → fire → block path is proven end-to-end against a live Hermes by the `make hermes-e2e` integration test (it installs a pinned Hermes, drives Hermes' own plugin manager, and asserts a secret-bearing tool call is blocked through the real binary). The one cooperative arm is terminal egress: Pipelock sees terminal network traffic only when the proxy env **values** are also set in Hermes' environment and the backend honors them (see below).
+
+`--mode mcp-only` is the lighter opt-in: it wraps every declared MCP server with no Python plugin and no terminal env changes. It is honestly labeled partial coverage — it does not touch the terminal, file, browser, or gateway surfaces. Choose it when you only want MCP traffic wrapped, or when a network-level pipelock deployment (forward proxy + sandbox) already covers the rest of the agent's egress.
+
+## Quick Start
+
+```bash
+# 1. Install pipelock (requires Go 1.26+)
+git clone --branch v3.8.0 --depth 1 https://github.com/pipelab-org/pipelock.git
+make -C pipelock install
+# or (macOS): brew install luckyPipewrench/tap/pipelock
+
+# 2. Full coverage (default): plugin-visible tool surfaces + terminal env passthrough
+pipelock hermes install --mode full --pipelock-config ~/.config/pipelock/pipelock.yaml
+
+# 2b. OR lighter MCP-only coverage: wrap mcp_servers, no plugin
+pipelock hermes install --mode mcp-only --pipelock-config ~/.config/pipelock/pipelock.yaml
+
+# 3. Confirm what was wired
+pipelock hermes verify
+```
+
+Both modes are idempotent — re-running wraps only new entries and never duplicates work — and back up `~/.hermes/config.yaml` to a timestamped `.bak` before any change.
+
+### Terminal coverage is cooperative
+
+`--mode full` adds Pipelock's proxy environment **names** (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, …) to the terminal backend's `env_passthrough`. For terminal traffic to actually route through Pipelock you must also set those env **values** in Hermes' own environment and the backend must honor them. This is cooperative proxying, not binary-enforced network isolation; pair it with `pipelock contain`, a sandbox, or a network policy where you need a hard boundary.
+
+The plugin looks for the `pipelock` executable on its `PATH`. If Hermes does not inherit a `PATH` that includes it, set `PIPELOCK_BIN` in Hermes' process environment to the absolute path of the Pipelock executable.
+
+## MCP-Only Mode: Auth-Header Preservation
+
+When `--mode mcp-only` wraps a remote (`url`) MCP server that carries auth `headers`, the credential is **not** placed on the wrapped command line — process arguments are world-visible via `/proc/<pid>/cmdline`. Instead the header lines are written to an operator-private `0600` sidecar under `~/.config/pipelock/wrap-headers/` and referenced through `--header-file`:
+
+```yaml
+# before
+mcp_servers:
+  remote:
+    url: https://mcp.example.com
+    headers:
+      Authorization: "Bearer sk-…"
+
+# after `pipelock hermes install --mode mcp-only`
+mcp_servers:
+  remote:
+    command: /usr/local/bin/pipelock
+    args: [mcp, proxy, --config, …, --header-file, ~/.config/pipelock/wrap-headers/<hash>.headers, --upstream, https://mcp.example.com]
+    _pipelock: { … }   # original entry, restored by rollback
+```
+
+The original headers are retained in the `_pipelock` metadata so `rollback` restores the entry faithfully — the same file-level exposure as the source `headers:` block. The sidecar's job is to prevent the *new* argv exposure that wrapping would otherwise introduce.
+
+## What Gets Scanned
+
+| Direction | full | mcp-only | Scanning |
+|---|---|---|---|
+| Any tool call args (`terminal`, `write_file`, `web_extract`, …) | ✅ | — | DLP, input injection, tool-policy rules |
+| Any tool result | ✅ | — | Response injection (6-pass normalisation), redaction |
+| Hermes → MCP server | ✅ | ✅ | DLP + injection on `tools/call` arguments |
+| MCP server → Hermes | ✅ | ✅ | Response injection, tool-poisoning, chain detection |
+| Gateway dispatch | ✅ | — | `pre_gateway_dispatch` skip/rewrite/allow |
+
+The **full** column reflects what the plugin scans once enabled; the plugin path is proven end-to-end against a live Hermes by `make hermes-e2e`. The **mcp-only** column is the lighter opt-in path for MCP traffic only.
+
+### Direction-aware DLP
+
+The exfil-class DLP checks — environment-variable and file-secret **value** matching, which detect a secret the proxy holds appearing in text — run only on **outbound** surfaces, where a secret could actually leave: a tool call's arguments (`pre_tool_call`). On **inbound** surfaces — an operator→agent message (`pre_gateway_dispatch`) and a tool result flowing back to the agent (`transform_tool_result`) — those checks are skipped, because a value the agent is *receiving* is not exfiltration. Inbound surfaces still get full prompt-injection scanning plus the generic DLP detectors (regex patterns, seed phrases, canary tokens, hostname exfiltration); only the agent's-own-secret value match is direction-scoped. The Hermes hook also applies a narrow inbound-only precision filter for AWS Access ID matches that exist only because whitespace collapse joined lowercase OCR/prose into a key-shaped string. Raw, decoded, credential-context, and outbound AWS findings still block. This prevents an operator message or a local file read that happens to contain an env value (a path, a config setting) from false-positively blocking the agent, without weakening exfiltration protection on the outbound path. Outbound exfil detection is unchanged.
+
+### Environment lookups in tool commands
+
+A `terminal` tool call's command, a tool result, and a gateway message are not sent anywhere as written, so the hook scans them with one narrow difference; other tools' arguments keep the full check because they can be sent to a server as literal bytes. A `Credential in URL` candidate does not count when it is an assignment at line start or right after a `;` that is not part of a URL, whose value is exactly one environment-variable lookup and the statement ends right after it, as in `token=os.environ.get("API_TOKEN");` in a one-line script. The accepted forms are `os.environ["NAME"]`, `os.environ.get("NAME")`, `os.getenv("NAME")`, `process.env.NAME`, `process.env["NAME"]`, `os.Getenv("NAME")`, `ENV["NAME"]`, and `ENV.fetch("NAME")`, with an uppercase POSIX variable name. After the lookup only spaces or tabs may come before `;`, the end of the text, or the closing quote of a `python3 -c '...'` argument. Every candidate is judged in each view the scanner checks, and any other candidate still blocks. A fallback argument, an `or` default, a comment, a trailing call, a lowercase name, a lookup after `?` or `&` or after a `;` that touches a URL, or any other form still blocks. DLP normalization removes line breaks, so a lookup followed only by a line break runs into the next statement and still blocks; end the statement with `;`. Other patterns are unaffected. The rule follows the built-in regex text: a custom pattern that reuses it exactly gets the same rule, and a pattern that replaces it with a different regex does not. The Claude Code and Cursor hooks apply the same rule to shell commands only. The proxy applies no such rule, because on the wire those characters are literal bytes and the quoted name could itself be a credential; a command that later sends the value is still blocked there.
+
+## Verify and Roll Back
+
+```bash
+pipelock hermes verify            # human-readable coverage report
+pipelock hermes verify --json     # machine-readable
+
+pipelock hermes rollback          # surgical: unwrap mcp_servers, strip proxy env, remove plugin
+pipelock hermes rollback --restore-backup ~/.hermes/config.yaml.bak.<ts>   # explicit recovery
+```
+
+`verify` reports coverage honestly, and counts the plugin as ready only when it will actually load and fire under Hermes: the plugin files are present, the `plugin.yaml` manifest exists (Hermes skips manifest-less plugin directories), the plugin is enabled in `plugins.enabled` (standalone plugins are opt-in), the hook binary is resolvable, and the config sidecar is sane. File presence alone is **not** coverage. `full` means a ready plugin **and** the proxy env names are present; `partial` means some coverage (a ready plugin, env, or wrapped MCP servers) but not all surfaces; `none` means nothing is wired. `verify` annotates a `full` result to note that terminal egress is cooperative (it routes through Pipelock only when the proxy env values are set in Hermes' environment); the plugin hook path itself is proven by `make hermes-e2e`. It also reports how many MCP servers are declared versus wrapped. Rollback is surgical by default and undoes both modes — it unwraps any wrapped `mcp_servers` (deleting their header sidecars), strips the proxy env names, and removes the plugin from `plugins.enabled` — so you do not have to remember which mode you installed.
+
+## Browser Defaults
+
+`pipelock hermes install` also writes `~/.agent-browser/config.json` in the resolved Hermes user's home. Hermes's browser tool drives Chromium through agent-browser, and under automation Chromium advertises an automation marker that managed bot challenges can loop on. Install adds `--disable-blink-features=AutomationControlled` to that file's `args` string, preserves existing keys and launch arguments, and backs up an existing file before changing it. Pass `--no-browser-defaults` to skip this step.
+
+When Hermes runs under `pipelock contain`, you don't need this step: `pipelock contain install` merges the same flag into the contained agent's agent-browser config for every contained agent, using the same merge and rollback rules (see [Browser launch default](../contain-cli.md#browser-launch-default)). `pipelock hermes install` keeps writing it for Hermes users who run without containment. The flag only reaches browsers launched through agent-browser; an agent that launches Playwright's or Puppeteer's bundled browser directly reads neither this file nor an environment variable for launch arguments, so only that agent's launch code can add it.
+
+`pipelock hermes verify` reports the browser setting as `present`, `missing`, `invalid` (the file is not valid JSON or `args` is not a string; repair it, then rerun install), `overridden`, or `unknown` (no home directory could be resolved; pass `--home`). An `AGENT_BROWSER_ARGS` environment value replaces the file's `args`. Hermes sets one itself when it decides Chromium needs its sandbox disabled: running as root, inside a container, or on hosts that restrict unprivileged user namespaces. In that case add the flag to the environment value Hermes starts with. Verify can only inspect its own environment, so it reports `overridden` when the variable is set where verify runs, not inside an already-running Hermes process.
+
+Concurrent `pipelock hermes install` and `pipelock hermes rollback` runs by the same account are serialized when they share a Hermes config directory, browser-state home, or plugin directory. An install with `--no-browser-defaults` touches no browser state, so it doesn't wait on the browser-state home, and a `--mode full` install still waits on its plugin directory. The locks live in that account's own cache directory (`~/.cache` from the account database on Linux and macOS, Local AppData on Windows), so a changed `XDG_CACHE_HOME` or `LOCALAPPDATA` can't split them; runs by different accounts, such as root with `--home` and the Hermes user itself, are not serialized against each other. If the lock wait times out after 30 seconds, the error names the lock file and means another install or rollback is running; wait for it to finish and retry.
+
+`pipelock hermes rollback` removes the flag only when Pipelock added it. If `args` is otherwise unchanged since install, rollback restores the previous value exactly; if you edited `args` afterward, it removes only Pipelock's flag and keeps your edits, including arguments you removed. It deletes the file when Pipelock created it and nothing else was added. Rollback undoes the Hermes integration first; if the agent-browser file cannot be read or parsed, rollback still completes, prints a warning naming the file, and a later rollback retries the browser cleanup. All three commands take `--home` to name the Hermes user's home when it is not the current user's. agent-browser opens bare hostnames over HTTPS.
+
+## Choosing a Config
+
+| Preset | Action | Best for |
+|---|---|---|
+| `balanced` | warn | Getting started, tuning phase |
+| `strict` | block | High-security workflows |
+| `hostile-model` | block | Running an uncensored or jailbroken model |
+
+Start with `balanced` to see what gets flagged, then move to a blocking preset once you have verified no false positives.
+
+## See also
+
+- [Cline guide](cline.md) — the same MCP-wrap pattern for an MCP-native IDE
+- [OpenClaw guide](openclaw.md) — agent framework integration
+- [Receipt verification](receipt-verification.md) — independent audit of what each tool call did

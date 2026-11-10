@@ -1,0 +1,2256 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package rules
+
+import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+
+	"gopkg.in/yaml.v3"
+)
+
+// testPipelockVersion is used for tests that need a current pipelock version.
+const testPipelockVersion = "1.3.0"
+
+// testBundleName is the default bundle name used in loader tests.
+const testBundleName = "test-bundle"
+
+// testBundle is a minimal valid bundle for test helpers.
+func testBundle(name string, rules []Rule) *Bundle {
+	return &Bundle{
+		FormatVersion: 1,
+		Name:          name,
+		Version:       "2026.03.0",
+		Author:        "Test Author",
+		Description:   "Test bundle for loader tests",
+		Rules:         rules,
+	}
+}
+
+// testBundleV2 creates a v2 bundle with tier, freshness, and key binding fields.
+func testBundleV2(name, tier string, monotonic uint64, rules []Rule) *Bundle {
+	return &Bundle{
+		FormatVersion:    2,
+		Name:             name,
+		Version:          "2026.04.0",
+		Author:           "Test Author",
+		Description:      "Test v2 bundle for loader tests",
+		Tier:             tier,
+		MonotonicVersion: monotonic,
+		PublishedAt:      "2026-04-01T00:00:00Z",
+		ExpiresAt:        time.Now().UTC().AddDate(1, 0, 0).Format(time.RFC3339),
+		KeyID:            "sha256:test-key-id",
+		Rules:            rules,
+	}
+}
+
+// testDLPRule creates a valid DLP rule with the given id, confidence, and status.
+func testDLPRule(id, confidence, status string) Rule {
+	return Rule{
+		ID:          id,
+		Type:        RuleTypeDLP,
+		Status:      status,
+		Name:        "Test DLP Rule " + id,
+		Description: "Detects test pattern " + id,
+		Severity:    severityHigh,
+		Confidence:  confidence,
+		Pattern:     RulePattern{Regex: `test-secret-\d+`},
+	}
+}
+
+func TestLoadBundles_PropagatesDLPValidator(t *testing.T) {
+	for _, validator := range []string{config.ValidatorABA, config.ValidatorDEA, config.ValidatorNPI} {
+		t.Run(validator, func(t *testing.T) {
+			testLoadBundleValidator(t, validator)
+		})
+	}
+}
+
+func testLoadBundleValidator(t *testing.T, validator string) {
+	t.Helper()
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	rule := testDLPRule("dlp-aba", confidenceHigh, StatusStable)
+	rule.Pattern.Validator = validator
+	bundle := testBundle(testBundleName, []Rule{rule})
+	writeUnsignedBundle(t, bundleDir, bundle)
+
+	result := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion})
+	if len(result.DLP) != 1 {
+		t.Fatalf("DLP patterns = %d, errors=%v", len(result.DLP), result.Errors)
+	}
+	if result.DLP[0].Validator != validator {
+		t.Fatalf("validator = %q, want %q", result.DLP[0].Validator, validator)
+	}
+}
+
+func TestBundleValidatorReload(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	rule := testDLPRule("dlp-dea", confidenceHigh, StatusStable)
+	rule.Pattern.Regex = `\b[ABFMPRSX][A-Z9]\d{7}\b`
+	load := func(validator string) *config.Config {
+		t.Helper()
+		rule.Pattern.Validator = validator
+		bundle := testBundle(testBundleName, []Rule{rule})
+		if validator != "" {
+			bundle.Version = "2026.03.1"
+		}
+		writeUnsignedBundle(t, bundleDir, bundle)
+		cfg := config.Defaults()
+		cfg.Rules.RulesDir = dir
+		result := MergeIntoConfig(cfg, testPipelockVersion)
+		if len(result.Errors) != 0 {
+			t.Fatalf("bundle merge errors: %v", result.Errors)
+		}
+		return cfg
+	}
+	before := load("")
+	after := load(config.ValidatorDEA)
+	wantName := NamespacedID(testBundleName, rule.ID)
+	for _, warning := range config.ValidateReload(before, after) {
+		if warning.Field == "dlp.patterns" && strings.Contains(warning.Message, wantName+" (validator changed)") && warning.Disposition != config.ReloadWarningDispositionAdvisory {
+			return
+		}
+	}
+	t.Fatal("bundle-sourced validator addition did not produce a rejectable reload warning")
+}
+
+func TestLoadBundles_ExemptDomainsParseAndWarn(t *testing.T) {
+	tests := []struct {
+		name           string
+		exemptDomains  []string
+		status         string
+		disabled       []string
+		wantDLP        int
+		wantExemptWarn bool
+	}{
+		{
+			name:           "configured exemption warns and stays ineffective",
+			exemptDomains:  []string{"safe.vendor.example"},
+			status:         StatusStable,
+			wantDLP:        1,
+			wantExemptWarn: true,
+		},
+		{
+			name:           "filtered rule still warns about ignored exemption",
+			exemptDomains:  []string{"safe.vendor.example"},
+			status:         StatusStable,
+			disabled:       []string{"test-bundle:dlp-exempt"},
+			wantDLP:        0,
+			wantExemptWarn: true,
+		},
+		{
+			name:           "no exemption has no warning",
+			status:         StatusStable,
+			wantDLP:        1,
+			wantExemptWarn: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			bundleDir := filepath.Join(dir, testBundleName)
+			if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+				t.Fatalf("make bundle directory: %v", err)
+			}
+
+			rule := testDLPRule("dlp-exempt", confidenceHigh, tt.status)
+			rule.Pattern.ExemptDomains = tt.exemptDomains
+			writeUnsignedBundle(t, bundleDir, testBundle(testBundleName, []Rule{rule}))
+
+			raw, err := os.ReadFile(filepath.Clean(filepath.Join(bundleDir, bundleFilename)))
+			if err != nil {
+				t.Fatalf("read bundle.yaml: %v", err)
+			}
+			parsed, err := ParseBundle(raw)
+			if err != nil {
+				t.Fatalf("ParseBundle rejected exempt_domains: %v", err)
+			}
+			if got := parsed.Rules[0].Pattern.ExemptDomains; !slices.Equal(got, tt.exemptDomains) {
+				t.Fatalf("parsed ExemptDomains = %v, want %v", got, tt.exemptDomains)
+			}
+
+			result := LoadBundles(dir, LoadOptions{
+				MinConfidence:   confidenceLow,
+				Disabled:        tt.disabled,
+				PipelockVersion: testPipelockVersion,
+			})
+			if len(result.Errors) != 0 {
+				t.Fatalf("LoadBundles errors = %v", result.Errors)
+			}
+			if len(result.Loaded) != 1 {
+				t.Fatalf("loaded bundles = %d, want 1", len(result.Loaded))
+			}
+			if len(result.DLP) != tt.wantDLP {
+				t.Fatalf("DLP patterns = %d, want %d", len(result.DLP), tt.wantDLP)
+			}
+			if len(result.DLP) > 0 && len(result.DLP[0].ExemptDomains) != 0 {
+				t.Fatalf("loaded ExemptDomains = %v, want dropped", result.DLP[0].ExemptDomains)
+			}
+
+			gotExemptWarn := false
+			for _, warning := range result.Warnings {
+				if strings.Contains(warning, testBundleName) &&
+					strings.Contains(warning, "dlp-exempt") &&
+					strings.Contains(warning, "pattern.exempt_domains") {
+					gotExemptWarn = true
+				}
+			}
+			if gotExemptWarn != tt.wantExemptWarn {
+				t.Fatalf("exempt warning = %t, want %t; warnings=%v", gotExemptWarn, tt.wantExemptWarn, result.Warnings)
+			}
+		})
+	}
+}
+
+func TestLoadResultErrorHelpers(t *testing.T) {
+	var nilResult *LoadResult
+	if got := nilResult.IntegrityErrors(); got != nil {
+		t.Fatalf("nil IntegrityErrors = %+v, want nil", got)
+	}
+	if got := nilResult.AvailabilityErrors(); got != nil {
+		t.Fatalf("nil AvailabilityErrors = %+v, want nil", got)
+	}
+	if got := nilResult.DegradedBundleNames(); got != nil {
+		t.Fatalf("nil DegradedBundleNames = %+v, want nil", got)
+	}
+	// An unclassified (zero-value) error must default to integrity so it fails
+	// CLOSED in strict startup rather than silently booting degraded.
+	if got := (BundleError{}).ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("zero class default = %q, want %q (fail closed)", got, BundleErrorClassIntegrity)
+	}
+	// An unrecognized (e.g. typo'd) class value must also fail closed rather
+	// than pass through unrecognized and be tolerated by the strict integrity
+	// filter.
+	if got := (BundleError{Class: BundleErrorClass("unknown")}).ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("unknown class default = %q, want %q (fail closed)", got, BundleErrorClassIntegrity)
+	}
+
+	result := &LoadResult{
+		Errors: []BundleError{
+			{Name: "z-bundle", Class: BundleErrorClassIntegrity, Reason: "hash mismatch"},
+			{Name: "", Class: BundleErrorClassIntegrity, Reason: "nameless state error"},
+			{Name: "a-bundle", Class: BundleErrorClassAvailability, Reason: "requires future feature"},
+			{Name: "z-bundle", Class: BundleErrorClassIntegrity, Reason: "duplicate"},
+		},
+	}
+	if got := len(result.IntegrityErrors()); got != 3 {
+		t.Fatalf("IntegrityErrors len = %d, want 3", got)
+	}
+	if got := len(result.AvailabilityErrors()); got != 1 {
+		t.Fatalf("AvailabilityErrors len = %d, want 1", got)
+	}
+	if got := strings.Join(result.DegradedBundleNames(), ","); got != "a-bundle,z-bundle" {
+		t.Fatalf("DegradedBundleNames = %q, want sorted de-duped names", got)
+	}
+}
+
+func TestLoadBundlesFreshnessSaveFailureIsIntegrityError(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	bundle := testBundleV2(testBundleName, TierCommunity, 1, []Rule{testDLPRule("dlp-save", confidenceHigh, StatusStable)})
+	bundle.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, bundleDir, bundle, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TrustedKeys:     []config.TrustedKey{{Name: "test", PublicKey: hex.EncodeToString(pub)}},
+		saveFreshnessState: func(string, *FreshnessState) error {
+			return errors.New("forced durability failure")
+		},
+	})
+	if !result.Degraded {
+		t.Fatal("persistLoadedFreshness Degraded = false, want true")
+	}
+	if len(result.IntegrityErrors()) != 1 || !strings.Contains(result.IntegrityErrors()[0].Reason, "forced durability failure") {
+		t.Fatalf("integrity errors = %+v, want freshness durability failure", result.IntegrityErrors())
+	}
+	if len(result.DLP) != 0 || len(result.Injection) != 0 || len(result.ToolPoison) != 0 {
+		t.Fatalf("usable rules after freshness save failure = DLP:%d Injection:%d ToolPoison:%d, want none", len(result.DLP), len(result.Injection), len(result.ToolPoison))
+	}
+}
+
+func TestLoadBundlesFailedBundleIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	failingDir := filepath.Join(dir, "a-failing")
+	if err := os.MkdirAll(failingDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll failing bundle: %v", err)
+	}
+	failing := testBundleV2("a-failing", TierCommunity, 7, []Rule{
+		testDLPRule("dlp-before-failure", confidenceHigh, StatusStable),
+		testToolPoisonRule("forced-failure", scanFieldDescription),
+	})
+	failing.KeyID = KeyFingerprint(pub)
+	failing.TestedThroughPipelock = "1.0.0"
+	writeSignedBundle(t, failingDir, failing, pub, priv)
+
+	successDir := filepath.Join(dir, "z-success")
+	if err := os.MkdirAll(successDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll successful bundle: %v", err)
+	}
+	success := testBundleV2("z-success", TierCommunity, 3, []Rule{
+		testDLPRule("dlp-success", confidenceHigh, StatusStable),
+	})
+	success.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, successDir, success, pub, priv)
+
+	definitions := append([]ruleTypeDefinition(nil), ruleTypeDefinitions...)
+	for i := range definitions {
+		if definitions[i].ID == RuleTypeToolPoison {
+			definitions[i].Load = func(_ *bundleExecCtx, _ *Bundle, _ *Rule, _, _ string, _ *LoadedBundle) error {
+				return errors.New("forced loader failure")
+			}
+		}
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TrustedKeys:     []config.TrustedKey{{Name: "test", PublicKey: hex.EncodeToString(pub)}},
+		definitions:     definitions,
+	})
+	if len(result.IntegrityErrors()) != 1 || !strings.Contains(result.IntegrityErrors()[0].Reason, "forced loader failure") {
+		t.Fatalf("integrity errors = %+v, want forced loader failure", result.IntegrityErrors())
+	}
+	if len(result.DLP) != 1 || result.DLP[0].Bundle != "z-success" {
+		t.Fatalf("DLP patterns = %+v, want only the successful bundle", result.DLP)
+	}
+	if len(result.Loaded) != 1 || result.Loaded[0].Name != "z-success" {
+		t.Fatalf("loaded bundles = %+v, want only z-success", result.Loaded)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("warnings = %q, want none from failed bundle", result.Warnings)
+	}
+
+	state, err := LoadFreshnessState(dir)
+	if err != nil {
+		t.Fatalf("LoadFreshnessState: %v", err)
+	}
+	if _, ok := state.HighestSeen[freshnessKey(TierCommunity, "a-failing")]; ok {
+		t.Fatalf("failed bundle version persisted: %+v", state.HighestSeen)
+	}
+	if _, ok := state.FormatFloor["a-failing"]; ok {
+		t.Fatalf("failed bundle format persisted: %+v", state.FormatFloor)
+	}
+	if got := state.HighestSeen[freshnessKey(TierCommunity, "z-success")]; got != 3 {
+		t.Fatalf("successful bundle version = %d, want 3", got)
+	}
+	if got := state.FormatFloor["z-success"]; got != 2 {
+		t.Fatalf("successful bundle format = %d, want 2", got)
+	}
+}
+
+func TestLoadBundlesMissingRuntimeLoaderIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "missing-loader")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	bundle := testBundle("missing-loader", []Rule{
+		testDLPRule("dlp-before-missing-loader", confidenceHigh, StatusStable),
+		testToolPoisonRule("missing-loader", scanFieldDescription),
+	})
+	writeUnsignedBundle(t, bundleDir, bundle)
+
+	definitions := slices.DeleteFunc(append([]ruleTypeDefinition(nil), ruleTypeDefinitions...), func(definition ruleTypeDefinition) bool {
+		return definition.ID == RuleTypeToolPoison
+	})
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		definitions:     definitions,
+	})
+
+	if len(result.IntegrityErrors()) != 1 || !strings.Contains(result.IntegrityErrors()[0].Reason, "has no runtime loader") {
+		t.Fatalf("integrity errors = %+v, want missing runtime loader", result.IntegrityErrors())
+	}
+	if len(result.DLP) != 0 || len(result.Loaded) != 0 {
+		t.Fatalf("failed bundle leaked state: DLP=%+v loaded=%+v", result.DLP, result.Loaded)
+	}
+}
+
+func TestLoadBundlesOfficialLoaderFailureWarnsDegraded(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, StandardBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	bundle := testBundle(StandardBundleName, []Rule{
+		testToolPoisonRule("forced-failure", scanFieldDescription),
+	})
+	writeSignedBundle(t, bundleDir, bundle, pub, priv)
+
+	definitions := append([]ruleTypeDefinition(nil), ruleTypeDefinitions...)
+	for i := range definitions {
+		if definitions[i].ID == RuleTypeToolPoison {
+			definitions[i].Load = func(_ *bundleExecCtx, _ *Bundle, _ *Rule, _, _ string, _ *LoadedBundle) error {
+				return errors.New("forced official loader failure")
+			}
+		}
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		definitions:     definitions,
+	})
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("integrity errors = %+v, want one forced loader failure", result.IntegrityErrors())
+	}
+	if !result.IntegrityErrors()[0].Official {
+		t.Fatal("official loader failure was not classified as official")
+	}
+	if !slices.ContainsFunc(result.Warnings, func(warning string) bool {
+		return strings.Contains(warning, "DEGRADED: standard pack") && strings.Contains(warning, "forced official loader failure")
+	}) {
+		t.Fatalf("warnings = %q, want degraded standard-pack warning", result.Warnings)
+	}
+}
+
+func TestLoadBundlesRejectsV1AfterAcceptedV2AcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	trustedKeys := []config.TrustedKey{{Name: "test", PublicKey: hex.EncodeToString(pub)}}
+	v2 := testBundleV2(testBundleName, TierCommunity, 7, []Rule{testDLPRule("dlp-v2", confidenceHigh, StatusStable)})
+	v2.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, bundleDir, v2, pub, priv)
+
+	first := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion, TrustedKeys: trustedKeys})
+	if len(first.Errors) != 0 || len(first.DLP) != 1 {
+		t.Fatalf("first LoadBundles = errors %v, DLP %d; want accepted v2", first.Errors, len(first.DLP))
+	}
+
+	v1 := testBundle(testBundleName, []Rule{testDLPRule("dlp-v1", confidenceHigh, StatusStable)})
+	writeSignedBundle(t, bundleDir, v1, pub, priv)
+	second := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion, TrustedKeys: trustedKeys})
+	if !second.Degraded || len(second.DLP) != 0 {
+		t.Fatalf("second LoadBundles = degraded %v, DLP %d; want rejected v1", second.Degraded, len(second.DLP))
+	}
+	if len(second.IntegrityErrors()) != 1 || !strings.Contains(second.IntegrityErrors()[0].Reason, "format rollback") {
+		t.Fatalf("integrity errors = %+v, want format rollback", second.IntegrityErrors())
+	}
+}
+
+func TestClassifyBundleFileReadError(t *testing.T) {
+	if got := classifyBundleFileReadError(os.ErrNotExist); got != BundleErrorClassIntegrity {
+		t.Fatalf("missing bundle file class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if got := classifyBundleFileReadError(errBundleFileTooLarge); got != BundleErrorClassIntegrity {
+		t.Fatalf("oversized bundle file class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if got := classifyBundleFileReadError(os.ErrPermission); got != BundleErrorClassAvailability {
+		t.Fatalf("permission error class = %q, want %q", got, BundleErrorClassAvailability)
+	}
+}
+
+// testInjectionRule creates a valid injection rule.
+func testInjectionRule(id, confidence string) Rule {
+	return Rule{
+		ID:          id,
+		Type:        RuleTypeInjection,
+		Status:      StatusStable,
+		Name:        "Test Injection Rule " + id,
+		Description: "Detects injection pattern " + id,
+		Severity:    severityMedium,
+		Confidence:  confidence,
+		Pattern:     RulePattern{Regex: `(?i)ignore previous`},
+	}
+}
+
+// testToolPoisonRule creates a valid tool-poison rule.
+func testToolPoisonRule(id, scanField string) Rule {
+	return Rule{
+		ID:          id,
+		Type:        RuleTypeToolPoison,
+		Status:      StatusStable,
+		Name:        "Test Tool Poison Rule " + id,
+		Description: "Detects poisoned tool " + id,
+		Severity:    severityCritical,
+		Confidence:  confidenceHigh,
+		Pattern:     RulePattern{Regex: `exec\s+curl`, ScanField: scanField},
+	}
+}
+
+// writeUnsignedBundle writes a bundle.yaml and bundle.lock for an unsigned bundle.
+func writeUnsignedBundle(t *testing.T, dir string, b *Bundle) {
+	t.Helper()
+
+	data, err := yaml.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshaling bundle: %v", err)
+	}
+
+	bundlePath := filepath.Join(dir, bundleFilename)
+	if err := os.WriteFile(bundlePath, data, 0o600); err != nil {
+		t.Fatalf("writing bundle.yaml: %v", err)
+	}
+
+	hash := sha256.Sum256(data)
+	lock := &LockFile{
+		InstalledVersion: b.Version,
+		Source:           "test",
+		BundleSHA256:     hex.EncodeToString(hash[:]),
+		Unsigned:         true,
+	}
+
+	lockPath := filepath.Join(dir, lockFilename)
+	if err := WriteLockFile(lockPath, lock); err != nil {
+		t.Fatalf("writing bundle.lock: %v", err)
+	}
+}
+
+// writeSignedBundle writes a bundle.yaml, signs it, and writes bundle.lock.
+// Returns the public key used for signing.
+func writeSignedBundle(t *testing.T, dir string, b *Bundle, pub ed25519.PublicKey, priv ed25519.PrivateKey) {
+	t.Helper()
+
+	data, err := yaml.Marshal(b)
+	if err != nil {
+		t.Fatalf("marshaling bundle: %v", err)
+	}
+
+	bundlePath := filepath.Join(dir, bundleFilename)
+	if err := os.WriteFile(bundlePath, data, 0o600); err != nil {
+		t.Fatalf("writing bundle.yaml: %v", err)
+	}
+
+	sig, err := signing.SignFile(bundlePath, priv)
+	if err != nil {
+		t.Fatalf("signing bundle: %v", err)
+	}
+	if err := signing.SaveSignature(sig, bundlePath+signing.SigExtension); err != nil {
+		t.Fatalf("saving signature: %v", err)
+	}
+
+	hash := sha256.Sum256(data)
+	lock := &LockFile{
+		InstalledVersion:  b.Version,
+		Source:            "test-signed",
+		BundleSHA256:      hex.EncodeToString(hash[:]),
+		SignerFingerprint: KeyFingerprint(pub),
+		Unsigned:          false,
+	}
+
+	lockPath := filepath.Join(dir, lockFilename)
+	if err := WriteLockFile(lockPath, lock); err != nil {
+		t.Fatalf("writing bundle.lock: %v", err)
+	}
+}
+
+// setupKeyring sets the test keyring to the given public key.
+// Must NOT be used in parallel tests.
+func setupKeyring(t *testing.T, pub ed25519.PublicKey) {
+	t.Helper()
+	setEmbeddedKeyringHexForTest(t, "", hex.EncodeToString(pub))
+}
+
+func TestLoadBundles_NonExistentDir(t *testing.T) {
+	t.Parallel()
+
+	result := LoadBundles("/nonexistent/path/to/rules", LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+	if len(result.Injection) != 0 {
+		t.Errorf("expected 0 Injection rules, got %d", len(result.Injection))
+	}
+	if len(result.ToolPoison) != 0 {
+		t.Errorf("expected 0 ToolPoison rules, got %d", len(result.ToolPoison))
+	}
+	if len(result.Errors) != 0 {
+		t.Errorf("expected 0 errors, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if len(result.Loaded) != 0 {
+		t.Errorf("expected 0 loaded bundles, got %d", len(result.Loaded))
+	}
+}
+
+func TestLoadBundles_EmptyDir(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+	if len(result.Errors) != 0 {
+		t.Errorf("expected 0 errors, got %d", len(result.Errors))
+	}
+	if len(result.Loaded) != 0 {
+		t.Errorf("expected 0 loaded bundles, got %d", len(result.Loaded))
+	}
+}
+
+func TestLoadBundles_ValidUnsignedBundle(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle(testBundleName, []Rule{
+		testDLPRule("dlp-rule-001", confidenceHigh, StatusStable),
+		testInjectionRule("inj-rule-001", confidenceMedium),
+		testToolPoisonRule("tp-rule-001", scanFieldDescription),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	if len(result.Loaded) != 1 {
+		t.Fatalf("expected 1 loaded bundle, got %d", len(result.Loaded))
+	}
+
+	// Check DLP rule.
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule, got %d", len(result.DLP))
+	}
+	if result.DLP[0].Name != "test-bundle:dlp-rule-001" {
+		t.Errorf("DLP name = %q, want %q", result.DLP[0].Name, "test-bundle:dlp-rule-001")
+	}
+	if result.DLP[0].Regex != `test-secret-\d+` {
+		t.Errorf("DLP regex = %q, want %q", result.DLP[0].Regex, `test-secret-\d+`)
+	}
+	if result.DLP[0].Severity != severityHigh {
+		t.Errorf("DLP severity = %q, want %q", result.DLP[0].Severity, severityHigh)
+	}
+
+	// Check injection rule.
+	if len(result.Injection) != 1 {
+		t.Fatalf("expected 1 injection rule, got %d", len(result.Injection))
+	}
+	if result.Injection[0].Name != "test-bundle:inj-rule-001" {
+		t.Errorf("Injection name = %q, want %q", result.Injection[0].Name, "test-bundle:inj-rule-001")
+	}
+
+	// Check tool-poison rule.
+	if len(result.ToolPoison) != 1 {
+		t.Fatalf("expected 1 tool-poison rule, got %d", len(result.ToolPoison))
+	}
+	tp := result.ToolPoison[0]
+	if tp.Name != "test-bundle:tp-rule-001" {
+		t.Errorf("ToolPoison name = %q, want %q", tp.Name, "test-bundle:tp-rule-001")
+	}
+	if tp.RuleID != "test-bundle:tp-rule-001" {
+		t.Errorf("ToolPoison RuleID = %q, want %q", tp.RuleID, "test-bundle:tp-rule-001")
+	}
+	if tp.ScanField != scanFieldDescription {
+		t.Errorf("ToolPoison ScanField = %q, want %q", tp.ScanField, scanFieldDescription)
+	}
+	if tp.Bundle != testBundleName {
+		t.Errorf("ToolPoison Bundle = %q, want %q", tp.Bundle, testBundleName)
+	}
+	if tp.BundleVersion != "2026.03.0" {
+		t.Errorf("ToolPoison BundleVersion = %q, want %q", tp.BundleVersion, "2026.03.0")
+	}
+	// Verify case-insensitive regex compilation.
+	if !tp.Re.MatchString("EXEC CURL") {
+		t.Error("expected case-insensitive regex to match 'EXEC CURL'")
+	}
+
+	// Check loaded bundle diagnostics.
+	lb := result.Loaded[0]
+	if lb.Name != testBundleName {
+		t.Errorf("Loaded.Name = %q, want %q", lb.Name, testBundleName)
+	}
+	if lb.Rules != 3 {
+		t.Errorf("Loaded.Rules = %d, want 3", lb.Rules)
+	}
+	if lb.DLP != 1 {
+		t.Errorf("Loaded.DLP = %d, want 1", lb.DLP)
+	}
+	if lb.Injection != 1 {
+		t.Errorf("Loaded.Injection = %d, want 1", lb.Injection)
+	}
+	if lb.ToolPoison != 1 {
+		t.Errorf("Loaded.ToolPoison = %d, want 1", lb.ToolPoison)
+	}
+	if !lb.Unsigned {
+		t.Error("expected Loaded.Unsigned to be true")
+	}
+}
+
+func TestLoadBundles_ValidSignedBundle(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "signed-bundle")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("signed-bundle", []Rule{
+		testDLPRule("dlp-signed-001", confidenceHigh, StatusStable),
+	})
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule, got %d", len(result.DLP))
+	}
+	if result.Loaded[0].Unsigned {
+		t.Error("expected Loaded.Unsigned to be false for signed bundle")
+	}
+}
+
+func TestLoadBundles_SignedBundleThirdPartyKey(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+
+	// Official key in keyring (not the signer).
+	officialPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating official key: %v", err)
+	}
+	setupKeyring(t, officialPub)
+
+	// Third-party key signs the bundle.
+	thirdPub, thirdPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating third-party key: %v", err)
+	}
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "third-party-bundle")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("third-party-bundle", []Rule{
+		testDLPRule("dlp-tp-001", confidenceHigh, StatusStable),
+	})
+	writeSignedBundle(t, bundleDir, b, thirdPub, thirdPriv)
+
+	trustedKeys := []config.TrustedKey{
+		{Name: "test-third-party", PublicKey: hex.EncodeToString(thirdPub)},
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TrustedKeys:     trustedKeys,
+	})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_InvalidBundleYAML(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "bad-yaml-bundle")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write invalid YAML for bundle.yaml.
+	badYAML := []byte("{{{{invalid yaml")
+	bundlePath := filepath.Join(bundleDir, bundleFilename)
+	if err := os.WriteFile(bundlePath, badYAML, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write lock file with matching SHA.
+	hash := sha256.Sum256(badYAML)
+	lock := &LockFile{
+		InstalledVersion: "2026.03.0",
+		Source:           "test",
+		BundleSHA256:     hex.EncodeToString(hash[:]),
+		Unsigned:         true,
+	}
+	lockPath := filepath.Join(bundleDir, lockFilename)
+	if err := WriteLockFile(lockPath, lock); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if result.Errors[0].Name != "bad-yaml-bundle" {
+		t.Errorf("error Name = %q, want %q", result.Errors[0].Name, "bad-yaml-bundle")
+	}
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_InvalidBundleContinuesOthers(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Bundle "aaa-bad" has invalid YAML (sorted first).
+	badDir := filepath.Join(dir, "aaa-bad")
+	if err := os.MkdirAll(badDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	badYAML := []byte("{{{{invalid yaml")
+	if err := os.WriteFile(filepath.Join(badDir, bundleFilename), badYAML, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(badYAML)
+	lock := &LockFile{BundleSHA256: hex.EncodeToString(hash[:]), Unsigned: true}
+	if err := WriteLockFile(filepath.Join(badDir, lockFilename), lock); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bundle "zzz-good" is valid (sorted second).
+	goodDir := filepath.Join(dir, "zzz-good")
+	if err := os.MkdirAll(goodDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	b := testBundle("zzz-good", []Rule{
+		testDLPRule("dlp-good-001", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, goodDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// Bad bundle produces error but doesn't prevent good bundle from loading.
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(result.Errors))
+	}
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule from good bundle, got %d", len(result.DLP))
+	}
+	if len(result.Loaded) != 1 {
+		t.Fatalf("expected 1 loaded bundle, got %d", len(result.Loaded))
+	}
+	if result.Loaded[0].Name != "zzz-good" {
+		t.Errorf("loaded bundle name = %q, want %q", result.Loaded[0].Name, "zzz-good")
+	}
+}
+
+func TestLoadBundles_MinPipelockTooHigh(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "needs-future")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("needs-future", []Rule{
+		testDLPRule("dlp-future-001", confidenceHigh, StatusStable),
+	})
+	b.MinPipelock = "99.0.0"
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for min_pipelock, got %d", len(result.Errors))
+	}
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_RefusesCheckedCompatibilityAndIntegrityFailures(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(t *testing.T, dir string)
+		want  string
+	}{
+		{
+			name: "released version below minimum",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				bundle := testBundle("below-minimum", []Rule{testDLPRule("below-minimum-001", confidenceHigh, StatusStable)})
+				bundle.MinPipelock = "9.0.0"
+				bundleDir := filepath.Join(dir, bundle.Name)
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeUnsignedBundle(t, bundleDir, bundle)
+			},
+			want: "below minimum",
+		},
+		{
+			name: "incompatible format",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				bundle := testBundle("unsupported-format", []Rule{testDLPRule("unsupported-format-001", confidenceHigh, StatusStable)})
+				bundle.FormatVersion = 3
+				bundleDir := filepath.Join(dir, bundle.Name)
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeUnsignedBundle(t, bundleDir, bundle)
+			},
+			want: "format_version must be 1-2",
+		},
+		{
+			name: "signature failure",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				pub, priv, err := ed25519.GenerateKey(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bundle := testBundle("bad-signature", []Rule{testDLPRule("bad-signature-001", confidenceHigh, StatusStable)})
+				bundleDir := filepath.Join(dir, bundle.Name)
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeSignedBundle(t, bundleDir, bundle, pub, priv)
+				if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), []byte("changed"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "integrity check",
+		},
+		{
+			name: "malformed manifest",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				bundleDir := filepath.Join(dir, "malformed-manifest")
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				data := []byte("format_version: 1\n")
+				if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				hash := sha256.Sum256(data)
+				if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), &LockFile{BundleSHA256: hex.EncodeToString(hash[:]), Unsigned: true}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "parse error",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.write(t, dir)
+
+			result := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion})
+			if len(result.Loaded) != 0 {
+				t.Fatalf("loaded = %v, want no bundle loaded", result.Loaded)
+			}
+			if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Reason, tc.want) {
+				t.Fatalf("errors = %v, want refusal containing %q", result.Errors, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadBundles_TestedThroughPipelockWarning(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "tested-ceiling")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	b := testBundle("tested-ceiling", []Rule{testDLPRule("tested-ceiling-001", confidenceHigh, StatusStable)})
+	b.TestedThroughPipelock = "1.2.0"
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: "1.3.0"})
+	if len(result.Errors) != 0 || len(result.Loaded) != 1 {
+		t.Fatalf("LoadBundles() errors=%v loaded=%v, want loaded bundle without errors", result.Errors, result.Loaded)
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "tested through") {
+		t.Fatalf("LoadBundles() warnings=%v, want tested-through warning", result.Warnings)
+	}
+
+	b.MinPipelock = "2.0.0"
+	writeUnsignedBundle(t, bundleDir, b)
+	result = LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: "1.3.0"})
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Reason, "below minimum") {
+		t.Fatalf("LoadBundles() errors=%v, want fail-closed minimum-version rejection", result.Errors)
+	}
+}
+
+func TestLoadBundles_ConfidenceFilterHigh(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "multi-conf")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("multi-conf", []Rule{
+		testDLPRule("dlp-high-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-med-001", confidenceMedium, StatusStable),
+		testDLPRule("dlp-low-001", confidenceLow, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceHigh,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	// Only high confidence should pass.
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule (high only), got %d", len(result.DLP))
+	}
+	if result.DLP[0].Name != "multi-conf:dlp-high-001" {
+		t.Errorf("DLP name = %q, want %q", result.DLP[0].Name, "multi-conf:dlp-high-001")
+	}
+}
+
+func TestLoadBundles_ConfidenceFilterMedium(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "multi-conf")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("multi-conf", []Rule{
+		testDLPRule("dlp-high-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-med-001", confidenceMedium, StatusStable),
+		testDLPRule("dlp-low-001", confidenceLow, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceMedium,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// High + medium should pass, low skipped.
+	if len(result.DLP) != 2 {
+		t.Fatalf("expected 2 DLP rules (high + medium), got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_DeprecatedAlwaysSkipped(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "deprecated-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("deprecated-test", []Rule{
+		testDLPRule("dlp-stable-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-deprecated-001", confidenceHigh, StatusDeprecated),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:       confidenceLow,
+		IncludeExperimental: true,
+		PipelockVersion:     testPipelockVersion,
+	})
+
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule (deprecated skipped), got %d", len(result.DLP))
+	}
+	if result.DLP[0].Name != "deprecated-test:dlp-stable-001" {
+		t.Errorf("DLP name = %q, want %q", result.DLP[0].Name, "deprecated-test:dlp-stable-001")
+	}
+}
+
+func TestLoadBundles_ExperimentalSkippedByDefault(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "experimental-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("experimental-test", []Rule{
+		testDLPRule("dlp-stable-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-experimental-001", confidenceHigh, StatusExperimental),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	// Default: experimental not included.
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule (experimental skipped), got %d", len(result.DLP))
+	}
+	if result.DLP[0].Name != "experimental-test:dlp-stable-001" {
+		t.Errorf("DLP name = %q, want %q", result.DLP[0].Name, "experimental-test:dlp-stable-001")
+	}
+}
+
+func TestLoadBundles_ExperimentalLoadedWithFlag(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "experimental-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("experimental-test", []Rule{
+		testDLPRule("dlp-stable-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-experimental-001", confidenceHigh, StatusExperimental),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	// Include experimental.
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:       confidenceLow,
+		IncludeExperimental: true,
+		PipelockVersion:     testPipelockVersion,
+	})
+
+	if len(result.DLP) != 2 {
+		t.Fatalf("expected 2 DLP rules (experimental included), got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_DisabledByExactID(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "disable-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("disable-test", []Rule{
+		testDLPRule("dlp-keep-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-skip-001", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		Disabled:        []string{"disable-test:dlp-skip-001"},
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule (1 disabled), got %d", len(result.DLP))
+	}
+	if result.DLP[0].Name != "disable-test:dlp-keep-001" {
+		t.Errorf("DLP name = %q, want %q", result.DLP[0].Name, "disable-test:dlp-keep-001")
+	}
+}
+
+func TestLoadBundles_DisabledByGlobPattern(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "glob-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("glob-test", []Rule{
+		testDLPRule("dlp-rule-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-rule-002", confidenceHigh, StatusStable),
+		testInjectionRule("inj-rule-001", confidenceHigh),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	// Glob disables all DLP rules from this bundle.
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		Disabled:        []string{"glob-test:dlp-*"},
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.DLP) != 0 {
+		t.Fatalf("expected 0 DLP rules (all disabled by glob), got %d", len(result.DLP))
+	}
+	if len(result.Injection) != 1 {
+		t.Fatalf("expected 1 injection rule (not disabled), got %d", len(result.Injection))
+	}
+}
+
+func TestLoadBundles_MultipleBundlesAlphabetical(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Create bundles with names that sort alphabetically.
+	for _, name := range []string{"beta-rules", "alpha-rules", "gamma-rules"} {
+		bundleDir := filepath.Join(dir, name)
+		if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		b := testBundle(name, []Rule{
+			testDLPRule("dlp-001", confidenceHigh, StatusStable),
+		})
+		writeUnsignedBundle(t, bundleDir, b)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Loaded) != 3 {
+		t.Fatalf("expected 3 loaded bundles, got %d", len(result.Loaded))
+	}
+
+	// Verify alphabetical ordering.
+	expectedOrder := []string{"alpha-rules", "beta-rules", "gamma-rules"}
+	for i, want := range expectedOrder {
+		if result.Loaded[i].Name != want {
+			t.Errorf("Loaded[%d].Name = %q, want %q", i, result.Loaded[i].Name, want)
+		}
+	}
+
+	// Total DLP rules from all bundles.
+	if len(result.DLP) != 3 {
+		t.Errorf("expected 3 DLP rules total, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_PipelockPrefixNonOfficialSigner(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+
+	// Official key in keyring.
+	officialPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating official key: %v", err)
+	}
+	setupKeyring(t, officialPub)
+
+	// Third-party key signs a bundle with pipelock- prefix.
+	thirdPub, thirdPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating third-party key: %v", err)
+	}
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "pipelock-core")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("pipelock-core", []Rule{
+		testDLPRule("dlp-core-001", confidenceHigh, StatusStable),
+	})
+	writeSignedBundle(t, bundleDir, b, thirdPub, thirdPriv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TrustedKeys: []config.TrustedKey{
+			{Name: "impersonator", PublicKey: hex.EncodeToString(thirdPub)},
+		},
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for reserved prefix, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules (reserved prefix violation), got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_PipelockPrefixOfficialSigner(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "pipelock-core")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("pipelock-core", []Rule{
+		testDLPRule("dlp-core-001", confidenceHigh, StatusStable),
+	})
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors for official pipelock- bundle: %v", result.Errors)
+	}
+	if len(result.DLP) != 1 {
+		t.Fatalf("expected 1 DLP rule, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_SkipEmbeddedKeysDoesNotClassifyOfficial(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "pipelock-core")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("pipelock-core", []Rule{
+		testDLPRule("dlp-core-001", confidenceHigh, StatusStable),
+	})
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:    confidenceLow,
+		PipelockVersion:  testPipelockVersion,
+		SkipEmbeddedKeys: true,
+		TrustedKeys: []config.TrustedKey{
+			{Name: "private-root", PublicKey: hex.EncodeToString(pub)},
+		},
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 integrity error for de-trusted embedded signer, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if result.Errors[0].Class != BundleErrorClassIntegrity {
+		t.Fatalf("error class = %q, want %q", result.Errors[0].Class, BundleErrorClassIntegrity)
+	}
+	if result.Errors[0].Official {
+		t.Fatal("de-trusted embedded signer was still classified as official")
+	}
+	if len(result.DLP) != 0 {
+		t.Fatalf("expected 0 loaded DLP rules, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_V2TierKeyBindingFailureIsIntegrity(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "tier-mismatch")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundleV2("tier-mismatch", TierCommunity, 1, []Rule{
+		testDLPRule("dlp-tier-001", confidenceHigh, StatusStable),
+	})
+	b.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TierKeyMapping: map[string]string{
+			TierCommunity: "sha256:different-key",
+		},
+	})
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 tier-key error, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("tier-key error class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("IntegrityErrors len = %d, want 1", len(result.IntegrityErrors()))
+	}
+}
+
+func TestLoadBundles_BundleExceedsMaxFileSize(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "oversized-bundle")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write an oversized bundle.yaml (MaxBundleFileSize + 1).
+	oversize := make([]byte, MaxBundleFileSize+1)
+	for i := range oversize {
+		oversize[i] = 'x'
+	}
+	bundlePath := filepath.Join(bundleDir, bundleFilename)
+	if err := os.WriteFile(bundlePath, oversize, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a lock file (SHA won't matter, we fail before integrity check).
+	hash := sha256.Sum256(oversize)
+	lock := &LockFile{BundleSHA256: hex.EncodeToString(hash[:]), Unsigned: true}
+	if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), lock); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for oversized bundle, got %d", len(result.Errors))
+	}
+}
+
+func TestLoadBundles_BundlePathDirectoryIsAvailabilityFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "bundle-path-directory")
+	if err := os.MkdirAll(filepath.Join(bundleDir, bundleFilename), 0o750); err != nil {
+		t.Fatalf("mkdir bundle.yaml directory: %v", err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 bundle read error, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassAvailability {
+		t.Fatalf("bundle directory read error class = %q, want %q", got, BundleErrorClassAvailability)
+	}
+	if !strings.Contains(result.Errors[0].Reason, "reading bundle file") {
+		t.Fatalf("bundle read error reason = %q, want read failure", result.Errors[0].Reason)
+	}
+}
+
+func TestLoadBundles_RuleTypeRouting(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "routing-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("routing-test", []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-002", confidenceHigh, StatusStable),
+		testInjectionRule("inj-001", confidenceHigh),
+		testToolPoisonRule("tp-001", scanFieldName),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.DLP) != 2 {
+		t.Errorf("expected 2 DLP rules, got %d", len(result.DLP))
+	}
+	if len(result.Injection) != 1 {
+		t.Errorf("expected 1 Injection rule, got %d", len(result.Injection))
+	}
+	if len(result.ToolPoison) != 1 {
+		t.Errorf("expected 1 ToolPoison rule, got %d", len(result.ToolPoison))
+	}
+	// Verify scan_field is preserved for tool-poison.
+	if result.ToolPoison[0].ScanField != scanFieldName {
+		t.Errorf("ToolPoison ScanField = %q, want %q", result.ToolPoison[0].ScanField, scanFieldName)
+	}
+}
+
+func TestLoadBundles_MissingLockFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "no-lock")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only write bundle.yaml, no lock file.
+	b := testBundle("no-lock", []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+	})
+	data, err := yaml.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for missing lock file, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("missing lock class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("IntegrityErrors len = %d, want 1", len(result.IntegrityErrors()))
+	}
+}
+
+func TestLoadBundles_IntegrityFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "tampered")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("tampered", []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+	})
+	data, err := yaml.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write lock file with wrong SHA.
+	wrongSHA := "0000000000000000000000000000000000000000000000000000000000000000"
+	lock := &LockFile{BundleSHA256: wrongSHA, Unsigned: true}
+	if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), lock); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for integrity failure, got %d", len(result.Errors))
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("SHA mismatch class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("IntegrityErrors len = %d, want 1", len(result.IntegrityErrors()))
+	}
+}
+
+func TestLoadBundles_UnsignedMissingSHAFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "unsigned-empty-sha")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("unsigned-empty-sha", []Rule{
+		testDLPRule("dlp-empty-sha-001", confidenceHigh, StatusStable),
+	})
+	data, err := yaml.Marshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), &LockFile{Unsigned: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for missing unsigned hash, got %d", len(result.Errors))
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("missing unsigned hash class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if !strings.Contains(result.Errors[0].Reason, "missing SHA-256") {
+		t.Fatalf("missing unsigned hash reason = %q, want missing SHA-256", result.Errors[0].Reason)
+	}
+	if len(result.Loaded) != 0 || len(result.DLP) != 0 {
+		t.Fatalf("unsigned bundle with empty hash loaded: loaded=%d dlp=%d", len(result.Loaded), len(result.DLP))
+	}
+}
+
+func TestLoadBundles_SkipEmbeddedKeysRejectsUnsignedV1(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "unsigned-private-root-only")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("unsigned-private-root-only", []Rule{
+		testDLPRule("dlp-unsigned-policy-001", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:    confidenceLow,
+		PipelockVersion:  testPipelockVersion,
+		SkipEmbeddedKeys: true,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 integrity error for unsigned bundle with embedded keys disabled, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("unsigned policy error class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if !strings.Contains(result.Errors[0].Reason, "unsigned bundles are disabled") {
+		t.Fatalf("unsigned policy reason = %q, want unsigned disabled", result.Errors[0].Reason)
+	}
+	if len(result.Loaded) != 0 || len(result.DLP) != 0 {
+		t.Fatalf("unsigned bundle loaded under private-root-only policy: loaded=%d dlp=%d", len(result.Loaded), len(result.DLP))
+	}
+}
+
+func TestLoadBundles_ExpiredV2BundleIsIntegrity(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "expired")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := testBundleV2("expired", TierCommunity, 1, []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+	})
+	b.KeyID = KeyFingerprint(pub)
+	b.ExpiresAt = time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for expired bundle, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("expired bundle class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("IntegrityErrors len = %d, want 1", len(result.IntegrityErrors()))
+	}
+}
+
+func TestLoadBundles_MissingInstalledBundleManifestIsIntegrity(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "missing-manifest")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), &LockFile{
+		InstalledVersion: "2026.07.0",
+		Source:           "test",
+		BundleSHA256:     strings.Repeat("0", 64),
+		Unsigned:         true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 integrity error, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if got := result.Errors[0].ClassOrDefault(); got != BundleErrorClassIntegrity {
+		t.Fatalf("missing installed bundle manifest class = %q, want %q", got, BundleErrorClassIntegrity)
+	}
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("IntegrityErrors len = %d, want 1", len(result.IntegrityErrors()))
+	}
+}
+
+func TestLoadBundles_SkipsNonDirectoryEntries(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Create a regular file (not a directory) in the rules dir.
+	if err := os.WriteFile(filepath.Join(dir, "not-a-dir.txt"), []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a valid bundle directory alongside it.
+	bundleDir := filepath.Join(dir, "valid-bundle")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	b := testBundle("valid-bundle", []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// Only the directory should be processed.
+	if len(result.Errors) != 0 {
+		t.Errorf("unexpected errors: %v", result.Errors)
+	}
+	if len(result.DLP) != 1 {
+		t.Errorf("expected 1 DLP rule, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_LoadedBundleSource(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "source-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("source-test", []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Loaded) != 1 {
+		t.Fatalf("expected 1 loaded bundle, got %d", len(result.Loaded))
+	}
+	if result.Loaded[0].Source != "test" {
+		t.Errorf("Loaded.Source = %q, want %q", result.Loaded[0].Source, "test")
+	}
+	if result.Loaded[0].Version != "2026.03.0" {
+		t.Errorf("Loaded.Version = %q, want %q", result.Loaded[0].Version, "2026.03.0")
+	}
+}
+
+func TestIsDisabled(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		nsID     string
+		disabled []string
+		want     bool
+	}{
+		{
+			name:     "exact match",
+			nsID:     "bundle:rule-001",
+			disabled: []string{"bundle:rule-001"},
+			want:     true,
+		},
+		{
+			name:     "no match",
+			nsID:     "bundle:rule-001",
+			disabled: []string{"bundle:rule-002"},
+			want:     false,
+		},
+		{
+			name:     "glob all rules in bundle",
+			nsID:     "bundle:rule-001",
+			disabled: []string{"bundle:*"},
+			want:     true,
+		},
+		{
+			name:     "glob prefix match",
+			nsID:     "bundle:dlp-rule-001",
+			disabled: []string{"bundle:dlp-*"},
+			want:     true,
+		},
+		{
+			name:     "glob no match",
+			nsID:     "bundle:inj-rule-001",
+			disabled: []string{"bundle:dlp-*"},
+			want:     false,
+		},
+		{
+			name:     "empty disabled list",
+			nsID:     "bundle:rule-001",
+			disabled: nil,
+			want:     false,
+		},
+		{
+			name:     "multiple patterns first matches",
+			nsID:     "bundle:rule-001",
+			disabled: []string{"bundle:rule-001", "other:*"},
+			want:     true,
+		},
+		{
+			name:     "glob question mark",
+			nsID:     "bundle:rule-001",
+			disabled: []string{"bundle:rule-00?"},
+			want:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := isDisabled(tt.nsID, tt.disabled)
+			if got != tt.want {
+				t.Errorf("isDisabled(%q, %v) = %v, want %v", tt.nsID, tt.disabled, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsOfficialFingerprint(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	fp := KeyFingerprint(pub)
+	if !isOfficialFingerprint(fp, true) {
+		t.Error("expected official fingerprint to return true")
+	}
+	if isOfficialFingerprint(fp, false) {
+		t.Error("expected de-trusted official fingerprint to return false")
+	}
+
+	if isOfficialFingerprint("0000000000000000000000000000000000000000000000000000000000000000", true) {
+		t.Error("expected non-official fingerprint to return false")
+	}
+}
+
+func TestLoadBundles_MissingBundleYAML(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "no-bundle-yaml")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only write lock file, no bundle.yaml.
+	lock := &LockFile{BundleSHA256: "deadbeef", Unsigned: true}
+	if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), lock); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for missing bundle.yaml, got %d", len(result.Errors))
+	}
+}
+
+func TestLoadBundles_AllRulesDisabled(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "all-disabled")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("all-disabled", []Rule{
+		testDLPRule("dlp-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-002", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		Disabled:        []string{"all-disabled:*"},
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// Bundle still loads successfully, just with 0 rules.
+	if len(result.Errors) != 0 {
+		t.Fatalf("unexpected errors: %v", result.Errors)
+	}
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+	if len(result.Loaded) != 1 {
+		t.Fatalf("expected 1 loaded bundle, got %d", len(result.Loaded))
+	}
+	if result.Loaded[0].Rules != 0 {
+		t.Errorf("Loaded.Rules = %d, want 0", result.Loaded[0].Rules)
+	}
+}
+
+func TestLoadBundles_SkipsBakDirectories(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Create a .bak directory that looks like a bundle.
+	bakDir := filepath.Join(dir, "test-bundle.bak")
+	if err := os.MkdirAll(bakDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bakDir, "bundle.yaml"), []byte("invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a hidden staging directory.
+	stageDir := filepath.Join(dir, ".stage-test-abc123")
+	if err := os.MkdirAll(stageDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stageDir, "bundle.yaml"), []byte("invalid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// Neither .bak nor .stage should appear as errors or loaded bundles.
+	for _, e := range result.Errors {
+		if strings.HasSuffix(e.Name, ".bak") || strings.HasPrefix(e.Name, ".") {
+			t.Errorf("staging artifact should be skipped, got error for %q", e.Name)
+		}
+	}
+	for _, b := range result.Loaded {
+		if strings.HasSuffix(b.Name, ".bak") || strings.HasPrefix(b.Name, ".") {
+			t.Errorf("staging artifact should be skipped, got loaded bundle %q", b.Name)
+		}
+	}
+}
+
+func TestLoadBundles_PermissionError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// Create a subdirectory, then remove read permission so ReadDir fails
+	// with a permission error (not ENOENT).
+	rulesDir := filepath.Join(dir, "rules")
+	if err := os.MkdirAll(rulesDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(rulesDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(rulesDir, 0o750) }) //nolint:gosec // G302: restoring directory permissions for t.TempDir cleanup
+
+	result := LoadBundles(rulesDir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// Permission error should be reported, not silently swallowed.
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 error for permission denied, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if !strings.Contains(result.Errors[0].Reason, "reading rules directory") {
+		t.Errorf("error reason should mention reading rules directory, got: %s", result.Errors[0].Reason)
+	}
+}
+
+func TestLoadBundles_EmptyRulesDirString(t *testing.T) {
+	t.Parallel()
+
+	result := LoadBundles("", LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// Empty string should return empty result with no errors.
+	if len(result.Errors) != 0 {
+		t.Errorf("expected 0 errors for empty rulesDir, got %d: %v", len(result.Errors), result.Errors)
+	}
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+	if len(result.Loaded) != 0 {
+		t.Errorf("expected 0 loaded bundles, got %d", len(result.Loaded))
+	}
+}
+
+func TestLoadBundles_ConfidenceFilterLow(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "conf-low-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundle("conf-low-test", []Rule{
+		testDLPRule("dlp-high-001", confidenceHigh, StatusStable),
+		testDLPRule("dlp-med-001", confidenceMedium, StatusStable),
+		testDLPRule("dlp-low-001", confidenceLow, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// All three should pass with low minimum.
+	if len(result.DLP) != 3 {
+		t.Fatalf("expected 3 DLP rules with low confidence filter, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_V2UnsignedRejected(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "v2-test")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundleV2("v2-test", TierCommunity, 5, []Rule{
+		testDLPRule("dlp-v2-001", confidenceHigh, StatusStable),
+	})
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	// V2 bundles MUST be signed. Unsigned v2 should be rejected.
+	if len(result.Errors) == 0 {
+		t.Fatal("expected unsigned v2 bundle to be rejected")
+	}
+	if !strings.Contains(result.Errors[0].Reason, "format_version 2 bundles must be signed") {
+		t.Fatalf("unsigned v2 error reason = %q, want signed-bundle gate", result.Errors[0].Reason)
+	}
+	if len(result.Loaded) != 0 {
+		t.Errorf("expected 0 loaded bundles for unsigned v2, got %d", len(result.Loaded))
+	}
+}
+
+func TestLoadBundles_V2RequiredFeaturesKnown(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "feat-known")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundleV2("feat-known", TierStandard, 1, []Rule{
+		testDLPRule("dlp-feat-001", confidenceHigh, StatusStable),
+	})
+	b.KeyID = KeyFingerprint(pub)
+	b.RequiredFeatures = []string{"dlp", "checksum"}
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) != 0 {
+		t.Fatalf("expected no errors for known features, got: %v", result.Errors)
+	}
+	if len(result.DLP) != 1 {
+		t.Errorf("expected 1 DLP rule, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_V2RequiredFeaturesUnknown(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "feat-unknown")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	b := testBundleV2("feat-unknown", TierCommunity, 1, []Rule{
+		testDLPRule("dlp-feat-002", confidenceHigh, StatusStable),
+	})
+	b.KeyID = KeyFingerprint(pub)
+	b.RequiredFeatures = []string{"dlp", "quantum_crypto"}
+	writeSignedBundle(t, bundleDir, b, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+	})
+
+	if len(result.Errors) == 0 {
+		t.Fatal("expected error for unknown required feature")
+	}
+	if !strings.Contains(result.Errors[0].Reason, "unknown feature") {
+		t.Errorf("error %q should mention unknown feature", result.Errors[0].Reason)
+	}
+	if len(result.DLP) != 0 {
+		t.Errorf("expected 0 DLP rules for rejected bundle, got %d", len(result.DLP))
+	}
+}
+
+// TestLoadBundles_ExemptDomainsWarnOncePerBundle pins that a bundle full of
+// rules carrying the ignored field produces one warning naming them all, not
+// one line per rule, so a hostile or sloppy bundle cannot flood the log on
+// every reload.
+func TestLoadBundles_ExemptDomainsWarnOncePerBundle(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("make bundle directory: %v", err)
+	}
+	var rules []Rule
+	for _, id := range []string{"dlp-exempt-a", "dlp-exempt-b", "dlp-exempt-c"} {
+		rule := testDLPRule(id, confidenceHigh, StatusStable)
+		rule.Pattern.ExemptDomains = []string{"safe.vendor.example"}
+		rules = append(rules, rule)
+	}
+	writeUnsignedBundle(t, bundleDir, testBundle(testBundleName, rules))
+
+	result := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion})
+	if len(result.Errors) != 0 {
+		t.Fatalf("LoadBundles errors = %v", result.Errors)
+	}
+	exemptWarnings := 0
+	for _, warning := range result.Warnings {
+		if !strings.Contains(warning, "pattern.exempt_domains") {
+			continue
+		}
+		exemptWarnings++
+		for _, id := range []string{"dlp-exempt-a", "dlp-exempt-b", "dlp-exempt-c"} {
+			if !strings.Contains(warning, id) {
+				t.Fatalf("exempt warning %q does not name rule %s", warning, id)
+			}
+		}
+	}
+	if exemptWarnings != 1 {
+		t.Fatalf("exempt_domains warnings = %d, want exactly 1; warnings=%v", exemptWarnings, result.Warnings)
+	}
+}

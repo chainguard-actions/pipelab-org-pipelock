@@ -1,0 +1,358 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"net/url"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+// A path-entropy exclusion exempts ONE host plus ONE literal path prefix from
+// the path-entropy gate, and nothing else. The reason the field exists is that
+// the only previous tool, subdomain_entropy_exclusions, is host-wide AND also
+// governs the subdomain gate, so using it to fix a path false positive gave up
+// an unrelated detection. These tests pin that this one does not.
+
+// highEntropyID is a base64url-shaped identifier above the default 4.5
+// threshold. Asserted rather than assumed, because a fixture below the
+// threshold would make every case below pass for the wrong reason.
+const highEntropyID = "pTyGJMuHbEL31IeL2HPcHyGcFRl1SPnXNYvMIHa_2o76umfX"
+
+func pathExclusionScanner(t *testing.T, entries ...config.PathEntropyExclusion) *Scanner {
+	t.Helper()
+	cfg := config.Defaults()
+	cfg.Internal = nil // no DNS in unit tests; the literal-IP SSRF floor still runs
+	cfg.FetchProxy.Monitoring.PathEntropyExclusions = entries
+	return MustNew(cfg)
+}
+
+func TestPathEntropyExclusion_FixtureIsAboveThreshold(t *testing.T) {
+	t.Parallel()
+	got := ShannonEntropy(highEntropyID)
+	if got <= 4.5 {
+		t.Fatalf("fixture entropy = %.2f, which is not above the 4.5 default; every exclusion test would pass for the wrong reason", got)
+	}
+}
+
+func TestPathEntropyExclusion_ExemptsOnlyTheNamedRoute(t *testing.T) {
+	t.Parallel()
+
+	entry := config.PathEntropyExclusion{
+		Host:       "docs.vendor.example",
+		PathPrefix: "/document/d/",
+		Reason:     "service-issued document identifier",
+	}
+
+	tests := []struct {
+		name      string
+		rawURL    string
+		wantBlock bool
+		why       string
+	}{
+		{
+			name:      "exempted route allows the opaque segment",
+			rawURL:    "https://docs.vendor.example/document/d/" + highEntropyID + "/edit",
+			wantBlock: false,
+			why:       "this is the false positive the field exists to fix",
+		},
+		{
+			name:      "a different path on the SAME host still blocks",
+			rawURL:    "https://docs.vendor.example/random/" + highEntropyID,
+			wantBlock: true,
+			why:       "the exemption is scoped to the prefix, not to the host",
+		},
+		{
+			name:      "the same route on a DIFFERENT host still blocks",
+			rawURL:    "https://other.vendor.example/document/d/" + highEntropyID + "/edit",
+			wantBlock: true,
+			why:       "the exemption names one host",
+		},
+		{
+			name:      "a host that merely shares the prefix string still blocks",
+			rawURL:    "https://docs.vendor.example.evil.test/document/d/" + highEntropyID,
+			wantBlock: true,
+			why:       "host matching is domain-aware, not a string prefix",
+		},
+		{
+			name:      "http is not exempt when the entry is https",
+			rawURL:    "http://docs.vendor.example/document/d/" + highEntropyID + "/edit",
+			wantBlock: true,
+			why:       "an entry never matches a scheme it does not name",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := pathExclusionScanner(t, entry)
+			defer s.Close()
+
+			parsed, err := url.Parse(tt.rawURL)
+			if err != nil {
+				t.Fatalf("url.Parse(%q): %v", tt.rawURL, err)
+			}
+			res := s.checkEntropy(parsed)
+			blocked := !res.Allowed
+			if blocked != tt.wantBlock {
+				t.Fatalf("checkEntropy(%q) blocked = %v, want %v (%s); reason=%q", tt.rawURL, blocked, tt.wantBlock, tt.why, res.Reason)
+			}
+			if tt.wantBlock && !strings.Contains(res.Reason, "path segment") {
+				t.Errorf("expected a path-entropy block, got reason %q", res.Reason)
+			}
+		})
+	}
+}
+
+func TestPathEntropyExclusion_HTTPEntryMatchesCleartextOnly(t *testing.T) {
+	t.Parallel()
+
+	entry := config.PathEntropyExclusion{
+		Scheme:     "http",
+		Host:       "files.vendor.example",
+		PathPrefix: "/artifacts/",
+	}
+	httpURL := "http://files.vendor.example/artifacts/" + highEntropyID
+	httpsURL := "https://files.vendor.example/artifacts/" + highEntropyID
+
+	s := pathExclusionScanner(t, entry)
+	defer s.Close()
+
+	for _, raw := range []string{httpURL, httpsURL} {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", raw, err)
+		}
+		bare := pathExclusionScanner(t)
+		if bare.checkEntropy(parsed).Allowed {
+			bare.Close()
+			t.Fatalf("probe %q is allowed with no exclusions, so this case cannot detect an installed entry", raw)
+		}
+		bare.Close()
+	}
+
+	httpParsed, err := url.Parse(httpURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if res := s.checkEntropy(httpParsed); !res.Allowed {
+		t.Fatalf("http entry did not exempt the cleartext route: %s", res.Reason)
+	}
+	httpsParsed, err := url.Parse(httpsURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if res := s.checkEntropy(httpsParsed); res.Allowed {
+		t.Fatal("http entry exempted the https URL")
+	}
+}
+
+// The whole point of a dedicated field is that it does not disable the other
+// gates the way the host-wide list does. Query entropy is the one that matters
+// most: the query is where a payload actually reaches a collector.
+func TestPathEntropyExclusion_LeavesQueryEntropyEnforced(t *testing.T) {
+	t.Parallel()
+
+	s := pathExclusionScanner(t, config.PathEntropyExclusion{
+		Host:       "docs.vendor.example",
+		PathPrefix: "/document/d/",
+	})
+	defer s.Close()
+
+	// Control: the exempted path is allowed, so a block below is attributable
+	// to the query rather than to the path.
+	allowed, err := url.Parse("https://docs.vendor.example/document/d/" + highEntropyID + "/edit")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if res := s.checkEntropy(allowed); !res.Allowed {
+		t.Fatalf("control failed: the exempted path was blocked (%s)", res.Reason)
+	}
+
+	withQuery, err := url.Parse("https://docs.vendor.example/document/d/" + highEntropyID + "/edit?data=" + highEntropyID)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	res := s.checkEntropy(withQuery)
+	if res.Allowed {
+		t.Fatal("a high-entropy QUERY value was allowed on a path-exempted route; the path exemption must not reach the query gate")
+	}
+	if !strings.Contains(res.Reason, "query") {
+		t.Fatalf("expected a query-entropy block, got %q", res.Reason)
+	}
+}
+
+// An entry whose PATH PREFIX cannot name a route is dropped rather than treated
+// as a wildcard, so a malformed config cannot silently disable the gate.
+// Validation rejects these too; this is the second line, at the point of use.
+//
+// The host is well-formed in every case here, deliberately. A malformed HOST no
+// longer reaches this defense, because construction refuses it outright; that
+// boundary has its own test below.
+func TestPathEntropyExclusion_IncompleteEntriesAreInert(t *testing.T) {
+	t.Parallel()
+
+	for _, entry := range []config.PathEntropyExclusion{
+		{Host: "docs.vendor.example", PathPrefix: ""},
+		{Host: "docs.vendor.example", PathPrefix: "   "},
+		{Host: "docs.vendor.example", PathPrefix: "/"},
+	} {
+		s := pathExclusionScanner(t, entry)
+		parsed, err := url.Parse("https://docs.vendor.example/document/d/" + highEntropyID + "/edit")
+		if err != nil {
+			s.Close()
+			t.Fatalf("url.Parse: %v", err)
+		}
+		res := s.checkEntropy(parsed)
+		s.Close()
+		if res.Allowed {
+			t.Errorf("an incomplete entry %+v exempted the route; it must be inert", entry)
+		}
+	}
+}
+
+// A malformed HOST is refused at construction rather than dropped. Dropping it
+// would leave the operator reading a configuration the runtime is not running:
+// the exemption they wrote is gone, the gate is stricter than the YAML says,
+// and nothing reports the difference.
+func TestPathEntropyExclusion_MalformedHostIsRefusedAtConstruction(t *testing.T) {
+	t.Parallel()
+
+	for _, entry := range []config.PathEntropyExclusion{
+		{Host: "", PathPrefix: "/document/d/"},
+		{Host: "   ", PathPrefix: "/document/d/"},
+		{Host: "*.co.uk", PathPrefix: "/document/d/"},
+		{Host: "https://docs.vendor.example", PathPrefix: "/document/d/"},
+	} {
+		cfg := config.Defaults()
+		cfg.Internal = nil
+		cfg.FetchProxy.Monitoring.PathEntropyExclusions = []config.PathEntropyExclusion{entry}
+
+		s, err := New(cfg)
+		if err == nil {
+			s.Close()
+			t.Errorf("New accepted a path-entropy exclusion with host %q; it must refuse rather than silently drop it", entry.Host)
+			continue
+		}
+		if !strings.Contains(err.Error(), "fetch_proxy.monitoring.path_entropy_exclusions[0].host") {
+			t.Errorf("New error %q does not name the field the operator has to edit", err)
+		}
+	}
+}
+
+// The builder's own drop stays in place behind the refusal above. It is
+// unreachable through New now, which is the point of a second line, so it is
+// exercised directly rather than deleted on the strength of the first.
+func TestPathEntropyExclusion_BuilderStillDropsMalformedHost(t *testing.T) {
+	t.Parallel()
+
+	for _, entry := range []config.PathEntropyExclusion{
+		{Scheme: "https", Host: "", PathPrefix: "/document/d/"},
+		{Scheme: "https", Host: "   ", PathPrefix: "/document/d/"},
+		{Scheme: "https", Host: "*.co.uk", PathPrefix: "/document/d/"},
+		{Scheme: "https", Host: "\u212Aexample.com", PathPrefix: "/document/d/"},
+	} {
+		if got := buildPathEntropyExclusions([]config.PathEntropyExclusion{entry}); len(got) != 0 {
+			t.Errorf("buildPathEntropyExclusions kept %+v as %+v; the point-of-use defense must still drop it", entry, got)
+		}
+	}
+}
+
+// With no entries configured the gate behaves exactly as before, which is what
+// makes shipping the field with an empty default safe.
+func TestPathEntropyExclusion_EmptyListChangesNothing(t *testing.T) {
+	t.Parallel()
+
+	s := pathExclusionScanner(t)
+	defer s.Close()
+
+	parsed, err := url.Parse("https://docs.vendor.example/document/d/" + highEntropyID + "/edit")
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if res := s.checkEntropy(parsed); res.Allowed {
+		t.Fatal("with no exclusions configured the opaque path segment must still block")
+	}
+}
+
+// A wildcard host is supported because the sibling gates support it and an
+// operator would reasonably expect consistency, but it must still be
+// domain-aware rather than a string match.
+func TestPathEntropyExclusion_WildcardHost(t *testing.T) {
+	t.Parallel()
+
+	s := pathExclusionScanner(t, config.PathEntropyExclusion{
+		Host:       "*.vendor.example",
+		PathPrefix: "/document/d/",
+	})
+	defer s.Close()
+
+	cases := map[string]bool{
+		"https://docs.vendor.example/document/d/" + highEntropyID:           false,
+		"https://sheets.vendor.example/document/d/" + highEntropyID:         false,
+		"https://vendor.example/document/d/" + highEntropyID:                false,
+		"https://docs.vendor.example.evil.test/document/d/" + highEntropyID: true,
+		"https://notvendor.example/document/d/" + highEntropyID:             true,
+	}
+	for raw, wantBlock := range cases {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", raw, err)
+		}
+		if blocked := !s.checkEntropy(parsed).Allowed; blocked != wantBlock {
+			t.Errorf("checkEntropy(%q) blocked = %v, want %v", raw, blocked, wantBlock)
+		}
+	}
+}
+
+// An operator's own list adds to the shipped vendor routes. It used to replace
+// them, so adding one route for one site silently dropped Google Docs and the
+// Cloudflare challenge route, and every Cloudflare-fronted site looped on its
+// bot check. An explicitly empty list is still the documented way to remove
+// the shipped set.
+func TestPathEntropyExclusion_OperatorListAddsToShippedRoutes(t *testing.T) {
+	t.Parallel()
+
+	operator := config.PathEntropyExclusion{Host: "app.vendor.example", PathPrefix: "/r/", Reason: "operator route"}
+	challenge := "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/flow/ov1/" + highEntropyID + "/" + highEntropyID
+
+	tests := []struct {
+		name      string
+		entries   []config.PathEntropyExclusion
+		rawURL    string
+		wantBlock bool
+	}{
+		{"operator route", []config.PathEntropyExclusion{operator}, "https://app.vendor.example/r/" + highEntropyID, false},
+		{"shipped challenge route kept beside an operator list", []config.PathEntropyExclusion{operator}, challenge, false},
+		{"shipped document route kept beside an operator list", []config.PathEntropyExclusion{operator}, "https://docs.google.com/document/d/" + highEntropyID + "/edit", false},
+		{"shipped challenge route on a fresh install", config.ShippedPathEntropyExclusions(), challenge, false},
+		{"explicitly empty list removes the shipped routes", []config.PathEntropyExclusion{}, challenge, true},
+		{"another path on the challenge host", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com/x/" + highEntropyID, true},
+		{"a prefix that only shares the string", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com/cdn-cgi/challenge-platformX/" + highEntropyID, true},
+		{"an encoded separator in the route", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com/cdn-cgi%2Fchallenge-platform/" + highEntropyID, true},
+		{"the challenge route on a third-party host", []config.PathEntropyExclusion{operator}, "https://collector.evil.test/cdn-cgi/challenge-platform/h/" + highEntropyID, true},
+		{"a lookalike challenge host", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com.evil.test/cdn-cgi/challenge-platform/h/" + highEntropyID, true},
+		{"cleartext to the challenge host", []config.PathEntropyExclusion{operator}, "http://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/" + highEntropyID, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := pathExclusionScanner(t, tt.entries...)
+			defer s.Close()
+			parsed, err := url.Parse(tt.rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res := s.checkEntropy(parsed)
+			if blocked := !res.Allowed; blocked != tt.wantBlock {
+				t.Fatalf("checkEntropy(%q) blocked = %v, want %v; reason=%q", tt.rawURL, blocked, tt.wantBlock, res.Reason)
+			}
+			if tt.wantBlock && !strings.Contains(res.Reason, "path segment") {
+				t.Fatalf("expected a path-entropy block, got %q", res.Reason)
+			}
+		})
+	}
+}

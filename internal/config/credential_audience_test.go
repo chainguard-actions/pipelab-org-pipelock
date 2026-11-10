@@ -1,0 +1,409 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func TestLoad_CredentialAudienceHostsRejectedFromYAML(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pipelock.yaml")
+	yaml := `version: 1
+mode: balanced
+dlp:
+  patterns:
+    - name: OpenAI API Key
+      regex: '(?:^|[^A-Za-z0-9_-])sk-proj-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+      credential_audience_hosts:
+        - api.attacker.example
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load() succeeded with operator-configured credential_audience_hosts")
+	}
+	if !strings.Contains(err.Error(), "credential_audience_hosts") {
+		t.Fatalf("strict decode error = %v, want credential_audience_hosts", err)
+	}
+}
+
+func TestGoogleOAuthCredentialAudienceAuthorizationOnly_CompiledMetadata(t *testing.T) {
+	var builtIn DLPPattern
+	for _, pattern := range DefaultDLPPatterns() {
+		if pattern.Name == "Google OAuth Token" {
+			builtIn = pattern
+			break
+		}
+	}
+	if !builtIn.CredentialAudienceAuthorizationOnly || len(builtIn.CredentialAudienceHosts) == 0 {
+		t.Fatalf("Google OAuth compiled carrier policy missing: %#v", builtIn)
+	}
+	builtIn.CredentialAudienceHosts = nil
+	builtIn.CredentialAudienceAuthorizationOnly = false
+	patterns := []DLPPattern{builtIn}
+	markBuiltInCredentialAudienceHosts(patterns)
+	if !patterns[0].CredentialAudienceAuthorizationOnly || len(patterns[0].CredentialAudienceHosts) == 0 {
+		t.Fatalf("exact built-in lost carrier policy: %#v", patterns[0])
+	}
+	patterns[0].Regex += "(?:custom)"
+	markBuiltInCredentialAudienceHosts(patterns)
+	if patterns[0].CredentialAudienceAuthorizationOnly || len(patterns[0].CredentialAudienceHosts) != 0 {
+		t.Fatalf("customized pattern kept compiled carrier policy: %#v", patterns[0])
+	}
+
+	path := filepath.Join(t.TempDir(), "pipelock.yaml")
+	yaml := "version: 1\ndlp:\n  patterns:\n    - name: Google OAuth Token\n      regex: 'ya29\\.[a-zA-Z0-9_-]{20,}'\n      severity: critical\n      credential_audience_authorization_only: true\n"
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "credential_audience_authorization_only") {
+		t.Fatalf("operator carrier override did not fail strict load: %v", err)
+	}
+}
+
+func TestMarkBuiltInCredentialAudienceHosts_OnlyExactBuiltins(t *testing.T) {
+	builtIn := DefaultDLPPatterns()[0]
+	builtIn.CredentialAudienceHosts = nil // generated YAML cannot serialize it.
+
+	patterns := []DLPPattern{builtIn}
+	markBuiltInCredentialAudienceHosts(patterns)
+	if got := patterns[0].CredentialAudienceHosts; len(got) != 3 || got[0] != "api.anthropic.com" || got[1] != "platform.claude.com" || got[2] != "mcp-proxy.anthropic.com" {
+		t.Fatalf("exact built-in audience hosts = %#v, want the three compiled Anthropic hosts", got)
+	}
+
+	patterns[0].CredentialAudienceHosts = nil
+	patterns[0].Regex += "(?:changed)"
+	markBuiltInCredentialAudienceHosts(patterns)
+	if got := patterns[0].CredentialAudienceHosts; len(got) != 0 {
+		t.Fatalf("customized pattern received immutable audience hosts %#v", got)
+	}
+}
+
+// TestMarkBuiltInCredentialAudienceHosts_ActionIsPartOfIdentity pins the action
+// as part of what makes a pattern the shipped one.
+//
+// The scanner sets its warn flag as "the action is warn AND the pattern carries
+// no audience", because an audience narrows enforcement rather than softening
+// it. So restoring an audience onto a pattern an operator marked warn does not
+// merely add metadata: it clears the warn flag and sends every non-audience
+// match to the blocking branch. A profile that changes only the action is a
+// customized pattern like any other, and must not be handed the built-in
+// audience back.
+func TestMarkBuiltInCredentialAudienceHosts_ActionIsPartOfIdentity(t *testing.T) {
+	builtIn := DefaultDLPPatterns()[0]
+	builtIn.CredentialAudienceHosts = nil
+
+	// Control: untouched, the audience comes back.
+	exact := []DLPPattern{builtIn}
+	markBuiltInCredentialAudienceHosts(exact)
+	if len(exact[0].CredentialAudienceHosts) == 0 {
+		t.Fatal("control: an unmodified built-in must keep its audience")
+	}
+
+	warned := builtIn
+	warned.Action = ActionWarn
+	if builtIn.Action == ActionWarn {
+		t.Fatal("control: the shipped pattern already warns, so this case proves nothing")
+	}
+	patterns := []DLPPattern{warned}
+	markBuiltInCredentialAudienceHosts(patterns)
+	if got := patterns[0].CredentialAudienceHosts; len(got) != 0 {
+		t.Fatalf("a pattern the operator set to warn received immutable audience hosts %#v; "+
+			"the scanner would then drop its warn flag and block every non-audience match", got)
+	}
+}
+
+// The git-over-HTTPS rule is audience metadata like the host list, so a
+// GitHub or GitLab pattern redefined with action: warn must lose it too, and a
+// clone carrying it must be cleared, not kept.
+func TestMarkBuiltInCredentialAudienceHosts_GitRuleFollowsIdentity(t *testing.T) {
+	for _, name := range []string{"GitHub Token", "GitHub Fine-Grained PAT", "GitLab PAT"} {
+		t.Run(name, func(t *testing.T) {
+			var builtIn DLPPattern
+			for _, p := range DefaultDLPPatterns() {
+				if p.Name == name {
+					builtIn = p
+				}
+			}
+			if len(builtIn.CredentialAudienceGitHosts) == 0 || builtIn.CredentialAudienceCarrierMask&CredentialAudienceCarrierGitBasic == 0 {
+				t.Fatalf("control: %s ships no git rule: %+v", name, builtIn)
+			}
+			exact := []DLPPattern{builtIn}
+			exact[0].CredentialAudienceGitHosts = nil
+			markBuiltInCredentialAudienceHosts(exact)
+			if len(exact[0].CredentialAudienceGitHosts) == 0 {
+				t.Fatal("control: an unmodified built-in must keep its git rule")
+			}
+			warned := builtIn // still carries the git hosts, as a clone would
+			warned.Action = ActionWarn
+			patterns := []DLPPattern{warned}
+			markBuiltInCredentialAudienceHosts(patterns)
+			if got := patterns[0]; len(got.CredentialAudienceGitHosts) != 0 || got.CredentialAudienceCarrierMask != 0 {
+				t.Fatalf("warn-redefined %s kept the git rule: hosts=%v mask=%d", name, got.CredentialAudienceGitHosts, got.CredentialAudienceCarrierMask)
+			}
+		})
+	}
+}
+
+func TestLoad_CredentialAudienceLegacySubsetControlsWarn(t *testing.T) {
+	const legacy = `version: 1
+mode: balanced
+dlp:
+  patterns:
+    - name: OpenAI API Key
+      regex: '(?:^|[^A-Za-z0-9_-])sk-proj-[a-zA-Z0-9\-_]{20,}'
+      severity: critical
+      exempt_domains:
+        - '*.openai.com'
+suppress:
+  - rule: OpenAI API Key
+    path: '*.openai.com*'
+    reason: provider-bound credential
+`
+	cfg, err := LoadBytes([]byte(legacy))
+	if err != nil {
+		t.Fatalf("LoadBytes legacy preset stanza: %v", err)
+	}
+	foundAudience := false
+	for _, pattern := range cfg.DLP.Patterns {
+		if pattern.Name == "OpenAI API Key" && len(pattern.CredentialAudienceHosts) == 1 && pattern.CredentialAudienceHosts[0] == "api.openai.com" {
+			foundAudience = true
+			break
+		}
+		if pattern.Name == "OpenAI API Key" {
+			t.Fatalf("legacy OpenAI pattern lost compiled audience: %#v", pattern.CredentialAudienceHosts)
+		}
+	}
+	if !foundAudience {
+		t.Fatal("legacy OpenAI pattern missing compiled audience")
+	}
+	warnings, err := cfg.ValidateWithWarnings()
+	if err != nil {
+		t.Fatalf("ValidateWithWarnings legacy preset stanza: %v", err)
+	}
+	var patternWarning, suppressWarning bool
+	for _, warning := range warnings {
+		switch {
+		case strings.HasPrefix(warning.Field, "dlp.patterns[") && strings.HasSuffix(warning.Field, ".exempt_domains"):
+			patternWarning = strings.Contains(warning.Message, warning.Field)
+		case warning.Field == "suppress[0].path":
+			suppressWarning = strings.Contains(warning.Message, "suppress[0]")
+		}
+	}
+	if !patternWarning || !suppressWarning {
+		t.Fatalf("legacy config warnings missing or did not name their fields: %#v", warnings)
+	}
+}
+
+func TestValidate_CredentialAudienceProperSubsetControlsWarn(t *testing.T) {
+	const pattern = "OpenAI API Key"
+	cfg := Defaults()
+	for i := range cfg.DLP.Patterns {
+		if cfg.DLP.Patterns[i].Name == pattern {
+			cfg.DLP.Patterns[i].ExemptDomains = []string{"api.openai.com"}
+			break
+		}
+	}
+	cfg.Suppress = []SuppressEntry{{Rule: pattern, Path: "https://api.openai.com/*"}}
+
+	warnings, err := cfg.ValidateWithWarnings()
+	if err != nil {
+		t.Fatalf("ValidateWithWarnings proper audience subset: %v", err)
+	}
+	var patternWarning, suppressWarning bool
+	for _, warning := range warnings {
+		switch {
+		case strings.HasPrefix(warning.Field, "dlp.patterns[") && strings.HasSuffix(warning.Field, ".exempt_domains"):
+			patternWarning = strings.Contains(warning.Message, warning.Field)
+		case warning.Field == "suppress[0].path":
+			suppressWarning = strings.Contains(warning.Message, warning.Field)
+		}
+	}
+	if !patternWarning || !suppressWarning {
+		t.Fatalf("proper-subset warnings missing or did not name their fields: %#v", warnings)
+	}
+}
+
+// The three controls below WIDEN a compiled credential audience: they let a
+// provider credential leave for a destination the vendor does not own. That is
+// a decision an operator is entitled to make, most often for an internal relay,
+// so each one warns and the config still loads.
+//
+// This is deliberately a permissive failure direction, chosen over the
+// alternative it replaced. Rejecting these stopped a previously valid config
+// from loading on upgrade, which takes the whole proxy down on a product every
+// request depends on, and told the operator to delete a control they may
+// genuinely need. An over-strict guard that gets routed around by disabling
+// something broader is the outcome this avoids. The immutable CORE DLP floor is
+// unaffected and still rejects all three; see the sibling test above.
+func TestValidate_CredentialAudienceWideningWarnsAndLoads(t *testing.T) {
+	const pattern = "Anthropic API Key"
+	tests := []struct {
+		name      string
+		configure func(*Config)
+		wantField string
+	}{
+		{
+			name: "suppression",
+			configure: func(cfg *Config) {
+				cfg.Suppress = []SuppressEntry{{Rule: pattern, Path: "https://relay.internal.example/*"}}
+			},
+			wantField: "suppress[0]",
+		},
+		{
+			name: "disable body scanning",
+			configure: func(cfg *Config) {
+				cfg.RequestBodyScanning.DisablePatterns = []string{pattern}
+			},
+			wantField: "request_body_scanning.disable_patterns[0]",
+		},
+		{
+			name: "warn body scanning",
+			configure: func(cfg *Config) {
+				cfg.RequestBodyScanning.PatternActions = map[string]string{pattern: ActionWarn}
+			},
+			wantField: "request_body_scanning.pattern_actions",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			tt.configure(cfg)
+			warnings, err := cfg.ValidateWithWarnings()
+			if err != nil {
+				t.Fatalf("config must still load: %v", err)
+			}
+			var found bool
+			for _, w := range warnings {
+				if strings.Contains(w.Field, tt.wantField) {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("widening the audience produced no warning naming %q: %+v", tt.wantField, warnings)
+			}
+		})
+	}
+}
+
+// The suppress-path subset check decides whether an operator's suppression is
+// contained by the compiled audience, which is what separates a redundant entry
+// (warned and ignored) from a real widening (warned and honored). Both the
+// legacy host-glob form and the URL form must be recognized, and anything that
+// cannot prove its host scope must be treated as NOT a subset, which is the
+// fail-closed direction for this check.
+func TestCredentialAudienceSuppressPathSubset_Direction(t *testing.T) {
+	audience := []string{"*.anthropic.com"}
+	tests := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"url inside the audience", "https://api.anthropic.com/v1/messages", true},
+		{"url on a subdomain of the audience", "https://eu.api.anthropic.com/v1", true},
+		{"url outside the audience", "https://relay.internal.example/v1", false},
+		// The legacy host glob is star-delimited on BOTH ends; a leading-star
+		// form alone is not recognized as a host scope and therefore is not a
+		// subset, which is the fail-closed direction.
+		{"host glob inside the audience", "*.anthropic.com*", true},
+		{"host glob outside the audience", "*.attacker.example*", false},
+		{"leading star alone proves no host scope", "*.anthropic.com", false},
+		{"lookalike suffix is not contained", "https://notanthropic.com/v1", false},
+		{"embedded credentials are refused", "https://user:pw@api.anthropic.com/v1", false},
+		{"bare path proves no host scope", "config/initializers/*.rb", false},
+		{"non-http scheme proves no host scope", "ftp://api.anthropic.com/v1", false},
+		{"empty is not a subset", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := credentialAudienceSuppressPathSubset(tt.path, audience); got != tt.want {
+				t.Fatalf("credentialAudienceSuppressPathSubset(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// A wildcard audience contains its own apex and dot-bounded subdomains, and
+// nothing else. A suffix lookalike must not be treated as contained.
+func TestCredentialAudienceDomainContains_Direction(t *testing.T) {
+	tests := []struct {
+		allowed, candidate string
+		want               bool
+	}{
+		{"*.anthropic.com", "*.anthropic.com", true},
+		{"*.anthropic.com", "*.eu.anthropic.com", true},
+		{"*.anthropic.com", "api.anthropic.com", true},
+		{"*.anthropic.com", "*.notanthropic.com", false},
+		{"*.anthropic.com", "anthropic.com.attacker.example", false},
+		{"api.anthropic.com", "api.anthropic.com", true},
+		{"api.anthropic.com", "other.anthropic.com", false},
+	}
+	for _, tt := range tests {
+		if got := credentialAudienceDomainContains(tt.allowed, tt.candidate); got != tt.want {
+			t.Fatalf("credentialAudienceDomainContains(%q, %q) = %v, want %v",
+				tt.allowed, tt.candidate, got, tt.want)
+		}
+	}
+}
+
+func TestJWTCredentialAudience_CompiledQueryOnlyMetadata(t *testing.T) {
+	var builtIn DLPPattern
+	for _, pattern := range DefaultDLPPatterns() {
+		if pattern.Name == "JWT Token" {
+			builtIn = pattern
+			break
+		}
+	}
+	wantHosts := []string{"release-assets.githubusercontent.com"}
+	if strings.Join(builtIn.CredentialAudienceHosts, ",") != strings.Join(wantHosts, ",") ||
+		builtIn.CredentialAudienceCarrierMask != CredentialAudienceCarrierURLQuery|CredentialAudienceCarrierRegistryBearer|CredentialAudienceCarrierRegistryBasic|CredentialAudienceCarrierSignInBearer ||
+		builtIn.CredentialAudienceAuthorizationOnly || len(builtIn.CredentialAudienceGitHosts) != 0 {
+		t.Fatalf("JWT compiled audience = %#v", builtIn)
+	}
+	if !IsCredentialAudiencePatternName("JWT Token") {
+		t.Fatal("JWT Token is not reported as a credential-audience pattern")
+	}
+
+	// The audience is compiled-only: a serialized copy loses it and normalize
+	// restores it from exact identity; any edit or severity change drops it.
+	for name, mutate := range map[string]func(*DLPPattern){
+		"regex edit":      func(p *DLPPattern) { p.Regex += "(?:custom)" },
+		"severity change": func(p *DLPPattern) { p.Severity = SeverityCritical },
+		"warn action":     func(p *DLPPattern) { p.Action = ActionWarn },
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := builtIn
+			mutate(&p)
+			patterns := []DLPPattern{p}
+			markBuiltInCredentialAudienceHosts(patterns)
+			if len(patterns[0].CredentialAudienceHosts) != 0 || patterns[0].CredentialAudienceCarrierMask != 0 {
+				t.Fatalf("customized JWT pattern kept the compiled audience: %#v", patterns[0])
+			}
+		})
+	}
+	// An operator exempt_domains list is not part of the identity: it changes
+	// where the pattern is skipped, never what it matches, so it keeps the
+	// audience and validation warns about it instead.
+	withExemption := builtIn
+	withExemption.CredentialAudienceHosts, withExemption.CredentialAudienceCarrierMask = nil, 0
+	withExemption.ExemptDomains = []string{"*.vendor.example"}
+	exempted := []DLPPattern{withExemption}
+	markBuiltInCredentialAudienceHosts(exempted)
+	if len(exempted[0].CredentialAudienceHosts) != 1 || exempted[0].CredentialAudienceCarrierMask == 0 {
+		t.Fatalf("an exempt_domains list cost the JWT pattern its audience: %#v", exempted[0])
+	}
+	exact := builtIn
+	exact.CredentialAudienceHosts, exact.CredentialAudienceCarrierMask = nil, 0
+	patterns := []DLPPattern{exact}
+	markBuiltInCredentialAudienceHosts(patterns)
+	if len(patterns[0].CredentialAudienceHosts) != 1 || patterns[0].CredentialAudienceCarrierMask != CredentialAudienceCarrierURLQuery|CredentialAudienceCarrierRegistryBearer|CredentialAudienceCarrierRegistryBasic|CredentialAudienceCarrierSignInBearer {
+		t.Fatalf("exact built-in lost its audience: %#v", patterns[0])
+	}
+}

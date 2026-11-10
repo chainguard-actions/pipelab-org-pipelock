@@ -1,0 +1,68 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"github.com/spf13/cobra"
+)
+
+// Cmd returns the `pipelock contain` cobra command tree.
+func Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "contain",
+		Short: "Host containment for AI coding agents",
+		Long: `Install, verify, and roll back a kernel-level nftables containment model
+for AI coding agents on Linux hosts.
+
+The model splits a single host into three system users
+(operator / pipelock-proxy / pipelock-agent) and uses nftables owner-match
+rules to force every agent process through the Pipelock proxy.
+
+Subcommands:
+  install     Create users, systemd unit, nft rules, wrappers, sudoers.
+  upgrade     Download, verify, replace, re-pin, restart, verify (one command).
+  run         Verify containment, then launch a registered agent tool.
+  verify      Run containment probes; report pass/fail/skip.
+  doctor      Live self-test of the runtime contract; report remediation.
+  view        Connect a VNC client to the contained display.
+  rollback    Undo install (idempotent).
+  add-tool    Drop a new /usr/local/bin/plk-<name> wrapper.
+  grant-workspace
+              Grant pipelock-agent ACL access to a project directory.
+  revoke-workspace
+              Revoke pipelock-agent ACL access from a project directory.
+  list-workspaces
+              List recorded workspace grants (path, mode, owner, expiry, status).
+  ca-refresh  Rebuild the combined CA bundle after a CA rotation.
+
+All mutating subcommands except 'upgrade' accept --dry-run to print the
+planned actions without touching state.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	cmd.AddCommand(
+		verifyCmd(),
+		doctorCmd(),
+		runCmd(),
+		servicePostureCmd(),
+		installCmd(),
+		rollbackCmd(),
+		addToolCmd(),
+		explainCmd(),
+		grantWorkspaceCmd(),
+		revokeWorkspaceCmd(),
+		listWorkspacesCmd(),
+		caRefreshCmd(),
+		reloadNFTRulesCmd(),
+		netnsForwardCmd(),
+		netnsAssertCmd(),
+		viewerCmd(),
+		viewCmd(),
+		upgradeCmd(),
+		launchPropertiesCmd(),
+	)
+
+	return cmd
+}

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits"
+  ],
+  "minimumReleaseAge": "10 days",
+  "internalChecksFilter": "strict",
+  "dependencyDashboard": false,
+  "schedule": ["* * * * 1"],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "osvVulnerabilityAlerts": true,
+  "vulnerabilityAlerts": {
+    "labels": ["security", "fast-track"],
+    "minimumReleaseAge": "0 days",
+    "schedule": ["at any time"]
+  },
+  "packageRules": [
+    {
+      "description": "Keep GitHub Actions, Docker, and k8s image refs pinned to digests so the OpenSSF Scorecard pinned-dependencies check stays satisfied. The digest-maintenance PRs this produces are batched into the weekly group below, so pinning costs no extra PR noise. charts/pipelock/values.yaml is excluded by a later rule: its image.tag and image.digest are intentionally empty and must not be written by an updater.",
+      "matchManagers": ["github-actions", "dockerfile", "docker-compose", "kubernetes", "helm-values", "helmv3"],
+      "pinDigests": true
+    },
+    {
+      "description": "Collapse every non-major update (minor, patch, digest, pin) into ONE weekly batched PR so the PR volume stays low. Majors and security alerts are handled separately below.",
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest", "bump"],
+      "groupName": "weekly dependencies"
+    },
+    {
+      "description": "Major updates stay individual and manually reviewed (no automerge), and are not delayed to the weekly window.",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major-update", "needs-review"],
+      "automerge": false,
+      "schedule": ["at any time"]
+    },
+    {
+      "description": "Keep the TypeScript verifier on the Unicode package that supplies its required property modules. Version 2.0.7 omits Binary_Property/Assigned/regex.js, preventing the verifier CLI from starting. Updates require checking the imported modules and cross-language conformance before changing this pin.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["sdk/verifiers/ts/**"],
+      "matchPackageNames": ["@unicode/unicode-15.0.0"],
+      "allowedVersions": "2.0.2"
+    },
+    {
+      "description": "Keep the TypeScript verifier on he 1.2.0. Version 2 is ESM-only and requires Node 22, while the published verifier uses its CommonJS default export and declares Node 20. Revisit this pin with the next verifier release after reviewing the Node floor, import migration, and cross-language conformance together.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["sdk/verifiers/ts/**"],
+      "matchPackageNames": ["he"],
+      "allowedVersions": "1.2.0"
+    },
+    {
+      "description": "Allow security-fix proposals to override the he maintenance hold; migration and conformance checks still apply.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["sdk/verifiers/ts/**"],
+      "matchPackageNames": ["he"],
+      "matchJsonata": ["isVulnerabilityAlert = true"],
+      "allowedVersions": "*"
+    },
+    {
+      "description": "Hold TypeScript at 5.x in the verifier. TS 6.0 needs tsconfig and source migrations we have not scoped.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["sdk/verifiers/ts/**"],
+      "matchPackageNames": ["typescript"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Hold cosign at 2.x in the release workflow. GoReleaser emits separate checksums.txt.sig/.pem assets; cosign 3.x requires the new bundle format and rejects the flags that produce them. Advancing it needs a release-signing migration we have not scoped, and a major bump here breaks artifact signing at tag time rather than in PR CI. Only the cosign-release version is held; the cosign-installer action itself still updates.",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["sigstore/cosign"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Hold jsonschema at 0.18.x in the Rust verifier. 0.19+ renames JSONSchema to Validator and changes the compile/validate API, needs manual migration.",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["sdk/verifiers/rust/**"],
+      "matchPackageNames": ["jsonschema"],
+      "allowedVersions": "<0.19"
+    },
+    {
+      "description": "The release process manages charts/pipelock/values.yaml. image.tag is intentionally empty so the chart uses Chart.AppVersion; image.digest is a separate operator opt-in. Keep dependency updaters from writing this file. The values schema and template helper reject a digest placed in image.tag.",
+      "matchManagers": ["helm-values"],
+      "matchFileNames": ["charts/pipelock/values.yaml"],
+      "enabled": false
+    },
+    {
+      "description": "The Rust verifier must use Unicode 15.0.0 normalization tables to match the signed evidence-provenance transform profile and the other verifiers. The admitted version bound is <0.1.23; the unicode_normalization_tables_match_pinned_profile_version test checks the selected tables. Review updates as a coordinated verifier/profile migration and preserve cross-language canonical bytes.",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["sdk/verifiers/rust/**"],
+      "matchPackageNames": ["unicode-normalization"],
+      "allowedVersions": "<0.1.23"
+    },
+    {
+      "description": "The Rust verifier's sha2, sha2_10, hmac and p256 dependencies share RustCrypto digest traits. Review series updates together, including the older sha2 alias and cross-language conformance. Minor and major updates are held; patch updates within the admitted series remain enabled. Match both sha2 and its sha2_10 alias.",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["sdk/verifiers/rust/**"],
+      "matchPackageNames": ["sha2", "sha2_10", "hmac", "p256"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    },
+    {
+      "description": "Hold the Gauntlet workflow's Ubuntu runner for review.",
+      "matchManagers": ["github-actions"],
+      "matchFileNames": [".github/workflows/continuous-gauntlet.yaml"],
+      "matchDepNames": ["ubuntu"],
+      "enabled": false
+    }
+  ]
+}

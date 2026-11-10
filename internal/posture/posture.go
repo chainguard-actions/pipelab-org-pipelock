@@ -1,0 +1,819 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package posture emits signed posture capsules for the current pipelock state.
+package posture
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/atomicfile"
+	"github.com/luckyPipewrench/pipelock/internal/cli/audit"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/discover"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+const (
+	// SchemaVersion is the posture capsule schema version.
+	SchemaVersion = "1"
+
+	// DefaultExpirationDays is the default validity period for posture capsules.
+	DefaultExpirationDays = 30
+
+	// DefaultOutputDir is the default output directory for posture artifacts.
+	DefaultOutputDir = ".pipelock/posture"
+
+	// ProofFilename is the JSON artifact written by posture emit.
+	ProofFilename = "proof.json"
+
+	// ProofMarkdownFilename is the human-readable proof artifact written
+	// alongside ProofFilename so operators (auditors, procurement reviewers)
+	// can read the posture summary without re-parsing the JSON.
+	ProofMarkdownFilename = "proof.md"
+
+	evidenceFilePrefix = "evidence-"
+)
+
+var (
+	canonicalize     = canonicalJSON
+	jsonMarshal      = json.Marshal
+	userHomeDir      = os.UserHomeDir
+	discoverConfigs  = discoverAmbient
+	readRecorderFile = recorder.ReadHistoryEntries
+)
+
+// Capsule is the signed posture artifact emitted by pipelock posture emit.
+type Capsule struct {
+	SchemaVersion string         `json:"schema_version"`
+	GeneratedAt   time.Time      `json:"generated_at"`
+	ExpiresAt     time.Time      `json:"expires_at"`
+	ToolVersion   string         `json:"tool_version"`
+	ConfigHash    string         `json:"config_hash"`
+	Evidence      EvidenceBundle `json:"evidence"`
+	Signature     string         `json:"signature"`
+	SignerKeyID   string         `json:"signer_key_id"`
+}
+
+// EvidenceBundle contains the raw posture evidence collected at emit time.
+type EvidenceBundle struct {
+	Discover       DiscoverEvidence       `json:"discover"`
+	VerifyInstall  VerifyInstallEvidence  `json:"verify_install"`
+	Simulate       audit.SimulateResult   `json:"simulate"`
+	FlightRecorder FlightRecorderCounts   `json:"flight_recorder"`
+	ContainLaunch  *ContainLaunchEvidence `json:"contain_launch,omitempty"`
+	Containment    *ContainmentEvidence   `json:"containment,omitempty"`
+}
+
+// ContainLaunchEvidence binds a signed posture capsule to the exact
+// containment launch attempt without writing prompt-like argv values or env
+// values in cleartext. Operators can recompute the hashes from the observed
+// command/env when auditing a run.
+type ContainLaunchEvidence struct {
+	Launcher     string   `json:"launcher"`
+	AgentUser    string   `json:"agent_user"`
+	TargetUID    string   `json:"target_uid"`
+	TargetGID    string   `json:"target_gid"`
+	TargetGroups []string `json:"target_groups"`
+	Tool         string   `json:"tool"`
+	Argc         int      `json:"argc"`
+	ArgvSHA256   string   `json:"argv_sha256"`
+	CWD          string   `json:"cwd"`
+	ProxyPort    int      `json:"proxy_port"`
+	EnvVars      []string `json:"env_vars"`
+	EnvSHA256    string   `json:"env_sha256"`
+	// FilesystemMode and FilesystemBindsSHA256 are optional. Absent means this
+	// launch did not confine the host filesystem. They do not change
+	// BoundaryVerified, which remains the nftables boundary.
+	FilesystemMode        string `json:"filesystem_mode,omitempty"`
+	FilesystemBindsSHA256 string `json:"filesystem_binds_sha256,omitempty"`
+}
+
+const (
+	ContainmentModeKernelNFTOwnerMatch = "kernel_nft_owner_match"
+	ContainmentModeBestEffortProxyEnv  = "best_effort_proxy_env"
+)
+
+type ContainmentEvidence struct {
+	Mode                     string `json:"mode"`
+	BoundaryVerified         bool   `json:"boundary_verified"`
+	ProbeRefusedDirectEgress bool   `json:"probe_refused_direct_egress"`
+	KernelRuleHash           string `json:"kernel_rule_hash,omitempty"`
+	TargetUID                string `json:"target_uid"`
+	// FilesystemMode and FilesystemBindsSHA256 report the mount profile. They
+	// are optional and do not feed the nftables grade. Absent means the host
+	// filesystem was not confined.
+	FilesystemMode        string `json:"filesystem_mode,omitempty"`
+	FilesystemBindsSHA256 string `json:"filesystem_binds_sha256,omitempty"`
+}
+
+// DiscoverEvidence captures high-level MCP protection counts.
+type DiscoverEvidence struct {
+	TotalClients      int `json:"total_clients"`
+	TotalServers      int `json:"total_servers"`
+	ProtectedPipelock int `json:"protected_pipelock"`
+	ProtectedOther    int `json:"protected_other"`
+	Unprotected       int `json:"unprotected"`
+	Unknown           int `json:"unknown"`
+	HighRisk          int `json:"high_risk"`
+	ParseErrors       int `json:"parse_errors"`
+}
+
+// VerifyInstallEvidence captures whether pipelock appears to be actively proxying.
+type VerifyInstallEvidence struct {
+	FlightRecorderActive bool `json:"flight_recorder_active"`
+	ReceiptCount         int  `json:"receipt_count"`
+	Proxying             bool `json:"proxying"`
+}
+
+// FlightRecorderCounts summarizes signed receipt activity.
+type FlightRecorderCounts struct {
+	ReceiptCount   int                     `json:"receipt_count"`
+	LastReceiptAt  *time.Time              `json:"last_receipt_at,omitempty"`
+	ScannerVerdict map[string]VerdictCount `json:"scanner_verdict"`
+}
+
+// VerdictCount tracks allow/block/warn verdicts for one scanner layer.
+type VerdictCount struct {
+	Allow int `json:"allow"`
+	Block int `json:"block"`
+	Warn  int `json:"warn"`
+}
+
+// Options configures posture capsule emission.
+type Options struct {
+	ExpirationDays int
+	SigningKey     ed25519.PrivateKey
+	EvidenceBundle *EvidenceBundle
+	ContainLaunch  *ContainLaunchEvidence
+	Containment    *ContainmentEvidence
+}
+
+type signableCapsule struct {
+	SchemaVersion string         `json:"schema_version"`
+	GeneratedAt   time.Time      `json:"generated_at"`
+	ExpiresAt     time.Time      `json:"expires_at"`
+	ToolVersion   string         `json:"tool_version"`
+	ConfigHash    string         `json:"config_hash"`
+	Evidence      EvidenceBundle `json:"evidence"`
+	// SignerKeyID is intentionally excluded: the signature cannot cover its own
+	// verification key identifier. Verify() pins the trusted public key and
+	// separately checks SignerKeyID as a defense-in-depth consistency check.
+}
+
+// Emit builds and signs a posture capsule from the current state.
+func Emit(cfg *config.Config, opts Options) (*Capsule, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config is required")
+	}
+	if opts.ExpirationDays < 0 {
+		return nil, fmt.Errorf("expiration_days must be >= 0")
+	}
+
+	opts = opts.withDefaults()
+
+	privKey, err := resolveSigningKey(cfg, opts.SigningKey)
+	if err != nil {
+		return nil, err
+	}
+
+	evidence, err := resolveEvidence(cfg, opts.EvidenceBundle)
+	if err != nil {
+		return nil, err
+	}
+	if opts.ContainLaunch != nil {
+		evidence.ContainLaunch = cloneContainLaunchEvidence(opts.ContainLaunch)
+	}
+	if opts.Containment != nil {
+		evidence.Containment = cloneContainmentEvidence(opts.Containment)
+	}
+
+	configHash, err := hashConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("hash config: %w", err)
+	}
+
+	now := time.Now().UTC()
+	capsule := &Capsule{
+		SchemaVersion: SchemaVersion,
+		GeneratedAt:   now,
+		ExpiresAt:     now.AddDate(0, 0, opts.ExpirationDays),
+		ToolVersion:   cliutil.Version,
+		ConfigHash:    configHash,
+		Evidence:      evidence,
+		SignerKeyID:   hex.EncodeToString(privKey.Public().(ed25519.PublicKey)),
+	}
+
+	payload, err := capsule.signableJSON()
+	if err != nil {
+		return nil, fmt.Errorf("marshal signable capsule: %w", err)
+	}
+
+	capsule.Signature = hex.EncodeToString(ed25519.Sign(privKey, payload))
+	return capsule, nil
+}
+
+// Verify validates the capsule signature, expiration, and schema version.
+func Verify(capsule *Capsule, trustedKey ed25519.PublicKey) error {
+	return VerifyAt(capsule, trustedKey, time.Now().UTC())
+}
+
+// VerifyAt validates the capsule signature, expiration, and schema version at a
+// caller-supplied time. It is used by receipt verification so historical
+// receipts can be assessed against their signed time window instead of the
+// verifier's wall clock.
+func VerifyAt(capsule *Capsule, trustedKey ed25519.PublicKey, now time.Time) error {
+	if capsule == nil {
+		return fmt.Errorf("capsule is required")
+	}
+	if capsule.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("unsupported schema_version %q", capsule.SchemaVersion)
+	}
+	if len(trustedKey) != ed25519.PublicKeySize {
+		return fmt.Errorf("invalid trusted key length: got %d, want %d", len(trustedKey), ed25519.PublicKeySize)
+	}
+	if capsule.GeneratedAt.IsZero() || capsule.ExpiresAt.IsZero() || !capsule.GeneratedAt.Before(capsule.ExpiresAt) {
+		return fmt.Errorf("invalid capsule window: generated_at=%s expires_at=%s", capsule.GeneratedAt.Format(time.RFC3339), capsule.ExpiresAt.Format(time.RFC3339))
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if capsule.ExpiresAt.Before(now.UTC()) {
+		return fmt.Errorf("capsule expired at %s", capsule.ExpiresAt.Format(time.RFC3339))
+	}
+	if capsule.Signature == "" {
+		return fmt.Errorf("capsule signature is required")
+	}
+
+	expectedKeyID := hex.EncodeToString(trustedKey)
+	if capsule.SignerKeyID != expectedKeyID {
+		return fmt.Errorf("signer_key_id %q does not match trusted key", capsule.SignerKeyID)
+	}
+
+	sig, err := hex.DecodeString(capsule.Signature)
+	if err != nil {
+		return fmt.Errorf("decode signature: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("invalid signature length: got %d, want %d", len(sig), ed25519.SignatureSize)
+	}
+
+	payload, err := capsule.signableJSON()
+	if err != nil {
+		return fmt.Errorf("marshal signable capsule: %w", err)
+	}
+	if !ed25519.Verify(trustedKey, payload, sig) {
+		return fmt.Errorf("signature verification failed")
+	}
+	return nil
+}
+
+// WriteProofJSON writes proof.json atomically into the output directory.
+func WriteProofJSON(outputDir string, capsule *Capsule) (string, error) {
+	path, _, err := WriteProofJSONWithBytes(outputDir, capsule)
+	return path, err
+}
+
+// WriteProofJSONWithBytes writes proof.json atomically and returns the exact
+// bytes published to disk. Callers binding other signed evidence to the
+// capsule must use these bytes rather than reopen the output path.
+func WriteProofJSONWithBytes(outputDir string, capsule *Capsule) (string, []byte, error) {
+	if capsule == nil {
+		return "", nil, fmt.Errorf("capsule is required")
+	}
+
+	cleanDir := filepath.Clean(outputDir)
+	if err := os.MkdirAll(cleanDir, 0o750); err != nil {
+		return "", nil, fmt.Errorf("create output directory: %w", err)
+	}
+
+	data, err := json.Marshal(capsule)
+	if err != nil {
+		return "", nil, fmt.Errorf("marshal capsule: %w", err)
+	}
+	data = append(data, '\n')
+
+	path := filepath.Join(cleanDir, ProofFilename)
+	if err := atomicfile.Write(path, data, 0o600); err != nil {
+		return "", nil, fmt.Errorf("write %s: %w", ProofFilename, err)
+	}
+	return path, data, nil
+}
+
+// WriteProofMarkdown writes proof.md atomically into the output directory.
+// The markdown summarizes the same evidence as proof.json in a form auditors
+// and procurement reviewers can read directly. proof.json remains the
+// load-bearing signed artifact; proof.md is presentation only and is not
+// signed.
+func WriteProofMarkdown(outputDir string, capsule *Capsule) (string, error) {
+	if capsule == nil {
+		return "", fmt.Errorf("capsule is required")
+	}
+
+	cleanDir := filepath.Clean(outputDir)
+	if err := os.MkdirAll(cleanDir, 0o750); err != nil {
+		return "", fmt.Errorf("create output directory: %w", err)
+	}
+
+	data := []byte(RenderProofMarkdown(capsule))
+	path := filepath.Join(cleanDir, ProofMarkdownFilename)
+	if err := atomicfile.Write(path, data, 0o600); err != nil {
+		return "", fmt.Errorf("write %s: %w", ProofMarkdownFilename, err)
+	}
+	return path, nil
+}
+
+// RenderProofMarkdown renders a human-readable posture summary from the
+// capsule. Output is deterministic given the same capsule input - scanner
+// verdicts are sorted by scanner label and times are formatted as RFC 3339.
+//
+// A nil capsule produces an explicit "no evidence" stub rather than an empty
+// string so that a proof.md file written via a future code path that bypasses
+// WriteProofMarkdown's nil guard cannot read as "all clear" to an auditor.
+func RenderProofMarkdown(c *Capsule) string {
+	if c == nil {
+		return "# Pipelock Posture Proof\n\nNo evidence capsule available.\n"
+	}
+
+	signerShort := c.SignerKeyID
+	if len(signerShort) > 16 {
+		signerShort = signerShort[:16] + "…"
+	}
+	sigShort := c.Signature
+	if len(sigShort) > 16 {
+		sigShort = sigShort[:16] + "…"
+	}
+
+	var b strings.Builder
+	_, _ = fmt.Fprintf(&b, "# Pipelock Posture Proof\n\n")
+	_, _ = fmt.Fprintf(&b, "- Schema version: `%s`\n", c.SchemaVersion)
+	_, _ = fmt.Fprintf(&b, "- Tool version: `%s`\n", c.ToolVersion)
+	_, _ = fmt.Fprintf(&b, "- Generated at: %s\n", c.GeneratedAt.UTC().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(&b, "- Expires at: %s\n", c.ExpiresAt.UTC().Format(time.RFC3339))
+	_, _ = fmt.Fprintf(&b, "- Config hash: `%s`\n", c.ConfigHash)
+	_, _ = fmt.Fprintf(&b, "- Signer key ID: `%s`\n", signerShort)
+	_, _ = fmt.Fprintf(&b, "- Signature: `%s`\n", sigShort)
+
+	d := c.Evidence.Discover
+	_, _ = fmt.Fprintf(&b, "\n## Discover\n\n")
+	_, _ = fmt.Fprintf(&b, "- Clients: %d\n", d.TotalClients)
+	_, _ = fmt.Fprintf(&b, "- Servers: %d\n", d.TotalServers)
+	_, _ = fmt.Fprintf(&b, "- Protected (pipelock): %d\n", d.ProtectedPipelock)
+	_, _ = fmt.Fprintf(&b, "- Protected (other): %d\n", d.ProtectedOther)
+	_, _ = fmt.Fprintf(&b, "- Unprotected: %d\n", d.Unprotected)
+	_, _ = fmt.Fprintf(&b, "- Unknown: %d\n", d.Unknown)
+	_, _ = fmt.Fprintf(&b, "- High risk: %d\n", d.HighRisk)
+	_, _ = fmt.Fprintf(&b, "- Parse errors: %d\n", d.ParseErrors)
+
+	vi := c.Evidence.VerifyInstall
+	_, _ = fmt.Fprintf(&b, "\n## Verify install\n\n")
+	_, _ = fmt.Fprintf(&b, "- Flight recorder active: %t\n", vi.FlightRecorderActive)
+	_, _ = fmt.Fprintf(&b, "- Proxying: %t\n", vi.Proxying)
+	_, _ = fmt.Fprintf(&b, "- Receipt count: %d\n", vi.ReceiptCount)
+
+	s := c.Evidence.Simulate
+	_, _ = fmt.Fprintf(&b, "\n## Simulate\n\n")
+	if s.Total > 0 {
+		_, _ = fmt.Fprintf(&b, "- Mode: %s\n", s.Mode)
+		_, _ = fmt.Fprintf(&b, "- Grade: %s  (%d%%)\n", s.Grade, s.Percentage)
+		_, _ = fmt.Fprintf(&b, "- Passed: %d / %d\n", s.Passed, s.Total)
+		_, _ = fmt.Fprintf(&b, "- Failed: %d\n", s.Failed)
+		_, _ = fmt.Fprintf(&b, "- Known limitations: %d\n", s.KnownLimits)
+	} else {
+		_, _ = fmt.Fprintf(&b, "- No scenarios executed.\n")
+	}
+
+	fr := c.Evidence.FlightRecorder
+	_, _ = fmt.Fprintf(&b, "\n## Flight recorder\n\n")
+	_, _ = fmt.Fprintf(&b, "- Receipt count: %d\n", fr.ReceiptCount)
+	if fr.LastReceiptAt != nil {
+		_, _ = fmt.Fprintf(&b, "- Last receipt at: %s\n", fr.LastReceiptAt.UTC().Format(time.RFC3339))
+	} else {
+		_, _ = fmt.Fprintf(&b, "- Last receipt at: (none recorded)\n")
+	}
+	if len(fr.ScannerVerdict) > 0 {
+		_, _ = fmt.Fprintf(&b, "\n| Scanner | Allow | Block | Warn |\n| --- | ---: | ---: | ---: |\n")
+		scanners := make([]string, 0, len(fr.ScannerVerdict))
+		for k := range fr.ScannerVerdict {
+			scanners = append(scanners, k)
+		}
+		sort.Strings(scanners)
+		for _, name := range scanners {
+			v := fr.ScannerVerdict[name]
+			_, _ = fmt.Fprintf(&b, "| %s | %d | %d | %d |\n", name, v.Allow, v.Block, v.Warn)
+		}
+	}
+	if launch := c.Evidence.ContainLaunch; launch != nil {
+		_, _ = fmt.Fprintf(&b, "\n## Contain launch\n\n")
+		_, _ = fmt.Fprintf(&b, "- Launcher: `%s`\n", launch.Launcher)
+		_, _ = fmt.Fprintf(&b, "- Agent user: `%s` (uid `%s`, gid `%s`, groups `%s`)\n", launch.AgentUser, launch.TargetUID, launch.TargetGID, strings.Join(launch.TargetGroups, "`, `"))
+		_, _ = fmt.Fprintf(&b, "- Tool: `%s`\n", launch.Tool)
+		_, _ = fmt.Fprintf(&b, "- Arg count: %d\n", launch.Argc)
+		_, _ = fmt.Fprintf(&b, "- Argv SHA-256: `%s`\n", launch.ArgvSHA256)
+		_, _ = fmt.Fprintf(&b, "- CWD: `%s`\n", launch.CWD)
+		_, _ = fmt.Fprintf(&b, "- Proxy port: %d\n", launch.ProxyPort)
+		_, _ = fmt.Fprintf(&b, "- Env SHA-256: `%s`\n", launch.EnvSHA256)
+		_, _ = fmt.Fprintf(&b, "- Env vars: `%s`\n", strings.Join(launch.EnvVars, "`, `"))
+		if launch.FilesystemMode != "" {
+			_, _ = fmt.Fprintf(&b, "- Filesystem mode: `%s`\n", launch.FilesystemMode)
+			_, _ = fmt.Fprintf(&b, "- Filesystem binds SHA-256: `%s`\n", launch.FilesystemBindsSHA256)
+		}
+	}
+	if containment := c.Evidence.Containment; containment != nil && containment.FilesystemMode != "" {
+		_, _ = fmt.Fprintf(&b, "- Containment filesystem mode: `%s`\n", containment.FilesystemMode)
+		_, _ = fmt.Fprintf(&b, "- Containment filesystem binds SHA-256: `%s`\n", containment.FilesystemBindsSHA256)
+	}
+
+	return b.String()
+}
+
+// MarshalJSON emits deterministic canonical JSON for signature stability.
+func (c Capsule) MarshalJSON() ([]byte, error) {
+	type alias Capsule
+	return canonicalize(alias(c))
+}
+
+// UnmarshalJSON decodes a posture capsule from JSON with strict field
+// matching. Unknown fields and trailing payload are rejected so unsigned
+// side-channel data cannot piggyback on an otherwise valid signed capsule.
+func (c *Capsule) UnmarshalJSON(data []byte) error {
+	type alias Capsule
+	if err := jsonscan.RejectNonCanonicalFields(data, new(alias)); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var raw alias
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON payload")
+		}
+		return err
+	}
+	*c = Capsule(raw)
+	return nil
+}
+
+func (o Options) withDefaults() Options {
+	if o.ExpirationDays == 0 {
+		o.ExpirationDays = DefaultExpirationDays
+	}
+	return o
+}
+
+func resolveSigningKey(cfg *config.Config, key ed25519.PrivateKey) (ed25519.PrivateKey, error) {
+	if len(key) > 0 {
+		if len(key) != ed25519.PrivateKeySize {
+			return nil, fmt.Errorf("invalid signing key length: got %d, want %d", len(key), ed25519.PrivateKeySize)
+		}
+		return key, nil
+	}
+
+	keyPath := filepath.Clean(cfg.FlightRecorder.SigningKeyPath)
+	if keyPath == "." || cfg.FlightRecorder.SigningKeyPath == "" {
+		return nil, fmt.Errorf("flight_recorder.signing_key_path is required")
+	}
+
+	privKey, err := signing.LoadPrivateKeyFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load signing key: %w", err)
+	}
+	return privKey, nil
+}
+
+func resolveEvidence(cfg *config.Config, preload *EvidenceBundle) (EvidenceBundle, error) {
+	if preload != nil {
+		return cloneEvidenceBundle(*preload), nil
+	}
+	return collectEvidence(cfg)
+}
+
+func cloneEvidenceBundle(bundle EvidenceBundle) EvidenceBundle {
+	cloned := bundle
+	if bundle.Simulate.Scenarios != nil {
+		cloned.Simulate.Scenarios = append([]audit.ScenarioResult(nil), bundle.Simulate.Scenarios...)
+	}
+	if bundle.FlightRecorder.LastReceiptAt != nil {
+		ts := *bundle.FlightRecorder.LastReceiptAt
+		cloned.FlightRecorder.LastReceiptAt = &ts
+	}
+	if bundle.FlightRecorder.ScannerVerdict != nil {
+		cloned.FlightRecorder.ScannerVerdict = make(map[string]VerdictCount, len(bundle.FlightRecorder.ScannerVerdict))
+		for key, value := range bundle.FlightRecorder.ScannerVerdict {
+			cloned.FlightRecorder.ScannerVerdict[key] = value
+		}
+	}
+	if bundle.ContainLaunch != nil {
+		cloned.ContainLaunch = cloneContainLaunchEvidence(bundle.ContainLaunch)
+	}
+	if bundle.Containment != nil {
+		cloned.Containment = cloneContainmentEvidence(bundle.Containment)
+	}
+	return cloned
+}
+
+func cloneContainLaunchEvidence(in *ContainLaunchEvidence) *ContainLaunchEvidence {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.TargetGroups = append([]string(nil), in.TargetGroups...)
+	out.EnvVars = append([]string(nil), in.EnvVars...)
+	return &out
+}
+
+func cloneContainmentEvidence(in *ContainmentEvidence) *ContainmentEvidence {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
+func collectEvidence(cfg *config.Config) (EvidenceBundle, error) {
+	discoverEvidence, err := collectDiscoverEvidence()
+	if err != nil {
+		return EvidenceBundle{}, err
+	}
+
+	simulateEvidence, err := collectSimulateEvidence(cfg)
+	if err != nil {
+		return EvidenceBundle{}, err
+	}
+
+	flightRecorderEvidence, err := collectFlightRecorderEvidence(cfg)
+	if err != nil {
+		return EvidenceBundle{}, err
+	}
+
+	verifyInstallEvidence := VerifyInstallEvidence{
+		FlightRecorderActive: cfg.FlightRecorder.Enabled && cfg.FlightRecorder.Dir != "" && flightRecorderEvidence.ScannerVerdict != nil,
+		ReceiptCount:         flightRecorderEvidence.ReceiptCount,
+		Proxying:             cfg.FlightRecorder.Enabled && flightRecorderEvidence.ReceiptCount > 0,
+	}
+
+	return EvidenceBundle{
+		Discover:       discoverEvidence,
+		VerifyInstall:  verifyInstallEvidence,
+		Simulate:       simulateEvidence,
+		FlightRecorder: flightRecorderEvidence,
+	}, nil
+}
+
+// discoverAmbient inventories the current user's config directories and
+// current project, using the same inputs as pipelock discover.
+func discoverAmbient(home string) (*discover.Report, error) {
+	opts := discover.AmbientOptions(os.Getenv)
+	return discover.DiscoverWithOptions(home, opts)
+}
+
+func collectDiscoverEvidence() (DiscoverEvidence, error) {
+	home, err := userHomeDir()
+	if err != nil {
+		return DiscoverEvidence{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+
+	report, err := discoverConfigs(home)
+	if err != nil {
+		return DiscoverEvidence{}, fmt.Errorf("discover: %w", err)
+	}
+
+	return DiscoverEvidence{
+		TotalClients:      report.Summary.TotalClients,
+		TotalServers:      report.Summary.TotalServers,
+		ProtectedPipelock: report.Summary.ProtectedPipelock,
+		ProtectedOther:    report.Summary.ProtectedOther,
+		Unprotected:       report.Summary.Unprotected,
+		// The signed schema already has an unknown bucket. Unconfirmed launches
+		// must feed that bucket so cleanliness and strict policy cannot treat
+		// missing launch evidence as confirmed protection.
+		Unknown:     report.Summary.Unknown + report.Summary.Unconfirmed,
+		HighRisk:    report.Summary.HighRisk,
+		ParseErrors: report.Summary.ParseErrors,
+	}, nil
+}
+
+func collectSimulateEvidence(cfg *config.Config) (audit.SimulateResult, error) {
+	sc, err := scanner.New(cfg)
+	if err != nil {
+		return audit.SimulateResult{}, fmt.Errorf("create simulate scanner: %w", err)
+	}
+	defer sc.Close()
+
+	scenarios := audit.BuildSimScenarios(cfg, sc)
+	return audit.RunSimulation(scenarios, "", cfg.Mode), nil
+}
+
+func collectFlightRecorderEvidence(cfg *config.Config) (FlightRecorderCounts, error) {
+	result := FlightRecorderCounts{}
+
+	if cfg.FlightRecorder.Dir == "" {
+		return result, nil
+	}
+
+	dir := filepath.Clean(cfg.FlightRecorder.Dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return result, nil
+		}
+		return FlightRecorderCounts{}, fmt.Errorf("read flight recorder dir: %w", err)
+	}
+	result.ScannerVerdict = make(map[string]VerdictCount)
+
+	var files []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if filepath.Ext(name) == ".jsonl" && strings.HasPrefix(name, evidenceFilePrefix) {
+			files = append(files, filepath.Join(dir, name))
+		}
+	}
+	sort.Strings(files)
+
+	var lastReceipt time.Time
+	for _, file := range files {
+		records, err := readRecorderFile(file)
+		if err != nil {
+			return FlightRecorderCounts{}, fmt.Errorf("read recorder file %s: %w", filepath.Base(file), err)
+		}
+		for _, record := range records {
+			if record.Type != "action_receipt" {
+				continue
+			}
+
+			detailJSON, err := json.Marshal(record.Detail)
+			if err != nil {
+				return FlightRecorderCounts{}, fmt.Errorf("marshal receipt detail: %w", err)
+			}
+			rcpt, err := receipt.Unmarshal(detailJSON)
+			if err != nil {
+				return FlightRecorderCounts{}, fmt.Errorf("decode receipt detail: %w", err)
+			}
+
+			result.ReceiptCount++
+			if rcpt.ActionRecord.Timestamp.After(lastReceipt) {
+				lastReceipt = rcpt.ActionRecord.Timestamp
+			}
+
+			layer := rcpt.ActionRecord.Layer
+			if layer == "" {
+				layer = "unknown"
+			}
+			counts := result.ScannerVerdict[layer]
+			switch rcpt.ActionRecord.Verdict {
+			case config.ActionAllow:
+				counts.Allow++
+			case config.ActionBlock:
+				counts.Block++
+			case config.ActionWarn:
+				counts.Warn++
+			}
+			result.ScannerVerdict[layer] = counts
+		}
+	}
+
+	if !lastReceipt.IsZero() {
+		lastReceipt = lastReceipt.UTC()
+		result.LastReceiptAt = &lastReceipt
+	}
+
+	return result, nil
+}
+
+// HashConfig computes the canonical SHA-256 hash of a config. Used by both
+// capsule emission and the verify command (to compare local config against the
+// capsule's config_hash).
+func HashConfig(cfg *config.Config) (string, error) {
+	return hashConfig(cfg)
+}
+
+func hashConfig(cfg *config.Config) (string, error) {
+	canonical, err := canonicalize(cfg)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (c Capsule) signableJSON() ([]byte, error) {
+	return canonicalize(signableCapsule{
+		SchemaVersion: c.SchemaVersion,
+		GeneratedAt:   c.GeneratedAt,
+		ExpiresAt:     c.ExpiresAt,
+		ToolVersion:   c.ToolVersion,
+		ConfigHash:    c.ConfigHash,
+		Evidence:      c.Evidence,
+	})
+}
+
+func canonicalJSON(v any) ([]byte, error) {
+	raw, err := jsonMarshal(v)
+	if err != nil {
+		return nil, err
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	var parsed any
+	if err := dec.Decode(&parsed); err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	if err := appendCanonical(&buf, parsed); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func appendCanonical(buf *bytes.Buffer, v any) error {
+	switch value := v.(type) {
+	case nil:
+		buf.WriteString("null")
+	case bool:
+		if value {
+			buf.WriteString("true")
+		} else {
+			buf.WriteString("false")
+		}
+	case string:
+		data, err := jsonMarshal(value)
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+	case json.Number:
+		buf.WriteString(value.String())
+	case float64:
+		data, err := jsonMarshal(value)
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+	case []any:
+		buf.WriteByte('[')
+		for i, item := range value {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			if err := appendCanonical(buf, item); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte(']')
+	case map[string]any:
+		buf.WriteByte('{')
+		keys := make([]string, 0, len(value))
+		for key := range value {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for i, key := range keys {
+			if i > 0 {
+				buf.WriteByte(',')
+			}
+			keyJSON, err := jsonMarshal(key)
+			if err != nil {
+				return err
+			}
+			buf.Write(keyJSON)
+			buf.WriteByte(':')
+			if err := appendCanonical(buf, value[key]); err != nil {
+				return err
+			}
+		}
+		buf.WriteByte('}')
+	default:
+		data, err := jsonMarshal(value)
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+	}
+	return nil
+}

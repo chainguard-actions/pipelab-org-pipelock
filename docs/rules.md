@@ -1,0 +1,318 @@
+# Community Rules
+
+Pipelock ships with built-in DLP patterns, injection detection, and tool-poison scanners. Community rule bundles extend these defaults with additional detections that ship on a faster cadence than the core binary.
+
+## Installing a Bundle
+
+```bash
+# Install the official community bundle (requires network access)
+pipelock rules install pipelock-community
+
+# Install from a third-party HTTPS source
+pipelock rules install --source https://example.com/my-bundle/bundle.yaml my-bundle
+
+# Install from a local path (signature verification skipped)
+pipelock rules install --path /path/to/bundle/ --allow-unsigned
+```
+
+Bundles are stored in `$XDG_DATA_HOME/pipelock/rules/` by default (typically `~/.local/share/pipelock/rules/`). Override with the `--rules-dir` flag or the `rules_dir` config field.
+
+> **Note:** Official bundle verification works in source builds because the official rules signing public key is compiled into the source. Release binaries additionally embed the rules keyring via ldflags. Use `trusted_keys` for third-party bundles signed by keys outside the official keyring.
+
+## Installing a bundle through a Pipelock proxy
+
+A rules bundle is a list of detection patterns, so the bundle's own contents read as injection text to a response scanner. If `pipelock rules install` runs behind a Pipelock proxy whose `response_scanning.action` is `block` or `ask` — the `strict`, `hostile-model`, `claude-code`, and `cursor` presets — that proxy scans the bundle it is fetching and refuses to release it. A proxy left on the default `warn` logs the finding and passes the bundle through, but adaptive enforcement can upgrade a warn to a block, so the same install can start failing on a session that has escalated. When it is refused, the install fails with a 403 and the command names the block-reason headers it saw without claiming to know who sent them:
+
+```
+HTTP GET https://pipelab.org/rules/pipelock-community/bundle.yaml: status 403: the response carries Pipelock block-reason headers (reason=prompt_injection, layer=response_scan), which points to a Pipelock proxy in front of this fetch refusing to release the bundle rather than the registry being down; any server can send these headers, so confirm the refusal in that proxy's log
+```
+
+The fix belongs in the **proxy's** config, not in the rules directory on the machine running the install. Name the exact artifact under `response_scanning.authenticated_artifacts`:
+
+```yaml
+response_scanning:
+  authenticated_artifacts:
+    - host: "pipelab.org"
+      path: "/rules/pipelock-community/bundle.yaml"
+      bundle_name: "pipelock-community"
+```
+
+`bundle_name` must equal the `name` field inside that bundle; the proxy refuses the artifact if they disagree, so the entry cannot be pointed at a different bundle later served from the same path.
+
+This is not a destination exemption and it does not turn scanning off for the host. The proxy buffers that one response, fetches the `.sig` sidecar itself with a fresh request, verifies the signature against its embedded official keyring, and releases the body only if the signer is in the official tier and the bundle's name matches. Everything else still applies: request-side DLP, an unsigned bundle, a third-party signer, a redirect, a non-443 port, a URL carrying a query string or userinfo, any method other than GET, and any other host or path are all still refused. Only injection matching on that verified artifact is skipped.
+
+No entry ships enabled in any preset. A standing exception to injection scanning is the operator's decision to make, and an operator who never installs a rules bundle should not be carrying one.
+
+## Updating and Removing
+
+```bash
+# Update to the latest version
+pipelock rules update pipelock-community
+
+# List installed bundles
+pipelock rules list
+
+# Show diff between installed and available versions
+pipelock rules diff pipelock-community
+
+# Remove a bundle
+pipelock rules remove pipelock-community
+```
+
+## Status
+
+```bash
+pipelock rules status
+```
+
+Reports the overall health of the rules stack: the immutable core tier, the standard-tier source and pattern counts, every installed bundle's tier/version/rule counts/signed status, and any errors or warnings from the last load. Returns non-zero when any bundle has an error (e.g., unknown `required_features`, signature failure) even if some bundles loaded successfully — in that case the proxy still starts, but the status command surfaces what's degraded.
+
+Add `--json` for machine-readable output suitable for piping into dashboards or CI checks:
+
+```bash
+pipelock rules status --json | jq '.healthy'
+```
+
+## Tiers
+
+Version 2 bundles declare a `tier`: `standard`, `community`, or `pro`. Version 1 bundles don't require this field. The declared tier doesn't prove who signed a bundle. Pipelock verifies the signer against the enabled embedded keyring and the operator's `trusted_keys`.
+
+| Tier | Current behavior |
+|------|------------------|
+| `standard` | Accepted as a v2 tier declaration. An operator-trusted third-party signer can use it. Runtime loading rejects it if a configured tier-to-key binding excludes that signer. Replacing compiled standard patterns requires the reserved bundle name `pipelock-standard` and an enabled official signer. |
+| `community` | Accepted as a v2 tier declaration. The official `pipelock-community` bundle uses the official signing key, but other bundles can use this declaration with an operator-trusted signer. |
+| `pro` | Accepted as a v2 tier declaration. Current install and load paths don't require a paid license or a dedicated pro signing key. Signature, compatibility, and freshness checks still apply. Runtime loading also applies configured tier-to-key bindings. |
+
+The immutable core scanner runs before any bundle and can't be replaced or disabled. Standard DLP and response patterns normally come from the binary's compiled defaults. A successfully loaded, officially signed `pipelock-standard` bundle replaces compiled standard patterns for each surface where it supplies active rules. A surface with no active rules from that bundle keeps its compiled fallback. Setting `dlp.include_defaults: false` or `response_scanning.include_defaults: false` disables that surface's standard defaults and standard-bundle patterns. `pipelock rules status` reports the selected sources in `standard_dlp_source` and `standard_response_source`.
+
+Other bundle names add patterns without replacing the core or the selected standard source. Declaring `tier: standard` under another name doesn't grant replacement behavior.
+
+## RequiredFeatures
+
+A bundle declares the engine features its rules need. Unknown features block the bundle at load time with a clear error:
+
+```yaml
+format_version: 2
+name: my-company-rules
+version: "2026.03.1"
+tier: community
+required_features:
+  - dlp           # built-in DLP scanner
+  - checksum      # post-match checksum validators (luhn, mod97, aba, wif, dea, npi)
+  - response      # response scanning
+rules:
+  # ...
+```
+
+Valid feature names are 1-64 lowercase alphanumeric characters with underscores. When an older pipelock binary encounters a bundle that requires a feature it doesn't support, the bundle fails to load rather than silently dropping the feature-dependent rules. This prevents detection drift between the bundle author's expectations and the running binary.
+
+## Core SSRF Literal
+
+The immutable core scanner includes private-IP literal enforcement — it blocks literal RFC 1918 ranges, loopback, link-local, and cloud metadata addresses regardless of bundle tier or scanner configuration. This is a separate layer from the standard SSRF scanner and cannot be disabled wholesale. It honors `ssrf.ip_allowlist` for ordinary private and loopback addresses, but cloud-metadata, link-local, and multicast addresses are a non-overridable deny: no allowlist entry exempts them, and an entry that overlaps one is rejected at config load.
+
+If you need to reach a private IP for legitimate internal use, do not disable pipelock — add the narrowest possible range (ideally a single `/32`) to `ssrf.ip_allowlist`, use `trusted_domains` for hostname-based internal services whose DNS you control, or scope pipelock to a narrower set of agents. There is no supported way to allow access to a cloud-metadata endpoint.
+
+## How Rules Are Loaded
+
+At startup, pipelock scans the rules directory for installed bundles. Each bundle's rules are merged with the built-in patterns:
+
+- **DLP rules** are added to the DLP pattern list alongside built-in patterns
+- **Injection rules** are added to the response scanning pattern list
+- **Tool-poison rules** are added to the tool description scanner
+
+Bundles other than the officially signed `pipelock-standard` bundle add patterns alongside the configured built-in patterns. The standard bundle follows the per-surface replacement rules described under [Tiers](#tiers).
+
+### Version-gate outcomes
+
+| Bundle check | Outcome |
+|---|---|
+| The running build version cannot be proven against `min_pipelock` | Warn and load the bundle by default. Set `rules.allow_unversioned_bundle_load: false` to refuse it. |
+| A released running version is below `min_pipelock` | Refuse the bundle. |
+| The bundle format is incompatible | Refuse the bundle. |
+
+During a rolling upgrade, set `allow_unversioned_bundle_load` explicitly on every instance. A binary from before this behavior treats an omitted value as refuse, so an omitted setting reads differently across a mixed fleet and the effective policy hash differs with it.
+## Configuration
+
+```yaml
+# pipelock.yaml
+rules:
+  rules_dir: ~/.local/share/pipelock/rules  # default ($XDG_DATA_HOME/pipelock/rules)
+  min_confidence: medium                    # skip experimental rules (low confidence)
+  include_experimental: false               # default: only stable rules are active
+  allow_degraded: false                     # strict mode refuses installed-bundle integrity failures
+  trust_embedded_keys: true                 # default: trust the compiled official rules keyring
+  # trusted_keys:                           # additional trusted public keys (beyond embedded keyring)
+  #   - name: "vendor-security"
+  #     public_key: "64-char-hex-encoded-ed25519-public-key"
+```
+
+## Degraded Bundle State
+
+Pipelock separates rule-bundle load failures into two operator classes:
+
+- **Integrity failures:** bad signatures, missing or mismatched `bundle.lock`, bundle hash mismatch, malformed installed bundle content, expired bundles, signer/tier mismatch, and freshness rollback state tampering.
+- **Availability failures:** missing optional rules directory, bundle file read/stat failures, freshness lock failures, or a bundle that requires a newer engine feature.
+
+In `mode: strict`, an integrity failure for an installed bundle refuses proxy startup, denies Claude Code, Cursor and Hermes hook calls, and fails `mcp scan` unless `rules.allow_degraded: true` is explicitly set. The error names the bundle and class so the operator can verify or reinstall the bundle before retrying. Availability failures keep the process available but mark the bundle state degraded.
+
+In non-strict modes, Pipelock starts with the remaining rules but emits a structured `rule_bundle_degraded` audit event and a startup warning. `/stats` reports degraded bundle count and names under `rule_bundles`; `/metrics` exposes `pipelock_rule_bundles_degraded`.
+
+On hot reload, a clean deletion of a previously live bundle is treated as a coverage drop. Strict mode rejects that reload and keeps the running config unless `rules.allow_degraded: true` is set on the candidate config. Non-strict modes allow the reload but emit a warning and audit event naming the bundle and pattern count dropped.
+
+`rules.allow_degraded` is an emergency override, not a normal operating mode. Use it only after confirming the bundle store is intentionally unavailable or after choosing to continue while restoring bundle integrity.
+
+## Trust Model
+
+Bundles are Ed25519-signed YAML files. Pipelock verifies signatures against a keyring before loading rules.
+
+### Official bundles
+
+Official bundles (like `pipelock-community`) are signed with the production key compiled into the source and also embedded in release binaries at build time. No additional configuration is needed.
+
+A valid signature establishes that the bundle bytes were signed by a trusted key; it doesn't establish that they're the newest published bytes. The first successful install is trust on first use for freshness. For `format_version: 2`, the first accepted monotonic version establishes a local rollback floor for that tier and bundle name. When staging an installation or changed update, Pipelock rejects a monotonic version below the saved floor and checks expiry. Runtime loading applies those checks too. A same-version, same-digest update reports "already up to date" without rechecking freshness, so update success isn't a runtime health check. Pipelock also records the highest accepted format by bundle name and checks it during staging and loading, preventing a return to v1 after v2 has been accepted.
+
+Version 1 bundles don't receive the v2 monotonic-version or expiry checks. Install and update still reject a CalVer older than the currently installed version. That comparison doesn't preserve the highest version after the installed bundle is removed. Removing a bundle leaves saved v2 freshness history intact.
+
+Deleting one freshness-state copy can cause Pipelock to restore it from the other copy. Missing state with a surviving freshness context is an error. After verifying the installed bundles, use `pipelock rules reset-freshness` for intentional recovery. Reset rebuilds floors from the installed bundles and discards higher historical values that are no longer represented there.
+
+Private-root-only operators can set `rules.trust_embedded_keys: false` to remove the compiled official keyring from bundle verification. In that mode, bundles must be signed by `rules.trusted_keys`; unsigned local bundles are rejected, and strict mode treats non-matching installed bundles as integrity failures unless the operator explicitly enables `rules.allow_degraded`.
+
+### Third-party bundles
+
+Organizations can create and sign their own bundles. Add their public key to `trusted_keys` in your config. Pipelock verifies third-party signatures the same way it verifies official ones.
+
+### Unsigned bundles
+
+The `--allow-unsigned` flag skips signature verification during install. Use this only for local testing. Unsigned bundles log a warning at startup.
+
+### Bundle keyring separated from the license key
+
+As of v2.5.0 the bundle-signing keyring is stored and loaded independently from the license key. Rotating one does not force rotating the other. The migration is automatic on first load; bundles signed under the prior layout verify unchanged. Operators running a custom `trusted_keys` list are unaffected.
+
+## Multi-bundle layout
+
+The `pipelock-rules` repo uses separate directories so bundles can be signed and versioned independently. The installed directory is keyed by bundle name. For v2 bundles, freshness counters are keyed by tier and name, and install rejects a tier change for an already installed v2 name. Install the bundles you need side by side. Bundle names other than `pipelock-standard` add rules to the configured policy:
+
+```bash
+pipelock rules install pipelock-community
+pipelock rules install --source https://example.com/finance-pii/bundle.yaml finance-pii
+```
+
+`pipelock rules list` shows the installed bundles and their versions, counts, and declared tiers. Version 1 bundles may have no declared tier. Rules in different bundles use namespaced identifiers so matching rule IDs don't replace each other. Identical regexes in different bundles remain separate loaded patterns. Reloading the same bundle replaces its previously merged patterns rather than appending a second copy.
+
+The official registry also publishes the independently versioned
+`healthcare-phi-pii` community bundle for regex-detectable healthcare and
+financial identifiers.
+
+## Verifying Signatures
+
+```bash
+# Re-verify all installed bundles against the embedded keyring
+pipelock rules verify
+```
+
+## Creating Your Own Bundle
+
+A bundle is a single YAML file with a header and a list of rules:
+
+```yaml
+format_version: 2
+name: my-company-rules
+version: "2026.04.1"
+author: vendor-security
+description: "Internal detection patterns for Vendor Corp"
+min_pipelock: "2.2.0"
+tier: community
+key_id: "d1517306bb5a0e596b5f5de996cec329e3980cc0f3dbc6a252c661d1c49f023a"
+monotonic_version: 1
+published_at: "2026-04-16T00:00:00Z"
+expires_at: "2027-04-16T00:00:00Z"
+required_features:
+  - dlp
+
+rules:
+  - id: dlp-internal-api-key
+    type: dlp
+    status: stable
+    name: "Vendor Internal API Key"
+    description: "Detects Vendor Corp internal API keys"
+    severity: critical
+    confidence: high
+    pattern:
+      regex: 'vendor_[a-zA-Z0-9]{32}'
+```
+
+DLP rules may set `pattern.validator` to `luhn`, `mod97`, `aba`, `wif`, `dea`,
+or `npi` when the identifier carries that checksum. Pipelock applies the
+validator after a regex match, so malformed lookalikes do not become DLP
+findings. Bundle authors should declare `required_features: ["checksum"]` and
+set `min_pipelock` to the oldest Pipelock release whose rule-bundle loader
+supports the specific validator value used. An older loader refuses the whole
+bundle at parse time, before it reads `min_pipelock` or `required_features`,
+and `required_features` cannot gate `dea` or `npi` because older loaders
+already know `checksum`. See [Validated Patterns](configuration.md#validated-patterns)
+for what each validator receives and what a checksum does not prove.
+
+`format_version: 1` bundles still load for backwards compatibility, but new bundles should use `format_version: 2` so they can declare `tier`, `required_features`, and freshness metadata. The v2 validation also requires `key_id`, `monotonic_version`, `published_at`, and `expires_at`. `key_id` is the signing public key as 64 lowercase hex characters, and an install fails with `key_id must not be empty for v2+ bundles` without it. The value in the example is a placeholder; [Signing your bundle](#signing-your-bundle) shows how to get yours.
+
+### Rule types
+
+| Type | `type` value | Merged with |
+|------|-------------|-------------|
+| DLP pattern | `dlp` | `dlp.patterns` |
+| Injection pattern | `injection` | `response_scanning.patterns` |
+| Tool poison pattern | `tool-poison` | `mcp_tool_scanning` descriptions |
+
+Every bundle rule matches regardless of case. Pipelock adds `(?i)` to a rule regex that doesn't already turn it on, for all three rule types. For an injection rule that opens with a flag group such as `(?s)`, `i` joins that group (`(?is)`), and a leading group that clears it, such as `(?-i)`, is kept as written. Wrap a span in `(?-i:...)` when it must match exact case.
+
+Tool-poison rules with `scan_field: description` scan the tool's `description` and `description` fields nested in its input schema. Built-in scanning still covers every other agent-visible tool field, but those fields do not trigger description-scoped bundle rules.
+
+Bundle rules are deny-only. A `pattern.exempt_domains` field is accepted for compatibility but ignored, and the loader reports a warning naming the rule when it sees one. Configure exemptions in the local Pipelock config instead.
+
+### Machine-readable reader contract
+
+A release-stamped Pipelock binary can export the rule-bundle contract it enforces:
+
+```bash
+pipelock rules schema > pipelock-rule-schema.json
+```
+
+The JSON records the exact Pipelock version and source revision, accepted bundle formats, YAML fields,
+enum values, rule types, type-specific pattern fields, merge targets, and bundle action semantics. The
+command refuses to produce an unversioned contract when the build can't report its source revision.
+Consumers should pin output from an exact Pipelock artifact by digest instead of fetching a moving
+release during ordinary pull-request checks.
+
+### Signing your bundle
+
+```bash
+# Generate a keypair for your organization
+pipelock keygen my-org
+
+# Print the public key as 64-character hex
+tail -n 1 ~/.pipelock/agents/my-org/id_ed25519.pub | base64 -d | od -An -vtx1 | tr -d ' \n'; echo
+
+# Put that hex in the bundle's key_id, then sign the bundle (uses the keystore at ~/.pipelock/)
+pipelock sign bundle.yaml --agent my-org
+
+# Distribute: bundle.yaml + bundle.yaml.sig + your public key hex
+```
+
+`pipelock keygen` writes the public key file as two lines: a `pipelock-ed25519-public-v1` header and the key in base64. Both `key_id` and `trusted_keys[].public_key` take the hex form of the same key, and Pipelock doesn't convert the base64 for you: a base64 value in `trusted_keys` is rejected at config load with `public_key must be exactly 64 hex chars`. The `key_id` must match the key that signed the bundle, otherwise the install fails with a `key_id mismatch` error. Set `key_id` before you run `pipelock sign`, because the signature covers the whole file.
+
+Users add your public key to their `trusted_keys` config to verify your bundles:
+
+```yaml
+rules:
+  trusted_keys:
+    - name: "my-org"
+      public_key: "d1517306bb5a0e596b5f5de996cec329e3980cc0f3dbc6a252c661d1c49f023a"
+```
+
+## Hosting
+
+The official community bundle is hosted at `pipelab.org/rules/`. The `pipelock rules install` command fetches from this URL by default. Self-hosted bundles can be served from any HTTPS endpoint using the `--source` flag.
+
+## Version Format
+
+Bundles use CalVer: `YYYY.MM.patch` (e.g., `2026.03.1`). The `min_pipelock` field ensures compatibility with the installed binary version.

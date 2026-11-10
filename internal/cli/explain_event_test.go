@@ -1,0 +1,805 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+func TestNewExplainEventSanitizerRejectsInvalidScannerConfig(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.DLP.Patterns = append(cfg.DLP.Patterns, config.DLPPattern{
+		Name:  "invalid",
+		Regex: "[",
+	})
+
+	if _, err := newExplainEventSanitizer(cfg); err == nil || !strings.Contains(err.Error(), "create scanner") {
+		t.Fatalf("newExplainEventSanitizer() error = %v, want create scanner error", err)
+	}
+}
+
+func TestExplainEventCmd_LooksUpBlockedRequestID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	line := `{"level":"warn","time":"2026-07-06T01:02:03Z","event":"blocked","method":"GET","url":"https://api.vendor.example/path?sig=abc","request_id":"req-123","scanner":"entropy","reason":"high entropy query param \"sig\"","remediation_hint":"Add a narrow query entropy exemption."}` + "\n"
+	if err := os.WriteFile(logPath, []byte(line), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-123", "--log", logPath)
+	if err != nil {
+		t.Fatalf("explain event failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"Pipelock Explain Event",
+		"Verdict: BLOCKED",
+		"Scanner: entropy",
+		"View:    url_query",
+		"Why:     high entropy query param \"sig\"",
+		"Add a narrow query entropy exemption.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestExplainEventCmd_JSONFallbackRemediation(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	line := `{"event":"blocked","request_id":"req-456","url":"https://api.vendor.example/?ref=example","scanner":"dlp","reason":"DLP match: test (critical)"}` + "\n"
+	if err := os.WriteFile(logPath, []byte(line), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-456", "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	var report explainEventReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("decode JSON: %v\n%s", err, out)
+	}
+	if report.RemediationHint == "" {
+		t.Fatalf("expected fallback remediation hint: %+v", report)
+	}
+	if report.Scanner != scanner.ScannerDLP {
+		t.Fatalf("scanner = %q, want %q", report.Scanner, scanner.ScannerDLP)
+	}
+}
+
+func TestExplainEventCmd_ExplainsRecordedResponseOutcomes(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	lines := []string{
+		`{"event":"response_scan","request_id":"req-warn","url":"https://api.vendor.example/response","scanner":"response_scan","action":"warn","patterns":["prompt_override"]}`,
+		`{"event":"blocked","request_id":"req-size","url":"https://api.vendor.example/response","scanner":"response_scan","reason":"response scan ceiling exceeded"}`,
+		`{"event":"blocked","request_id":"req-shield-block","url":"https://api.vendor.example/response","scanner":"shield_oversize","reason":"response exceeds browser_shield.max_shield_bytes"}`,
+		`{"event":"response_scan_exempt","request_id":"req-unscanned","url":"https://api.vendor.example/response","effect":"response_scanning.exempt_domains is a full-trust valve: injection scanning is disabled for ALL responses from this host, including oversized over-cap responses that stream unscanned"}`,
+		`{"action_id":"act-shield","request_id":"req-shield","verdict":"allow","layer":"browser_shield","shield":{"body_bytes":4096,"scanned_bytes":1024,"partial":true}}`,
+		`{"action_id":"act-malformed","request_id":"req-malformed","verdict":"allow","layer":"browser_shield","shield":{"partial":"true"}}`,
+		`{"action_id":"act-blocked-partial","verdict":"block","layer":"browser_shield","shield":{"partial":true}}`,
+		`{"action_id":"act-counts-omitted","verdict":"allow","shield":{"body_bytes":4096,"scanned_bytes":1024}}`,
+		`{"action_id":"act-counts-false","verdict":"allow","shield":{"body_bytes":4096,"scanned_bytes":1024,"partial":false}}`,
+		`{"action_id":"act-counts-complete","verdict":"allow","shield":{"body_bytes":4096,"scanned_bytes":4096}}`,
+		`{"action_id":"act-counts-blocked","verdict":"block","shield":{"body_bytes":4096,"scanned_bytes":1024}}`,
+		`{"event":"allowed","request_id":"req-unrelated-effect","effect":"stream unscanned"}`,
+		`{"event":"allowed","request_id":"req-allowed-warn","action":"warn"}`,
+		`{"event":"allowed","request_id":"req-allowed-strip","action":"strip"}`,
+		`{"event":"allowed","request_id":"req-allowed-ask-strip","action":"ask:strip"}`,
+		`{"event":"shield_rewrite","request_id":"req-rewrite-allow","action":"allow"}`,
+		`{"event":"shield_rewrite","request_id":"req-rewrite-warn","action":"warn"}`,
+		`{"event":"shield_rewrite","request_id":"req-rewrite-block","action":"block"}`,
+		`{"action_id":"act-partial-zero-scanned","verdict":"allow","shield":{"body_bytes":1024,"partial":true}}`,
+		`{"action_id":"act-only-body_bytes","verdict":"allow","shield":{"body_bytes":1024}}`,
+		`{"action_id":"act-only-scanned_bytes","verdict":"allow","shield":{"scanned_bytes":1024}}`,
+		`{"request_id":"req-verdict-approval","verdict":"ask:allow"}`,
+		`{"request_id":"req-action-precedence","action":"block","verdict":"ask:allow"}`,
+		`{"action_id":"act-invalid-count","verdict":"allow","layer":"browser_shield","shield":{"partial":true,"body_bytes":"password=placeholder","scanned_bytes":10}}`,
+		`{"event":"response_scan","request_id":"req-unknown","url":"https://api.vendor.example/response","scanner":"response_scan","action":"ask"}`,
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	tests := []struct {
+		id       string
+		outcome  string
+		pattern  string
+		remedy   string
+		contains []string
+	}{
+		{id: "req-warn", outcome: explainEventOutcomeWarned, pattern: "prompt_override", contains: []string{"action warn", "does not show a block"}},
+		{id: "req-size", outcome: explainEventOutcomeBlocked, remedy: "exact transport response ceiling"},
+		{id: "req-shield-block", outcome: explainEventOutcomeBlocked, remedy: "browser_shield.oversize_action"},
+		{id: "req-unscanned", outcome: explainEventOutcomePartial, contains: []string{"partial", "does not establish that the full response was scanned"}},
+		{id: "act-shield", outcome: explainEventOutcomePartial, contains: []string{"1024 of 4096", "not a clean full-response verdict"}},
+		{id: "act-malformed", outcome: "", contains: []string{"recorded outcome is unknown"}},
+		{id: "act-blocked-partial", outcome: explainEventOutcomeBlocked},
+		{id: "act-counts-omitted", outcome: explainEventOutcomePartial, contains: []string{"1024 of 4096"}},
+		{id: "act-counts-false", outcome: explainEventOutcomePartial, contains: []string{"1024 of 4096"}},
+		{id: "act-counts-complete", outcome: explainEventOutcomeAllowed},
+		{id: "act-counts-blocked", outcome: explainEventOutcomeBlocked},
+		{id: "req-unrelated-effect", outcome: explainEventOutcomeAllowed},
+		{id: "req-allowed-warn", outcome: explainEventOutcomeWarned},
+		{id: "req-allowed-strip", outcome: explainEventOutcomeModified},
+		{id: "req-allowed-ask-strip", outcome: explainEventOutcomeModified},
+		{id: "req-rewrite-allow", outcome: explainEventOutcomeModified},
+		{id: "req-rewrite-warn", outcome: explainEventOutcomeModified},
+		{id: "req-rewrite-block", outcome: explainEventOutcomeBlocked},
+		{id: "act-partial-zero-scanned", outcome: explainEventOutcomePartial},
+		{id: "act-only-body_bytes", outcome: "", contains: []string{"recorded outcome is unknown"}},
+		{id: "act-only-scanned_bytes", outcome: "", contains: []string{"recorded outcome is unknown"}},
+		{id: "req-verdict-approval", outcome: explainEventOutcomeAllowed, contains: []string{"an operator allowed", "not a clean scan verdict"}},
+		{id: "req-action-precedence", outcome: explainEventOutcomeBlocked},
+		{id: "act-invalid-count", outcome: "", contains: []string{"recorded outcome is unknown"}},
+		{id: "req-unknown", outcome: "", contains: []string{"recorded outcome is unknown"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			out, err := runExplainCmd(t, "event", tt.id, "--log", logPath, "--json")
+			if err != nil {
+				t.Fatalf("explain event failed: %v\n%s", err, out)
+			}
+			var report explainEventReport
+			if err := json.Unmarshal([]byte(out), &report); err != nil {
+				t.Fatalf("decode JSON: %v\n%s", err, out)
+			}
+			if report.Outcome != tt.outcome {
+				t.Fatalf("outcome = %q, want %q", report.Outcome, tt.outcome)
+			}
+			if report.PatternName != tt.pattern {
+				t.Fatalf("pattern = %q, want %q", report.PatternName, tt.pattern)
+			}
+			if !strings.Contains(report.RemediationHint, tt.remedy) {
+				t.Fatalf("remediation = %q, want %q", report.RemediationHint, tt.remedy)
+			}
+			for _, want := range tt.contains {
+				if !strings.Contains(strings.Join(report.Notes, "\n"), want) {
+					t.Fatalf("notes = %q, want %q", report.Notes, want)
+				}
+			}
+		})
+	}
+}
+
+func TestExplainEventCmd_UsesResponseScanAuditProducer(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "audit.log")
+	logger, err := audit.New("json", "file", logPath, true, true)
+	if err != nil {
+		t.Fatalf("create audit logger: %v", err)
+	}
+	t.Cleanup(logger.Close)
+
+	for _, tt := range []struct {
+		requestID string
+		action    string
+		outcome   string
+	}{
+		{requestID: "req-producer-warn", action: config.ActionWarn, outcome: explainEventOutcomeWarned},
+		{requestID: "req-producer-block", action: config.ActionBlock, outcome: explainEventOutcomeBlocked},
+		{requestID: "req-producer-ask-allow", action: "ask:allow", outcome: explainEventOutcomeAllowed},
+		{requestID: "req-producer-ask-strip", action: "ask:strip", outcome: explainEventOutcomeModified},
+	} {
+		ctx, err := audit.NewHTTPLogContext("GET", "https://api.vendor.example/response", "127.0.0.1", tt.requestID, "agent")
+		if err != nil {
+			t.Fatalf("create audit context: %v", err)
+		}
+		logger.LogResponseScan(ctx, tt.action, 1, []string{"prompt_override"}, nil)
+	}
+	logger.Close()
+
+	for _, tt := range []struct {
+		requestID string
+		outcome   string
+	}{
+		{requestID: "req-producer-warn", outcome: explainEventOutcomeWarned},
+		{requestID: "req-producer-block", outcome: explainEventOutcomeBlocked},
+		{requestID: "req-producer-ask-allow", outcome: explainEventOutcomeAllowed},
+		{requestID: "req-producer-ask-strip", outcome: explainEventOutcomeModified},
+	} {
+		t.Run(tt.requestID, func(t *testing.T) {
+			out, err := runExplainCmd(t, "event", tt.requestID, "--log", logPath, "--json")
+			if err != nil {
+				t.Fatalf("explain event failed: %v\n%s", err, out)
+			}
+			var report explainEventReport
+			if err := json.Unmarshal([]byte(out), &report); err != nil {
+				t.Fatalf("decode JSON: %v\n%s", err, out)
+			}
+			if report.Outcome != tt.outcome || report.PatternName != "prompt_override" {
+				t.Fatalf("report = %+v, want outcome %q and recorded pattern", report, tt.outcome)
+			}
+		})
+	}
+}
+
+func TestExplainEventCmd_JSONFallbackRemediationUsesSanitizer(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	line := `{"event":"blocked","request_id":"req-sanitize-hint","url":"https://api.vendor.example/?ref=example","scanner":"dlp","reason":"DLP match: test (critical)"}` + "\n"
+	if err := os.WriteFile(logPath, []byte(line), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+	cfgPath := writeConfig(t, `
+mode: balanced
+dlp:
+  patterns:
+    - name: Fallback Hint Redaction Guard
+      regex: "Add the destination host"
+      severity: critical
+`)
+
+	out, err := runExplainCmd(t, "event", "req-sanitize-hint", "--config", cfgPath, "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	var report explainEventReport
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("decode JSON: %v\n%s", err, out)
+	}
+	if report.RemediationHint != explainEventRedacted {
+		t.Fatalf("fallback remediation hint = %q, want %q", report.RemediationHint, explainEventRedacted)
+	}
+	if strings.Contains(out, "Add the destination host") {
+		t.Fatalf("JSON output leaked unsanitized fallback hint:\n%s", out)
+	}
+}
+
+func TestExplainEventCmd_RedactsSecretBearingAuditFields(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	secret := fakeExplainEventGitHubToken()
+	line := map[string]any{
+		"event":            "blocked",
+		"request_id":       "req-secret",
+		"url":              "https://user:pass@api.vendor.example/v1/keys?model=ok&token=" + secret + "#fragment",
+		"scanner":          "dlp",
+		"reason":           "DLP match leaked " + secret,
+		"pattern_name":     secret,
+		"remediation_hint": "rotate " + secret,
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-secret", "--log", logPath)
+	if err != nil {
+		t.Fatalf("explain event failed: %v\n%s", err, out)
+	}
+	for _, leaked := range []string{secret, "user:pass", "#fragment"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("text output leaked %q:\n%s", leaked, out)
+		}
+	}
+	if !strings.Contains(out, "[redacted") {
+		t.Fatalf("text output did not show redaction marker:\n%s", out)
+	}
+
+	out, err = runExplainCmd(t, "event", "req-secret", "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	for _, leaked := range []string{secret, "user:pass", "#fragment"} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("JSON output leaked %q:\n%s", leaked, out)
+		}
+	}
+}
+
+func TestExplainEventCmd_RedactsUsingActiveConfigDLPPatterns(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	cfgPath := writeConfig(t, `
+mode: balanced
+dlp:
+  patterns:
+    - name: Custom Audit Token
+      regex: "custom-leak-[a-z]{8}"
+      severity: critical
+`)
+	secret := "custom-leak-abcdefgh"
+	line := map[string]any{
+		"event":            "blocked",
+		"request_id":       "req-custom-dlp",
+		"url":              "https://api.vendor.example/callback?note=" + secret + "&state=public",
+		"scanner":          "dlp",
+		"reason":           "DLP match leaked " + secret,
+		"display_label":    secret,
+		"remediation_hint": "rotate " + secret,
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	for _, args := range [][]string{
+		{"event", "req-custom-dlp", "--config", cfgPath, "--log", logPath},
+		{"event", "req-custom-dlp", "--config", cfgPath, "--log", logPath, "--json"},
+	} {
+		out, err := runExplainCmd(t, args...)
+		if err != nil {
+			t.Fatalf("explain event failed for args %v: %v\n%s", args, err, out)
+		}
+		if strings.Contains(out, secret) {
+			t.Fatalf("output leaked active-config DLP value for args %v:\n%s", args, out)
+		}
+		if strings.Contains(out, "state=public") || !strings.Contains(out, "https://api.vendor.example") {
+			t.Fatalf("output should retain only destination context for args %v:\n%s", args, out)
+		}
+	}
+}
+
+func TestExplainEventCmd_RedactsTokenFamilyQueryParams(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	refreshValue := "short-refresh-" + "value"
+	idValue := "short-id-" + "value"
+	line := map[string]any{
+		"event":      "blocked",
+		"request_id": "req-token-family",
+		"url":        "https://api.vendor.example/oauth/callback?refresh_token=" + refreshValue + "&id_token=" + idValue + "&state=public",
+		"scanner":    "allowlist",
+		"reason":     "domain blocked",
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-token-family", "--log", logPath)
+	if err != nil {
+		t.Fatalf("explain event failed: %v\n%s", err, out)
+	}
+	for _, leaked := range []string{refreshValue, idValue} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("text output leaked token-family query value %q:\n%s", leaked, out)
+		}
+	}
+	if strings.Contains(out, "state=public") || !strings.Contains(out, "https://api.vendor.example") {
+		t.Fatalf("text output should retain only destination context:\n%s", out)
+	}
+
+	out, err = runExplainCmd(t, "event", "req-token-family", "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	for _, leaked := range []string{refreshValue, idValue} {
+		if strings.Contains(out, leaked) {
+			t.Fatalf("JSON output leaked token-family query value %q:\n%s", leaked, out)
+		}
+	}
+	if strings.Contains(out, "state=public") || !strings.Contains(out, "https://api.vendor.example") {
+		t.Fatalf("JSON output should retain only destination context:\n%s", out)
+	}
+}
+
+func TestExplainEventCmd_RedactsShortAuthorizationBearerAssignments(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	privateValue := "short-" + "bearer-" + "value"
+	line := map[string]any{
+		"event":            "blocked",
+		"request_id":       "req-short-bearer",
+		"scanner":          "dlp",
+		"reason":           "blocked upstream header Authorization: Bearer " + privateValue,
+		"remediation_hint": "rotate Bearer " + privateValue,
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-short-bearer", "--log", logPath)
+	if err != nil {
+		t.Fatalf("explain event failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, privateValue) {
+		t.Fatalf("text output leaked short bearer value:\n%s", out)
+	}
+
+	out, err = runExplainCmd(t, "event", "req-short-bearer", "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, privateValue) {
+		t.Fatalf("JSON output leaked short bearer value:\n%s", out)
+	}
+}
+
+func TestExplainEventCmd_RedactsRelativeTargetSecretQueryParams(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	privateValue := "short-" + "access-" + "value"
+	line := map[string]any{
+		"event":      "blocked",
+		"request_id": "req-relative-target",
+		"target":     "/oauth/callback?access_token=" + privateValue + "&state=public",
+		"scanner":    "allowlist",
+		"reason":     "domain blocked",
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-relative-target", "--log", logPath)
+	if err != nil {
+		t.Fatalf("explain event failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, privateValue) {
+		t.Fatalf("text output leaked relative target query value:\n%s", out)
+	}
+	if !strings.Contains(out, "state=public") {
+		t.Fatalf("text output should preserve non-sensitive query context:\n%s", out)
+	}
+
+	out, err = runExplainCmd(t, "event", "req-relative-target", "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, privateValue) {
+		t.Fatalf("JSON output leaked relative target query value:\n%s", out)
+	}
+	if !strings.Contains(out, "state=public") {
+		t.Fatalf("JSON output should preserve non-sensitive query context:\n%s", out)
+	}
+}
+
+func TestExplainEventCmd_KeepsPathDiagnosticTargetPath(t *testing.T) {
+	for _, tc := range []struct{ scanner, path string }{
+		{"path_traversal", "/files/../../etc/passwd"},
+		{"crlf_injection", "/files/%0d%0aSet-Cookie:x"},
+	} {
+		t.Run(tc.scanner, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "audit.log")
+			target := "https://api.vendor.example" + tc.path + "?ref=private#frag"
+			line := map[string]any{
+				"event":      "blocked",
+				"request_id": "req-path-diagnostic",
+				"url":        target,
+				"target":     target,
+				"scanner":    tc.scanner,
+				"reason":     "path diagnostic",
+			}
+			data, err := json.Marshal(line)
+			if err != nil {
+				t.Fatalf("marshal audit line: %v", err)
+			}
+			if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+				t.Fatalf("write audit log: %v", err)
+			}
+
+			for _, args := range [][]string{
+				{"event", "req-path-diagnostic", "--log", logPath},
+				{"event", "req-path-diagnostic", "--log", logPath, "--json"},
+			} {
+				out, err := runExplainCmd(t, args...)
+				if err != nil {
+					t.Fatalf("explain %v failed: %v\n%s", args, err, out)
+				}
+				if !strings.Contains(out, "https://api.vendor.example"+tc.path) {
+					t.Fatalf("explain %v dropped the path that carries the finding:\n%s", args, out)
+				}
+				if strings.Contains(out, "ref=private") || strings.Contains(out, "frag") {
+					t.Fatalf("explain %v kept query or fragment for a path-diagnostic event:\n%s", args, out)
+				}
+			}
+		})
+	}
+}
+
+func TestExplainEventCmd_TextEscapesControlCharacters(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	line := map[string]any{
+		"event":      "blocked",
+		"request_id": "req-control",
+		"scanner":    "dlp",
+		"reason":     "real reason\nFAKE: allowed\r\x1b[31mred",
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-control", "--log", logPath)
+	if err != nil {
+		t.Fatalf("explain event failed: %v\n%s", err, out)
+	}
+	for _, raw := range []string{"\nFAKE: allowed", "\r", "\x1b"} {
+		if strings.Contains(out, raw) {
+			t.Fatalf("text output contained raw control sequence %q:\n%q", raw, out)
+		}
+	}
+	if !strings.Contains(out, `\nFAKE: allowed`) || !strings.Contains(out, `\x1b`) {
+		t.Fatalf("text output did not render controls as escaped text:\n%q", out)
+	}
+}
+
+func TestExplainEventCmd_JSONEscapesUnicodeFormatControls(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	line := map[string]any{
+		"event":      "blocked",
+		"request_id": "req-bidi",
+		"scanner":    "dlp",
+		"reason":     "blocked \u202Eallowed",
+	}
+	data, err := json.Marshal(line)
+	if err != nil {
+		t.Fatalf("marshal audit line: %v", err)
+	}
+	if err := os.WriteFile(logPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatalf("write audit log: %v", err)
+	}
+
+	out, err := runExplainCmd(t, "event", "req-bidi", "--log", logPath, "--json")
+	if err != nil {
+		t.Fatalf("explain event JSON failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "\u202E") {
+		t.Fatalf("JSON output contained raw Unicode format control:\n%q", out)
+	}
+	if !strings.Contains(out, `\u202e`) {
+		t.Fatalf("JSON output did not render Unicode format control as escaped text:\n%q", out)
+	}
+}
+
+func TestExplainEventCmd_ErrorPaths(t *testing.T) {
+	tests := []struct {
+		name    string
+		args    []string
+		logBody string
+		wantErr string
+	}{
+		{
+			name:    "missing log flag",
+			args:    []string{"event", "req-1"},
+			wantErr: "audit log path required",
+		},
+		{
+			name:    "not found",
+			args:    []string{"event", "req-missing"},
+			logBody: `{"event":"allowed","request_id":"req-present"}` + "\n",
+			wantErr: "not found",
+		},
+		{
+			name:    "empty id",
+			args:    []string{"event", " "},
+			logBody: `{"event":"allowed","request_id":"req-present"}` + "\n",
+			wantErr: "event id cannot be empty",
+		},
+		{
+			name:    "unreadable log path",
+			args:    []string{"event", "req-1", "--log", filepath.Join(t.TempDir(), "does-not-exist.log")},
+			wantErr: "open audit log",
+		},
+		{
+			name:    "malformed skipped then found",
+			args:    []string{"event", "req-ok"},
+			logBody: "{not-json}\n" + `{"event":"allowed","request_id":"req-ok","status_code":200}` + "\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			args := append([]string(nil), tt.args...)
+			if tt.logBody != "" {
+				logPath := filepath.Join(t.TempDir(), "audit.log")
+				if err := os.WriteFile(logPath, []byte(tt.logBody), 0o600); err != nil {
+					t.Fatalf("write audit log: %v", err)
+				}
+				args = append(args, "--log", logPath)
+			}
+			out, err := runExplainCmd(t, args...)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v\n%s", err, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want substring %q\nout=%s", err, tt.wantErr, out)
+			}
+		})
+	}
+}
+
+func TestScanExplainEvent_BoundaryLongLineFailsClosedAsSkipped(t *testing.T) {
+	longLine := strings.Repeat("x", 1<<20+1)
+	lookup, err := scanExplainEvent(strings.NewReader(longLine), "req-1")
+	if err != nil {
+		t.Fatalf("scanExplainEvent long line returned hard error: %v", err)
+	}
+	if lookup.found {
+		t.Fatal("oversized malformed line must not match an event")
+	}
+	if lookup.skippedLines != 1 {
+		t.Fatalf("skippedLines = %d, want 1", lookup.skippedLines)
+	}
+}
+
+func TestScanExplainEvent_OversizedLineSkippedThenFound(t *testing.T) {
+	longLine := strings.Repeat("x", 1<<20+1)
+	body := longLine + "\n" + `{"event":"allowed","request_id":"req-after","status_code":200}` + "\n"
+	lookup, err := scanExplainEvent(strings.NewReader(body), "req-after")
+	if err != nil {
+		t.Fatalf("scanExplainEvent returned error: %v", err)
+	}
+	if !lookup.found {
+		t.Fatal("oversized malformed line must not hide later valid events")
+	}
+	if lookup.skippedLines != 1 {
+		t.Fatalf("skippedLines = %d, want 1", lookup.skippedLines)
+	}
+}
+
+func TestScanExplainEvent_PrefersRequestIDAcrossWholeLog(t *testing.T) {
+	body := strings.Join([]string{
+		`{"event":"blocked","event_id":"collision","scanner":"allowlist","reason":"wrong lower-priority event"}`,
+		`{"event":"blocked","request_id":"collision","scanner":"dlp","reason":"right request event"}`,
+		"",
+	}, "\n")
+	lookup, err := scanExplainEvent(strings.NewReader(body), "collision")
+	if err != nil {
+		t.Fatalf("scanExplainEvent returned error: %v", err)
+	}
+	if !lookup.found {
+		t.Fatal("expected event match")
+	}
+	if lookup.report.MatchedField != explainEventIDRequest {
+		t.Fatalf("matched field = %q, want %q", lookup.report.MatchedField, explainEventIDRequest)
+	}
+	if lookup.report.Reason != "right request event" {
+		t.Fatalf("reason = %q, want request_id event", lookup.report.Reason)
+	}
+}
+
+func TestQuickstartCmd_PrintsConcreteCommands(t *testing.T) {
+	cmd := quickstartCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("quickstart failed: %v", err)
+	}
+	got := out.String()
+	// These used to name configs/balanced.yaml, which ships only in a source
+	// clone, so this test required the walkthrough to hand a reader a file they
+	// did not have. The walkthrough now creates its own config first and every
+	// later step refers to that; see quickstart_test.go for the property tests.
+	want := []string{
+		"pipelock init --output ./pipelock.yaml",
+		"pipelock run --config ./pipelock.yaml",
+		"pipelock mcp proxy --config ./pipelock.yaml",
+		"pipelock status --config ./pipelock.yaml",
+	}
+	// The walkthrough is written in the syntax of the platform it prints on, so
+	// requiring a shell export line or a Unix install path unconditionally would
+	// fail this test on Windows, which the project publishes binaries for.
+	if runtime.GOOS == "windows" {
+		want = append(want, "set HTTPS_PROXY=http://127.0.0.1:8888")
+	} else {
+		want = append(want,
+			"pipelock install /usr/local/bin/pipelock",
+			"export HTTPS_PROXY=http://127.0.0.1:8888")
+	}
+	for _, want := range want {
+		if !strings.Contains(got, want) {
+			t.Fatalf("quickstart output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "<") || strings.Contains(got, ">") {
+		t.Fatalf("quickstart must not contain angle-bracket placeholders:\n%s", got)
+	}
+}
+
+func fakeExplainEventGitHubToken() string {
+	return "ghp_" + strings.Repeat("A", 36)
+}
+
+func TestJSONInspectionExplainHint(t *testing.T) {
+	cfg := config.Defaults()
+	sanitizer, err := newExplainEventSanitizer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := map[string]any{
+		"event": "body_dlp", "scanner": scanner.ScannerBodyDLP,
+		"patterns": []any{scanner.UninspectableJSONNumberPattern},
+	}
+	report := buildExplainEventReport(raw, "test", "request_id", sanitizer)
+	if !strings.Contains(report.RemediationHint, "Reduce nesting or number size") || strings.Contains(report.RemediationHint, "suppress") {
+		t.Fatalf("event hint = %q", report.RemediationHint)
+	}
+	remediation := explainRemediationFor(scanner.Result{Scanner: scanner.ScannerBodyDLP, Reason: "request body contains secret: " + scanner.UninspectableJSONNumberPattern})
+	if !remediation.Immutable || !strings.Contains(remediation.Knob, "Reduce nesting or number size") || strings.Contains(remediation.Knob, "suppress") {
+		t.Fatalf("explain remediation = %+v", remediation)
+	}
+}
+
+func TestRemediationNestedJSONInspectionKey(t *testing.T) {
+	sanitizer, err := newExplainEventSanitizer(config.Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{scanner.ScannerSSRF, scanner.ScannerDLP} {
+		t.Run(label, func(t *testing.T) {
+			reason := "SSRF blocked: 10.0.0.12 is an internal IP"
+			if label == scanner.ScannerDLP {
+				reason = "DLP match: Test credential (high)"
+			}
+			nested := fmt.Sprintf("nested URL in query parameter %q: %s", scanner.UninspectableJSONNumberPattern, reason)
+			report := buildExplainEventReport(map[string]any{"event": "blocked", "scanner": label, "reason": nested}, "test", "request_id", sanitizer)
+			baseline := scanner.OperatorHintForResult(label, reason)
+			remediation := explainRemediationFor(scanner.Result{Scanner: label, Reason: nested})
+			if baseline == "" || !strings.HasPrefix(report.RemediationHint, baseline) || remediation.Immutable || !strings.HasPrefix(remediation.Knob, baseline) {
+				t.Fatalf("event = %+v; remediation = %+v; want %q", report, remediation, baseline)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionExplainRequiresPatternIdentity(t *testing.T) {
+	sanitizer, err := newExplainEventSanitizer(config.Defaults())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fields := range []map[string]any{
+		{"patterns": []any{"prefix " + scanner.UninspectableJSONNumberPattern}},
+		{"patterns": []any{"ordinary, " + scanner.UninspectableJSONNumberPattern}},
+		{"pattern_name": scanner.UninspectableJSONNumberPattern + " suffix"},
+		{"display_label": scanner.UninspectableJSONNumberPattern},
+		{"reason": "client text mentions " + scanner.UninspectableJSONNumberPattern},
+	} {
+		fields["event"] = "body_dlp"
+		fields["scanner"] = scanner.ScannerBodyDLP
+		report := buildExplainEventReport(fields, "test", "request_id", sanitizer)
+		if report.RemediationHint != scanner.OperatorHintFor(scanner.ScannerBodyDLP) {
+			t.Fatalf("display text changed hint: %+v", report)
+		}
+	}
+	for _, field := range []string{"pattern_name", "pattern", "patterns", "findings"} {
+		raw := map[string]any{"event": "body_dlp", "scanner": scanner.ScannerBodyDLP, "reason": "other finding"}
+		raw[field] = scanner.UninspectableJSONNumberPattern
+		if field == "patterns" || field == "findings" {
+			raw[field] = []any{"ordinary", scanner.UninspectableJSONNumberPattern}
+		}
+		report := buildExplainEventReport(raw, "test", "request_id", sanitizer)
+		if !strings.Contains(report.RemediationHint, "limits are fixed") {
+			t.Fatalf("structured %s lost hint: %+v", field, report)
+		}
+	}
+}

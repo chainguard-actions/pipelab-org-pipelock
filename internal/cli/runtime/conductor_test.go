@@ -1,0 +1,1776 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package runtime
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor/applycache"
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor/auditbatcher"
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor/emergency"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/contract"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+func TestNewConductorMTLSClientConfiguresClientCertificate(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	trustPath := filepath.Join(dir, "trust-roster.json")
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, trustPath, []byte(`{"keys":[]}`))
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	client, err := newConductorMTLSClient(config.Conductor{
+		ConductorURL:    "https://conductor.example",
+		TrustRosterPath: trustPath,
+		ServerCAFile:    caPath,
+		ClientCertPath:  clientCertPath,
+		ClientKeyPath:   clientKeyPath,
+	})
+	if err != nil {
+		t.Fatalf("newConductorMTLSClient() error = %v", err)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig = nil, want mTLS config")
+	}
+	if transport.TLSClientConfig.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("MinVersion = %d, want TLS 1.3", transport.TLSClientConfig.MinVersion)
+	}
+	if len(transport.TLSClientConfig.Certificates) != 1 {
+		t.Fatalf("Certificates len = %d, want 1", len(transport.TLSClientConfig.Certificates))
+	}
+	if transport.TLSClientConfig.RootCAs == nil {
+		t.Fatal("RootCAs = nil; mTLS client must pin Boss server cert against roster, not system trust")
+	}
+	if transport.TLSClientConfig.ServerName != "conductor.example" {
+		t.Fatalf("ServerName = %q, want pinned host conductor.example", transport.TLSClientConfig.ServerName)
+	}
+	if transport.TLSHandshakeTimeout == 0 {
+		t.Fatal("TLSHandshakeTimeout = 0, want bounded handshake timeout")
+	}
+	if transport.ResponseHeaderTimeout == 0 {
+		t.Fatal("ResponseHeaderTimeout = 0, want bounded response header timeout")
+	}
+	if transport.MaxResponseHeaderBytes == 0 {
+		t.Fatal("MaxResponseHeaderBytes = 0, want explicit cap")
+	}
+}
+
+func TestNewConductorMTLSClientRejectsMissingClientCertificate(t *testing.T) {
+	dir := t.TempDir()
+	certPEM, _ := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	writePrivateTestFile(t, caPath, certPEM)
+
+	_, err := newConductorMTLSClient(config.Conductor{
+		ConductorURL:    "https://conductor.example",
+		TrustRosterPath: filepath.Join(t.TempDir(), "trust.json"),
+		ServerCAFile:    caPath,
+		ClientCertPath:  filepath.Join(t.TempDir(), "missing.crt"),
+		ClientKeyPath:   filepath.Join(t.TempDir(), "missing.key"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "mTLS client certificate") {
+		t.Fatalf("newConductorMTLSClient() = %v, want certificate load error", err)
+	}
+}
+
+func TestNewConductorMTLSClientRejectsMissingServerCABundle(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	_, err := newConductorMTLSClient(config.Conductor{
+		ConductorURL:    "https://conductor.example",
+		TrustRosterPath: filepath.Join(t.TempDir(), "trust.json"),
+		ServerCAFile:    filepath.Join(t.TempDir(), "missing.pem"),
+		ClientCertPath:  clientCertPath,
+		ClientKeyPath:   clientKeyPath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "server CA bundle") {
+		t.Fatalf("newConductorMTLSClient() = %v, want server CA bundle load error", err)
+	}
+}
+
+func TestNewConductorMTLSClientRejectsNonPEMServerCABundle(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	writePrivateTestFile(t, caPath, []byte("not a PEM bundle"))
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	_, err := newConductorMTLSClient(config.Conductor{
+		ConductorURL:    "https://conductor.example",
+		TrustRosterPath: filepath.Join(t.TempDir(), "trust.json"),
+		ServerCAFile:    caPath,
+		ClientCertPath:  clientCertPath,
+		ClientKeyPath:   clientKeyPath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "PEM-encoded certificates") {
+		t.Fatalf("newConductorMTLSClient() = %v, want PEM parse error", err)
+	}
+}
+
+// TestNewConductorMTLSClient_VerifiesAgainstPinnedRosterOnly is the "proves
+// the pin" test. Two test CAs sign two server certs. The follower's mTLS
+// client gets only one CA in its roster. A request to the matching server
+// succeeds; a request to the off-roster server is rejected at TLS verification
+// even though both certs are valid X.509 leaves with healthy chains.
+func TestNewConductorMTLSClient_VerifiesAgainstPinnedRosterOnly(t *testing.T) {
+	dir := t.TempDir()
+	pinnedCAPEM, pinnedServer := newTestTLSServer(t)
+	_, offRosterServer := newTestTLSServer(t)
+	defer pinnedServer.Close()
+	defer offRosterServer.Close()
+
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	writePrivateTestFile(t, caPath, pinnedCAPEM)
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	client, err := newConductorMTLSClient(config.Conductor{
+		ConductorURL:    pinnedServer.URL,
+		TrustRosterPath: filepath.Join(t.TempDir(), "trust.json"),
+		ServerCAFile:    caPath,
+		ClientCertPath:  clientCertPath,
+		ClientKeyPath:   clientKeyPath,
+	})
+	if err != nil {
+		t.Fatalf("newConductorMTLSClient() error = %v", err)
+	}
+
+	// Override ServerName because httptest servers bind 127.0.0.1 and the
+	// pinned-cert SAN below is also 127.0.0.1. The production code derives
+	// ServerName from the configured URL, so this test mirrors that path.
+	transport := client.Transport.(*http.Transport)
+	transport.TLSClientConfig.ServerName = mustHostname(t, pinnedServer.URL)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pinnedServer.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(pinned) error = %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("Do(pinned) error = %v; pinned-CA chain must validate", err)
+	}
+	_ = resp.Body.Close()
+
+	transport.TLSClientConfig.ServerName = mustHostname(t, offRosterServer.URL)
+	transport.CloseIdleConnections()
+	offReq, err := http.NewRequestWithContext(ctx, http.MethodGet, offRosterServer.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(off-roster) error = %v", err)
+	}
+	offResp, err := client.Do(offReq)
+	if err == nil {
+		_ = offResp.Body.Close()
+		t.Fatal("Do(off-roster) error = nil; off-roster CA must NOT be accepted")
+	}
+	if !strings.Contains(err.Error(), "unknown authority") &&
+		!strings.Contains(err.Error(), "x509") &&
+		!strings.Contains(err.Error(), "certificate") {
+		t.Fatalf("Do(off-roster) error = %v; want TLS verification error", err)
+	}
+}
+
+func TestConductorServerNameStripsPort(t *testing.T) {
+	got, err := conductorServerName("https://boss.example:8443")
+	if err != nil {
+		t.Fatalf("conductorServerName() error = %v", err)
+	}
+	if got != "boss.example" {
+		t.Fatalf("conductorServerName() = %q, want boss.example", got)
+	}
+}
+
+func TestBuildConductorTrustResolverLoadsPinnedRoster(t *testing.T) {
+	dir := t.TempDir()
+	remotePub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	rosterPath := filepath.Join(dir, "trust-roster.json")
+	rootFingerprint := writeRuntimeTrustRoster(t, rosterPath, remotePub, "remote-kill-1", signing.PurposeRemoteKillSigning)
+
+	resolver, err := buildConductorTrustResolver(config.Conductor{
+		TrustRosterPath:            rosterPath,
+		TrustRosterRootFingerprint: rootFingerprint,
+	}, func() time.Time { return time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC) })
+	if err != nil {
+		t.Fatalf("buildConductorTrustResolver() error = %v", err)
+	}
+	key, err := resolver("remote-kill-1")
+	if err != nil {
+		t.Fatalf("resolver(remote-kill-1) error = %v", err)
+	}
+	if key.KeyPurpose != signing.PurposeRemoteKillSigning {
+		t.Fatalf("KeyPurpose = %q, want %q", key.KeyPurpose, signing.PurposeRemoteKillSigning)
+	}
+	if !key.NotBefore.Equal(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)) || !key.NotAfter.IsZero() {
+		t.Fatalf("key windows = not_before=%s not_after=%s", key.NotBefore, key.NotAfter)
+	}
+	if string(key.PublicKey) != string(remotePub) {
+		t.Fatal("resolver returned wrong public key")
+	}
+	if _, err := resolver("missing"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("resolver(missing) error = %v, want ErrSignatureVerification", err)
+	}
+}
+
+func TestBuildConductorRemoteKillPollerHonorsDisableWithoutRoster(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	poller, err := buildConductorRemoteKillPoller(&config.Config{
+		Conductor: config.Conductor{
+			Enabled:               true,
+			ConductorURL:          "https://conductor.example",
+			OrgID:                 "org-main",
+			FleetID:               "prod",
+			InstanceID:            "pl-prod-1",
+			TrustRosterPath:       filepath.Join(dir, "missing-roster.json"),
+			ServerCAFile:          caPath,
+			ClientCertPath:        clientCertPath,
+			ClientKeyPath:         clientKeyPath,
+			BundleCacheDir:        filepath.Join(dir, "bundles"),
+			PollInterval:          "30s",
+			HonorRemoteKillSwitch: false,
+		},
+	}, &testRuntimeKillSwitch{}, nil)
+	if err != nil {
+		t.Fatalf("buildConductorRemoteKillPoller() error = %v", err)
+	}
+	if poller == nil {
+		t.Fatal("poller = nil, want disabled-mode poller for visible rejected messages")
+	}
+}
+
+// TestBuildConductorBundlePollerRejectsBadRosterEvenWithHonorFalse proves the
+// policy-bundle poller fails closed when the trust roster cannot be loaded,
+// REGARDLESS of honor_remote_kill_switch. Unlike the remote-kill poller (which
+// installs a reject-all resolver and keeps running when honor=false so it can
+// log visible rejections), the bundle poller must have a real verified trust
+// root before it can apply any signed bundle - so a missing/unreadable roster
+// is a hard startup error.
+func TestBuildConductorBundlePollerRejectsBadRosterEvenWithHonorFalse(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	s := &Server{}
+	_, err := s.buildConductorBundlePoller(&config.Config{
+		Conductor: config.Conductor{
+			Enabled:                    true,
+			ConductorURL:               "https://conductor.example",
+			OrgID:                      "org-main",
+			FleetID:                    "prod",
+			InstanceID:                 "pl-prod-1",
+			TrustRosterPath:            filepath.Join(dir, "missing-roster.json"),
+			TrustRosterRootFingerprint: strings.Repeat("a", 64),
+			ServerCAFile:               caPath,
+			ClientCertPath:             clientCertPath,
+			ClientKeyPath:              clientKeyPath,
+			BundleCacheDir:             filepath.Join(dir, "bundles"),
+			DurableAuditQueueDir:       filepath.Join(dir, "audit-queue"),
+			PollInterval:               "30s",
+			HonorRemoteKillSwitch:      false, // the crux: honor=false must NOT skip roster verification
+		},
+	}, io.Discard)
+	if err == nil {
+		t.Fatal("buildConductorBundlePoller() with honor=false + missing roster: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "trust resolver") && !strings.Contains(err.Error(), "trust roster") {
+		t.Fatalf("error = %v, want trust roster/resolver failure", err)
+	}
+}
+
+func TestBuildConductorAuditTransportReleasesQueueOnConstructorFailure(t *testing.T) {
+	dir := t.TempDir()
+	queueDir := filepath.Join(dir, "audit-queue")
+	queueKeyringPath := filepath.Join(dir, "secrets", "audit-queue-keyring.json")
+	keyring := writeTestQueueKeyring(t, queueKeyringPath)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	writePrivateTestFile(t, caPath, []byte("not a PEM bundle"))
+
+	cfg := &config.Config{
+		Conductor: config.Conductor{
+			Enabled:                  true,
+			ConductorURL:             "https://conductor.example",
+			ServerCAFile:             caPath,
+			ClientCertPath:           filepath.Join(dir, "missing-client.crt"),
+			ClientKeyPath:            filepath.Join(dir, "missing-client.key"),
+			DurableAuditQueueDir:     queueDir,
+			DurableAuditQueueKeyring: queueKeyringPath,
+		},
+	}
+	if _, _, err := buildConductorAuditTransport(cfg, nil); err == nil {
+		t.Fatal("buildConductorAuditTransport() error = nil, want mTLS constructor failure")
+	}
+	reopened, err := auditbatcher.Open(auditbatcher.Config{Dir: queueDir, Keyring: keyring})
+	if err != nil {
+		t.Fatalf("Open(queue after failed build) error = %v, want lock released", err)
+	}
+	defer func() { _ = reopened.Close() }()
+}
+
+func TestBuildConductorAuditTransportRejectsMissingQueueKeyring(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		Conductor: config.Conductor{
+			Enabled:                  true,
+			DurableAuditQueueDir:     filepath.Join(dir, "audit-queue"),
+			DurableAuditQueueKeyring: filepath.Join(dir, "missing-keyring.json"),
+		},
+	}
+	if _, _, err := buildConductorAuditTransport(cfg, nil); err == nil || !strings.Contains(err.Error(), "loading conductor audit queue keyring") {
+		t.Fatalf("buildConductorAuditTransport() error = %v, want missing keyring refusal", err)
+	}
+}
+
+func TestBuildConductorAuditTransportOpensPlaintextWhenQueueKeyringEmpty(t *testing.T) {
+	dir := t.TempDir()
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+	cfg := &config.Config{
+		Conductor: config.Conductor{
+			Enabled:                  true,
+			ConductorURL:             "https://conductor.example",
+			ServerCAFile:             filepath.Join(dir, "missing-ca.pem"),
+			DurableAuditQueueDir:     filepath.Join(dir, "audit-queue"),
+			DurableAuditQueueKeyring: "",
+		},
+	}
+	if _, _, err := buildConductorAuditTransport(cfg, nil); err == nil || strings.Contains(err.Error(), "queue keyring is required") {
+		t.Fatalf("buildConductorAuditTransport() error = %v, want later constructor failure after plaintext queue open", err)
+	}
+	gotLogs := logs.String()
+	if !strings.Contains(gotLogs, "level=WARN") ||
+		!strings.Contains(gotLogs, "conductor durable audit queue running unencrypted at rest") ||
+		!strings.Contains(gotLogs, "component=conductor_audit_queue") {
+		t.Fatalf("plaintext queue warning log = %q, want WARN unencrypted advisory", gotLogs)
+	}
+	// The plaintext-mode Open must actually have run: it lays down the private
+	// queue subdirectories. If the keyring check had blocked, these would not exist.
+	for _, sub := range []string{"pending", "inflight", "dead"} {
+		if _, statErr := os.Stat(filepath.Join(cfg.Conductor.DurableAuditQueueDir, sub)); statErr != nil {
+			t.Fatalf("plaintext queue subdir %q not created (Open did not run in plaintext mode): %v", sub, statErr)
+		}
+	}
+	reopened, err := auditbatcher.Open(auditbatcher.Config{
+		Dir:            cfg.Conductor.DurableAuditQueueDir,
+		AllowPlaintext: true,
+	})
+	if err != nil {
+		t.Fatalf("Open(queue after plaintext build) error = %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+}
+
+// TestBuildConductorBundlePollerDisabled confirms the poller is a no-op (nil,
+// nil) when conductor is not enabled.
+func TestBuildConductorBundlePollerDisabled(t *testing.T) {
+	s := &Server{}
+	poller, err := s.buildConductorBundlePoller(&config.Config{Conductor: config.Conductor{Enabled: false}}, io.Discard)
+	if err != nil {
+		t.Fatalf("disabled buildConductorBundlePoller() error = %v", err)
+	}
+	if poller != nil {
+		t.Fatal("disabled buildConductorBundlePoller() poller = non-nil, want nil")
+	}
+}
+
+// TestBuildConductorBundlePollerErrorPaths covers the remaining fail-closed
+// branches: an unreadable mTLS client certificate, and (with valid mTLS + a real
+// signed roster) an unparseable poll interval. The trust-resolver branch is
+// covered by TestBuildConductorBundlePollerRejectsBadRosterEvenWithHonorFalse.
+func TestBuildConductorBundlePollerErrorPaths(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	rosterPath := filepath.Join(dir, "trust-roster.json")
+	bundlePub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	rootFingerprint := writeRuntimeTrustRoster(t, rosterPath, bundlePub, "policy-signer-1", signing.PurposePolicyBundleSigning)
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+
+	base := config.Conductor{
+		Enabled:                    true,
+		ConductorURL:               "https://conductor.example",
+		OrgID:                      "org-main",
+		FleetID:                    "prod",
+		InstanceID:                 "pl-prod-1",
+		TrustRosterPath:            rosterPath,
+		TrustRosterRootFingerprint: rootFingerprint,
+		ServerCAFile:               caPath,
+		ClientCertPath:             clientCertPath,
+		ClientKeyPath:              clientKeyPath,
+		BundleCacheDir:             filepath.Join(dir, "bundles"),
+		DurableAuditQueueDir:       filepath.Join(dir, "audit-queue"),
+		PollInterval:               "30s",
+		HonorRemoteKillSwitch:      false,
+	}
+
+	t.Run("mtls_client_error", func(t *testing.T) {
+		cfg := base
+		cfg.ClientCertPath = filepath.Join(dir, "missing-client.crt")
+		s := &Server{}
+		if _, err := s.buildConductorBundlePoller(&config.Config{Conductor: cfg}, io.Discard); err == nil ||
+			!strings.Contains(err.Error(), "mTLS client") {
+			t.Fatalf("error = %v, want mTLS client failure", err)
+		}
+	})
+
+	t.Run("poll_interval_error", func(t *testing.T) {
+		cfg := base
+		cfg.PollInterval = "not-a-duration"
+		s := &Server{}
+		if _, err := s.buildConductorBundlePoller(&config.Config{Conductor: cfg}, io.Discard); err == nil ||
+			!strings.Contains(err.Error(), "parsing conductor policy bundle poll interval") {
+			t.Fatalf("error = %v, want poll interval parse failure", err)
+		}
+	})
+
+	t.Run("valid_builds_poller", func(t *testing.T) {
+		s := &Server{}
+		poller, err := s.buildConductorBundlePoller(&config.Config{Conductor: base}, nil)
+		if err != nil {
+			t.Fatalf("valid config: %v", err)
+		}
+		if poller == nil {
+			t.Fatal("poller = nil, want a poller for enabled conductor")
+		}
+	})
+}
+
+func TestBuildConductorRemoteKillPollerRejectsInvalidConfig(t *testing.T) {
+	dir := t.TempDir()
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+	base := config.Conductor{
+		Enabled:                    true,
+		ConductorURL:               "https://conductor.example",
+		OrgID:                      "org-main",
+		FleetID:                    "prod",
+		InstanceID:                 "pl-prod-1",
+		TrustRosterPath:            filepath.Join(dir, "missing-roster.json"),
+		TrustRosterRootFingerprint: strings.Repeat("a", 64),
+		ServerCAFile:               caPath,
+		ClientCertPath:             clientCertPath,
+		ClientKeyPath:              clientKeyPath,
+		BundleCacheDir:             filepath.Join(dir, "bundles"),
+		PollInterval:               "30s",
+		HonorRemoteKillSwitch:      false,
+	}
+	tests := []struct {
+		name string
+		edit func(*config.Conductor)
+		want string
+	}{
+		{
+			name: "mtls_client_error",
+			edit: func(c *config.Conductor) { c.ClientCertPath = filepath.Join(dir, "missing-client.crt") },
+			want: "loading conductor mTLS client certificate",
+		},
+		{
+			name: "trust_resolver_error",
+			edit: func(c *config.Conductor) { c.HonorRemoteKillSwitch = true },
+			want: "loading conductor trust roster",
+		},
+		{
+			name: "poll_interval_error",
+			edit: func(c *config.Conductor) { c.PollInterval = "not-a-duration" },
+			want: "parsing conductor remote kill poll interval",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			tc.edit(&cfg)
+			_, err := buildConductorRemoteKillPoller(&config.Config{Conductor: cfg}, &testRuntimeKillSwitch{}, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("buildConductorRemoteKillPoller() error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildConductorRemoteKillPollerRestoresPersistedState(t *testing.T) {
+	dir := t.TempDir()
+	trustPath := filepath.Join(dir, "trust-roster.json")
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	caPath := filepath.Join(dir, "boss-ca.pem")
+	clientCertPath := filepath.Join(dir, "client.crt")
+	clientKeyPath := filepath.Join(dir, "client.key")
+	bundleCacheDir := filepath.Join(dir, "bundles")
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+	statePath := filepath.Join(bundleCacheDir, "remote-kill-state.json")
+	if err := os.MkdirAll(bundleCacheDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(bundle cache): %v", err)
+	}
+	// Seed a properly signed, re-verifiable persisted kill (threshold = 2 signers
+	// in the roster the poller will build). A persisted decision is honored on
+	// restore only if its signed message re-verifies against the trust roster.
+	rootFingerprint, reason := seedSignedRemoteKillState(t, trustPath, statePath)
+	ks := &testRuntimeKillSwitch{}
+	poller, err := buildConductorRemoteKillPoller(&config.Config{
+		Conductor: config.Conductor{
+			Enabled:                    true,
+			ConductorURL:               "https://conductor.example",
+			OrgID:                      "org-main",
+			FleetID:                    "prod",
+			InstanceID:                 "pl-prod-1",
+			TrustRosterPath:            trustPath,
+			TrustRosterRootFingerprint: rootFingerprint,
+			ServerCAFile:               caPath,
+			ClientCertPath:             clientCertPath,
+			ClientKeyPath:              clientKeyPath,
+			BundleCacheDir:             bundleCacheDir,
+			PollInterval:               "30s",
+			HonorRemoteKillSwitch:      true,
+		},
+	}, ks, io.Discard)
+	if err != nil {
+		t.Fatalf("buildConductorRemoteKillPoller() error = %v", err)
+	}
+	if poller == nil {
+		t.Fatal("poller = nil")
+	}
+	if !ks.active || ks.message != reason {
+		t.Fatalf("kill switch = active=%v message=%q, want restored active", ks.active, ks.message)
+	}
+}
+
+// seedSignedRemoteKillState writes a 2-signer remote-kill trust roster to
+// trustPath and seeds a properly signed, re-verifiable persisted kill decision
+// at statePath (via the real Apply path, so the on-disk binding is correct). It
+// returns the roster root fingerprint and the kill reason. This mirrors what a
+// follower's on-disk state looks like after the Conductor signed and the
+// follower applied a real kill.
+func seedSignedRemoteKillState(t *testing.T, trustPath, statePath string) (rootFingerprint, reason string) {
+	t.Helper()
+	rootPub, rootPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey(root): %v", err)
+	}
+	pub1, priv1, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey(signer 1): %v", err)
+	}
+	pub2, priv2, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey(signer 2): %v", err)
+	}
+	rootFingerprint, err = signing.Fingerprint(rootPub)
+	if err != nil {
+		t.Fatalf("Fingerprint(root): %v", err)
+	}
+	body := contract.KeyRoster{
+		SchemaVersion:  1,
+		RosterSignedBy: "roster-root-1",
+		DataClassRoot:  string(contract.DataClassInternal),
+		Keys: []contract.KeyInfo{
+			{KeyID: "roster-root-1", KeyPurpose: signing.PurposeRosterRoot.String(), PublicKeyHex: hex.EncodeToString(rootPub), ValidFrom: "2026-01-01T00:00:00Z", Status: contract.KeyStatusRoot},
+			{KeyID: "remote-kill-1", KeyPurpose: signing.PurposeRemoteKillSigning.String(), PublicKeyHex: hex.EncodeToString(pub1), ValidFrom: "2026-01-01T00:00:00Z", Status: contract.KeyStatusActive},
+			{KeyID: "remote-kill-2", KeyPurpose: signing.PurposeRemoteKillSigning.String(), PublicKeyHex: hex.EncodeToString(pub2), ValidFrom: "2026-01-01T00:00:00Z", Status: contract.KeyStatusActive},
+		},
+	}
+	rosterPreimage, err := body.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage(roster): %v", err)
+	}
+	envelope := contract.RosterEnvelope{
+		Body:      body,
+		Signature: "ed25519:" + hex.EncodeToString(ed25519.Sign(rootPriv, rosterPreimage)),
+	}
+	rosterData, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal(roster): %v", err)
+	}
+	writePrivateTestFile(t, trustPath, rosterData)
+
+	reason = "persisted emergency stop"
+	seedNow := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	msg := conductor.RemoteKillMessage{
+		SchemaVersion: conductor.SchemaVersion,
+		MessageID:     "kill-runtime-1",
+		OrgID:         "org-main",
+		FleetID:       "prod",
+		Audience:      conductor.Audience{InstanceIDs: []string{"pl-prod-1"}},
+		State:         conductor.KillSwitchActive,
+		Counter:       7,
+		Reason:        reason,
+		CreatedAt:     seedNow,
+		NotBefore:     seedNow.Add(-time.Minute),
+		ExpiresAt:     seedNow.Add(time.Hour),
+	}
+	msgPreimage, err := msg.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage(kill): %v", err)
+	}
+	msg.Signatures = []conductor.SignatureProof{
+		{SignerKeyID: "remote-kill-1", KeyPurpose: signing.PurposeRemoteKillSigning, Algorithm: conductor.SignatureAlgorithmEd25519, Signature: conductor.SignaturePrefixEd25519 + hex.EncodeToString(ed25519.Sign(priv1, msgPreimage))},
+		{SignerKeyID: "remote-kill-2", KeyPurpose: signing.PurposeRemoteKillSigning, Algorithm: conductor.SignatureAlgorithmEd25519, Signature: conductor.SignaturePrefixEd25519 + hex.EncodeToString(ed25519.Sign(priv2, msgPreimage))},
+	}
+	resolver := func(keyID string) (conductor.SignatureKey, error) {
+		switch keyID {
+		case "remote-kill-1":
+			return conductor.SignatureKey{PublicKey: pub1, KeyPurpose: signing.PurposeRemoteKillSigning}, nil
+		case "remote-kill-2":
+			return conductor.SignatureKey{PublicKey: pub2, KeyPurpose: signing.PurposeRemoteKillSigning}, nil
+		default:
+			return conductor.SignatureKey{}, conductor.ErrSignatureVerification
+		}
+	}
+	if err := (&emergency.RemoteKillApplier{
+		OrgID:      "org-main",
+		FleetID:    "prod",
+		InstanceID: "pl-prod-1",
+		Resolver:   resolver,
+		KillSwitch: &testRuntimeKillSwitch{},
+		StatePath:  statePath,
+		Now:        func() time.Time { return seedNow },
+	}).Apply(msg); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	return rootFingerprint, reason
+}
+
+func TestConductorRuntimeChanged(t *testing.T) {
+	oldCfg := config.Defaults()
+	newCfg := oldCfg.Clone()
+	if conductorRuntimeChanged(oldCfg, newCfg) {
+		t.Fatal("conductorRuntimeChanged(equal) = true, want false")
+	}
+	newCfg.Conductor.Enabled = true
+	if !conductorRuntimeChanged(oldCfg, newCfg) {
+		t.Fatal("conductorRuntimeChanged(changed) = false, want true")
+	}
+
+	// A reload that tries to weaken stale-fail-closed (flip after_grace from the
+	// strict_deny_all default to continue_last_known_good) must be detected as a
+	// conductor-runtime change, so the reload path preserves the original
+	// conductor block instead of applying it. Conductor settings are restart-only;
+	// an operator cannot hot-reload their way out of stale fail-closed.
+	staleFlip := oldCfg.Clone()
+	staleFlip.Conductor.StalePolicy.AfterGrace = config.ConductorStaleContinueLastKnownGood
+	if !conductorRuntimeChanged(oldCfg, staleFlip) {
+		t.Fatal("conductorRuntimeChanged(after_grace flip) = false, want true (stale policy is restart-only)")
+	}
+	graceFlip := oldCfg.Clone()
+	graceFlip.Conductor.StalePolicy.GraceMultiplier = oldCfg.Conductor.StalePolicy.GraceMultiplier + 5
+	if !conductorRuntimeChanged(oldCfg, graceFlip) {
+		t.Fatal("conductorRuntimeChanged(grace_multiplier flip) = false, want true (stale policy is restart-only)")
+	}
+}
+
+func TestBuildConductorApplyCacheRejectsInvalidDir(t *testing.T) {
+	if cache, err := buildConductorApplyCache(nil); err != nil || cache != nil {
+		t.Fatalf("buildConductorApplyCache(nil) = cache=%v err=%v, want nil nil", cache, err)
+	}
+	cfg := config.Defaults()
+	if cache, err := buildConductorApplyCache(cfg); err != nil || cache != nil {
+		t.Fatalf("buildConductorApplyCache(disabled) = cache=%v err=%v, want nil nil", cache, err)
+	}
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "cache-file")
+	if err := os.WriteFile(filePath, []byte("not a dir"), 0o600); err != nil {
+		t.Fatalf("write cache file path: %v", err)
+	}
+	cfg.Conductor.Enabled = true
+	cfg.Conductor.BundleCacheDir = filePath
+	if _, err := buildConductorApplyCache(cfg); err == nil || !strings.Contains(err.Error(), "opening conductor apply cache") {
+		t.Fatalf("buildConductorApplyCache(file dir) = %v, want wrapped cache error", err)
+	}
+}
+
+// TestNewServer_WiresConductorBundlePoller proves the policy-bundle poller is
+// constructed and stored on the Server when conductor.enabled with a valid
+// signed roster, so server_lifecycle launches its poll loop alongside the audit
+// transport and remote-kill poller.
+func TestNewServer_WiresConductorBundlePoller(t *testing.T) {
+	s, _ := newConductorApplyTestServer(t)
+	if s.conductorBundle == nil {
+		t.Fatal("conductor policy-bundle poller should be wired when conductor.enabled")
+	}
+}
+
+func TestApplyConductorPolicyBundleReloadsAndActivates(t *testing.T) {
+	s, signer := newConductorApplyTestServer(t)
+	s.containmentManaged = true
+	oldCfg := s.proxy.CurrentConfig()
+	oldCfg.FetchProxy.Listen = "127.0.0.1:18897"
+	oldCfg.ForwardProxy.Enabled = true
+	sniOn := true
+	oldCfg.ForwardProxy.SNIVerification = &sniOn
+	oldCfg.ForwardProxy.SNIRequireTLS = &sniOn
+	oldCfg.WebSocketProxy.Enabled = true
+	oldCfg.MCPInputScanning.Enabled = true
+	oldCfg.MCPToolScanning.Enabled = true
+	oldCfg.MCPToolPolicy.Enabled = true
+	oldCfg.MCPToolPolicy.Rules = append(oldCfg.MCPToolPolicy.Rules, config.ToolPolicyRule{
+		Name:        "deny-shell",
+		ToolPattern: `(?i)\b(sh|bash)\b`,
+		Action:      config.ActionBlock,
+	})
+	oldCfg.DLP.Patterns = []config.DLPPattern{{Name: "local-secret", Regex: `LOCAL_SECRET_[A-Z]+`, Severity: config.SeverityHigh}}
+	oldCfg.ResponseScanning.Enabled = true
+	oldCfg.ResponseScanning.Action = config.ActionBlock
+	oldCfg.ResponseScanning.Patterns = []config.ResponseScanPattern{{Name: "local-response", Regex: `IGNORE_ALL_PREVIOUS_INSTRUCTIONS`}}
+	oldCfg.RequestBodyScanning.Enabled = true
+	oldCfg.RequestBodyScanning.Action = config.ActionBlock
+	oldCfg.Suppress = []config.SuppressEntry{{Rule: "local-fp", Path: "/safe/*", Reason: "local false positive"}}
+	oldCfg.TrustedDomains = []string{"local-fixture.internal"}
+	oldCfg.SSRF.IPAllowlist = []string{"192.0.2.0/24"}
+	oldCfg.FetchProxy.Monitoring.MaxReqPerMinute = 12
+	oldCfg.FetchProxy.Monitoring.MaxDataPerMinute = 4096
+	oldCfg.FetchProxy.Monitoring.Blocklist = []string{"blocked.local"}
+	oldCfg.SessionProfiling.Enabled = true
+	oldCfg.AdaptiveEnforcement.Enabled = true
+	oldCfg.MCPSessionBinding.Enabled = true
+	oldCfg.A2AScanning.Enabled = true
+	oldCfg.A2AScanning.Action = config.ActionBlock
+	oldCfg.A2AScanning.RequireSignedAgentCards = true
+	oldCfg.A2AScanning.TrustedAgentCardKeys = []config.A2ATrustedCardKey{{
+		KeyID:          "follower-agent-card",
+		PublicKey:      hex.EncodeToString(signer.pub),
+		AllowedOrigins: []string{"https://agent.vendor.example"},
+	}}
+	oldCfg.ToolChainDetection.Enabled = true
+	oldCfg.CrossRequestDetection.Enabled = true
+	oldCfg.CrossRequestDetection.Action = config.ActionBlock
+	oldCfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	oldCfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 512
+	oldCfg.CrossRequestDetection.EntropyBudget.Action = config.ActionBlock
+	oldCfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	oldCfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 8192
+	oldCfg.AddressProtection.Enabled = true
+	oldCfg.AddressProtection.Action = config.ActionBlock
+	oldCfg.AddressProtection.UnknownAction = config.ActionBlock
+	oldCfg.FlightRecorder.RequireReceipts = true
+	oldCfg.MCPBinaryIntegrity.Enabled = true
+	oldCfg.MCPBinaryIntegrity.ManifestPath = "/etc/pipelock/mcp-integrity.json"
+	oldCfg.MCPBinaryIntegrity.RequireSignature = true
+	oldCfg.MCPBinaryIntegrity.TrustedSigner = "follower-release"
+	// Non-default values for the remaining inputs, so the whole-struct
+	// comparison below can actually detect them being cleared. Left at their
+	// zero values they would compare equal either way and prove nothing.
+	oldCfg.MCPBinaryIntegrity.SignaturePath = "/etc/pipelock/mcp-integrity.json.sig"
+	oldCfg.MCPBinaryIntegrity.Keystore = "/var/lib/pipelock/mcp-keystore"
+	oldCfg.MediationEnvelope.VerifyInbound.Enabled = true
+	oldCfg.MediationEnvelope.VerifyInbound.TrustList = []config.MediationEnvelopeTrustedKey{{
+		KeyID:     "follower-mediator",
+		PublicKey: hex.EncodeToString(signer.pub),
+	}}
+	requireIntermediate := true
+	oldCfg.LicenseRequireIntermediate = &requireIntermediate
+	oldCfg.LicenseRequireIntermediateResolved = true
+	oldCfg.FileSentry.Enabled = true
+	oldCfg.FileSentry.Action = config.ActionWarn // block is refused on the server listener; warn is the state a live follower can carry
+	oldCfg.FileSentry.WatchPaths = []config.WatchPath{{Path: "/tmp/pipelock-watch"}}
+	oldCfg.BrowserShield.Enabled = true
+	oldCfg.BrowserShield.Strictness = config.ShieldStrictnessAggressive
+	oldCfg.BrowserShield.OversizeAction = config.ShieldOversizeBlock
+	oldCfg.Agents = map[string]config.AgentProfile{"local-agent": {Mode: config.ModeStrict, APIAllowlist: []string{"agent-api.example.com"}}}
+	oldCfg.DefaultAgentIdentity = "local-agent"
+	oldCfg.BindDefaultAgentIdentity = true
+	oldCfg.Emit.Syslog.Address = "udp://127.0.0.1:1514"
+	oldCfg.Sandbox.Enabled = true
+	oldCfg.Sandbox.Workspace = "/tmp/pipelock-sandbox"
+	oldCfg.LicenseFile = "/etc/pipelock/license.token"
+	oldCfg.MetricsListen = "192.0.2.20:19090"
+	oldCfg.Containment.MetricsExposure = &config.ContainmentMetricsExposure{
+		AllowFullMetrics:   true,
+		AllowedSourceCIDRs: []string{"192.0.2.42/32"},
+		Owner:              "observability",
+		Reason:             "Prometheus scrape",
+		ExpiresAt:          "2099-01-01T00:00:00Z",
+	}
+	bundleDLP := config.DLPPattern{Name: "bundle-secret", Regex: `BUNDLE_SECRET_[A-Z]+`, Severity: config.SeverityCritical}
+	oldCfg.ApplyDefaults()
+	expectedLocal := oldCfg.Clone()
+	rules.MergeIntoConfig(expectedLocal, cliutil.Version)
+	expectedWithBundleDLP := oldCfg.Clone()
+	expectedWithBundleDLP.DLP.Patterns = append(expectedWithBundleDLP.DLP.Patterns, bundleDLP)
+	rules.MergeIntoConfig(expectedWithBundleDLP, cliutil.Version)
+
+	// Enforcement-only bundle: policy bundles may carry only enforcement-policy
+	// sections (default-deny allowlist), so flight_recorder/conductor/etc. are
+	// NOT included here. The follower's existing flight_recorder + conductor
+	// config and locally enabled scanner baseline must survive the reload for
+	// the apply to succeed.
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-1", 1, "", strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.example.com",
+		"dlp:",
+		"  include_defaults: false",
+		"  patterns:",
+		"    - name: " + bundleDLP.Name,
+		"      regex: " + strconv.Quote(bundleDLP.Regex),
+		"      severity: " + bundleDLP.Severity,
+		"",
+	}, "\n"))
+
+	applied, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+	if err != nil {
+		t.Fatalf("ApplyConductorPolicyBundle() error = %v", err)
+	}
+	if applied.Bundle.BundleID != "bundle-1" || applied.ReloadedConfigHash == "" {
+		t.Fatalf("applied bundle = %q hash=%q, want bundle-1 with config hash", applied.Bundle.BundleID, applied.ReloadedConfigHash)
+	}
+	cache, _ := s.conductorApply.(*applycache.Cache)
+	if cache == nil {
+		t.Fatalf("conductorApply: want *applycache.Cache, got %T", s.conductorApply)
+	}
+	active, err := cache.Active()
+	if err != nil {
+		t.Fatalf("Active() error = %v", err)
+	}
+	if active.Bundle.BundleID != "bundle-1" || active.ConfigPath != applied.ConfigPath {
+		t.Fatalf("active bundle = %q path=%q, want bundle-1 path=%q", active.Bundle.BundleID, active.ConfigPath, applied.ConfigPath)
+	}
+	live := s.proxy.CurrentConfig()
+	if live == nil || live.Mode != config.ModeStrict {
+		t.Fatalf("live mode = %v, want strict", live)
+	}
+	for _, tt := range []struct {
+		name string
+		got  bool
+	}{
+		{"forward_proxy", live.ForwardProxy.Enabled},
+		{"websocket_proxy", live.WebSocketProxy.Enabled},
+		{"mcp_input_scanning", live.MCPInputScanning.Enabled},
+		{"mcp_tool_scanning", live.MCPToolScanning.Enabled},
+		{"mcp_tool_policy", live.MCPToolPolicy.Enabled},
+		{"adaptive_enforcement", live.AdaptiveEnforcement.Enabled},
+		{"mcp_session_binding", live.MCPSessionBinding.Enabled},
+		{"a2a_scanning", live.A2AScanning.Enabled},
+		{"tool_chain_detection", live.ToolChainDetection.Enabled},
+		{"cross_request_detection", live.CrossRequestDetection.Enabled},
+		{"address_protection", live.AddressProtection.Enabled},
+	} {
+		if !tt.got {
+			t.Fatalf("%s was disabled by enforcement-only conductor bundle", tt.name)
+		}
+	}
+	if live.FetchProxy.Listen != oldCfg.FetchProxy.Listen {
+		t.Fatalf("fetch_proxy.listen = %q, want preserved %q", live.FetchProxy.Listen, oldCfg.FetchProxy.Listen)
+	}
+	if live.LicenseFile != oldCfg.LicenseFile {
+		t.Fatalf("license_file = %q, want preserved %q", live.LicenseFile, oldCfg.LicenseFile)
+	}
+	if live.Emit.Syslog.Address != oldCfg.Emit.Syslog.Address {
+		t.Fatalf("emit.syslog.address = %q, want preserved %q", live.Emit.Syslog.Address, oldCfg.Emit.Syslog.Address)
+	}
+	if live.MetricsListen != oldCfg.MetricsListen || !reflect.DeepEqual(live.Containment, oldCfg.Containment) {
+		t.Fatalf("containment metrics config = listen %q containment=%+v, want listen %q containment=%+v",
+			live.MetricsListen, live.Containment, oldCfg.MetricsListen, oldCfg.Containment)
+	}
+	if s.containmentMetricsDenied.Load() {
+		t.Fatal("valid preserved containment metrics policy left metrics denied")
+	}
+	for _, required := range []struct {
+		name string
+		got  bool
+	}{
+		{"flight_recorder.require_receipts", live.FlightRecorder.RequireReceipts},
+		{"a2a_scanning.require_signed_agent_cards", live.A2AScanning.Enabled && live.A2AScanning.RequireSignedAgentCards},
+		{"mcp_binary_integrity.require_signature", live.MCPBinaryIntegrity.Enabled && live.MCPBinaryIntegrity.RequireSignature},
+		{"mediation_envelope.verify_inbound.enabled", live.MediationEnvelope.VerifyInbound.Enabled},
+		{"license_require_intermediate", live.LicenseRequireIntermediateResolved},
+		{"forward_proxy.sni_require_tls", live.ForwardProxy.SNIVerificationEnabled() && live.ForwardProxy.SNIRequireTLSEnabled()},
+	} {
+		t.Run(required.name, func(t *testing.T) {
+			if !required.got {
+				t.Fatalf("enforcement-only conductor bundle cleared follower-local %s", required.name)
+			}
+		})
+	}
+	// The booleans above are necessary and not sufficient. Each one gates a
+	// check whose MEANING comes from local trust material, so a bundle that
+	// left every flag true while clearing the keys, the manifest path, or the
+	// inbound trust list would pass the loop and still change who is
+	// authorized, or deny everything. Assert the material itself.
+	if !reflect.DeepEqual(live.A2AScanning.TrustedAgentCardKeys, oldCfg.A2AScanning.TrustedAgentCardKeys) {
+		t.Fatalf("a2a trusted agent card keys = %+v, want preserved %+v",
+			live.A2AScanning.TrustedAgentCardKeys, oldCfg.A2AScanning.TrustedAgentCardKeys)
+	}
+	// Whole struct, not a chosen pair of fields: naming two inputs leaves a
+	// reload free to clear SignaturePath or Keystore while the assertion still
+	// passes, which is the same subset problem this block was added to fix.
+	if !reflect.DeepEqual(live.MCPBinaryIntegrity, oldCfg.MCPBinaryIntegrity) {
+		t.Fatalf("mcp binary integrity = %+v, want preserved %+v",
+			live.MCPBinaryIntegrity, oldCfg.MCPBinaryIntegrity)
+	}
+	if !reflect.DeepEqual(live.MediationEnvelope.VerifyInbound, oldCfg.MediationEnvelope.VerifyInbound) {
+		t.Fatalf("mediation inbound verification = %+v, want preserved %+v",
+			live.MediationEnvelope.VerifyInbound, oldCfg.MediationEnvelope.VerifyInbound)
+	}
+	if !reflect.DeepEqual(live.Sandbox, oldCfg.Sandbox) {
+		t.Fatalf("sandbox config = %+v, want preserved %+v", live.Sandbox, oldCfg.Sandbox)
+	}
+	if !reflect.DeepEqual(live.DLP, expectedWithBundleDLP.DLP) {
+		t.Fatalf("dlp config = %+v, want local plus bundle-added %+v", live.DLP, expectedWithBundleDLP.DLP)
+	}
+	if !reflect.DeepEqual(live.ResponseScanning, expectedLocal.ResponseScanning) {
+		t.Fatalf("response_scanning = %+v, want preserved %+v", live.ResponseScanning, expectedLocal.ResponseScanning)
+	}
+	if !reflect.DeepEqual(live.RequestBodyScanning, oldCfg.RequestBodyScanning) {
+		t.Fatalf("request_body_scanning = %+v, want preserved %+v", live.RequestBodyScanning, oldCfg.RequestBodyScanning)
+	}
+	if !reflect.DeepEqual(live.Suppress, oldCfg.Suppress) {
+		t.Fatalf("suppress = %+v, want preserved %+v", live.Suppress, oldCfg.Suppress)
+	}
+	if !reflect.DeepEqual(live.TrustedDomains, oldCfg.TrustedDomains) {
+		t.Fatalf("trusted_domains = %+v, want preserved %+v", live.TrustedDomains, oldCfg.TrustedDomains)
+	}
+	if !reflect.DeepEqual(live.SSRF, oldCfg.SSRF) {
+		t.Fatalf("ssrf = %+v, want preserved %+v", live.SSRF, oldCfg.SSRF)
+	}
+	if !reflect.DeepEqual(live.FetchProxy.Monitoring, oldCfg.FetchProxy.Monitoring) {
+		t.Fatalf("fetch_proxy.monitoring = %+v, want preserved %+v", live.FetchProxy.Monitoring, oldCfg.FetchProxy.Monitoring)
+	}
+	if !reflect.DeepEqual(live.CrossRequestDetection, oldCfg.CrossRequestDetection) {
+		t.Fatalf("cross_request_detection = %+v, want preserved %+v", live.CrossRequestDetection, oldCfg.CrossRequestDetection)
+	}
+	if !reflect.DeepEqual(live.AddressProtection, oldCfg.AddressProtection) {
+		t.Fatalf("address_protection = %+v, want preserved %+v", live.AddressProtection, oldCfg.AddressProtection)
+	}
+	if !reflect.DeepEqual(live.FileSentry, oldCfg.FileSentry) {
+		t.Fatalf("file_sentry = %+v, want preserved %+v", live.FileSentry, oldCfg.FileSentry)
+	}
+	if !reflect.DeepEqual(live.BrowserShield, oldCfg.BrowserShield) {
+		t.Fatalf("browser_shield = %+v, want preserved %+v", live.BrowserShield, oldCfg.BrowserShield)
+	}
+	if !reflect.DeepEqual(live.Agents, oldCfg.Agents) ||
+		live.DefaultAgentIdentity != oldCfg.DefaultAgentIdentity ||
+		live.BindDefaultAgentIdentity != oldCfg.BindDefaultAgentIdentity {
+		t.Fatalf("agent identity config = agents=%+v default=%q bind=%v, want agents=%+v default=%q bind=%v",
+			live.Agents, live.DefaultAgentIdentity, live.BindDefaultAgentIdentity,
+			oldCfg.Agents, oldCfg.DefaultAgentIdentity, oldCfg.BindDefaultAgentIdentity)
+	}
+	sc := s.proxy.ScannerPtr().Load()
+	if sc == nil {
+		t.Fatal("reloaded scanner is nil")
+	}
+	if result := sc.ScanTextForDLP(t.Context(), "exfil LOCAL_SECRET_ALPHA"); result.Clean {
+		t.Fatalf("local DLP pattern did not enforce after conductor apply: %+v", result)
+	}
+	if result := sc.ScanTextForDLP(t.Context(), "exfil BUNDLE_SECRET_BRAVO"); result.Clean {
+		t.Fatalf("bundle-added DLP pattern did not enforce after conductor apply: %+v", result)
+	}
+}
+
+func TestApplyConductorPolicyBundleRejectsConflictingDLPRedefinition(t *testing.T) {
+	s, signer := newConductorApplyTestServer(t)
+	oldCfg := s.proxy.CurrentConfig()
+	oldCfg.DLP.Patterns = []config.DLPPattern{{Name: "local-secret", Regex: `LOCAL_SECRET_[A-Z]+`, Severity: config.SeverityHigh}}
+	oldCfg.ApplyDefaults()
+	oldLive := s.proxy.CurrentConfig()
+	oldScanner := s.proxy.ScannerPtr().Load()
+
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-conflict", 1, "", strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.example.com",
+		"dlp:",
+		"  patterns:",
+		"    - name: local-secret",
+		"      regex: " + strconv.Quote(`BUNDLE_SECRET_[A-Z]+`),
+		"      severity: " + config.SeverityHigh,
+		"",
+	}, "\n"))
+
+	_, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+	if err == nil || !strings.Contains(err.Error(), `cannot redefine local dlp.patterns item "local-secret"`) {
+		t.Fatalf("ApplyConductorPolicyBundle() error = %v, want DLP conflict rejection", err)
+	}
+	if s.proxy.CurrentConfig() != oldLive {
+		t.Fatal("conflicting bundle changed live config")
+	}
+	if s.proxy.ScannerPtr().Load() != oldScanner {
+		t.Fatal("conflicting bundle changed live scanner")
+	}
+}
+
+func TestApplyConductorPolicyBundleRejectsUnenforcedConcurrentToolLimit(t *testing.T) {
+	s, signer := newConductorApplyTestServer(t)
+	oldLive := s.proxy.CurrentConfig()
+	oldScanner := s.proxy.ScannerPtr().Load()
+
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-reserved-concurrency", 1, "", strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.example.com",
+		"",
+	}, "\n"))
+	bundle.Payload.ConfigYAML = strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.example.com",
+		"agents:",
+		"  _default:",
+		"    budget:",
+		"      max_concurrent_tool_calls: 3",
+		"",
+	}, "\n")
+	payloadHash, err := bundle.Payload.PayloadHash()
+	if err != nil {
+		t.Fatalf("PayloadHash() error = %v", err)
+	}
+	bundle.PayloadSHA256 = payloadHash
+	bundle = signRuntimePolicyBundle(t, signer, bundle)
+
+	_, err = s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+	if err == nil {
+		t.Fatal("ApplyConductorPolicyBundle accepted max_concurrent_tool_calls")
+	}
+	// Agent profiles are follower-local and not permitted in signed policy
+	// bundles, so the whole agents section must fail before config loading can
+	// reach the reserved-field validator.
+	for _, want := range []string{"config section not permitted", `"agents"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("ApplyConductorPolicyBundle error = %q, want substring %q", err, want)
+		}
+	}
+	if s.proxy.CurrentConfig() != oldLive {
+		t.Fatal("rejected concurrency bundle changed live config")
+	}
+	if s.proxy.ScannerPtr().Load() != oldScanner {
+		t.Fatal("rejected concurrency bundle changed live scanner")
+	}
+}
+
+func TestApplyConductorPolicyBundleAuthenticatesBeforeConfigValidation(t *testing.T) {
+	forbiddenYAML := strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.example.com",
+		"agents:",
+		"  _default:",
+		"    budget:",
+		"      max_concurrent_tool_calls: 3",
+		"",
+	}, "\n")
+
+	t.Run("signature before config validation", func(t *testing.T) {
+		s, signer := newConductorApplyTestServer(t)
+		bundle := signedRuntimePolicyBundle(t, signer, "bundle-tampered-config", 1, "", strings.Join([]string{
+			"mode: strict",
+			"api_allowlist:",
+			"  - api.example.com",
+			"",
+		}, "\n"))
+		bundle.Payload.ConfigYAML = forbiddenYAML
+		payloadHash, err := bundle.Payload.PayloadHash()
+		if err != nil {
+			t.Fatalf("PayloadHash() error = %v", err)
+		}
+		bundle.PayloadSHA256 = payloadHash
+
+		_, err = s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+		if !errors.Is(err, conductor.ErrSignatureVerification) {
+			t.Fatalf("ApplyConductorPolicyBundle(tampered config) error = %v, want ErrSignatureVerification", err)
+		}
+		if strings.Contains(err.Error(), "config section not permitted") {
+			t.Fatalf("ApplyConductorPolicyBundle(tampered config) reached config validation before signature verification: %v", err)
+		}
+	})
+
+	t.Run("payload hash before config validation", func(t *testing.T) {
+		s, signer := newConductorApplyTestServer(t)
+		bundle := signedRuntimePolicyBundle(t, signer, "bundle-tampered-hash", 1, "", strings.Join([]string{
+			"mode: strict",
+			"api_allowlist:",
+			"  - api.example.com",
+			"",
+		}, "\n"))
+		bundle.Payload.ConfigYAML = forbiddenYAML
+		bundle.PayloadSHA256 = strings.Repeat("0", 64)
+		bundle = signRuntimePolicyBundle(t, signer, bundle)
+
+		_, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+		if !errors.Is(err, conductor.ErrHashMismatch) {
+			t.Fatalf("ApplyConductorPolicyBundle(tampered payload hash) error = %v, want ErrHashMismatch", err)
+		}
+		if strings.Contains(err.Error(), "config section not permitted") {
+			t.Fatalf("ApplyConductorPolicyBundle(tampered payload hash) reached config validation before payload verification: %v", err)
+		}
+	})
+}
+
+func TestApplyConductorPolicyBundlePreservesReloadDowngradeGuardAfterAdditiveMerge(t *testing.T) {
+	s, signer := newConductorApplyTestServer(t)
+	oldCfg := s.proxy.CurrentConfig()
+	oldCfg.Mode = config.ModeStrict
+	oldCfg.DLP.Patterns = []config.DLPPattern{{Name: "local-secret", Regex: `LOCAL_SECRET_[A-Z]+`, Severity: config.SeverityHigh}}
+	oldCfg.ApplyDefaults()
+	oldLive := s.proxy.CurrentConfig()
+	oldScanner := s.proxy.ScannerPtr().Load()
+
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-downgrade", 1, "", strings.Join([]string{
+		"mode: balanced",
+		"api_allowlist:",
+		"  - api.example.com",
+		"dlp:",
+		"  patterns:",
+		"    - name: bundle-secret",
+		"      regex: " + strconv.Quote(`BUNDLE_SECRET_[A-Z]+`),
+		"      severity: " + config.SeverityHigh,
+		"",
+	}, "\n"))
+
+	_, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+	if err == nil || !strings.Contains(err.Error(), "security downgrade from strict mode") {
+		t.Fatalf("ApplyConductorPolicyBundle() error = %v, want reload downgrade rejection", err)
+	}
+	if s.proxy.CurrentConfig() != oldLive {
+		t.Fatal("downgrade bundle changed live config")
+	}
+	if s.proxy.ScannerPtr().Load() != oldScanner {
+		t.Fatal("downgrade bundle changed live scanner")
+	}
+}
+
+func TestApplyConductorPolicyBundleWithBundleResolutionErrorPreservesCoverage(t *testing.T) {
+	xdgDataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", xdgDataHome)
+	installServerTestStandardBundle(t, xdgDataHome, true)
+
+	s, signer := newConductorApplyTestServer(t)
+	requireBundlePatternSelected(t, s.proxy.CurrentConfig().DLP.Patterns, s.proxy.CurrentConfig().ResponseScanning.Patterns)
+	if err := os.Remove(filepath.Join(xdgDataHome, "pipelock", "rules", rules.StandardBundleName, "bundle.lock")); err != nil {
+		t.Fatalf("remove standard bundle lock: %v", err)
+	}
+
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-with-broken-rules-dir", 1, "", strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.example.com",
+		"",
+	}, "\n"))
+	if _, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()}); err != nil {
+		t.Fatalf("valid conductor apply should preserve local bundle coverage and reload despite rules-dir error: %v", err)
+	}
+	requireBundlePatternSelected(t, s.proxy.CurrentConfig().DLP.Patterns, s.proxy.CurrentConfig().ResponseScanning.Patterns)
+}
+
+func TestApplyConductorPolicyBundleFailsClosed(t *testing.T) {
+	if _, err := (*Server)(nil).ApplyConductorPolicyBundle(conductor.PolicyBundle{}, ConductorApplyOptions{}); err == nil {
+		t.Fatal("nil server ApplyConductorPolicyBundle() = nil, want error")
+	}
+	if _, err := (&Server{}).ApplyConductorPolicyBundle(conductor.PolicyBundle{}, ConductorApplyOptions{}); !errors.Is(err, applycache.ErrCacheRequired) {
+		t.Fatalf("missing cache ApplyConductorPolicyBundle() = %v, want ErrCacheRequired", err)
+	}
+	cache, err := applycache.Open(applycache.Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("applycache.Open(): %v", err)
+	}
+	if _, err := (&Server{conductorApply: cache}).ApplyConductorPolicyBundle(conductor.PolicyBundle{}, ConductorApplyOptions{}); err == nil || !strings.Contains(err.Error(), "runtime config unavailable") {
+		t.Fatalf("missing config ApplyConductorPolicyBundle() = %v, want runtime config error", err)
+	}
+}
+
+// TestNewServerRejectsCachedPolicyWhenLocalVersionCannotVerifyItsMinimum
+// reproduces a process restart with a durable policy cache. A follower must not
+// rebuild its base policy and admit traffic merely because the cache's active
+// record is structurally intact: the restarted binary must establish that it
+// can still satisfy the cached policy's minimum before the listener can start.
+func TestNewServerRejectsCachedPolicyWhenLocalVersionCannotVerifyItsMinimum(t *testing.T) {
+	s, signer := newConductorApplyTestServer(t)
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-restart-minimum", 1, "", strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.vendor.example",
+		"",
+	}, "\n"))
+	bundle.MinPipelockVersion = "1.0.0"
+	bundle = signRuntimePolicyBundle(t, signer, bundle)
+	if _, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()}); err != nil {
+		t.Fatalf("ApplyConductorPolicyBundle: %v", err)
+	}
+
+	cache, _ := s.conductorApply.(*applycache.Cache)
+	before, err := cache.Active()
+	if err != nil {
+		t.Fatalf("cache.Active before restart: %v", err)
+	}
+	s.cleanup()
+
+	previousVersion := cliutil.Version
+	cliutil.Version = "0.0.0-dev.unknown"
+	t.Cleanup(func() { cliutil.Version = previousVersion })
+
+	restarted, err := NewServer(ServerOpts{ConfigFile: s.opts.ConfigFile, Stdout: &syncBuffer{}, Stderr: &syncBuffer{}})
+	if restarted != nil {
+		t.Cleanup(restarted.cleanup)
+	}
+	if !errors.Is(err, applycache.ErrUnsupportedMinVersion) {
+		t.Fatalf("NewServer with unverifiable cached policy minimum = %v, want ErrUnsupportedMinVersion", err)
+	}
+
+	after, err := cache.Active()
+	if err != nil {
+		t.Fatalf("cache.Active after rejected restart: %v", err)
+	}
+	if after.BundleHash != before.BundleHash || after.Bundle.Version != before.Bundle.Version {
+		t.Fatalf("active bundle after rejected restart = hash %q version %d, want preserved hash %q version %d", after.BundleHash, after.Bundle.Version, before.BundleHash, before.Bundle.Version)
+	}
+}
+
+func TestNewServerRecoversVerifiedCachedPolicyBeforeAdmission(t *testing.T) {
+	s, signer := newConductorApplyTestServer(t)
+	bundle := signedRuntimePolicyBundle(t, signer, "bundle-restart-recovery", 1, "", strings.Join([]string{
+		"mode: strict",
+		"api_allowlist:",
+		"  - api.vendor.example",
+		"",
+	}, "\n"))
+	if _, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()}); err != nil {
+		t.Fatalf("ApplyConductorPolicyBundle: %v", err)
+	}
+	cache, _ := s.conductorApply.(*applycache.Cache)
+	before, err := cache.Active()
+	if err != nil {
+		t.Fatalf("cache.Active before restart: %v", err)
+	}
+	s.cleanup()
+
+	restarted, err := NewServer(ServerOpts{ConfigFile: s.opts.ConfigFile, Stdout: &syncBuffer{}, Stderr: &syncBuffer{}})
+	if err != nil {
+		t.Fatalf("NewServer with verified cached policy: %v", err)
+	}
+	t.Cleanup(restarted.cleanup)
+	if live := restarted.proxy.CurrentConfig(); live == nil || live.Mode != config.ModeStrict {
+		t.Fatalf("restarted live mode = %v, want strict cached policy", live)
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url=https%3A%2F%2Funapproved.vendor.example", nil)
+	rec := httptest.NewRecorder()
+	restarted.proxy.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("cached strict policy request status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+
+	after, err := cache.Active()
+	if err != nil {
+		t.Fatalf("cache.Active after recovery: %v", err)
+	}
+	if after.BundleHash != before.BundleHash || after.Bundle.Version != before.Bundle.Version {
+		t.Fatalf("active bundle after recovery = hash %q version %d, want preserved hash %q version %d", after.BundleHash, after.Bundle.Version, before.BundleHash, before.Bundle.Version)
+	}
+}
+
+func TestNewServerRecoversExpiredCachedPolicyWithStaleAdmission(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		expiredAgo time.Duration
+		afterGrace string
+		wantStatus int
+	}{
+		{"within grace", time.Minute, config.ConductorStaleStrictDenyAll, http.StatusForbidden},
+		{"strict after grace", 4 * time.Minute, config.ConductorStaleStrictDenyAll, http.StatusServiceUnavailable},
+		{"continue after grace", 4 * time.Minute, config.ConductorStaleContinueLastKnownGood, http.StatusForbidden},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			s, signer := newConductorApplyTestServer(t)
+			bundle := signedRuntimePolicyBundle(t, signer, "bundle-restart-stale", 1, "", "mode: strict\napi_allowlist:\n  - api.vendor.example\n")
+			bundle.ExpiresAt = time.Now().UTC().Add(-tt.expiredAgo)
+			bundle.NotBefore = bundle.ExpiresAt.Add(-2 * time.Minute)
+			bundle.CreatedAt = bundle.NotBefore
+			bundle = signRuntimePolicyBundle(t, signer, bundle)
+			cache, _ := s.conductorApply.(*applycache.Cache)
+			_, err := (applycache.Boundary{
+				Cache: cache, Identity: applycache.Identity{OrgID: "org-main", FleetID: "prod", InstanceID: "pl-prod-1"},
+				Resolver: signer.resolver(), LocalVersion: cliutil.Version,
+				Now:    func() time.Time { return bundle.NotBefore.Add(time.Second) },
+				Reload: func(cfg *config.Config) error { return s.reloadConductorPolicyBundle(cfg, bundle.Payload.ConfigYAML) },
+			}).Apply(bundle, applycache.ApplyOptions{})
+			if err != nil {
+				t.Fatalf("seed policy before expiry: %v", err)
+			}
+			s.cleanup()
+			data, err := os.ReadFile(s.opts.ConfigFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const section = "conductor:\n"
+			if strings.Count(string(data), section) != 1 {
+				t.Fatal("fixture must contain one conductor section")
+			}
+			updated := strings.Replace(string(data), section, section+"  stale_policy:\n    grace_multiplier: 1\n    after_grace: "+tt.afterGrace+"\n", 1)
+			writePrivateTestFile(t, s.opts.ConfigFile, []byte(updated))
+			restarted, err := NewServer(ServerOpts{ConfigFile: s.opts.ConfigFile, Stdout: &syncBuffer{}, Stderr: &syncBuffer{}})
+			if err != nil {
+				t.Fatalf("restart with expired cached policy: %v", err)
+			}
+			t.Cleanup(restarted.cleanup)
+			if restarted.proxy.CurrentConfig().Mode != config.ModeStrict {
+				t.Fatal("restart did not restore strict policy")
+			}
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url=https%3A%2F%2Funapproved.vendor.example", nil)
+			rec := httptest.NewRecorder()
+			restarted.proxy.Handler().ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status before listener admission = %d, want %d: %s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestRecoverActiveConductorPolicySkipsDisabledConductor(t *testing.T) {
+	s := &Server{cfg: &config.Config{}}
+	if err := s.recoverActiveConductorPolicy(); err != nil {
+		t.Fatalf("recoverActiveConductorPolicy() with conductor disabled: %v", err)
+	}
+}
+
+func TestRecoverActiveConductorPolicyRefusesUnavailableState(t *testing.T) {
+	t.Run("nil runtime", func(t *testing.T) {
+		var s *Server
+		if err := s.recoverActiveConductorPolicy(); err == nil {
+			t.Fatal("nil runtime recovery succeeded")
+		}
+	})
+	t.Run("entitlement teardown", func(t *testing.T) {
+		s := &Server{}
+		s.conductorDown.Store(true)
+		if err := s.recoverActiveConductorPolicy(); !errors.Is(err, applycache.ErrEntitlementLost) {
+			t.Fatalf("recovery after teardown = %v, want ErrEntitlementLost", err)
+		}
+	})
+	t.Run("missing config", func(t *testing.T) {
+		if err := (&Server{}).recoverActiveConductorPolicy(); err == nil {
+			t.Fatal("recovery without runtime config succeeded")
+		}
+	})
+	t.Run("missing cache", func(t *testing.T) {
+		s := &Server{cfg: &config.Config{Conductor: config.Conductor{Enabled: true}}}
+		if err := s.recoverActiveConductorPolicy(); !errors.Is(err, applycache.ErrCacheRequired) {
+			t.Fatalf("recovery without cache = %v, want ErrCacheRequired", err)
+		}
+	})
+	t.Run("proxy config fallback still requires cache", func(t *testing.T) {
+		parent, _ := newConductorApplyTestServer(t)
+		s := &Server{proxy: parent.proxy}
+		if err := s.recoverActiveConductorPolicy(); !errors.Is(err, applycache.ErrCacheRequired) {
+			t.Fatalf("proxy config fallback = %v, want ErrCacheRequired", err)
+		}
+	})
+	for _, fault := range []string{"substituted config", "unreadable roster", "missing enforcer"} {
+		t.Run(fault, func(t *testing.T) {
+			s, signer := newConductorApplyTestServer(t)
+			bundle := signedRuntimePolicyBundle(t, signer, "bundle-recovery-state", 1, "", "mode: strict\napi_allowlist:\n  - api.vendor.example\n")
+			applied, err := s.ApplyConductorPolicyBundle(bundle, ConductorApplyOptions{Resolver: signer.resolver()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := s.currentConfig()
+			activePath := filepath.Join(cfg.Conductor.BundleCacheDir, "active.json")
+			before, err := os.ReadFile(filepath.Clean(activePath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var want string
+			switch fault {
+			case "substituted config":
+				writePrivateTestFile(t, applied.ConfigPath, []byte("mode: balanced\n"))
+				want = "cached config does not match"
+			case "unreadable roster":
+				writePrivateTestFile(t, cfg.Conductor.TrustRosterPath, []byte("{"))
+				want = "building conductor recovery trust resolver"
+			case "missing enforcer":
+				s.conductorStale = nil
+				want = "requires the stale-policy enforcer"
+			}
+			if err := s.recoverActiveConductorPolicy(); err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("recovery with %s = %v, want %q", fault, err, want)
+			}
+			after, err := os.ReadFile(filepath.Clean(activePath))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("failed recovery replaced durable active state: %v", err)
+			}
+		})
+	}
+}
+
+type runtimePolicySigner struct {
+	id   string
+	pub  ed25519.PublicKey
+	priv ed25519.PrivateKey
+}
+
+func newRuntimePolicySigner(t *testing.T) runtimePolicySigner {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("ed25519.GenerateKey() error = %v", err)
+	}
+	return runtimePolicySigner{id: "policy-signer-1", pub: pub, priv: priv}
+}
+
+func (s runtimePolicySigner) resolver() conductor.SignatureKeyResolver {
+	return func(signerKeyID string) (conductor.SignatureKey, error) {
+		if signerKeyID != s.id {
+			return conductor.SignatureKey{}, conductor.ErrSignatureVerification
+		}
+		return conductor.SignatureKey{
+			PublicKey:  s.pub,
+			KeyPurpose: signing.PurposePolicyBundleSigning,
+			NotBefore:  time.Now().Add(-time.Hour),
+			NotAfter:   time.Now().Add(time.Hour),
+		}, nil
+	}
+}
+
+func newConductorApplyTestServer(t *testing.T) (*Server, runtimePolicySigner) {
+	t.Helper()
+	return newConductorApplyTestServerWithConfig(t, "")
+}
+
+func newConductorApplyTestServerWithConfig(t *testing.T, extraConfig string) (*Server, runtimePolicySigner) {
+	t.Helper()
+	// conductor.enabled triggers the fleet-license gate; install a real
+	// Enterprise token for the test so the production gate path is exercised.
+	setTestFleetLicense(t)
+	// This serial fixture models a released follower. Restore after server
+	// cleanup so other runtime tests retain the unstamped development version.
+	previousVersion := cliutil.Version
+	cliutil.Version = "1.0.0"
+	t.Cleanup(func() { cliutil.Version = previousVersion })
+	tmp, err := os.MkdirTemp(".", ".runtime-conductor-apply-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
+	tmp, err = filepath.Abs(tmp)
+	if err != nil {
+		t.Fatalf("Abs: %v", err)
+	}
+	_, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	keyPath := filepath.Join(tmp, "recorder.key")
+	if err := signing.SavePrivateKey(priv, keyPath); err != nil {
+		t.Fatalf("SavePrivateKey: %v", err)
+	}
+	clientPEM, clientKeyPEM := testTLSClientCert(t)
+	trustPath := filepath.Join(tmp, "trust-roster.json")
+	caPath := filepath.Join(tmp, "boss-ca.pem")
+	clientCertPath := filepath.Join(tmp, "client.crt")
+	clientKeyPath := filepath.Join(tmp, "client.key")
+	queueKeyringPath := filepath.Join(tmp, "secrets", "audit-queue-keyring.json")
+	// A real signed roster is mandatory whenever conductor.enabled, independent
+	// of honor_remote_kill_switch: the policy-bundle poller must verify signed
+	// bundles against a pinned trust root before applying them.
+	bundleSigner := newRuntimePolicySigner(t)
+	rootFingerprint := writeRuntimeTrustRoster(t, trustPath, bundleSigner.pub, bundleSigner.id, signing.PurposePolicyBundleSigning)
+	writePrivateTestFile(t, caPath, clientPEM)
+	writePrivateTestFile(t, clientCertPath, clientPEM)
+	writePrivateTestFile(t, clientKeyPath, clientKeyPEM)
+	writeTestQueueKeyring(t, queueKeyringPath)
+
+	recorderDir := filepath.Join(tmp, "recorder")
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"flight_recorder:",
+		"  enabled: true",
+		"  dir: " + strconv.Quote(recorderDir),
+		"  checkpoint_interval: 1",
+		"  sign_checkpoints: true",
+		"  signing_key_path: " + strconv.Quote(keyPath),
+		"conductor:",
+		"  enabled: true",
+		"  conductor_url: https://conductor.example",
+		"  org_id: org-main",
+		"  fleet_id: prod",
+		"  instance_id: pl-prod-1",
+		"  trust_roster_path: " + strconv.Quote(trustPath),
+		"  trust_roster_root_fingerprint: " + strconv.Quote(rootFingerprint),
+		"  server_ca_file: " + strconv.Quote(caPath),
+		"  client_cert_path: " + strconv.Quote(clientCertPath),
+		"  client_key_path: " + strconv.Quote(clientKeyPath),
+		"  bundle_cache_dir: " + strconv.Quote(filepath.Join(tmp, "bundles")),
+		"  durable_audit_queue_dir: " + strconv.Quote(filepath.Join(tmp, "audit-queue")),
+		"  durable_audit_queue_keyring: " + strconv.Quote(queueKeyringPath),
+		"  audit_signing_key_id: audit-key-1",
+		"  recorder_key_id: recorder-key-1",
+		"  honor_remote_kill_switch: false",
+		extraConfig,
+		"",
+	}, "\n"))
+
+	buf := &syncBuffer{}
+	server, err := NewServer(ServerOpts{ConfigFile: cfgPath, Stdout: buf, Stderr: buf})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(func() { server.cleanup() })
+	if server.conductorApply == nil {
+		t.Fatal("conductor apply cache should be initialized")
+	}
+	return server, bundleSigner
+}
+
+func signedRuntimePolicyBundle(t *testing.T, signer runtimePolicySigner, id string, version uint64, previousHash, configYAML string) conductor.PolicyBundle {
+	t.Helper()
+	now := time.Now().UTC()
+	payload := conductor.PolicyBundlePayload{ConfigYAML: configYAML}
+	payloadHash, err := payload.PayloadHash()
+	if err != nil {
+		t.Fatalf("PayloadHash() error = %v", err)
+	}
+	policyHash, err := payload.PolicyHash()
+	if err != nil {
+		t.Fatalf("PolicyHash() error = %v", err)
+	}
+	bundle := conductor.PolicyBundle{
+		SchemaVersion:      conductor.SchemaVersion,
+		BundleID:           id,
+		OrgID:              "org-main",
+		FleetID:            "prod",
+		Environment:        "prod",
+		Audience:           conductor.Audience{InstanceIDs: []string{"pl-prod-1"}},
+		Version:            version,
+		PreviousBundleHash: previousHash,
+		CreatedAt:          now.Add(-time.Minute),
+		NotBefore:          now.Add(-time.Minute),
+		ExpiresAt:          now.Add(time.Hour),
+		MinPipelockVersion: "0.0.1",
+		PolicyHash:         policyHash,
+		PayloadSHA256:      payloadHash,
+		Payload:            payload,
+	}
+	return signRuntimePolicyBundle(t, signer, bundle)
+}
+
+func signRuntimePolicyBundle(t *testing.T, signer runtimePolicySigner, bundle conductor.PolicyBundle) conductor.PolicyBundle {
+	t.Helper()
+	preimage, err := bundle.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage() error = %v", err)
+	}
+	bundle.Signatures = []conductor.SignatureProof{{
+		SignerKeyID: signer.id,
+		KeyPurpose:  signing.PurposePolicyBundleSigning,
+		Algorithm:   conductor.SignatureAlgorithmEd25519,
+		Signature:   conductor.SignaturePrefixEd25519 + hex.EncodeToString(ed25519.Sign(signer.priv, preimage)),
+	}}
+	return bundle
+}
+
+func mustHostname(t *testing.T, raw string) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("url.Parse(%s) error = %v", raw, err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		t.Fatalf("url %s has no host", raw)
+	}
+	return host
+}
+
+type testRuntimeKillSwitch struct {
+	active  bool
+	message string
+}
+
+func (t *testRuntimeKillSwitch) SetConductorRemote(active bool, message string) {
+	t.active = active
+	t.message = message
+}
+
+func writeRuntimeTrustRoster(t *testing.T, path string, pub ed25519.PublicKey, keyID string, purpose signing.KeyPurpose) string {
+	t.Helper()
+	rootPub, rootPriv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey(root): %v", err)
+	}
+	rootFingerprint, err := signing.Fingerprint(rootPub)
+	if err != nil {
+		t.Fatalf("Fingerprint(root): %v", err)
+	}
+	body := contract.KeyRoster{
+		SchemaVersion:  1,
+		RosterSignedBy: "roster-root-1",
+		DataClassRoot:  string(contract.DataClassInternal),
+		Keys: []contract.KeyInfo{
+			{
+				KeyID:        "roster-root-1",
+				KeyPurpose:   signing.PurposeRosterRoot.String(),
+				PublicKeyHex: hex.EncodeToString(rootPub),
+				ValidFrom:    "2026-01-01T00:00:00Z",
+				Status:       contract.KeyStatusRoot,
+			},
+			{
+				KeyID:        keyID,
+				KeyPurpose:   purpose.String(),
+				PublicKeyHex: hex.EncodeToString(pub),
+				ValidFrom:    "2026-01-01T00:00:00Z",
+				Status:       contract.KeyStatusActive,
+			},
+		},
+	}
+	preimage, err := body.SignablePreimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage(roster): %v", err)
+	}
+	envelope := contract.RosterEnvelope{
+		Body:      body,
+		Signature: "ed25519:" + hex.EncodeToString(ed25519.Sign(rootPriv, preimage)),
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal(roster): %v", err)
+	}
+	writePrivateTestFile(t, path, data)
+	return rootFingerprint
+}
+
+// newTestTLSServer builds a single-leaf CA + server cert, starts an httptest
+// server, and returns the CA PEM bundle plus the server. The CA is unique per
+// call so two servers can't reuse the same chain.
+func newTestTLSServer(t *testing.T) ([]byte, *httptest.Server) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey(ca) error = %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          mustSerial(t),
+		Subject:               pkix.Name{CommonName: "pipelock-test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate(ca) error = %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("ParseCertificate(ca) error = %v", err)
+	}
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("ecdsa.GenerateKey(leaf) error = %v", err)
+	}
+	leafTmpl := &x509.Certificate{
+		SerialNumber: mustSerial(t),
+		Subject:      pkix.Name{CommonName: "pipelock-test-boss"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		DNSNames:     []string{"localhost"},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, leafTmpl, caCert, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate(leaf) error = %v", err)
+	}
+	leafCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER})
+	leafKeyBytes, err := x509.MarshalECPrivateKey(leafKey)
+	if err != nil {
+		t.Fatalf("MarshalECPrivateKey() error = %v", err)
+	}
+	leafKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: leafKeyBytes})
+	leafCert, err := tls.X509KeyPair(leafCertPEM, leafKeyPEM)
+	if err != nil {
+		t.Fatalf("X509KeyPair(leaf) error = %v", err)
+	}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{
+		Certificates: []tls.Certificate{leafCert},
+		MinVersion:   tls.VersionTLS13,
+	}
+	srv.StartTLS()
+	return caPEM, srv
+}

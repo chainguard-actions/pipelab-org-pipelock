@@ -1,0 +1,250 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+pub const PREFIX_STATUS: &str = "VALID PREFIX, END UNPROVEN";
+
+use crate::types::{AuditPacketReport, ChainCommandReport, ChainSetReport, ReceiptReport};
+use crate::util::{Result, VerifierError};
+
+pub fn write_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|err| VerifierError::Runtime(format!("encode json: {err}")))?;
+    println!("{text}");
+    Ok(())
+}
+
+pub fn emit_audit_packet(report: &AuditPacketReport, json: bool) -> Result<()> {
+    if json {
+        return write_json(report);
+    }
+    let verdict = if report.verdict.is_empty() {
+        "(unset)"
+    } else {
+        report.verdict.as_str()
+    };
+    println!("Audit Packet:   {}", report.path);
+    println!("  schema:       {}", report.schema_check);
+    println!("  chain:        {}", report.chain_check);
+    println!("  cross-check:  {}", report.cross_check);
+    println!("  integrity:    {}", report.integrity);
+    println!("  end proof:    {}", report.end_proof.proven);
+    if report.lifecycle_assessment != "assessed" {
+        println!(
+            "  lifecycle:    not assessed ({})",
+            report
+                .lifecycle_assessment_reason
+                .as_deref()
+                .unwrap_or("chain re-verification did not complete")
+        );
+    } else {
+        println!(
+            "  lifecycle:    {} ({})",
+            report.lifecycle_status.as_deref().unwrap_or(""),
+            report.lifecycle_reason.as_deref().unwrap_or("")
+        );
+    }
+    println!("  verdict:      {verdict}");
+    println!("  status:       {}", report.status);
+    println!("  trusted:      {}", report.trusted);
+    println!("  receipts:     {}", report.summary.receipt_count);
+    if !report.run.provider.is_empty() {
+        println!("  provider:     {}", report.run.provider);
+    }
+    if let Some(repository) = &report.run.repository {
+        println!("  repository:   {repository}");
+    }
+    if let Some(sha) = &report.run.sha {
+        println!("  sha:          {sha}");
+    }
+    if !report.run.agent_identity.is_empty() {
+        println!("  agent:        {}", report.run.agent_identity);
+    }
+    if !report.posture.enforcement_mode.is_empty() {
+        println!("  enforcement:  {}", report.posture.enforcement_mode);
+    }
+    if !report.posture.unsupported_paths.is_empty() {
+        println!(
+            "  unsupported:  {}",
+            report.posture.unsupported_paths.join(", ")
+        );
+    }
+    if let Some(errors) = &report.errors {
+        for err in errors {
+            eprintln!("ERROR: {err}");
+        }
+    }
+    if let Some(warnings) = &report.warnings {
+        for warning in warnings {
+            eprintln!("WARN:  {warning}");
+        }
+    }
+    println!(
+        "  result:       {}",
+        if report.valid {
+            "VALID"
+        } else if report.status == PREFIX_STATUS {
+            PREFIX_STATUS
+        } else {
+            "INVALID"
+        }
+    );
+    Ok(())
+}
+
+pub fn emit_receipt(report: &ReceiptReport, json: bool) -> Result<()> {
+    if json {
+        return write_json(report);
+    }
+    if report.valid {
+        if report.unpinned == Some(true) {
+            println!("RECEIPT UNPINNED: {}", report.path);
+            if let Some(error) = &report.error {
+                println!("  warning:      {error}");
+            }
+        } else {
+            println!("RECEIPT VALID: {}", report.path);
+        }
+        println!(
+            "  action_id:    {}",
+            report.action_id.as_deref().unwrap_or("")
+        );
+        println!(
+            "  verdict:      {}",
+            report.verdict.as_deref().unwrap_or("")
+        );
+        println!(
+            "  transport:    {}",
+            report.transport.as_deref().unwrap_or("")
+        );
+        println!(
+            "  signer:       {}",
+            report.signer_key.as_deref().unwrap_or("")
+        );
+        println!(
+            "  policy_hash:  {}",
+            report.policy_hash.as_deref().unwrap_or("")
+        );
+        println!("  chain_seq:    {}", report.chain_seq.unwrap_or(0));
+        return Ok(());
+    }
+    if report.unpinned == Some(true) {
+        eprintln!("RECEIPT UNPINNED: {}", report.path);
+        if let Some(error) = &report.error {
+            eprintln!("  warning: {error}");
+        }
+        return Ok(());
+    }
+    eprintln!("RECEIPT INVALID: {}", report.path);
+    if let Some(error) = &report.error {
+        eprintln!("  error: {error}");
+    }
+    Ok(())
+}
+
+/// Writes the one-line reason a verification failed to stderr, in text and
+/// JSON mode alike, so no failing exit is silent.
+pub fn report_failure(reason: &str) {
+    eprintln!("verification failed: {}", reason.replace(['\r', '\n'], " "));
+}
+
+pub fn emit_chain(report: &ChainCommandReport, json: bool) -> Result<()> {
+    if json {
+        return write_json(report);
+    }
+    if report.valid {
+        if !report.end_proof.proven {
+            println!("{PREFIX_STATUS}: {}", report.path);
+        } else if report.unpinned == Some(true) {
+            println!("CHAIN UNPINNED: {}", report.path);
+        } else {
+            println!("CHAIN VALID: {}", report.path);
+        }
+        if report.unpinned == Some(true) {
+            println!(
+                "  warning:    {}",
+                report
+                    .error
+                    .as_deref()
+                    .unwrap_or(crate::signing::UNPINNED_RECEIPT_BANNER)
+            );
+        }
+        println!("  receipts:   {}", report.receipt_count);
+        if let (Some(action), Some(evidence)) = (report.action_receipts, report.evidence_receipts) {
+            println!("  by kind:    {action} action_receipt, {evidence} evidence_receipt");
+        }
+        println!("  final seq:  {}", report.final_seq);
+        println!(
+            "  root hash:  {}",
+            report.root_hash.as_deref().unwrap_or("")
+        );
+        return Ok(());
+    }
+    if report.unpinned == Some(true) {
+        eprintln!("CHAIN UNPINNED: {}", report.path);
+        if let Some(error) = &report.error {
+            eprintln!("  warning:    {error}");
+        }
+        return Ok(());
+    }
+    eprintln!("CHAIN BROKEN: {}", report.path);
+    if let Some(error) = &report.error {
+        eprintln!("  error:      {error}");
+    }
+    if let Some(seq) = report.broken_at_seq {
+        eprintln!("  broken at:  seq {seq}");
+    } else if report.error.is_some() {
+        eprintln!("  broken at:  seq unknown");
+    }
+    Ok(())
+}
+
+/// Prints each run's chain report, then the base's restart continuity in the
+/// same shape as the Go reference.
+pub fn emit_chain_set(report: &ChainSetReport, json: bool) -> Result<()> {
+    if json {
+        return write_json(report);
+    }
+    for chain in &report.chains {
+        emit_chain(&chain.report, false)?;
+    }
+    let c = &report.continuity;
+    let label = if c.healthy {
+        "RESTART CONTINUITY OK"
+    } else {
+        "RESTART CONTINUITY FAILED"
+    };
+    println!(
+        "{label}: base \"{}\": {} chain(s), {} linked, {} attested discontinuity(s), {} unlinked, {} finding(s)",
+        report.base,
+        c.chain_count,
+        c.linked.len(),
+        c.discontinuities.len(),
+        c.unlinked.len(),
+        c.findings.len()
+    );
+    for l in &c.linked {
+        println!(
+            "  linked:   {} continues {} at seq {} ({})",
+            l.session, l.predecessor_session, l.predecessor_tail_seq, l.trust
+        );
+    }
+    for discontinuity in &c.discontinuities {
+        println!(
+            "  discontinuity: {} continues {} across {} at byte {} (attested)",
+            discontinuity.session,
+            discontinuity.predecessor_session,
+            discontinuity.shard,
+            discontinuity.damage_offset
+        );
+    }
+    for s in &c.unlinked {
+        println!("  unlinked: {s}");
+    }
+    for f in &c.findings {
+        println!("  - {}: {}: {}", f.kind, f.session, f.detail);
+    }
+    println!("  Note: an unlinked run claims no predecessor. That is normal for a first run or concurrent runs,");
+    println!("  and it is also what a deleted link file looks like: this does not prove no run's evidence is missing.");
+    println!("  result:     {}", report.status.as_str());
+    Ok(())
+}

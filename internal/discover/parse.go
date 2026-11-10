@@ -1,0 +1,251 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package discover
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"gopkg.in/yaml.v3"
+)
+
+// rawServer is the JSON shape of a single MCP server entry across all clients.
+type rawServer struct {
+	Name      string            `json:"name" yaml:"name"`
+	Type      string            `json:"type"`
+	Command   string            `json:"command"`
+	Args      []string          `json:"args"`
+	Env       map[string]string `json:"env"`
+	URL       string            `json:"url"`
+	ServerURL string            `json:"serverUrl"` // Windsurf uses this
+	Headers   map[string]string `json:"headers"`
+}
+
+// UnmarshalJSON reads a server entry matching keys exactly. encoding/json
+// also accepts a case-variant key for a struct field ("Command" for
+// "command"), but the clients read these files with case-sensitive keys, so a
+// variant key they ignore must not shadow the one they run and make an
+// unwrapped server look wrapped.
+func (r *rawServer) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*r = rawServer{}
+	for key, target := range map[string]any{
+		"name":      &r.Name,
+		"type":      &r.Type,
+		"command":   &r.Command,
+		"args":      &r.Args,
+		"env":       &r.Env,
+		"url":       &r.URL,
+		"serverUrl": &r.ServerURL,
+		"headers":   &r.Headers,
+	} {
+		raw, present := fields[key]
+		if !present {
+			continue
+		}
+		if err := json.Unmarshal(raw, target); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseConfigFile reads a JSON config file and extracts MCP server entries
+// from the given top-level key (e.g., "mcpServers" or "servers").
+func parseConfigFile(path, key, client string) ([]MCPServer, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // paths are constructed from known config locations
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+
+	serversRaw, ok := raw[key]
+	if !ok {
+		return nil, nil // key not present, not an error
+	}
+
+	servers, err := parseServerMap(serversRaw, path, client)
+	if err != nil {
+		return nil, fmt.Errorf("parsing %s[%s]: %w", path, key, err)
+	}
+
+	return servers, nil
+}
+
+// parseContinueYAMLConfig reads Continue's YAML list-shaped mcpServers field.
+func parseContinueYAMLConfig(path string) ([]MCPServer, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	var document struct {
+		Servers []rawServer `yaml:"mcpServers"`
+	}
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	servers := make([]MCPServer, 0, len(document.Servers))
+	for index, rs := range document.Servers {
+		name := fmt.Sprintf("mcpServers[%d]", index)
+		// Continue's YAML schema requires name; preserve an observable entry
+		// rather than silently losing malformed input during discovery.
+		if rs.Name != "" {
+			name = rs.Name
+		}
+		// The JSON discovery contract emits args as an array; an omitted YAML
+		// list would otherwise decode to nil and serialize as null.
+		args := rs.Args
+		if args == nil {
+			args = []string{}
+		}
+		url := rs.URL
+		servers = append(servers, MCPServer{Client: "continue", ConfigPath: path, ServerName: name, Transport: inferTransport(rs, url), Command: rs.Command, Args: args, Env: rs.Env, URL: url})
+	}
+	return servers, nil
+}
+
+// parseClaudeCodeConfig handles Claude Code's nested structure where per-project
+// servers live under projects.<path>.mcpServers alongside global mcpServers.
+func parseClaudeCodeConfig(path string) ([]MCPServer, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // paths are constructed from known config locations
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
+	}
+
+	var servers []MCPServer
+
+	// Parse global mcpServers
+	if serversRaw, ok := raw[configKeyMCPServers]; ok {
+		global, err := parseServerMap(serversRaw, path, clientClaudeCode)
+		if err != nil {
+			return nil, fmt.Errorf("parsing %s[mcpServers]: %w", path, err)
+		}
+		servers = append(servers, global...)
+	}
+
+	// Parse per-project mcpServers, tagging each with its project path.
+	// Malformed entries emit a placeholder server with parse_warnings
+	// so operators know something was unreadable.
+	if projectsRaw, ok := raw["projects"]; ok {
+		var projects map[string]json.RawMessage
+		if err := json.Unmarshal(projectsRaw, &projects); err != nil {
+			servers = append(servers, MCPServer{
+				Client:        clientClaudeCode,
+				ConfigPath:    path,
+				ServerName:    "(projects)",
+				Transport:     TransportUnknown,
+				Args:          []string{},
+				ParseWarnings: []string{"projects key is not a valid object: " + err.Error()},
+			})
+			return servers, nil
+		}
+		for projPath, projRaw := range projects {
+			var proj map[string]json.RawMessage
+			if err := json.Unmarshal(projRaw, &proj); err != nil {
+				servers = append(servers, MCPServer{
+					Client:        clientClaudeCode,
+					ConfigPath:    path,
+					ProjectPath:   projPath,
+					ServerName:    "(malformed project)",
+					Transport:     TransportUnknown,
+					Args:          []string{},
+					ParseWarnings: []string{"project entry is not a valid object: " + err.Error()},
+				})
+				continue
+			}
+			if mcpRaw, ok := proj[configKeyMCPServers]; ok {
+				projServers, err := parseServerMap(mcpRaw, path, clientClaudeCode)
+				if err != nil {
+					servers = append(servers, MCPServer{
+						Client:        clientClaudeCode,
+						ConfigPath:    path,
+						ProjectPath:   projPath,
+						ServerName:    "(malformed mcpServers)",
+						Transport:     TransportUnknown,
+						Args:          []string{},
+						ParseWarnings: []string{"mcpServers is not a valid object: " + err.Error()},
+					})
+					continue
+				}
+				for i := range projServers {
+					projServers[i].ProjectPath = projPath
+				}
+				servers = append(servers, projServers...)
+			}
+		}
+	}
+
+	return servers, nil
+}
+
+// parseServerMap unmarshals a mcpServers/servers JSON object into MCPServer structs.
+func parseServerMap(raw json.RawMessage, path, client string) ([]MCPServer, error) {
+	var serverMap map[string]rawServer
+	if err := json.Unmarshal(raw, &serverMap); err != nil {
+		return nil, err
+	}
+
+	servers := make([]MCPServer, 0, len(serverMap))
+	for name, rs := range serverMap {
+		s := MCPServer{
+			Client:     client,
+			ConfigPath: path,
+			ServerName: name,
+			Command:    rs.Command,
+			Args:       rs.Args,
+			Env:        rs.Env,
+		}
+
+		switch {
+		case rs.URL != "":
+			s.URL = rs.URL
+		case rs.ServerURL != "":
+			s.URL = rs.ServerURL
+		}
+
+		s.Transport = inferTransport(rs, s.URL)
+
+		if s.Args == nil {
+			s.Args = []string{}
+		}
+
+		if len(rs.Headers) > 0 {
+			s.ParseWarnings = append(s.ParseWarnings, "headers present but not preserved in wrapper suggestions")
+		}
+
+		servers = append(servers, s)
+	}
+
+	return servers, nil
+}
+
+// inferTransport determines the transport type from the server config.
+// If the config has an explicit "type" field, that takes precedence.
+func inferTransport(rs rawServer, url string) string {
+	switch rs.Type {
+	case TransportStdio, TransportHTTP, "sse":
+		return rs.Type
+	}
+	if rs.Command != "" {
+		return TransportStdio
+	}
+	if url != "" {
+		return TransportHTTP
+	}
+	return TransportUnknown
+}

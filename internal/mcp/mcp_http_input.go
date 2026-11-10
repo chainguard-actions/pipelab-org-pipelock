@@ -1,0 +1,1414 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/deferred"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/a2amethods"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	session "github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+type httpInputDecision struct {
+	Blocked        *BlockedRequest
+	Synthetic      *mcpSyntheticResult
+	Deferred       *DeferredRequest
+	ForwardMessage []byte
+	Outcome        TrackedRequestOutcome
+}
+
+const redirectResultRedirected = "redirected"
+
+// DeferredRequest is a scanned action that must not reach the target until the
+// held-action manager resolves it.
+type DeferredRequest struct {
+	ID                  json.RawMessage
+	IsNotification      bool
+	DeferID             string
+	ShardIndex          int
+	ShardSelected       bool
+	ForwardMessage      []byte
+	ToolName            string
+	BaselineIdentity    string
+	Method              string
+	Reason              string
+	SessionID           string
+	SessionIDOriginal   string
+	ResolutionPolicy    config.DeferResolutionPolicy
+	ResolverProfile     config.DeferResolverProfile
+	ResolverProfileName string
+	ArgDigest           string
+	Arguments           string
+	authorityRef        string
+	authorityCarrierErr error
+	authorityFrame      MCPFrame
+}
+
+// scanHTTPInput checks a single input message for DLP/injection/policy/CEE.
+// Returns a *BlockedRequest if the message should be blocked, nil if clean.
+func scanHTTPInput(msg []byte, logW io.Writer, sessionKey, auditSessionKey string, opts MCPProxyOpts) *BlockedRequest {
+	return scanHTTPInputDecision(msg, logW, sessionKey, auditSessionKey, opts).Blocked
+}
+
+// scanHTTPInputDecision is the HTTP proxy equivalent of ForwardScannedInput's
+// per-message logic, but returns the block verdict plus the message to forward.
+// When cee is non-nil, outbound payloads are recorded for cross-request
+// exfiltration detection after content scanning passes.
+func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionKey string, opts MCPProxyOpts) (result httpInputDecision) {
+	// Strip any inbound com.pipelock/mediation from _meta before
+	// parsing, scanning, or forwarding. Prevents an agent (or compromised
+	// upstream that managed to send back through the listener) from
+	// spoofing the envelope pipelock injects. Mirrors the equivalent
+	// scrub on the stdio path at internal/mcp/input.go:213. The stdio
+	// strip runs unconditionally on every inbound line; the HTTP listener
+	// now matches.
+	msg, authorityRef, authorityCarrierErr := extractInboundMCPAuthority(msg)
+
+	opts = opts.snapshotScanPolicy()
+	sc := opts.scanner()
+	inputCfg := opts.inputCfg()
+	policyCfg := opts.policyCfg()
+	auditLogger := opts.AuditLogger
+	var denialAudit mcpDenialAudit
+	cee := opts.cee()
+	rec := opts.Rec
+	adaptiveCfg := opts.adaptiveCfg()
+	m := opts.Metrics
+	obs := opts.captureObserver()
+	redactionCfg := opts.redactionConfig()
+	envelopeEmitter := opts.envelopeEmitter()
+	redirectRT := opts.redirectRT()
+	result = httpInputDecision{ForwardMessage: msg}
+	mcpMethod := ""
+	toolName := ""
+	actionID := ""
+	var redactionReport *redact.Report
+	taintEval := taintDecision{
+		Authority: session.AuthorityUserBroad,
+		Result:    session.PolicyDecisionResult{Decision: session.PolicyAllow, Reason: taintReasonDisabled},
+	}
+	receiptVerdict := ""
+	receiptLayer := ""
+	receiptPattern := ""
+	receiptSeverity := ""
+	receiptDecisionPhase := ""
+	receiptDeferID := ""
+	receiptResolutionPolicy := ""
+	receiptResolutionSource := ""
+	receiptSessionID := ""
+	receiptSessionIDOriginal := ""
+	var receiptContractGate *mcpContractGateOutput
+	redirectReceiptEmitted := false
+	requireReceipts := opts.requireReceipts()
+	var receiptShard receipt.EmitOpts
+
+	// Parse the inbound frame once. Every gate below reads ID / Method /
+	// tool fields from this frame instead of re-parsing. Redaction may
+	// rewrite argument values; the frame is re-parsed after redaction so
+	// downstream gates (DoW, taint) see the redacted args while
+	// ID / Method / ToolCallName stay stable.
+	frame := ParseMCPFrame(msg)
+	baselineIdentity := mcpFrameBaselineIdentity(frame)
+	defer func() {
+		if result.Blocked != nil && result.Blocked.SyntheticResponse != nil {
+			result.Synthetic = &mcpSyntheticResult{response: result.Blocked.SyntheticResponse, notification: result.Blocked.IsNotification, logMessage: result.Blocked.LogMessage}
+			result.Blocked = nil
+		}
+		if result.Blocked != nil {
+			result.Blocked = inputMCPDenial(opts, denialAudit, result.Blocked)
+		}
+	}()
+	defer func() {
+		if redirectReceiptEmitted && receiptVerdict == config.ActionRedirect {
+			return
+		}
+		// A2A methods are not tools/call, so actionID stays empty on the
+		// tools/call path above. Mint an actionID lazily only when an A2A request
+		// needs a receipt: always for blocks, and for clean allows only when
+		// require_receipts is on. tools/call already carries its own actionID, so
+		// that path keeps its existing receipt behavior.
+		emitActionID := actionID
+		emitTarget := toolName
+		emitVerdict := receiptVerdict
+		if requireReceipts && result.Blocked == nil && isRequiredReceiptMetadataMethod(mcpMethod) {
+			// initialize and tools/list are ordinary mediated handshake actions.
+			// They do not carry a tool name or an envelope, but strict evidence
+			// still needs an action identity before the HTTP bridge forwards them.
+			if emitActionID == "" {
+				emitActionID = receipt.NewActionID()
+			}
+			if emitTarget == "" {
+				emitTarget = mcpMethod
+			}
+			if emitVerdict == "" {
+				emitVerdict = config.ActionAllow
+				if isRequiredReceiptHandshakeNotification(mcpMethod, frame.ID) {
+					emitVerdict = config.ActionForward
+				}
+			}
+		}
+		if IsA2AMethod(mcpMethod) {
+			if emitActionID == "" {
+				switch {
+				case receiptVerdict != "":
+					// A2A block path: mint an actionID here so the block still leaves a
+					// policy-hash-bearing receipt, matching the other applicable block
+					// surfaces. tools/call already carries its own actionID, so that
+					// path never reaches this branch.
+					emitActionID = receipt.NewActionID()
+				case requireReceipts && result.Blocked == nil:
+					// A clean A2A allow otherwise leaves both actionID and receiptVerdict
+					// empty, so emitMCPToolReceipt drops the emission (ActionID == "") and
+					// the request forwards with no receipt. Under require_receipts that is
+					// a hole in the every-allow-is-provable guarantee, so mint an actionID
+					// and record an explicit allow verdict. The emission-failure guard
+					// below then fails closed before the caller forwards. When
+					// require_receipts is off this branch is skipped, preserving the
+					// default of no receipt on a clean A2A allow (no receipt spam).
+					emitActionID = receipt.NewActionID()
+					emitVerdict = config.ActionAllow
+				}
+			}
+			// A2A frames carry no tool name, but the receipt record requires a
+			// non-empty target. Use the A2A method name (e.g. SendMessage) as the
+			// action target. ClassifyMCPTool only consults the tool name for
+			// tools/call, so this leaves the action type unaffected.
+			if emitActionID != "" && emitTarget == "" {
+				emitTarget = mcpMethod
+			}
+		}
+		requiredReceipt := (requireReceipts && result.Blocked == nil) || receiptVerdict == config.ActionDefer
+		if emitActionID != "" && opts.ReceiptGroup != nil && opts.ReceiptGroup.Shards != nil {
+			receiptShard = opts.ReceiptGroup.Shards.Admit(receiptShard)
+		}
+		receiptOpts := mcpToolReceiptOpts{
+			ProxyOpts:         opts,
+			Shard:             receiptShard,
+			Log:               logW,
+			Transport:         opts.Transport,
+			RedactionProfile:  redactionCfg.Profile,
+			ActionID:          emitActionID,
+			MCPMethod:         mcpMethod,
+			ToolName:          emitTarget,
+			Verdict:           emitVerdict,
+			Layer:             receiptLayer,
+			Pattern:           receiptPattern,
+			Severity:          receiptSeverity,
+			Decision:          taintEval,
+			Report:            redactionReport,
+			ContractGate:      receiptContractGate,
+			RequireReceipts:   requireReceipts,
+			RequireReceipt:    requiredReceipt,
+			DecisionPhase:     receiptDecisionPhase,
+			DeferID:           receiptDeferID,
+			ResolutionPolicy:  receiptResolutionPolicy,
+			ResolutionSource:  receiptResolutionSource,
+			SessionID:         receiptSessionID,
+			SessionIDOriginal: receiptSessionIDOriginal,
+		}
+		if redirectReceiptEmitted && receiptVerdict == config.ActionBlock {
+			receiptOpts.ParentActionID = actionID
+			receiptOpts.ActionID = receipt.NewActionID()
+		}
+		if err := emitMCPToolReceipt(receiptOpts); err != nil && requiredReceipt && result.Blocked == nil {
+			denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_input", mcpReceiptEmissionReason)
+			result.Deferred = nil
+			result.Blocked = &BlockedRequest{
+				ID:             frame.ID,
+				IsNotification: isRPCNotification(frame.ID),
+				LogMessage:     "receipt emission failed",
+				ErrorCode:      -32007,
+				ErrorMessage:   requiredReceiptFailureMessage(err),
+				ErrorData:      mcpBlockReasonData(blockreason.ReceiptEmissionFailed),
+			}
+			return
+		}
+		if result.Deferred != nil {
+			result.Deferred.ShardIndex = receiptShard.ShardIndex
+			result.Deferred.ShardSelected = receiptShard.ShardSelected
+		}
+		// Only a required allow is written as an intent. A best-effort allow is a
+		// single-phase decision, and an outcome naming it reads as a broken chain
+		// ("outcome without matching intent") to the completeness verifier.
+		if requiredReceipt && result.Blocked == nil && receipt.NormalizeVerdict(emitVerdict) == config.ActionAllow {
+			outcomeReceipt := opts.withReceiptPolicyHash(receipt.EmitOpts{
+				ActionID:            emitActionID,
+				Verdict:             emitVerdict,
+				Layer:               receiptLayer,
+				Pattern:             receiptPattern,
+				Severity:            receiptSeverity,
+				RedactionProfile:    redactionCfg.Profile,
+				RedactionReport:     redactionReport,
+				Transport:           opts.Transport,
+				Target:              emitTarget,
+				MCPMethod:           mcpMethod,
+				ToolName:            emitTarget,
+				SessionTaintLevel:   taintEval.Risk.Level.String(),
+				SessionContaminated: taintEval.Risk.Contaminated,
+				RecentTaintSources:  taintEval.Risk.Sources,
+				SessionTaskID:       taintEval.Task.CurrentTaskID,
+				SessionTaskLabel:    taintEval.Task.CurrentTaskLabel,
+				AuthorityKind:       taintEval.Authority.String(),
+				TaintDecision:       taintEval.Result.Decision.String(),
+				TaintDecisionReason: taintEval.Result.Reason,
+				TaskOverrideApplied: taintEval.TaskOverrideApplied,
+				PolicyHash:          opts.receiptPolicyHash(),
+			})
+			if receiptContractGate != nil {
+				outcomeReceipt = mcpWithContractReceipt(outcomeReceipt, *receiptContractGate)
+			}
+			outcomeReceipt.ShardIndex = receiptShard.ShardIndex
+			outcomeReceipt.ShardSelected = receiptShard.ShardSelected
+			result.Outcome = TrackedRequestOutcome{Receipt: outcomeReceipt, Method: mcpMethod}
+		}
+	}()
+	// Registered after the receipt finalizer so it runs first. A failed
+	// authority check clears pending allow evidence and replaces the forward
+	// result before the caller can perform any upstream write.
+	defer func() {
+		if opts.AuthorityVerifier == nil || result.Blocked != nil {
+			return
+		}
+		if result.Deferred != nil {
+			result.Deferred.authorityRef = authorityRef
+			result.Deferred.authorityCarrierErr = authorityCarrierErr
+			result.Deferred.authorityFrame = frame
+			return
+		}
+		if err := authorizeMCP(opts.warnContext(), authorityRef, authorityCarrierErr, frame, opts); err != nil {
+			denialAudit = mcpAuthorityDenialAudit()
+			result.Blocked = authorityBlockedRequest(frame)
+			result.Deferred = nil
+			result.Outcome = TrackedRequestOutcome{}
+			receiptVerdict = config.ActionBlock
+			receiptLayer, receiptPattern, receiptSeverity = authorityReceiptAttribution()
+			if actionID == "" {
+				actionID = receipt.NewActionID()
+			}
+			if toolName == "" {
+				toolName = mcpMethod
+			}
+		}
+	}()
+
+	// Helper: record an adaptive signal and handle escalation side-effects.
+	// Eliminates repeated nil/enabled guards at every call site.
+	hadAdaptiveFinding := false
+	recordAdaptiveFinding := func(sig session.SignalType, scannerName, reason string) {
+		hadAdaptiveFinding = true
+		if adaptiveCfg != nil && adaptiveCfg.Enabled {
+			recordMCPAdaptiveSignal(opts, rec, sig, decide.EscalationParams{
+				Threshold:     adaptiveCfg.EscalationThreshold,
+				Logger:        auditLogger,
+				Metrics:       m,
+				ConsoleWriter: logW,
+				Session:       auditSessionKey,
+				DenialScanner: scannerName,
+				DenialReason:  reason,
+				PolicyHash:    opts.receiptPolicyHash(),
+			})
+		}
+	}
+	recordAdaptiveSignal := func(sig session.SignalType) {
+		recordAdaptiveFinding(sig, "", "")
+	}
+
+	// On-entry de-escalation: recover sessions stuck at block_all.
+	// Runs before any per-message action so both clean and non-clean
+	// messages benefit from recovery.
+	if rec != nil {
+		tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+			sessionKey: auditSessionKey,
+			reason:     adaptiveRecoveryTimer,
+			logger:     auditLogger,
+			metrics:    m,
+		}, opts.warnContext()))
+	}
+
+	// Reject JSON-RPC batch requests unconditionally. MCP does not use
+	// batch messages, and the response path already drops batch arrays
+	// (proxy.go, proxy_http.go upstream handler). Forwarding a batch
+	// would produce a response blackhole. Rejecting here also closes the
+	// verdict.Method gap where per-call checks (DoW, chain, A2A) were
+	// silently skipped because the aggregated verdict had no Method.
+	if trimmed := bytes.TrimSpace(msg); len(trimmed) > 0 && trimmed[0] == '[' {
+		denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPProtocol, mcpBatchReason, audit.BlockClassProtective)
+		_, _ = fmt.Fprintf(logW, "pipelock: input: blocked batch request (not supported by MCP)\n")
+		recordAdaptiveSignal(session.SignalBlock)
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:           frame.ID,
+			ErrorCode:    -32600,
+			ErrorMessage: "pipelock: batch requests are not supported by MCP",
+		}
+		return result
+	}
+
+	// Determine input scanning parameters before redaction so block-mode
+	// DLP can enforce on the original tool arguments. Warn mode still
+	// redacts before forwarding below.
+	action := config.ActionWarn
+	onParseError := config.ActionBlock
+	if inputCfg != nil && inputCfg.Enabled {
+		action = inputCfg.Action
+		onParseError = inputCfg.OnParseError
+	}
+	scanEnabled := inputCfg != nil && inputCfg.Enabled
+
+	// Build the scan context once so pre-redaction and post-redaction
+	// scans share the same DLPWarnContext.
+	inputScanCtx := opts.warnContext()
+	wc := scanner.DLPWarnContextFromCtx(inputScanCtx)
+	if policyHash := opts.receiptPolicyHash(); policyHash != "" {
+		wc.PolicyHash = policyHash
+	}
+	if wc.Transport == "" {
+		wc.Transport = transportMCPHTTP
+	}
+	inputScanCtx = scanner.WithDLPWarnContext(inputScanCtx, wc)
+
+	if pendingToolName := frame.ToolCallName; pendingToolName != "" {
+		toolName = pendingToolName
+		mcpMethod = methodToolsCall
+		actionID = receipt.NewActionID()
+	} else if IsA2AMethod(frame.Method) {
+		// A2A methods (SendMessage, GetTask, ...) are not tools/call, so they
+		// carry no actionID up front. Record the method now so an early-return
+		// block path (pre-redaction content scan, redaction error) still
+		// attributes the receipt to the A2A method; the deferred emitter
+		// assigns the actionID lazily when the request is actually blocked.
+		if canonical, ok := a2amethods.Canonical(frame.Method); ok {
+			mcpMethod = canonical
+		}
+	}
+	var preRedactionDLP []scanner.TextDLPMatch
+	if scanEnabled && redactionCfg.Matcher != nil {
+		originalVerdict := scanRequestForAgent(inputScanCtx, msg, sc, action, onParseError, opts.addressProtectionAgent())
+		if !originalVerdict.Clean && originalVerdict.Error == "" && preRedactionBlock(originalVerdict, action) {
+			receiptLayer, receiptPattern, receiptSeverity = contentScanAttribution(originalVerdict)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s)\n", joinInputVerdictReasons(originalVerdict))
+			denialAudit = mcpInputBlockAudit(originalVerdict)
+			recordAdaptiveSignal(session.SignalBlock)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID:             originalVerdict.ID,
+				IsNotification: isRPCNotification(originalVerdict.ID),
+				LogMessage:     "blocked",
+				ErrorCode:      -32001,
+				ErrorMessage:   "pipelock: request blocked by MCP input scanning",
+				ErrorData:      mcpBlockReasonData(mcpScannerBlockReason(originalVerdict, policy.Verdict{}, false)),
+			}
+			return result
+		}
+		// Not blocked before redaction: remember the pre-redaction DLP findings
+		// so evidence survives if redaction scrubs them and the post-redaction
+		// rescan is clean (see restoreRedactedDLPEvidence).
+		if originalVerdict.Error == "" {
+			preRedactionDLP = originalVerdict.Matches
+		}
+	}
+	rewrittenMsg, report, redactErr := applyMCPToolCallRedactionWithConfig(msg, redactionCfg)
+	if redactErr != nil {
+		denialAudit = mcpInputGateBlockAudit(scanner.AuditRedaction, mcpRedactionReason, mcpRedactionBlockClass(redactErr))
+		var blockErr *redact.BlockError
+		reason := redactErr.Error()
+		if errors.As(redactErr, &blockErr) {
+			reason = "tool arguments redaction blocked: " + string(blockErr.Reason)
+		}
+		_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s)\n", reason)
+		recordAdaptiveSignal(session.SignalBlock)
+		receiptLayer, receiptPattern, receiptSeverity = redactionBlockAttribution(redactErr)
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             frame.ID,
+			IsNotification: isRPCNotification(frame.ID),
+			LogMessage:     "blocked (redaction)",
+			ErrorCode:      -32001,
+			ErrorMessage:   "pipelock: request blocked by MCP redaction",
+		}
+		return result
+	}
+	msg = rewrittenMsg
+	result.ForwardMessage = rewrittenMsg
+	redactionReport = report
+	// Redaction may have rewritten argument values; re-parse so
+	// downstream gates (DoW, taint) see the redacted args.
+	frame = ParseMCPFrame(msg)
+
+	// Evaluate every configured gate in one pass. The helper returns
+	// a composite verdict and the first gate that short-circuited,
+	// preserving per-gate block semantics and ordering.
+	eval := EvaluateMCPInputGates(inputScanCtx, frame, msg, sessionKey, opts, action, onParseError, scanEnabled)
+	// Preserve cross-agent exposure evidence on every gate outcome. Only
+	// enforced denials or unreadable risk state add enforcement points.
+	if eval.CrossAgentEscalate {
+		recordAdaptiveSignal(eval.CrossAgentObservation.AdaptiveSignal(eval.BlockingGate != ""))
+	}
+	verdict := eval.ContentVerdict
+	policyVerdict := eval.PolicyVerdict
+	receiptLayer, receiptPattern, receiptSeverity = pickAttribution(eval)
+
+	mcpMethod = verdict.Method
+	if canonical, ok := a2amethods.Canonical(mcpMethod); ok {
+		mcpMethod = canonical
+		verdict.Method = canonical
+	}
+	// Redaction evidence floor: if redaction scrubbed a pre-redaction DLP
+	// finding and the post-redaction rescan is clean, restore the finding as a
+	// warn so the request forwards scrubbed but the match is still recorded.
+	// Refresh the receipt attribution from the restored verdict.
+	verdict = restoreRedactedDLPEvidence(verdict, preRedactionDLP, redactionReport, action)
+	if verdict.RedactedDLPOnly {
+		eval.ContentVerdict = verdict
+		receiptLayer, receiptPattern, receiptSeverity = pickAttribution(eval)
+	}
+	if verdict.Method == methodToolsCall {
+		if actionID == "" {
+			actionID = receipt.NewActionID()
+		}
+		toolName = frame.ToolCallName
+	}
+	enforcementTarget := toolName
+	if enforcementTarget == "" {
+		enforcementTarget = eval.EnforcementIdentity
+	}
+	enforcementKind := "tools/call"
+	if toolName == "" && enforcementTarget != "" {
+		enforcementKind = "mcp method"
+	}
+	captureActionClass := captureMCPFrameActionClass(enforcementTarget, verdict.Method, mcpFrameCallableArgs(frame))
+	logTaintDecision := func() {
+		if auditLogger == nil {
+			return
+		}
+		decision := eval.TaintDecision
+		if eval.TaintAuditDecisionSet {
+			decision = eval.TaintAuditDecision
+		}
+		auditLogger.LogTaintDecision(
+			mustMCPAuditContext(auditLogger, "MCP", enforcementTarget),
+			audit.TaintDecision{
+				TaintLevel:  decision.Risk.Level.String(),
+				ActionClass: decision.ActionClass.String(),
+				Sensitivity: decision.Sensitivity.String(),
+				Authority:   decision.Authority.String(),
+				Decision:    decision.Result.Decision.String(),
+				Reason:      decision.Result.Reason,
+				SourceURL:   decision.Risk.SecurityOriginURL(),
+				SourceKind:  decision.Risk.SecurityOriginKind(),
+			},
+		)
+	}
+
+	// Dispatch block-level gate verdicts. Per-gate log / audit /
+	// metrics / adaptive-signal side effects live here so the
+	// transport-specific response shape (JSON-RPC error codes,
+	// LogMessage strings) stays in the transport layer.
+	switch eval.BlockingGate {
+	case blockingGateA2ABody:
+		class, reason := mcpA2AGateAudit(eval.A2AResult)
+		denialAudit = mcpInputGateBlockAudit(scanner.AuditA2AScan, reason, class)
+		_, _ = fmt.Fprintf(logW, "pipelock: a2a input: blocked (%s)\n", eval.A2AResult.Reason)
+		switch {
+		case eval.A2AResult.IsAdaptiveNeutral():
+			// Score-neutral: infrastructure errors (e.g. DNS resolver timeout
+			// on an embedded A2A URL field) block the request (fail-closed)
+			// but must not feed adaptive enforcement. Resolver wobble is not
+			// evidence of agent misbehavior.
+		case eval.A2AResult.IsConfigMismatch():
+			recordAdaptiveFinding(session.SignalNearMiss, "a2a", eval.A2AResult.Reason)
+		default:
+			recordAdaptiveFinding(session.SignalBlock, "a2a", eval.A2AResult.Reason)
+		}
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isRPCNotification(verdict.ID),
+			LogMessage:     "blocked (a2a input scanning)",
+			ErrorCode:      -32001,
+			ErrorMessage:   "pipelock: request blocked by A2A input scanning",
+		}
+		return result
+	case blockingGateAirlockHard, blockingGateAirlockMissing:
+		denialAudit = mcpAirlockDenialAudit()
+		blockMessage := mcpAirlockDiagnostic(eval, opts, rec, logW)
+		_, _ = fmt.Fprintf(logW, "%s: %q\n", blockMessage, enforcementTarget)
+		if auditLogger != nil {
+			warnCtx := scanner.DLPWarnContextFromCtx(opts.warnContext())
+			auditLogger.LogAirlockDenyReason(audit.AirlockDenyOptions{
+				SessionKey:      auditSessionKey,
+				Tier:            eval.AirlockTier,
+				Transport:       firstNonEmpty(opts.Transport, transportMCPHTTP),
+				Method:          methodToolsCall,
+				Reason:          eval.AirlockReason,
+				ClientIP:        warnCtx.ClientIP,
+				RequestID:       canonicalID(verdict.ID),
+				HTTPCorrelation: true,
+			})
+		}
+		if m != nil {
+			m.RecordAirlockDenial(eval.AirlockTier, "mcp", methodToolsCall)
+		}
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isRPCNotification(verdict.ID),
+			LogMessage:     "blocked (airlock)",
+			ErrorCode:      -32001,
+			ErrorMessage:   blockMessage,
+			ErrorData:      mcpBlockReasonData(blockreason.AirlockActive),
+		}
+		return result
+	case blockingGateDoW:
+		_, _ = fmt.Fprintf(logW, "pipelock: %s %q DoW %s: %s (%s)\n",
+			enforcementKind, enforcementTarget, eval.DoWAction, eval.DoWReason, eval.DoWBudgetType)
+		denialAudit = mcpDoWDenialAudit(opts, enforcementTarget, eval.DoWReason)
+		recordDoWMetric(m, config.ActionBlock, opts)
+		recordAdaptiveFinding(session.SignalBlock, scanner.ScannerDenialOfWallet, eval.DoWReason)
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{ID: verdict.ID, IsNotification: isRPCNotification(verdict.ID), ErrorCode: -32600, ErrorMessage: "pipelock: " + eval.DoWReason}
+		return result
+	case blockingGateChain:
+		_, _ = fmt.Fprintf(logW, "pipelock: chain detected: %s (severity=%s, action=%s)\n",
+			eval.ChainPatternName, eval.ChainSeverity, eval.ChainAction)
+		denialAudit = mcpChainBlockAudit(eval.ChainPatternName)
+		if auditLogger != nil {
+			auditLogger.LogChainDetection(eval.ChainPatternName, eval.ChainSeverity, eval.ChainAction, enforcementTarget, auditSessionKey)
+		}
+		recordAdaptiveFinding(session.SignalBlock, "chain", eval.ChainPatternName)
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isRPCNotification(verdict.ID),
+			LogMessage:     fmt.Sprintf("chain pattern %q blocked", eval.ChainPatternName),
+			ErrorCode:      -32004,
+			ErrorMessage:   fmt.Sprintf("tool call blocked: chain pattern %q detected", eval.ChainPatternName),
+		}
+		return result
+	case blockingGateParseError:
+		_, _ = fmt.Fprintf(logW, "pipelock: input: %s\n", verdict.Error)
+		denialAudit = mcpInputBlockAudit(verdict)
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isRPCNotification(verdict.ID),
+			LogMessage:     "blocked (parse error)",
+			ErrorCode:      jsonRPCErrorCodeForInputError(verdict.Error),
+		}
+		return result
+	case blockingGateTaintBlock, blockingGateTaintAskDenied:
+		denialAudit = mcpTaintDenialAudit()
+		logTaintDecision()
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isRPCNotification(verdict.ID),
+			LogMessage:     "blocked by taint policy",
+			ErrorCode:      -32002,
+			ErrorMessage:   "pipelock: " + eval.TaintDecision.Result.Reason,
+		}
+		return result
+	}
+
+	// Non-blocking warn-level side effects from gates that did not
+	// short-circuit. A2A warn logs and records a near-miss unless the
+	// finding is adaptive-neutral; DoW warn logs, records an anomaly,
+	// and records a near-miss. These happen after the switch so block
+	// dispatches skip them.
+	if eval.TaintApproved {
+		logTaintDecision()
+	}
+	if !eval.A2AResult.Clean && eval.A2AEffectiveAction != "" && eval.A2AEffectiveAction != config.ActionBlock {
+		_, _ = fmt.Fprintf(logW, "pipelock: a2a input: warning (%s)\n", eval.A2AResult.Reason)
+		if !eval.A2AResult.IsAdaptiveNeutral() {
+			recordAdaptiveFinding(session.SignalWarning, "a2a", eval.A2AResult.Reason)
+		}
+	}
+	if eval.DoWAction != "" && !eval.DoWAllowed && eval.DoWAction != config.ActionBlock {
+		_, _ = fmt.Fprintf(logW, "pipelock: %s %q DoW %s: %s (%s)\n",
+			enforcementKind, enforcementTarget, eval.DoWAction, eval.DoWReason, eval.DoWBudgetType)
+		if auditLogger != nil {
+			auditLogger.LogAnomaly(mustMCPDoWAuditContext(auditLogger, enforcementTarget, opts), scanner.ScannerDenialOfWallet, eval.DoWReason, 0)
+		}
+		recordDoWMetric(m, config.ActionWarn, opts)
+		recordAdaptiveFinding(session.SignalWarning, scanner.ScannerDenialOfWallet, eval.DoWReason)
+	}
+	// Chain warn has already been recorded as ChainAction on eval;
+	// log it here so the action-merge section below can fold it in.
+	if eval.ChainMatched && eval.ChainAction != config.ActionBlock {
+		_, _ = fmt.Fprintf(logW, "pipelock: chain detected: %s (severity=%s, action=%s)\n",
+			eval.ChainPatternName, eval.ChainSeverity, eval.ChainAction)
+		if auditLogger != nil {
+			auditLogger.LogChainDetection(eval.ChainPatternName, eval.ChainSeverity, eval.ChainAction, enforcementTarget, auditSessionKey)
+		}
+	}
+
+	taintEval = eval.TaintDecision
+	bindingAction := eval.BindingAction
+	bindingReason := eval.BindingReason
+	chainAction := eval.ChainAction
+	chainReason := eval.ChainReason
+	if bindingReason != "" {
+		switch bindingReason {
+		case bindingReasonMissingToolName:
+			_, _ = fmt.Fprintf(logW, "pipelock: tools/call missing params.name\n")
+		case bindingReasonNoBaseline:
+			_, _ = fmt.Fprintf(logW, "pipelock: %s %q before baseline established\n", enforcementKind, enforcementTarget)
+		case bindingReasonUnknownTool:
+			_, _ = fmt.Fprintf(logW, "pipelock: %s %q not in session baseline\n", enforcementKind, enforcementTarget)
+		default:
+			_, _ = fmt.Fprintf(logW, "pipelock: %s %q session binding violation: %s\n", enforcementKind, enforcementTarget, bindingReason)
+		}
+		obs.ObserveToolPolicyVerdict(context.Background(), &capture.ToolPolicyRecord{
+			Subsurface:        "session_binding",
+			Transport:         opts.Transport,
+			SessionID:         captureSessionID(opts.Transport),
+			SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+			ConfigHash:        opts.captureConfigHash(),
+			Profile:           opts.captureProfile(),
+			ActionClass:       captureActionClass,
+			Request: capture.CaptureRequest{
+				ToolName:  enforcementTarget,
+				MCPMethod: verdict.Method,
+				RPCID:     captureRPCID(verdict.ID),
+			},
+			RawFindings: []capture.Finding{{
+				Kind:       capture.KindSessionBinding,
+				ToolName:   enforcementTarget,
+				PolicyRule: bindingReason,
+				Action:     bindingAction,
+			}},
+			EffectiveAction: bindingAction,
+			Outcome:         captureOutcome(bindingAction, false),
+		})
+	}
+
+	// All clean - proceed (with block_all and CEE checks).
+	if verdict.Clean && !policyVerdict.Matched && bindingAction == "" && chainAction == "" {
+		if baselineIdentity != "" {
+			baselineDecision := checkMCPToolCallBaselineAttempt(opts, baselineMetricsRecorder(opts, rec), baselineIdentity)
+			switch baselineDecision.Action {
+			case config.ActionBlock, config.ActionAsk:
+				_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s)\n", baselineDecision.Detail)
+				denialAudit = mcpBaselineBlockAudit()
+				recordAdaptiveSignal(session.SignalBlock)
+				receiptVerdict = config.ActionBlock
+				errMsg := ""
+				if baselineDecision.Action == config.ActionAsk {
+					errMsg = "pipelock: MCP request blocked by behavioral baseline"
+				}
+				result.Blocked = &BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     "blocked (baseline deviation)",
+					ErrorCode:      -32001,
+					ErrorMessage:   errMsg,
+				}
+				return result
+			case config.ActionWarn:
+				_, _ = fmt.Fprintf(logW, "pipelock: input: warning (%s)\n", baselineDecision.Detail)
+				recordAdaptiveSignal(session.SignalWarning)
+			}
+		}
+		// block_all enforcement: deny ALL traffic (including clean) when the
+		// session is at an escalation level with block_all=true.
+		if rec != nil && decide.UpgradeAction("", rec.EscalationLevel(), adaptiveCfg) == config.ActionBlock {
+			_, _ = fmt.Fprintf(logW, "pipelock: adaptive upgrade (clean) -> block (level %s)\n", session.EscalationLabel(rec.EscalationLevel()))
+			denialAudit = mcpCleanAdaptiveBlockAudit()
+			if m != nil {
+				m.RecordAdaptiveUpgrade("", config.ActionBlock, session.EscalationLabel(rec.EscalationLevel()))
+			}
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     "blocked (session deny)",
+				ErrorCode:      -32001,
+				ErrorMessage:   mcpAdaptiveBlockMessage(rec, adaptiveCfg, "session_deny", logW),
+			}
+			return result
+		}
+		// Cross-request exfiltration check on clean outbound messages.
+		// The MCP session key is the CEE key verbatim. It is issued by the
+		// transport, not supplied by the caller, so there is no self-declared
+		// agent name to namespace by. Namespacing CEE state by a
+		// caller-controlled name would let a client rotate that name to
+		// partition a secret across buckets and evade accumulation.
+		ceeKey := sessionKey
+		inspectionMode, fallbackReason, matchedPattern, ceeBlockKind := "", "", "", ""
+		var ceeContributors []json.RawMessage
+		ceeOpts := ceeRecordMCPOptions{
+			denialAudit:    &denialAudit,
+			sessionKey:     ceeKey,
+			entropyPayload: msg,
+			frame:          frame,
+			cee:            cee,
+			sc:             sc,
+			logW:           logW,
+			logger:         auditLogger,
+			inspectionMode: &inspectionMode,
+			fallbackReason: &fallbackReason,
+			matchedPattern: &matchedPattern,
+			blockKind:      &ceeBlockKind,
+			contributors:   &ceeContributors,
+		}
+		if reason := ceeRecordMCP(ceeOpts); reason != "" {
+			// Capture: record CEE verdict.
+			obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
+				Subsurface:        "cee_mcp_http",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID), CEEContributors: ceeContributors},
+				RawFindings: []capture.Finding{{
+					Kind:   capture.KindCEE,
+					Action: config.ActionBlock,
+				}},
+				EffectiveAction: config.ActionBlock,
+				Outcome:         capture.OutcomeBlocked,
+				InspectionMode:  inspectionMode,
+				FallbackReason:  fallbackReason,
+			})
+			// A method that carries neither a tool call nor required receipt
+			// metadata never minted a receipt identity, and the emitter drops a
+			// receipt with an empty action ID. Mint one here so a CEE block on
+			// any method leaves evidence, matching the authorization path in
+			// the deferred finalizer above.
+			if actionID == "" {
+				actionID = receipt.NewActionID()
+			}
+			if toolName == "" {
+				toolName = mcpMethod
+			}
+			receiptVerdict = config.ActionBlock
+			receiptLayer = "cross_request"
+			receiptPattern = ceeBlockKind
+			if matchedPattern != "" {
+				receiptPattern = matchedPattern
+			}
+			receiptSeverity = "critical"
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     "CEE blocked",
+				ErrorCode:      -32005,
+				ErrorMessage:   fmt.Sprintf("pipelock: %s", reason),
+			}
+			return result
+		}
+		contractGate, contractErr := evaluateMCPToolGate(frame, config.ActionAllow, false, opts)
+		if contractErr != nil {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditContract, mcpContractEvalReason, audit.BlockClassInfrastructureError)
+			_, _ = fmt.Fprintf(logW, "pipelock: contract tool-call evaluation failed: %v\n", contractErr)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     "contract tool-call evaluation failed",
+				ErrorCode:      -32006,
+				ErrorMessage:   "pipelock: contract tool-call evaluation failed",
+			}
+			return result
+		}
+		if contractGate.Verdict == config.ActionBlock {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditContract, mcpContractDenyAuditReason, audit.BlockClassProtective)
+			_, _ = fmt.Fprintf(logW, "pipelock: contract blocked %s %q (%s)\n", enforcementKind, enforcementTarget, contractGate.Reason)
+			receiptVerdict = config.ActionBlock
+			receiptContractGate = &contractGate
+			result.Blocked = ptrMCPBlockedRequest(mcpContractBlockRequest(verdict.ID, contractGate, "pipelock: request blocked by live-lock contract"))
+			return result
+		}
+		if actionID != "" {
+			var decorateErr error
+			result.ForwardMessage, decorateErr = decorateMCPToolMessage(msg, envelopeEmitter, actionID, mcpMethod, toolName, config.ActionAllow, taintEval)
+			if decorateErr != nil {
+				denialAudit = mcpInputGateBlockAudit(scanner.AuditMediationEnvelope, mcpEnvelopeReason, audit.BlockClassInfrastructureError)
+				result.Blocked = &BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     "mediation envelope injection failed",
+					ErrorCode:      -32002,
+					ErrorMessage:   "pipelock: mediation envelope injection failed",
+				}
+				return result
+			}
+			receiptVerdict = config.ActionAllow
+			receiptContractGate = &contractGate
+		}
+		if !hadAdaptiveFinding {
+			recordCleanSession(rec, adaptiveCfg, true, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+				assessment: verdict.Assessment,
+				sessionKey: auditSessionKey,
+				reason:     adaptiveRecoveryClean,
+				requestID:  canonicalID(verdict.ID),
+				logger:     auditLogger,
+				metrics:    m,
+			}, opts.warnContext()))
+		}
+		return result
+	}
+
+	// Build reasons.
+	reasons := inputVerdictReasons(verdict)
+	for _, r := range policyVerdict.Rules {
+		reasons = append(reasons, "policy:"+r)
+	}
+	reasons = append(reasons, policyVerdict.Notes...)
+	if bindingReason != "" {
+		reasons = append(reasons, bindingReason)
+	}
+	if chainReason != "" {
+		reasons = append(reasons, chainReason)
+	}
+
+	// Determine effective action (strictest wins).
+	// mergeAction sets effectiveAction to the stricter of cur and next,
+	// handling the initial empty state correctly (empty = no action yet).
+	effectiveAction := ""
+	mergeAction := func(cur, next string) string {
+		if cur == "" {
+			return next
+		}
+		return policy.StricterAction(cur, next)
+	}
+	if !verdict.Clean {
+		effectiveAction = inputVerdictEffectiveAction(verdict, action)
+	}
+	if policyVerdict.Matched {
+		effectiveAction = mergeAction(effectiveAction, policyVerdict.Action)
+	}
+	if bindingAction != "" {
+		effectiveAction = mergeAction(effectiveAction, bindingAction)
+	}
+	if chainAction != "" {
+		effectiveAction = mergeAction(effectiveAction, chainAction)
+	}
+
+	isNotification := isRPCNotification(verdict.ID)
+
+	// Error code/message based on what triggered.
+	errCode := 0
+	errMsg := ""
+	if verdict.Clean && policyVerdict.Matched {
+		errCode = -32002
+		errMsg = errPolicyBlocked
+	}
+	if bindingReason != "" && bindingAction == config.ActionBlock {
+		errCode = -32000
+		errMsg = "pipelock: " + bindingReason
+	}
+
+	// Escalation upgrade: may promote warn/ask to block for elevated sessions.
+	entropyOnlyDecision := verdict.IsEntropyOnly() && !policyVerdict.Matched && bindingAction == "" && chainAction == ""
+	numberOnlyDecision := verdict.IsInformationalCardRuns() && !policyVerdict.Matched && bindingAction == "" && chainAction == ""
+	originalAction := effectiveAction
+	scoringAction := originalAction
+	if rec != nil && !entropyOnlyDecision && !numberOnlyDecision {
+		effectiveAction = decide.UpgradeAction(effectiveAction, rec.EscalationLevel(), adaptiveCfg)
+	}
+	if effectiveAction != originalAction {
+		errMsg = mcpAdaptiveBlockMessage(rec, adaptiveCfg, "mcp_input", logW)
+		levelLabel := session.EscalationLabel(rec.EscalationLevel())
+		_, _ = fmt.Fprintf(logW, "pipelock: adaptive upgrade %s -> %s (level %s)\n", originalAction, effectiveAction, levelLabel)
+		if auditLogger != nil {
+			auditLogger.LogAdaptiveUpgrade(auditSessionKey, levelLabel, originalAction, effectiveAction, "mcp_input", "", "")
+		}
+		if m != nil {
+			m.RecordAdaptiveUpgrade(originalAction, effectiveAction, levelLabel)
+		}
+	}
+
+	baselineAction := ""
+	if baselineIdentity != "" {
+		baselineDecision := checkMCPToolCallBaselineAttempt(opts, baselineMetricsRecorder(opts, rec), baselineIdentity)
+		if baselineDecision.Action != "" {
+			baselineAction = baselineDecision.Action
+			reasons = append(reasons, baselineDecision.Detail)
+			effectiveAction = mergeAction(effectiveAction, baselineDecision.Action)
+			scoringAction = mergeAction(scoringAction, baselineDecision.Action)
+			if baselineDecision.Action == config.ActionAsk {
+				errCode = -32001
+				errMsg = "pipelock: MCP request blocked by behavioral baseline"
+			}
+		}
+	}
+	// Deferral stores its correlation ID before the receipt finalizer runs.
+	// Metadata must share that ID with the deferred receipt and its resolution.
+	if effectiveAction == config.ActionDefer && actionID == "" &&
+		(IsA2AMethod(verdict.Method) || (requireReceipts && isRequiredReceiptMetadataMethod(verdict.Method))) {
+		actionID = receipt.NewActionID()
+	}
+
+	// Capture: record DLP/injection input verdict before action dispatch so
+	// block/ask/redirect/warn all preserve the same replay metadata.
+	if !verdict.Clean {
+		var rawFindings []capture.Finding
+		rawFindings = append(rawFindings, dlpMatchesToFindings(verdict.Matches)...)
+		rawFindings = append(rawFindings, responseMatchesToFindings(verdict.Inject, effectiveAction)...)
+		rawFindings = append(rawFindings, urlFindingsToCapture(verdict.URLFindings)...)
+		rawFindings = append(rawFindings, addressFindingsToCapture(verdict.AddressFindings)...)
+		obs.ObserveDLPVerdict(context.Background(), &capture.DLPVerdictRecord{
+			Subsurface:        "dlp_mcp_input",
+			Transport:         opts.Transport,
+			SessionID:         captureSessionID(opts.Transport),
+			SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+			ConfigHash:        opts.captureConfigHash(),
+			Profile:           opts.captureProfile(),
+			ActionClass:       captureActionClass,
+			Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+			TransformKind:     capture.TransformJoinedFields,
+			RawFindings:       rawFindings,
+			EffectiveAction:   effectiveAction,
+			Outcome:           captureOutcome(effectiveAction, false),
+		})
+	}
+
+	// Capture: record tool-policy verdict when policy matched. Mirrors the
+	// stdio path (ForwardScannedInput) so a tool-policy hit produces a
+	// mcp_tool_policy evidence entry on the HTTP transport too. Without this
+	// the HTTP path enforced policy but never captured the verdict — a
+	// transport-parity gap surfaced by the key-free capture work (#696).
+	if policyVerdict.Matched {
+		var policyFindings []capture.Finding
+		for _, r := range policyVerdict.Rules {
+			policyFindings = append(policyFindings, capture.Finding{
+				Kind:       capture.KindToolPolicy,
+				PolicyRule: r,
+				Action:     policyVerdict.Action,
+			})
+		}
+		obs.ObserveToolPolicyVerdict(context.Background(), &capture.ToolPolicyRecord{
+			Subsurface:        "mcp_tool_policy",
+			Transport:         opts.Transport,
+			SessionID:         captureSessionID(opts.Transport),
+			SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+			ConfigHash:        opts.captureConfigHash(),
+			Profile:           opts.captureProfile(),
+			ActionClass:       captureActionClass,
+			Request: capture.CaptureRequest{
+				ToolName:     toolName,
+				ToolArgsJSON: string(frame.Args),
+				MCPMethod:    verdict.Method,
+				RPCID:        captureRPCID(verdict.ID),
+			},
+			RawFindings:     policyFindings,
+			EffectiveAction: effectiveAction,
+			Outcome:         captureOutcome(effectiveAction, false),
+		})
+	}
+
+	contentBlock := inputBlockedByContent(verdict, action)
+	switch effectiveAction {
+	case config.ActionBlock:
+		_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s)\n", joinStrings(reasons))
+		denialAudit = mcpInputDecisionBlockAudit(verdict, contentBlock, policyVerdict, bindingAction, chainAction, eval.ChainPatternName, baselineAction)
+		if !entropyOnlyDecision {
+			recordAdaptiveFinding(decide.UpgradedWarningSignal(scoringAction, session.SignalBlock), "mcp_input", joinStrings(reasons))
+		}
+		receiptVerdict = effectiveAction
+		blockReason := mcpScannerBlockReason(verdict, policyVerdict, chainAction != "")
+		if bindingReason != "" && bindingAction == config.ActionBlock {
+			blockReason = blockreason.SessionBinding
+		}
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isNotification,
+			LogMessage:     "blocked",
+			ErrorCode:      errCode,
+			ErrorMessage:   errMsg,
+			ErrorData:      mcpBlockReasonData(blockReason),
+		}
+		return result
+	case config.ActionRedirect:
+		// Batch requests cannot be redirected element-by-element. Fail closed.
+		trimmedMsg := bytes.TrimSpace(msg)
+		if len(trimmedMsg) > 0 && trimmedMsg[0] == '[' {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPRedirect, mcpRedirectBatchReason, audit.BlockClassProtective)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked batch (%s) [redirect not supported for batches]\n", joinStrings(reasons))
+			recordAdaptiveSignal(session.SignalBlock)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID: verdict.ID, IsNotification: isNotification,
+				LogMessage: "blocked (batch redirect)", ErrorCode: -32002, ErrorMessage: errPolicyBlocked,
+			}
+			return result
+		}
+		if policyCfg == nil {
+			// No policy config - fail closed.
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPRedirect, mcpRedirectProfileReason, audit.BlockClassConfigMismatch)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s) [redirect without policy config]\n", joinStrings(reasons))
+			recordAdaptiveSignal(session.SignalBlock)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID: verdict.ID, IsNotification: isNotification,
+				LogMessage: "blocked (no policy config)", ErrorCode: -32002, ErrorMessage: errPolicyBlocked,
+			}
+			return result
+		}
+		profile, ok := policyCfg.RedirectProfiles[policyVerdict.RedirectProfile]
+		if !ok {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPRedirect, mcpRedirectProfileReason, audit.BlockClassConfigMismatch)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s) [redirect profile %q not found]\n", joinStrings(reasons), policyVerdict.RedirectProfile)
+			recordAdaptiveSignal(session.SignalBlock)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID: verdict.ID, IsNotification: isNotification,
+				LogMessage: "blocked (redirect profile missing)", ErrorCode: -32002, ErrorMessage: errPolicyBlocked,
+			}
+			return result
+		}
+		toolName, toolArgs := extractToolCallFields(msg)
+		policyRuleName := ""
+		if len(policyVerdict.Rules) > 0 {
+			policyRuleName = policyVerdict.Rules[0]
+		}
+		if requireReceipts {
+			if opts.ReceiptGroup != nil && opts.ReceiptGroup.Shards != nil {
+				receiptShard = opts.ReceiptGroup.Shards.Admit(receiptShard)
+			}
+			if err := emitMCPToolReceipt(mcpToolReceiptOpts{
+				ProxyOpts: opts,
+				Shard:     receiptShard, Log: logW,
+				Transport: opts.Transport, ActionID: actionID, MCPMethod: mcpMethod,
+				ToolName: toolName, Verdict: config.ActionRedirect,
+				Layer: receiptLayer, Pattern: receiptPattern, Severity: receiptSeverity,
+				Decision: taintEval, Report: redactionReport, RedactionProfile: redactionCfg.Profile,
+				RequireReceipt: true, RequireReceipts: true,
+			}); err != nil {
+				denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_input", mcpReceiptEmissionReason)
+				receiptVerdict = config.ActionBlock
+				result.Blocked = &BlockedRequest{
+					ID: verdict.ID, IsNotification: isNotification,
+					LogMessage: "receipt emission failed", ErrorCode: -32007,
+					ErrorMessage: requiredReceiptFailureMessage(err),
+					ErrorData:    mcpBlockReasonData(blockreason.ReceiptEmissionFailed),
+				}
+				return result
+			}
+			redirectReceiptEmitted = true
+		}
+		redirectResult := executeRedirect(profile, policyVerdict.RedirectProfile, verdict.ID, toolArgs, policyRuleName, redirectRT)
+		// Determine final outcome before audit logging so the event
+		// reflects the actual result delivered to the client.
+		var br *BlockedRequest
+		finalResult := "blocked"
+		if redirectResult.Success {
+			// Scan redirect handler output for prompt injection AND DLP before
+			// sending to client. Handler output is untrusted - it could contain
+			// secrets or injection payloads.
+			scanVerdict := scanResponseOpts(redirectResult.Response, sc, ResponseScanOptions{Context: inputScanCtx}, false)
+			wc := scanner.DLPWarnContextFromCtx(inputScanCtx)
+			if wc.Transport == "" {
+				wc.Transport = transportMCPHTTP
+			}
+			wc.Method = mcpWarnMethod
+			wc.Resource = mcpWarnResource(verdict.Method, msg)
+			if policyHash := opts.receiptPolicyHash(); policyHash != "" {
+				wc.PolicyHash = policyHash
+			}
+			httpWarnCtx := scanner.WithDLPWarnContext(inputScanCtx, wc)
+			dlpResult := sc.ScanTextForDLP(scanner.WithInboundDirection(httpWarnCtx), string(redirectResult.Response))
+			finalResponseVerdict := mergeRedirectResponseDLP(scanVerdict, dlpResult)
+			responseAction := config.ActionRedirect
+			if !finalResponseVerdict.Clean {
+				responseAction = config.ActionBlock
+			}
+			obs.ObserveResponseVerdict(context.Background(), &capture.ResponseVerdictRecord{
+				Subsurface:        "response_redirect_output",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+				TransformKind:     capture.TransformRedirectOutput,
+				WirePayload:       redirectResult.Response,
+				RawFindings:       append(responseMatchesToFindings(finalResponseVerdict.Matches, responseAction), dlpMatchesToFindingsWithAction(finalResponseVerdict.DLPMatches, responseAction)...),
+				EffectiveAction:   responseAction,
+				Outcome:           captureOutcome(responseAction, finalResponseVerdict.Clean),
+			})
+			if !finalResponseVerdict.Clean {
+				receiptLayer = mcpReceiptLayerResponse
+				receiptPattern, receiptSeverity = redirectResponseAttribution(finalResponseVerdict)
+			}
+			if finalResponseVerdict.Error != "" {
+				denialAudit = mcpResponseInspectionBlockAudit(finalResponseVerdict.Error)
+				br = &BlockedRequest{
+					ID: verdict.ID, IsNotification: isNotification,
+					LogMessage: "blocked (redirect output scan failed)", ErrorCode: -32001,
+					ErrorMessage: "pipelock: redirect handler output scan failed",
+					ErrorData:    mcpBlockReasonData(blockreason.ParseError),
+				}
+			} else if !scanVerdict.Clean {
+				denialAudit = mcpRedirectOutputBlockAudit(scanner.AuditMCPRedirectOutputInjection, mcpRedirectOutputInjectionReason)
+				_, _ = fmt.Fprintf(logW, "pipelock: input: blocked redirect response (injection detected in handler output)\n")
+				recordAdaptiveSignal(session.SignalBlock)
+				br = &BlockedRequest{
+					ID: verdict.ID, IsNotification: isNotification,
+					LogMessage: "blocked (redirect output injection)", ErrorCode: -32001,
+					ErrorMessage: "pipelock: redirect handler output blocked by response scanning",
+				}
+			} else if !dlpResult.Clean {
+				denialAudit = mcpRedirectOutputBlockAudit(scanner.AuditMCPRedirectOutputDLP, mcpRedirectOutputDLPReason)
+				pattern := patternUnknown
+				if len(dlpResult.Matches) > 0 {
+					pattern = dlpResult.Matches[0].PatternName
+				}
+				_, _ = fmt.Fprintf(logW, "pipelock: input: blocked redirect response (DLP match in handler output: %s)\n", pattern)
+				recordAdaptiveSignal(session.SignalBlock)
+				br = &BlockedRequest{
+					ID: verdict.ID, IsNotification: isNotification,
+					LogMessage: "blocked (redirect output DLP)", ErrorCode: -32001,
+					ErrorMessage: "pipelock: redirect handler output blocked by DLP scanning",
+				}
+			} else {
+				finalResult = redirectResultRedirected
+				_, _ = fmt.Fprintf(logW, "pipelock: input: redirected via profile %q (%dms)\n", policyVerdict.RedirectProfile, redirectResult.LatencyMs)
+				br = &BlockedRequest{
+					ID: verdict.ID, IsNotification: isNotification,
+					LogMessage: "redirected", SyntheticResponse: redirectResult.Response,
+				}
+			}
+		} else {
+			// Redirect handler failed - fall through to block (fail-closed).
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPRedirect, mcpRedirectHandlerReason, audit.BlockClassInfrastructureError)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s) [redirect failed: %s]\n", joinStrings(reasons), redirectResult.Error)
+			recordAdaptiveSignal(session.SignalBlock)
+			br = &BlockedRequest{
+				ID: verdict.ID, IsNotification: isNotification,
+				LogMessage: "blocked (redirect failed)", ErrorCode: -32002, ErrorMessage: errPolicyBlocked,
+			}
+		}
+		if auditLogger != nil {
+			auditLogger.LogToolRedirect(audit.ToolRedirectEvent{
+				SessionID:       auditSessionKey,
+				ToolName:        toolName,
+				ArgsDigest:      argsDigest(toolArgs),
+				RedirectProfile: policyVerdict.RedirectProfile,
+				RedirectReason:  profile.Reason,
+				PolicyRule:      policyRuleName,
+				Result:          finalResult,
+				LatencyMs:       redirectResult.LatencyMs,
+			})
+		}
+		if finalResult == redirectResultRedirected {
+			receiptVerdict = config.ActionRedirect
+		} else {
+			receiptVerdict = config.ActionBlock
+		}
+		result.Blocked = br
+		return result
+	case config.ActionDefer:
+		manager := opts.deferManager()
+		if err := deferred.ValidateAction(opts.Transport, config.ActionDefer); err != nil {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPDefer, mcpDeferUnsupportedReason, audit.BlockClassConfigMismatch)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s) [%v]\n", joinStrings(reasons), err)
+			recordAdaptiveSignal(session.SignalBlock)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isNotification,
+				LogMessage:     "blocked (defer unsupported)",
+				ErrorCode:      -32002,
+				ErrorMessage:   err.Error(),
+			}
+			return result
+		}
+		if manager == nil || !manager.Enabled() {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditMCPDefer, mcpDeferDisabledReason, audit.BlockClassConfigMismatch)
+			_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s) [defer manager disabled]\n", joinStrings(reasons))
+			recordAdaptiveSignal(session.SignalBlock)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isNotification,
+				LogMessage:     "blocked (defer disabled)",
+				ErrorCode:      -32002,
+				ErrorMessage:   "pipelock: defer is disabled",
+			}
+			return result
+		}
+		receiptVerdict = config.ActionDefer
+		receiptDecisionPhase = receipt.DecisionPhaseDefer
+		receiptDeferID = actionID
+		receiptResolutionPolicy = deferred.ReceiptPolicyString(manager.Policy(), policyVerdict.ResolutionPolicy)
+		receiptSessionID = sessionKey
+		receiptSessionIDOriginal = auditSessionKey
+		_, toolArgs := extractToolCallFields(result.ForwardMessage)
+		resolverProfileName := policyVerdict.ResolutionPolicy.ResolverProfile
+		var resolverProfile config.DeferResolverProfile
+		if resolverProfileName != "" && policyCfg != nil {
+			resolverProfile = policyCfg.DeferResolverProfiles[resolverProfileName]
+		}
+		result.Deferred = &DeferredRequest{
+			ID:                  verdict.ID,
+			IsNotification:      isNotification,
+			DeferID:             actionID,
+			ForwardMessage:      result.ForwardMessage,
+			ToolName:            toolName,
+			BaselineIdentity:    baselineIdentity,
+			Method:              verdict.Method,
+			Reason:              joinStrings(reasons),
+			SessionID:           sessionKey,
+			SessionIDOriginal:   auditSessionKey,
+			ResolutionPolicy:    policyVerdict.ResolutionPolicy,
+			ResolverProfile:     resolverProfile,
+			ResolverProfileName: resolverProfileName,
+			ArgDigest:           argsDigest(toolArgs),
+			Arguments:           toolArgs,
+		}
+		return result
+	case config.ActionAsk:
+		// HITL for input scanning is impractical - fall back to block (same as stdio proxy).
+		_, _ = fmt.Fprintf(logW, "pipelock: input: blocked (%s) [ask not supported for input scanning]\n", joinStrings(reasons))
+		denialAudit = mcpInputDecisionBlockAudit(verdict, contentBlock || (!verdict.Clean && !policyVerdict.Matched && bindingAction == "" && chainAction == "" && baselineAction == ""), policyVerdict, bindingAction, chainAction, eval.ChainPatternName, baselineAction)
+		recordAdaptiveSignal(session.SignalBlock)
+		receiptVerdict = config.ActionBlock
+		result.Blocked = &BlockedRequest{
+			ID:             verdict.ID,
+			IsNotification: isNotification,
+			LogMessage:     "blocked (ask fallback)",
+			ErrorCode:      errCode,
+			ErrorMessage:   errMsg,
+		}
+		return result
+	default: // warn
+		if len(reasons) > 0 {
+			_, _ = fmt.Fprintf(logW, "pipelock: input: warning (%s)\n", joinStrings(reasons))
+			if !entropyOnlyDecision && !numberOnlyDecision {
+				recordAdaptiveFinding(session.SignalWarning, "mcp_input", joinStrings(reasons))
+			}
+		}
+		// Cross-request exfiltration check even in warn mode.
+		// The MCP session key is the CEE key verbatim. It is issued by the
+		// transport, not supplied by the caller, so there is no self-declared
+		// agent name to namespace by. Namespacing CEE state by a
+		// caller-controlled name would let a client rotate that name to
+		// partition a secret across buckets and evade accumulation.
+		ceeKey := sessionKey
+		inspectionMode, fallbackReason, matchedPattern, ceeBlockKind := "", "", "", ""
+		var ceeContributors []json.RawMessage
+		ceeOpts := ceeRecordMCPOptions{
+			denialAudit:    &denialAudit,
+			sessionKey:     ceeKey,
+			entropyPayload: msg,
+			frame:          frame,
+			cee:            cee,
+			sc:             sc,
+			logW:           logW,
+			logger:         auditLogger,
+			inspectionMode: &inspectionMode,
+			fallbackReason: &fallbackReason,
+			matchedPattern: &matchedPattern,
+			blockKind:      &ceeBlockKind,
+			contributors:   &ceeContributors,
+		}
+		if reason := ceeRecordMCP(ceeOpts); reason != "" {
+			// Capture: record CEE verdict (warn-path).
+			obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
+				Subsurface:        "cee_mcp_http",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID), CEEContributors: ceeContributors},
+				RawFindings: []capture.Finding{{
+					Kind:   capture.KindCEE,
+					Action: config.ActionBlock,
+				}},
+				EffectiveAction: config.ActionBlock,
+				Outcome:         capture.OutcomeBlocked,
+				InspectionMode:  inspectionMode,
+				FallbackReason:  fallbackReason,
+			})
+			// A method that carries neither a tool call nor required receipt
+			// metadata never minted a receipt identity, and the emitter drops a
+			// receipt with an empty action ID. Mint one here so a CEE block on
+			// any method leaves evidence, matching the authorization path in
+			// the deferred finalizer above.
+			if actionID == "" {
+				actionID = receipt.NewActionID()
+			}
+			if toolName == "" {
+				toolName = mcpMethod
+			}
+			receiptVerdict = config.ActionBlock
+			receiptLayer = "cross_request"
+			receiptPattern = ceeBlockKind
+			if matchedPattern != "" {
+				receiptPattern = matchedPattern
+			}
+			receiptSeverity = "critical"
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     "CEE blocked",
+				ErrorCode:      -32005,
+				ErrorMessage:   fmt.Sprintf("pipelock: %s", reason),
+			}
+			return result
+		}
+		contractGate, contractErr := evaluateMCPToolGate(frame, effectiveAction, len(reasons) > 0, opts)
+		if contractErr != nil {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditContract, mcpContractEvalReason, audit.BlockClassInfrastructureError)
+			_, _ = fmt.Fprintf(logW, "pipelock: contract tool-call evaluation failed: %v\n", contractErr)
+			receiptVerdict = config.ActionBlock
+			result.Blocked = &BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     "contract tool-call evaluation failed",
+				ErrorCode:      -32006,
+				ErrorMessage:   "pipelock: contract tool-call evaluation failed",
+			}
+			return result
+		}
+		if contractGate.Verdict == config.ActionBlock {
+			denialAudit = mcpInputGateBlockAudit(scanner.AuditContract, mcpContractDenyAuditReason, audit.BlockClassProtective)
+			_, _ = fmt.Fprintf(logW, "pipelock: contract blocked %s %q (%s)\n", enforcementKind, enforcementTarget, contractGate.Reason)
+			receiptVerdict = config.ActionBlock
+			receiptContractGate = &contractGate
+			result.Blocked = ptrMCPBlockedRequest(mcpContractBlockRequest(verdict.ID, contractGate, "pipelock: request blocked by live-lock contract"))
+			return result
+		}
+		if verdict.Method == methodToolsCall {
+			var decorateErr error
+			result.ForwardMessage, decorateErr = decorateMCPToolMessage(msg, envelopeEmitter, actionID, verdict.Method, toolName, config.ActionWarn, taintEval)
+			if decorateErr != nil {
+				denialAudit = mcpInputGateBlockAudit(scanner.AuditMediationEnvelope, mcpEnvelopeReason, audit.BlockClassInfrastructureError)
+				result.Blocked = &BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     "mediation envelope injection failed",
+					ErrorCode:      -32002,
+					ErrorMessage:   "pipelock: mediation envelope injection failed",
+				}
+				return result
+			}
+			receiptVerdict = config.ActionWarn
+			receiptContractGate = &contractGate
+		}
+		return result // forward
+	}
+}

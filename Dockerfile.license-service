@@ -1,0 +1,22 @@
+# Copyright 2026 Pipelock contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Used by GoReleaser — copies the pre-built binary instead of building from source.
+# Alpine-based because the license service needs a writable filesystem for
+# SQLite (entitlement DB) and the append-only audit ledger.
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+
+RUN apk add --no-cache ca-certificates \
+    && adduser -D -h /data licenseservice
+
+COPY license-service /usr/local/bin/license-service
+
+USER licenseservice
+WORKDIR /data
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["wget", "-qO-", "http://localhost:8080/health"]
+
+ENTRYPOINT ["license-service"]

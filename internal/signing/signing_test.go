@@ -1,0 +1,1301 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package signing
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+func TestGenerateKeyPair(t *testing.T) {
+	pub, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair() error: %v", err)
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		t.Errorf("public key length = %d, want %d", len(pub), ed25519.PublicKeySize)
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		t.Errorf("private key length = %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+}
+
+func TestSignVerify_RoundTrip(t *testing.T) {
+	pub, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data := []byte("hello world")
+	sig := ed25519.Sign(priv, data)
+
+	if !ed25519.Verify(pub, data, sig) {
+		t.Fatal("valid signature rejected")
+	}
+}
+
+func TestSignVerify_WrongKey(t *testing.T) {
+	_, priv1, _ := GenerateKeyPair()
+	pub2, _, _ := GenerateKeyPair()
+
+	data := []byte("hello world")
+	sig := ed25519.Sign(priv1, data)
+
+	if ed25519.Verify(pub2, data, sig) {
+		t.Fatal("signature verified with wrong key")
+	}
+}
+
+func TestSignVerify_TamperedData(t *testing.T) {
+	pub, priv, _ := GenerateKeyPair()
+
+	data := []byte("original content")
+	sig := ed25519.Sign(priv, data)
+
+	tampered := []byte("tampered content")
+	if ed25519.Verify(pub, tampered, sig) {
+		t.Fatal("signature verified on tampered data")
+	}
+}
+
+func TestSignFile_RoundTrip(t *testing.T) {
+	pub, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	if err := os.WriteFile(path, []byte("file content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sig, err := SignFile(path, priv)
+	if err != nil {
+		t.Fatalf("SignFile() error: %v", err)
+	}
+
+	sigPath := path + SigExtension
+	if err := SaveSignature(sig, sigPath); err != nil {
+		t.Fatalf("SaveSignature() error: %v", err)
+	}
+
+	if err := VerifyFile(path, sigPath, pub); err != nil {
+		t.Fatalf("VerifyFile() error: %v", err)
+	}
+}
+
+func TestSignFile_DefaultSigPath(t *testing.T) {
+	pub, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "data.bin")
+	if err := os.WriteFile(path, []byte("binary data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sig, err := SignFile(path, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSignature(sig, path+SigExtension); err != nil {
+		t.Fatal(err)
+	}
+
+	// Empty sigPath should default to path + .sig
+	if err := VerifyFile(path, "", pub); err != nil {
+		t.Fatalf("VerifyFile with default sig path: %v", err)
+	}
+}
+
+func TestVerifyFile_TamperedFile(t *testing.T) {
+	pub, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sig, err := SignFile(path, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigPath := path + SigExtension
+	if err := SaveSignature(sig, sigPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tamper with the file
+	if err := os.WriteFile(path, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := VerifyFile(path, sigPath, pub); err == nil {
+		t.Fatal("expected verification failure on tampered file")
+	}
+}
+
+func TestVerifyFile_MissingSig(t *testing.T) {
+	pub, _, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	if err := os.WriteFile(path, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := VerifyFile(path, "", pub); err == nil {
+		t.Fatal("expected error for missing signature file")
+	}
+}
+
+func TestSignFile_Nonexistent(t *testing.T) {
+	_, priv, _ := GenerateKeyPair()
+	_, err := SignFile("/nonexistent/file.txt", priv)
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestSaveLoadSignature_RoundTrip(t *testing.T) {
+	_, priv, _ := GenerateKeyPair()
+	data := []byte("test data")
+	sig := ed25519.Sign(priv, data)
+
+	dir := t.TempDir()
+	sigPath := filepath.Join(dir, "test.sig")
+
+	if err := SaveSignature(sig, sigPath); err != nil {
+		t.Fatalf("SaveSignature() error: %v", err)
+	}
+
+	loaded, err := LoadSignature(sigPath)
+	if err != nil {
+		t.Fatalf("LoadSignature() error: %v", err)
+	}
+
+	if !bytes.Equal(sig, loaded) {
+		t.Fatal("loaded signature does not match saved signature")
+	}
+}
+
+func TestSaveSignature_Permissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses NTFS ACLs not Unix mode bits; os.Stat reports a synthesized 0o666")
+	}
+	dir := t.TempDir()
+	sigPath := filepath.Join(dir, "test.sig")
+
+	if err := SaveSignature([]byte("fake-sig"), sigPath); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(sigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("signature permissions = %04o, want 0644", info.Mode().Perm())
+	}
+}
+
+func TestLoadSignature_InvalidBase64(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.sig")
+	if err := os.WriteFile(path, []byte("not-valid-base64!!!"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadSignature(path)
+	if err == nil {
+		t.Fatal("expected error for invalid base64")
+	}
+}
+
+func TestEncodeDecodePublicKey_RoundTrip(t *testing.T) {
+	pub, _, _ := GenerateKeyPair()
+
+	encoded := EncodePublicKey(pub)
+	decoded, err := DecodePublicKey(encoded)
+	if err != nil {
+		t.Fatalf("DecodePublicKey() error: %v", err)
+	}
+
+	if !bytes.Equal(pub, decoded) {
+		t.Fatal("decoded public key does not match original")
+	}
+}
+
+func TestEncodeDecodePrivateKey_RoundTrip(t *testing.T) {
+	_, priv, _ := GenerateKeyPair()
+
+	encoded := EncodePrivateKey(priv)
+	decoded, err := DecodePrivateKey(encoded)
+	if err != nil {
+		t.Fatalf("DecodePrivateKey() error: %v", err)
+	}
+
+	if !bytes.Equal(priv, decoded) {
+		t.Fatal("decoded private key does not match original")
+	}
+}
+
+func TestDecodePublicKey_InvalidFormat(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"empty", ""},
+		{"no header", base64.StdEncoding.EncodeToString(make([]byte, 32))},
+		{"wrong header", "wrong-header\n" + base64.StdEncoding.EncodeToString(make([]byte, 32))},
+		{"bad base64", publicKeyHeader + "\nnot-base64!!!"},
+		{"wrong length", publicKeyHeader + "\n" + base64.StdEncoding.EncodeToString(make([]byte, 16))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodePublicKey(tt.input)
+			if err == nil {
+				t.Fatalf("expected error for input %q", tt.name)
+			}
+		})
+	}
+}
+
+func TestDecodePrivateKey_InvalidFormat(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"empty", ""},
+		{"wrong header", "wrong-header\n" + base64.StdEncoding.EncodeToString(make([]byte, 64))},
+		{"bad base64", privateKeyHeader + "\nnot-base64!!!"},
+		{"wrong length", privateKeyHeader + "\n" + base64.StdEncoding.EncodeToString(make([]byte, 16))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodePrivateKey(tt.input)
+			if err == nil {
+				t.Fatalf("expected error for input %q", tt.name)
+			}
+		})
+	}
+}
+
+// TestDecodePrivateKey_JSONKeyFile verifies that DecodePrivateKey accepts the
+// JSON keyfile format produced by "pipelock signing key generate".
+func TestDecodePrivateKey_JSONKeyFile(t *testing.T) {
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+
+	jsonKeyFile := fmt.Sprintf(`{
+  "schema_version": 1,
+  "purpose": "receipt-signing",
+  "key_id": "receipt-signing-test",
+  "public": %q,
+  "private": %q,
+  "created_at": "2026-01-01T00:00:00Z"
+}`, hex.EncodeToString(pub), hex.EncodeToString(priv))
+
+	loaded, err := DecodePrivateKey(jsonKeyFile)
+	if err != nil {
+		t.Fatalf("DecodePrivateKey(JSON keyfile) error: %v", err)
+	}
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match original")
+	}
+}
+
+// TestDecodePrivateKey_JSONKeyFileMalformed verifies fail-closed for bad JSON keyfiles.
+func TestDecodePrivateKey_JSONKeyFileMalformed(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"malformed JSON syntax", `{broken json`},
+		{"trailing JSON data", `{"schema_version":1,"private":"aa"} true`},
+		{"wrong schema version", `{"schema_version":99,"private":"aa","public":"bb"}`},
+		{"empty private field", `{"schema_version":1,"private":"","public":"bb"}`},
+		{"bad hex in private", `{"schema_version":1,"private":"not-hex","public":"bb"}`},
+		{"wrong private length", `{"schema_version":1,"private":"aabb","public":"cc"}`},
+		{"public key mismatch", func() string {
+			// Generate a real key, then pair it with a different public key.
+			_, p, _ := GenerateKeyPair()
+			wrongPub := make([]byte, ed25519.PublicKeySize)
+			wrongPub[0] = 0xff // guaranteed to differ from derived pub
+			return fmt.Sprintf(`{"schema_version":1,"private":"%s","public":"%s"}`,
+				hex.EncodeToString(p), hex.EncodeToString(wrongPub))
+		}()},
+		{"bad hex in public", func() string {
+			// Valid private key but a present, non-hex public field: a tamper
+			// signal that must fail closed, not be silently skipped.
+			_, p, _ := GenerateKeyPair()
+			return fmt.Sprintf(`{"schema_version":1,"private":"%s","public":"not-hex"}`,
+				hex.EncodeToString(p))
+		}()},
+		{"wrong size public", func() string {
+			// Valid private key but a present public field of the wrong length.
+			_, p, _ := GenerateKeyPair()
+			return fmt.Sprintf(`{"schema_version":1,"private":"%s","public":"aabb"}`,
+				hex.EncodeToString(p))
+		}()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodePrivateKey(tt.input)
+			if err == nil {
+				t.Fatalf("expected error for %s", tt.name)
+			}
+		})
+	}
+}
+
+// TestLoadPrivateKeyFile_JSONKeyFile verifies that LoadPrivateKeyFile (the consumer
+// used by flight_recorder.signing_key_path) accepts the JSON keyfile format
+// produced by "pipelock signing key generate".
+func TestLoadPrivateKeyFile_JSONKeyFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission check uses Unix mode bits")
+	}
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := priv.Public().(ed25519.PublicKey)
+
+	jsonKeyFile := fmt.Sprintf(`{
+  "schema_version": 1,
+  "purpose": "receipt-signing",
+  "key_id": "receipt-signing-test",
+  "public": %q,
+  "private": %q,
+  "created_at": "2026-01-01T00:00:00Z"
+}`, hex.EncodeToString(pub), hex.EncodeToString(priv))
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt-key.json")
+	if err := os.WriteFile(path, []byte(jsonKeyFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadPrivateKeyFile(path)
+	if err != nil {
+		t.Fatalf("LoadPrivateKeyFile(JSON keyfile) error: %v", err)
+	}
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match original")
+	}
+}
+
+// TestLoadPrivateKeyFile_TwoLineFormat confirms the existing 2-line format still works.
+func TestLoadPrivateKeyFile_TwoLineFormat(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission check uses Unix mode bits")
+	}
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "receipt.key")
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadPrivateKeyFile(path)
+	if err != nil {
+		t.Fatalf("LoadPrivateKeyFile(2-line format) error: %v", err)
+	}
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match original")
+	}
+}
+
+func TestSaveLoadPublicKeyFile_RoundTrip(t *testing.T) {
+	pub, _, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.pub")
+
+	if err := SavePublicKey(pub, path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadPublicKeyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(pub, loaded) {
+		t.Fatal("loaded key does not match saved key")
+	}
+}
+
+func TestSaveLoadPrivateKeyFile_RoundTrip(t *testing.T) {
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadPrivateKeyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match saved key")
+	}
+}
+
+func TestPublicKeyHexFromPrivateKey(t *testing.T) {
+	pub, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair(): %v", err)
+	}
+
+	got, err := PublicKeyHexFromPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("PublicKeyHexFromPrivateKey(): %v", err)
+	}
+	if want := hex.EncodeToString(pub); got != want {
+		t.Fatalf("public key hex = %q, want %q", got, want)
+	}
+}
+
+func TestPublicKeyHexFromPrivateKeyRejectsBadLength(t *testing.T) {
+	_, err := PublicKeyHexFromPrivateKey(ed25519.PrivateKey("not-a-valid-private-key"))
+	if err == nil {
+		t.Fatal("expected invalid private key length error")
+	}
+	if !strings.Contains(err.Error(), "invalid private key length") {
+		t.Fatalf("error = %v, want invalid private key length", err)
+	}
+}
+
+func TestSavePublicKeyHexFromPrivateKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses NTFS ACLs not Unix mode bits; os.Stat reports a synthesized 0o666")
+	}
+	pub, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair(): %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "flight-recorder-signing.key.pub")
+
+	if err := SavePublicKeyHexFromPrivateKey(priv, path, 0o640); err != nil {
+		t.Fatalf("SavePublicKeyHexFromPrivateKey(): %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatalf("read public key file: %v", err)
+	}
+	want := hex.EncodeToString(pub) + "\n"
+	if string(raw) != want {
+		t.Fatalf("public key file = %q, want %q", raw, want)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat public key file: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o640 {
+		t.Fatalf("public key mode = %s, want %s", got, os.FileMode(0o640))
+	}
+}
+
+func TestSavePublicKeyHexFromPrivateKeyPropagatesBadPrivateKey(t *testing.T) {
+	err := SavePublicKeyHexFromPrivateKey(ed25519.PrivateKey("bad"), filepath.Join(t.TempDir(), "out.pub"), 0o640)
+	if err == nil {
+		t.Fatal("expected bad private key error")
+	}
+	if !strings.Contains(err.Error(), "invalid private key length") {
+		t.Fatalf("error = %v, want invalid private key length", err)
+	}
+}
+
+func TestSavePrivateKeyFile_Permissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses NTFS ACLs not Unix mode bits; os.Stat reports a synthesized 0o666")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("private key permissions = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestSavePublicKeyFile_Permissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses NTFS ACLs not Unix mode bits; os.Stat reports a synthesized 0o666")
+	}
+	pub, _, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.pub")
+
+	if err := SavePublicKey(pub, path); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("public key permissions = %04o, want 0644", info.Mode().Perm())
+	}
+}
+
+func TestVerifyFile_MissingFile(t *testing.T) {
+	pub, _, _ := GenerateKeyPair()
+	err := VerifyFile("/nonexistent/file.txt", "/nonexistent/file.txt.sig", pub)
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestAtomicWrite_BadDirectory(t *testing.T) {
+	// Writing to a non-existent directory should fail.
+	err := atomicWrite("/nonexistent/dir/file.txt", []byte("data"), 0o644)
+	if err == nil {
+		t.Fatal("expected error for bad directory")
+	}
+}
+
+func TestAtomicWrite_RoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+	data := []byte("hello atomic write")
+
+	if err := atomicWrite(path, data, 0o644); err != nil {
+		t.Fatalf("atomicWrite() error: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("data mismatch: got %q, want %q", got, data)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Mode-bit assertion is meaningless on Windows; the content
+	// round-trip above still verifies cross-platform behavior.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o644 {
+		t.Errorf("permissions = %04o, want 0644", info.Mode().Perm())
+	}
+}
+
+func TestAtomicWrite_OverwritesExisting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "overwrite.txt")
+
+	if err := atomicWrite(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWrite(path, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "second" {
+		t.Fatalf("expected 'second', got %q", got)
+	}
+	info, _ := os.Stat(path)
+	// Mode-bit assertion is meaningless on Windows; overwrite content
+	// correctness above still covers cross-platform behavior.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
+		t.Errorf("permissions = %04o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestDefaultKeystorePath(t *testing.T) {
+	path, err := DefaultKeystorePath()
+	if err != nil {
+		t.Fatalf("DefaultKeystorePath() error: %v", err)
+	}
+	if path == "" {
+		t.Fatal("expected non-empty path")
+	}
+	if !filepath.IsAbs(path) {
+		t.Errorf("expected absolute path, got %q", path)
+	}
+	if filepath.Base(path) != DefaultPipelockDir {
+		t.Errorf("expected base %q, got %q", DefaultPipelockDir, filepath.Base(path))
+	}
+}
+
+func TestLoadSignature_WrongLength(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "truncated.sig")
+
+	// Write a valid base64 string but with wrong decoded length (not 64 bytes).
+	short := base64.StdEncoding.EncodeToString([]byte("too short"))
+	if err := os.WriteFile(path, []byte(short), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadSignature(path)
+	if err == nil {
+		t.Fatal("expected error for wrong signature length")
+	}
+}
+
+func TestLoadPrivateKeyFile_FailsOnLoosePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("LoadPrivateKeyFile's permission check uses Unix mode bits; Windows NTFS ACLs are not exercised by os.Chmod")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wide-open.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make the key readable by group/others (insecure).
+	if err := os.Chmod(path, 0o644); err != nil { //nolint:gosec // intentionally insecure for test
+		t.Fatal(err)
+	}
+
+	// LoadPrivateKeyFile must fail closed on loose permissions.
+	// 0644 has others-read (0o004) which trips the 0o037 mask.
+	_, err := LoadPrivateKeyFile(path)
+	if err == nil {
+		t.Fatal("expected error for loose permissions, got nil")
+	}
+	if !strings.Contains(err.Error(), "0644") {
+		t.Errorf("error should mention the bad permissions, got: %v", err)
+	}
+}
+
+func TestLoadPrivateKeyFile_GoodPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("LoadPrivateKeyFile's permission check uses Unix mode bits; Windows NTFS ACLs are not exercised by os.Chmod")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "secure.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify 0600 permissions (set by SavePrivateKey)
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected 0600, got %04o", info.Mode().Perm())
+	}
+
+	loaded, err := LoadPrivateKeyFile(path)
+	if err != nil {
+		t.Fatalf("LoadPrivateKeyFile error: %v", err)
+	}
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match")
+	}
+}
+
+// TestLoadPrivateKeyFile_GroupReadAllowed verifies that k8s fsGroup
+// permissions (0640) are accepted. K8s Secret volumes with fsGroup
+// automatically add group-read, so the loader must allow it.
+func TestLoadPrivateKeyFile_GroupReadAllowed(t *testing.T) {
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "k8s-secret.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate k8s fsGroup: defaultMode 0600 becomes 0640 at runtime.
+	if err := os.Chmod(path, 0o640); err != nil { //nolint:gosec // G302: intentionally testing k8s fsGroup permissions
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadPrivateKeyFile(path)
+	if err != nil {
+		t.Fatalf("LoadPrivateKeyFile should accept 0640 (k8s fsGroup): %v", err)
+	}
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match")
+	}
+}
+
+// TestLoadPrivateKeyFile_GroupWriteRejected verifies that group-write
+// is still rejected even though group-read is allowed.
+func TestLoadPrivateKeyFile_GroupWriteRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("LoadPrivateKeyFile's group-write rejection uses Unix mode bits; Windows has no equivalent")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "group-write.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, 0o660); err != nil { //nolint:gosec // intentionally insecure for test
+		t.Fatal(err)
+	}
+
+	_, err := LoadPrivateKeyFile(path)
+	if err == nil {
+		t.Fatal("expected error for group-write permissions, got nil")
+	}
+}
+
+// TestLoadPrivateKeyFile_GroupExecuteRejected verifies that group-execute
+// is rejected. Group-execute on a key file is dangerous.
+func TestLoadPrivateKeyFile_GroupExecuteRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("LoadPrivateKeyFile's group-execute rejection uses Unix mode bits; Windows has no equivalent")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "group-exec.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, 0o650); err != nil { //nolint:gosec // intentionally insecure for test
+		t.Fatal(err)
+	}
+
+	_, err := LoadPrivateKeyFile(path)
+	if err == nil {
+		t.Fatal("expected error for group-execute permissions, got nil")
+	}
+}
+
+// TestLoadPrivateKeyFile_SymlinkAllowed verifies that symlinks to
+// properly-permissioned key files are resolved and loaded. K8s Secret
+// volumes mount all files as symlinks.
+func TestLoadPrivateKeyFile_SymlinkAllowed(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink on Windows requires SeCreateSymbolicLinkPrivilege which non-admin shells lack")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "real.key")
+	linkPath := filepath.Join(dir, "link.key")
+
+	if err := SavePrivateKey(priv, realPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := LoadPrivateKeyFile(linkPath)
+	if err != nil {
+		t.Fatalf("LoadPrivateKeyFile should follow symlinks: %v", err)
+	}
+	if !bytes.Equal(priv, loaded) {
+		t.Fatal("loaded key does not match")
+	}
+}
+
+// TestLoadPrivateKeyFile_SymlinkToLoosePermsRejected verifies that
+// even though symlinks are followed, the resolved file must still
+// have proper permissions.
+func TestLoadPrivateKeyFile_SymlinkToLoosePermsRejected(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink on Windows requires SeCreateSymbolicLinkPrivilege; the loose-permission check also uses Unix mode bits")
+	}
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	realPath := filepath.Join(dir, "loose.key")
+	linkPath := filepath.Join(dir, "link-to-loose.key")
+
+	if err := SavePrivateKey(priv, realPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(realPath, 0o644); err != nil { //nolint:gosec // intentionally insecure for test
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realPath, linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := LoadPrivateKeyFile(linkPath)
+	if err == nil {
+		t.Fatal("expected error for symlink to loose-permissioned file")
+	}
+}
+
+func TestLoadPrivateKeyFile_RejectsEscapingSymlink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink on Windows requires SeCreateSymbolicLinkPrivilege")
+	}
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair: %v", err)
+	}
+	root := t.TempDir()
+	secretDir := filepath.Join(root, "secret")
+	mountDir := filepath.Join(root, "mount")
+	if err := os.MkdirAll(secretDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll secret: %v", err)
+	}
+	if err := os.MkdirAll(mountDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll mount: %v", err)
+	}
+	target := filepath.Join(secretDir, "private.key")
+	if err := SavePrivateKey(priv, target); err != nil {
+		t.Fatalf("SavePrivateKey: %v", err)
+	}
+	link := filepath.Join(mountDir, "private.key")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if _, err := LoadPrivateKeyFile(link); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("escaping symlink error = %v", err)
+	}
+}
+
+func TestLoadPrivateKeyFile_RejectsOversize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "private.key")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("a"), privateKeyFileMaxBytes+1), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if _, err := LoadPrivateKeyFile(path); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversize private key error = %v", err)
+	}
+}
+
+func TestLoadPrivateKeyFile_NonexistentFile(t *testing.T) {
+	_, err := LoadPrivateKeyFile("/nonexistent/key.pem")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestLoadPublicKeyFile_NonexistentFile(t *testing.T) {
+	_, err := LoadPublicKeyFile("/nonexistent/key.pub")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestSaveSignature_ReplacingDestSymlinkLeavesTargetUnchanged(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink replacement semantics differ on Windows")
+	}
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "signing.key")
+	original := []byte("protected-key-bytes")
+	if err := os.WriteFile(keyPath, original, 0o600); err != nil {
+		t.Fatalf("WriteFile key: %v", err)
+	}
+	dest := filepath.Join(dir, "manifest.sig")
+	if err := os.Symlink(keyPath, dest); err != nil {
+		t.Fatalf("Symlink dest: %v", err)
+	}
+	if err := SaveSignature([]byte("signature-bytes-here"), dest); err != nil {
+		t.Fatalf("SaveSignature: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		t.Fatalf("read key: %v", err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("protected key changed to %q", got)
+	}
+	info, err := os.Lstat(dest)
+	if err != nil {
+		t.Fatalf("Lstat dest: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("SaveSignature left dest as a symlink; rename should have replaced the directory entry")
+	}
+}
+
+func TestSaveSignature_BadDirectory(t *testing.T) {
+	err := SaveSignature([]byte("fake-sig"), "/nonexistent/dir/test.sig")
+	if err == nil {
+		t.Fatal("expected error for bad directory")
+	}
+}
+
+func TestLoadPrivateKeyFile_StatOKButUnreadable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod 0o000 does not block reads on Windows (NTFS ACLs, not Unix mode bits)")
+	}
+	// Save a valid key, then remove read permission.
+	// os.Stat succeeds (doesn't need read perm), but os.ReadFile fails.
+	_, priv, _ := GenerateKeyPair()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "noaccess.key")
+
+	if err := SavePrivateKey(priv, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0o600) }) //nolint:errcheck,gosec // best-effort cleanup
+
+	_, err := LoadPrivateKeyFile(path)
+	if err == nil {
+		t.Fatal("expected error when file is unreadable")
+	}
+	if !strings.Contains(err.Error(), "reading private key") {
+		t.Errorf("expected 'reading private key' error, got: %v", err)
+	}
+}
+
+func TestAtomicWrite_ReadOnlyDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod 0o500 does not block directory writes on Windows (NTFS ACLs, not Unix mode bits)")
+	}
+	dir := t.TempDir()
+	subdir := filepath.Join(dir, "readonly")
+	if err := os.MkdirAll(subdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a file first so we can test overwrite behavior.
+	path := filepath.Join(subdir, "file.txt")
+	if err := atomicWrite(path, []byte("first"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make dir read-only so CreateTemp fails.
+	if err := os.Chmod(subdir, 0o500); err != nil { //nolint:gosec // intentionally restrictive for test
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(subdir, 0o700) }) //nolint:gosec // restore for cleanup
+
+	err := atomicWrite(path, []byte("second"), 0o644)
+	if err == nil {
+		t.Fatal("expected error for read-only directory")
+	}
+	if !strings.Contains(err.Error(), "creating temp file") {
+		t.Errorf("expected 'creating temp file' error, got: %v", err)
+	}
+}
+
+func TestDefaultKeystorePath_ReturnsPath(t *testing.T) {
+	path, err := DefaultKeystorePath()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.HasSuffix(path, DefaultPipelockDir) {
+		t.Errorf("expected path ending with %s, got: %s", DefaultPipelockDir, path)
+	}
+}
+
+func TestSavePublicKey_BadPath(t *testing.T) {
+	pub, _, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = SavePublicKey(pub, "/nonexistent/dir/key.pub")
+	if err == nil {
+		t.Fatal("expected error for bad path")
+	}
+}
+
+func TestSavePrivateKey_BadPath(t *testing.T) {
+	_, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = SavePrivateKey(priv, "/nonexistent/dir/key.priv")
+	if err == nil {
+		t.Fatal("expected error for bad path")
+	}
+}
+
+func TestVerifyFile_BadSignature(t *testing.T) {
+	pub, priv, err := GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	file := filepath.Join(dir, "data.txt")
+	if err := os.WriteFile(file, []byte("test data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sign then modify the file to make signature invalid.
+	sig, err := SignFile(file, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sigPath := file + SigExtension
+	if err := SaveSignature(sig, sigPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Tamper the file.
+	if err := os.WriteFile(file, []byte("tampered data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = VerifyFile(file, "", pub)
+	if err == nil {
+		t.Fatal("expected verification failure for tampered file")
+	}
+}
+
+func TestLoadPublicKeyFile_Missing(t *testing.T) {
+	_, err := LoadPublicKeyFile("/nonexistent/key.pub")
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestLoadPrivateKeyFile_Missing(t *testing.T) {
+	_, err := LoadPrivateKeyFile("/nonexistent/key.priv")
+	if err == nil {
+		t.Fatal("expected error for missing file")
+	}
+}
+
+func TestParsePublicKey(t *testing.T) {
+	pub, _, _ := GenerateKeyPair()
+
+	// Build versioned and hex representations.
+	versioned := EncodePublicKey(pub)
+	hexKey := hex.EncodeToString(pub)
+
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty_string", input: "", wantErr: true, errMsg: "public key is empty"},
+		{name: "whitespace_only", input: "   \n\t  ", wantErr: true, errMsg: "public key is empty"},
+		{name: "valid_versioned", input: versioned, wantErr: false},
+		{name: "valid_hex", input: hexKey, wantErr: false},
+		{name: "invalid_hex", input: "zzzz_not_hex", wantErr: true, errMsg: "invalid public key"},
+		{name: "wrong_length_hex", input: hex.EncodeToString([]byte("short")), wantErr: true, errMsg: "invalid public key length"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, err := ParsePublicKey(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errMsg)
+				}
+				if !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error = %q, want substring %q", err.Error(), tt.errMsg)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(key, pub) {
+				t.Error("parsed key does not match original")
+			}
+		})
+	}
+}
+
+func TestLoadPublicKey(t *testing.T) {
+	pub, _, _ := GenerateKeyPair()
+	versioned := EncodePublicKey(pub)
+	hexKey := hex.EncodeToString(pub)
+
+	t.Run("empty_input", func(t *testing.T) {
+		_, err := LoadPublicKey("")
+		if err == nil || !strings.Contains(err.Error(), "public key is empty") {
+			t.Fatalf("expected empty error, got: %v", err)
+		}
+	})
+
+	t.Run("valid_file_versioned", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "key.pub")
+		if err := os.WriteFile(path, []byte(versioned), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		key, err := LoadPublicKey(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(key, pub) {
+			t.Error("loaded key does not match")
+		}
+	})
+
+	t.Run("valid_file_hex", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "key.hex")
+		if err := os.WriteFile(path, []byte(hexKey), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		key, err := LoadPublicKey(path)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(key, pub) {
+			t.Error("loaded key does not match")
+		}
+	})
+
+	t.Run("file_exists_but_garbage", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "key.pub")
+		if err := os.WriteFile(path, []byte("not a key at all"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadPublicKey(path)
+		if err == nil || !strings.Contains(err.Error(), "parsing public key file") {
+			t.Fatalf("expected parse error, got: %v", err)
+		}
+	})
+
+	t.Run("typo_path_with_slash", func(t *testing.T) {
+		_, err := LoadPublicKey("/nonexistent/typo.pub")
+		if err == nil {
+			t.Fatal("expected error for nonexistent file path")
+		}
+		if !strings.Contains(err.Error(), "reading public key file") {
+			t.Errorf("error = %q, want 'reading public key file'", err.Error())
+		}
+	})
+
+	t.Run("path_with_extension_not_found", func(t *testing.T) {
+		_, err := LoadPublicKey("missing-key.pem")
+		if err == nil {
+			t.Fatal("expected error for file-like input that doesn't exist")
+		}
+		if !strings.Contains(err.Error(), "reading public key file") {
+			t.Errorf("error = %q, want 'reading public key file'", err.Error())
+		}
+	})
+
+	t.Run("dotprefix_not_found", func(t *testing.T) {
+		_, err := LoadPublicKey("./relative.key")
+		if err == nil {
+			t.Fatal("expected error for dot-prefixed path")
+		}
+		if !strings.Contains(err.Error(), "reading public key file") {
+			t.Errorf("error = %q, want 'reading public key file'", err.Error())
+		}
+	})
+
+	t.Run("inline_hex_value", func(t *testing.T) {
+		key, err := LoadPublicKey(hexKey)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(key, pub) {
+			t.Error("inline hex key does not match")
+		}
+	})
+
+	t.Run("inline_hex_wins_over_same_named_file", func(t *testing.T) {
+		dir := t.TempDir()
+		otherPub, _, _ := GenerateKeyPair()
+		if err := os.WriteFile(
+			filepath.Join(dir, hexKey),
+			[]byte(hex.EncodeToString(otherPub)),
+			0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		key, err := LoadPublicKey(hexKey)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(key, pub) {
+			t.Error("same-named file replaced the inline key")
+		}
+	})
+
+	t.Run("inline_versioned_key_wins_over_same_named_file", func(t *testing.T) {
+		dir := t.TempDir()
+		otherPub, _, _ := GenerateKeyPair()
+		shadow := filepath.Join(dir, versioned)
+		if err := os.MkdirAll(filepath.Dir(shadow), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(shadow, []byte(hex.EncodeToString(otherPub)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(dir)
+		key, err := LoadPublicKey(versioned)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(key, pub) {
+			t.Error("same-named file replaced the inline versioned key")
+		}
+	})
+}
+
+func TestAtomicWrite_RenameError(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a subdirectory where the file should be written.
+	// os.Rename(file, directory) fails with EISDIR.
+	target := filepath.Join(dir, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := atomicWrite(target, []byte("data"), 0o600)
+	if err == nil {
+		t.Fatal("expected error when target is a directory")
+	}
+	if !strings.Contains(err.Error(), "renaming to target") {
+		t.Errorf("expected 'renaming to target' error, got: %v", err)
+	}
+}

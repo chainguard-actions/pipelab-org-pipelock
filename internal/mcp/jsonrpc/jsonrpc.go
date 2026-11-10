@@ -1,0 +1,1007 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package jsonrpc provides shared JSON-RPC 2.0 types used across the mcp
+// sub-packages. Extracting these into a dedicated package breaks circular
+// imports between tools/, policy/, and the parent mcp package.
+package jsonrpc
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/json"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// Version is the JSON-RPC protocol version used by MCP.
+const Version = "2.0"
+
+// Null is the JSON literal "null", used to detect nil-equivalent
+// json.RawMessage values that are non-nil Go slices.
+const Null = "null"
+
+// fallbackTextSeparator joins values from a non-standard JSON shape. The
+// space survives DLP normalization; the newline keeps values on their own line.
+const fallbackTextSeparator = " \n"
+
+// ContentBlock represents a single content block in an MCP tool result.
+type ContentBlock struct {
+	Type        string            `json:"type"`
+	Text        string            `json:"text,omitempty"`
+	Resource    *ResourceContents `json:"resource,omitempty"`
+	Name        string            `json:"name,omitempty"`
+	Title       string            `json:"title,omitempty"`
+	Description string            `json:"description,omitempty"`
+	Data        string            `json:"data,omitempty"`
+	Blob        string            `json:"blob,omitempty"`
+	Raw         string            `json:"raw,omitempty"`
+	MimeType    string            `json:"mimeType,omitempty"`
+	MediaType   string            `json:"mediaType,omitempty"`
+}
+
+// ResourceContents is the content carried by an embedded MCP resource.
+// Text is always agent-visible. Blob is scanned unless the VALUE is an
+// encoded media payload; a field name alone does not make it opaque.
+// Media policy handles declared MimeType separately.
+type ResourceContents struct {
+	URI      string `json:"uri,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"`
+}
+
+// ToolResult represents the result field of an MCP tool response.
+type ToolResult struct {
+	Content           []ContentBlock  `json:"content"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
+}
+
+// RPCError represents a JSON-RPC 2.0 error object.
+// Data is optional per JSON-RPC 2.0 but can carry arbitrary content,
+// so it must be scanned for injection like any other text field.
+type RPCError struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
+}
+
+// RPCResponse represents a JSON-RPC 2.0 response envelope.
+// Result is json.RawMessage (not *ToolResult) to handle non-standard result
+// shapes without failing the entire parse - a typed *ToolResult would cause
+// json.Unmarshal to error on string/array/non-object results, allowing bypass.
+// Method and Params are included to scan server notifications for injection.
+type RPCResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   json.RawMessage `json:"error,omitempty"`
+}
+
+const (
+	// ScanScopeResponseInjection names the MCP response prompt-injection scanner.
+	ScanScopeResponseInjection = "response_injection"
+	// ScanScopeResponseDLP names the MCP response inbound text-DLP scanner.
+	ScanScopeResponseDLP = "response_dlp"
+	// ScanScopeToolScanning names the MCP tool-definition poisoning/drift
+	// scanner (internal/mcp/tools). It only applies to tools/list responses.
+	ScanScopeToolScanning = "tool_scanning"
+)
+
+// ToolFinding summarizes one tool-definition-scan finding for a single tool in
+// a tools/list response. It mirrors the subset of tools.ToolScanMatch a
+// diagnostic verdict needs; internal/mcp/jsonrpc cannot import
+// internal/mcp/tools directly (tools already imports jsonrpc).
+type ToolFinding struct {
+	ToolName   string                  `json:"tool_name"`
+	Matches    []scanner.ResponseMatch `json:"matches,omitempty"`
+	ToolPoison []string                `json:"tool_poison,omitempty"`
+}
+
+// ScanVerdict describes the outcome of scanning a single MCP response for MCP
+// response content. Clean means every field family this verdict is
+// responsible for was inspected and none contained enforceable inbound DLP,
+// prompt injection, or tool-definition poisoning; it does not mean tool
+// policy or input scanning ran, since those require request-side context this
+// verdict never carries.
+//
+// Four states:
+//   - Clean:     Clean=true, Scanned names the scopes that ran, Unscanned empty.
+//   - Error:     Clean=false, Error set (parse/protocol failure). Not a finding.
+//   - Unscanned: Clean=false, Unscanned names a field family deliberately not
+//     inspected (e.g. tool scanning disabled by config). Never true alongside
+//     Clean=true: an uninspected family can never be certified clean.
+//   - Finding:   Clean=false, Error empty, Matches and/or DLPMatches and/or
+//     ToolFindings and Action set.
+type ScanVerdict struct {
+	// Assessment is runtime recovery evidence, separate from delivery.
+	Assessment scanner.InjectionAssessment `json:"-"`
+	// TaintFindingKinds preserves causes behind synthetic response matches.
+	// Runtime metadata only; it does not extend scan output or signed receipts.
+	TaintFindingKinds []string        `json:"-"`
+	Line              int             `json:"line"`
+	ID                json.RawMessage `json:"id"`
+	Clean             bool            `json:"clean"`
+	// Scanned is stamped by the surface that emits the verdict, not by each
+	// ScanVerdict constructor. A new surface that marshals a verdict must set
+	// it, otherwise the scope is silently absent from operator-facing output.
+	Scanned []string                `json:"scanned,omitempty"`
+	Action  string                  `json:"action,omitempty"`
+	Matches []scanner.ResponseMatch `json:"matches,omitempty"`
+	// DLPMatches contains enforceable inbound text-DLP findings. It is additive
+	// to the long-standing injection Matches field so existing JSON consumers
+	// retain their response-injection contract.
+	DLPMatches []scanner.TextDLPMatch `json:"dlp_matches,omitempty"`
+	// ToolFindings contains tool-definition poisoning/drift findings when tool
+	// scanning ran against a tools/list response. Empty does not by itself
+	// mean tool scanning ran; check Unscanned for ScanScopeToolScanning.
+	ToolFindings []ToolFinding `json:"tool_findings,omitempty"`
+	// Unscanned names field families this verdict deliberately did not
+	// inspect. Non-empty Unscanned forces Clean=false: the verdict cannot
+	// certify content it never looked at.
+	Unscanned []string `json:"unscanned,omitempty"`
+	Error     string   `json:"error,omitempty"`
+}
+
+// ExtractStringsResult is the bounded recursive extraction result. Truncated is
+// true when the JSON contains content beyond maxExtractDepth and a caller should
+// fail closed rather than make a decision from partial strings.
+// IncompleteReason is non-empty when media inspection ran out of budget; it is
+// a separate signal from Truncated and has the same consequence: the strings
+// are partial and the caller must block.
+type ExtractStringsResult struct {
+	// CardAtoms retains all scalar values, including values omitted from Strings.
+	CardAtoms []extract.DLPAtom
+	// StringPositions maps Strings to its positions in CardAtoms.
+	StringPositions  []int
+	Strings          []string
+	Truncated        bool
+	IncompleteReason string
+}
+
+// ExtractKeysResult is the bounded recursive JSON-key extraction result.
+// Truncated is true when the JSON contains keys beyond maxExtractDepth.
+type ExtractKeysResult struct {
+	Keys      []string
+	Truncated bool
+}
+
+// TextResult is the bounded text extraction result.
+type TextResult struct {
+	// CardText preserves string types while classifying complete text documents.
+	// It excludes object keys, which CardKeys retains for individual scans.
+	CardText string
+	// CardKeys retain ordinary whole-key scans without joining keys into cards.
+	CardKeys  []string
+	Text      string
+	Truncated bool
+	// IncompleteReason is non-empty when media inspection ran out of budget.
+	// Text is then empty: a caller must block rather than scan a prefix.
+	IncompleteReason string
+	// Numeric carries every numeric leaf of the result, in deterministic
+	// traversal order, joined by commas. It is a separate channel from Text
+	// on purpose: numbers never enter the prompt-injection or pattern-DLP
+	// cascade (a run of ordinary telemetry joined into one digit string is
+	// exactly the false-positive shape those scanners produce), but a value
+	// delivered entirely as numbers, such as a canary spelled out as decimal
+	// character codes, must still reach known-value matching.
+	Numeric string
+}
+
+// ExtractText extracts all text content from an MCP tool result.
+// First tries to parse as a standard ToolResult with content blocks (extracting
+// text from ALL block types, not just "text" - prevents bypass via image blocks).
+// Falls back to recursively extracting all string values from arbitrary JSON,
+// preventing bypass via non-standard result shapes.
+//
+// Content blocks are joined with a single space to preserve word boundaries.
+// Between-word splits ("previous" + "instructions") produce intact injections
+// the agent will act on - scanner must detect these. Mid-word splits
+// ("Igno" + "re" → "Igno re") don't match, but the injection is also broken
+// for the agent, so this is not exploitable.
+func ExtractText(raw json.RawMessage) string {
+	return ExtractTextOnlyResult(raw).Text
+}
+
+// ExtractTextResult extracts text content and reports uninspectable depth in
+// the complete JSON value.
+func ExtractTextResult(raw json.RawMessage) TextResult {
+	return extractTextResult(raw, true, nil)
+}
+
+// ExtractTextOnlyResult is ExtractTextResult without the numeric channel. An
+// injection-only scan never consults numeric leaves, and a message may be
+// megabytes, so walking the document a second time to build a channel nobody
+// reads is pure cost.
+func ExtractTextOnlyResult(raw json.RawMessage) TextResult {
+	return extractTextResult(raw, false, nil)
+}
+
+// ExtractTextResultWithMediaBudget is ExtractTextResult drawing on a media
+// budget the caller shares across every extraction over one response, so text
+// recovered from media in separate fields is bounded together. includeNumeric
+// selects the numeric channel as ExtractTextResult and ExtractTextOnlyResult do.
+func ExtractTextResultWithMediaBudget(raw json.RawMessage, includeNumeric bool, budget *MediaTextBudget) TextResult {
+	return extractTextResult(raw, includeNumeric, budget)
+}
+
+func extractTextResult(raw json.RawMessage, includeNumeric bool, budget *MediaTextBudget) TextResult {
+	if budget == nil {
+		budget = &MediaTextBudget{}
+	}
+	if len(raw) == 0 || string(raw) == Null {
+		return TextResult{}
+	}
+	if jsonDepthTruncated(raw) {
+		return TextResult{Truncated: true}
+	}
+	var numeric string
+	if includeNumeric {
+		numeric = ExtractNumericLeaves(raw)
+	}
+
+	// Try standard ToolResult structure first.
+	var tr ToolResult
+	if err := json.Unmarshal(raw, &tr); err == nil && (len(tr.Content) > 0 || tr.StructuredContent != nil) {
+		var texts []string
+		documents := make(map[int]string)
+		for _, block := range tr.Content {
+			// Extract text from ALL content blocks, not just type=="text".
+			// Non-text blocks (image, resource) may carry prompt injection
+			// in their text field.
+			if block.Text != "" {
+				documents[len(texts)] = jsonnumber.StructuredCardView(block.Text, extract.MaxExtractDepth)
+				texts = append(texts, block.Text)
+			}
+			// Embedded resources carry their rendered text under resource.text,
+			// rather than the top-level content block's text field. Treat it as
+			// agent-visible response content while deliberately excluding opaque
+			// resource blobs from prompt scanning.
+			if block.Resource != nil && block.Resource.Text != "" {
+				documents[len(texts)] = jsonnumber.StructuredCardView(block.Resource.Text, extract.MaxExtractDepth)
+				texts = append(texts, block.Resource.Text)
+			}
+			// resource_link metadata is also rendered to the agent. Keep URI
+			// out of this text path; Name, Title, and Description are the
+			// human-facing fields an attacker could use as instructions.
+			for _, field := range []string{block.Name, block.Title, block.Description} {
+				if field != "" {
+					texts = append(texts, field)
+				}
+			}
+			// Typed data/blob/raw fields are opaque only when the VALUE is
+			// encoded media. A plaintext secret or instruction under
+			// content[].data must be scanned, same as structuredContent.
+			for _, field := range []string{block.Data, block.Blob, block.Raw} {
+				texts = appendVisibleMediaField(texts, field, budget)
+			}
+			if block.Resource != nil {
+				texts = appendVisibleMediaField(texts, block.Resource.Blob, budget)
+			}
+		}
+		// structuredContent is rendered to the agent alongside content blocks.
+		// Extract its text even when the typed content fast path succeeds, while
+		// skipping only value-shaped opaque media.
+		structured := extractVisibleStrings(tr.StructuredContent, budget)
+		if structured.Truncated {
+			return TextResult{Truncated: true}
+		}
+		// Budget exhaustion in any field above leaves partial text; withhold it.
+		if reason := budget.Reason(); reason != "" {
+			return TextResult{IncompleteReason: reason}
+		}
+		cards := slices.Clone(texts)
+		cards = append(cards, ResponseCardText(structured.CardAtoms))
+		texts = append(texts, structured.Strings...)
+		keys := ExtractKeysFromJSONResult(tr.StructuredContent)
+		if keys.Truncated {
+			return TextResult{Truncated: true}
+		}
+		texts = append(texts, keys.Keys...)
+		// Always return after a successful ToolResult parse, even when
+		// texts is empty. Falling through to ExtractStringsFromJSON would
+		// feed base64 media in data/blob/raw fields into prompt scanning.
+		for i, view := range documents {
+			cards[i] = view
+		}
+		return TextResult{Text: strings.Join(texts, " "), CardText: strings.Join(cards, " "), CardKeys: keys.Keys, Numeric: numeric}
+	}
+
+	// Fallback: recursively extract all string values from arbitrary JSON.
+	// Catches non-standard result shapes (plain string, nested objects, etc).
+	// DLP normalization deletes the newline, so the space keeps each value's
+	// word boundary, as the typed content join above does.
+	extracted := ExtractStringsFromJSONResult(raw)
+	if len(extracted.Strings) > 0 {
+		joined := strings.Join(extracted.Strings, fallbackTextSeparator)
+		cards := ResponseCardText(extract.AllStringsFromJSONOrderedResult(raw).Atoms)
+		return TextResult{Text: joined, CardText: cards, Truncated: extracted.Truncated, Numeric: numeric}
+	}
+
+	return TextResult{Truncated: extracted.Truncated, Numeric: numeric}
+}
+
+// ResponseCardText joins response scalar values without discarding barriers.
+// Keys are scanned separately. Numbers stay on the numeric channel, with null
+// retaining their position here. Empty strings must retain their join position.
+func ResponseCardText(atoms []extract.DLPAtom) string {
+	var cards []string
+	for _, atom := range atoms {
+		if atom.Key {
+			continue
+		}
+		if atom.Number {
+			cards = append(cards, Null)
+		} else {
+			cards = append(cards, atom.Card)
+		}
+	}
+	return strings.Join(cards, fallbackTextSeparator)
+}
+
+// ExtractNumericLeaves returns every numeric leaf in raw, in the same
+// deterministic order the string extractors use (sorted object keys, array
+// order), joined by commas. Numbers keep their source spelling: a decoder
+// with UseNumber preserves large integers that float64 would round, and a
+// rounded digit string could never match the value it came from. Depth past
+// maxExtractDepth is skipped here because the caller has already failed
+// closed on truncation before asking for this channel.
+func ExtractNumericLeaves(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == Null {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var parsed interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return ""
+	}
+	var leaves []string
+	var walk func(v interface{}, depth int)
+	walk = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			return
+		}
+		switch val := v.(type) {
+		case json.Number:
+			leaves = append(leaves, val.String())
+		case []interface{}:
+			for _, item := range val {
+				walk(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, key := range SortedKeys(val) {
+				walk(val[key], depth+1)
+			}
+		}
+	}
+	walk(parsed, 0)
+	return strings.Join(leaves, ",")
+}
+
+// ExtractVisibleStringsFromJSONResult extracts agent-visible JSON string
+// values while deliberately excluding opaque MCP media payloads. It is used
+// for structuredContent, whose values are rendered to the agent but which may
+// include image/resource payloads that must not be treated as prompt text.
+//
+// Opacity is decided by the VALUE, not by the key alone. A key such as data,
+// blob or raw only nominates a string as a media candidate; the string is
+// skipped when it is actually shaped like a media payload (base64 or a data
+// URI). A nested object under such a key is walked normally, because
+// structuredContent follows a tool-defined schema in which "data" is as often
+// a record as a payload. Skipping by key name alone dropped every string
+// inside {"data":{...}} and let a plaintext secret reach the client unscanned.
+func ExtractVisibleStringsFromJSONResult(raw json.RawMessage) ExtractStringsResult {
+	return extractVisibleStrings(raw, nil)
+}
+
+// ExtractVisibleStringsFromJSONResultWithMediaBudget is
+// ExtractVisibleStringsFromJSONResult drawing on a media budget shared across
+// one response; see ExtractTextResultWithMediaBudget.
+func ExtractVisibleStringsFromJSONResultWithMediaBudget(raw json.RawMessage, budget *MediaTextBudget) ExtractStringsResult {
+	return extractVisibleStrings(raw, budget)
+}
+
+func extractVisibleStrings(raw json.RawMessage, budget *MediaTextBudget) ExtractStringsResult {
+	var parsed interface{}
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
+		return ExtractStringsResult{}
+	}
+	return ExtractVisibleStringsFromValueResult(parsed, budget)
+}
+
+// ExtractVisibleStringsFromValueResult walks a value already decoded by
+// extract.DecodeJSON, optionally drawing on a shared response media budget.
+// The value must contain only the decoder's JSON types, including json.Number,
+// with any removed fields replaced by nil. It must not be mutated during the
+// walk. This skips parsing, not the extraction depth or media limits.
+func ExtractVisibleStringsFromValueResult(parsed any, budget *MediaTextBudget) ExtractStringsResult {
+	if budget == nil {
+		budget = &MediaTextBudget{}
+	}
+	var result []string
+	var atoms []extract.DLPAtom
+	var positions []int
+	truncated := false
+	var visit func(interface{}, int, bool)
+	visit = func(v interface{}, depth int, mediaCandidate bool) {
+		if depth > maxExtractDepth {
+			truncated = true
+			return
+		}
+		if budget.Reason() != "" {
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			before := len(result)
+			card := val
+			if mediaCandidate {
+				result = appendVisibleMediaField(result, val, budget)
+				card = Null
+				if len(result) > before {
+					card = result[before]
+				}
+			} else {
+				result = append(result, val)
+			}
+			if len(result) > before {
+				positions = append(positions, len(atoms))
+			}
+			atoms = append(atoms, extract.DLPAtom{Text: val, Card: card})
+		case json.Number:
+			atoms = append(atoms, extract.DLPAtom{Text: val.String(), Card: jsonnumber.IntegralView(val), Number: true})
+		case bool:
+			card := "false"
+			if val {
+				card = "true"
+			}
+			atoms = append(atoms, extract.DLPAtom{Text: card, Card: card})
+		case nil:
+			atoms = append(atoms, extract.DLPAtom{Text: Null, Card: Null})
+		case []interface{}:
+			// An array under a media key is a list of payloads; each element
+			// decides for itself by shape.
+			for _, item := range val {
+				visit(item, depth+1, mediaCandidate)
+			}
+		case map[string]interface{}:
+			// Keys inside a nested object decide for themselves; a parent key
+			// never makes a whole object opaque.
+			for _, key := range SortedKeys(val) {
+				visit(val[key], depth+1, isOpaqueMCPMediaField(key))
+			}
+		}
+	}
+	visit(parsed, 0, false)
+	if reason := budget.Reason(); reason != "" {
+		return ExtractStringsResult{Truncated: truncated, IncompleteReason: reason}
+	}
+	return ExtractStringsResult{Strings: result, CardAtoms: atoms, StringPositions: positions, Truncated: truncated}
+}
+
+// isOpaqueMCPMediaField reports whether a structuredContent key conventionally
+// carries a media payload (MCP image and audio content use data, resource
+// blobs use blob). The key alone only nominates the value; isOpaqueMediaPayload
+// makes the decision.
+func isOpaqueMCPMediaField(key string) bool {
+	switch strings.ToLower(key) {
+	case "blob", "data", "raw":
+		return true
+	default:
+		return false
+	}
+}
+
+// appendVisibleMediaField appends visible text from a media candidate. Encoded
+// media with no readable text in any decoded view stays out of text scans; text
+// recovered from a recognized container is scanned in place of its base64
+// spelling. When the shared budget runs out the candidate contributes nothing
+// and the budget records why: the caller must block, not scan what remains.
+func appendVisibleMediaField(texts []string, field string, budget *MediaTextBudget) []string {
+	if field == "" || budget.Reason() != "" {
+		return texts
+	}
+	opaque, recovered := classifyMediaPayload(field, budget)
+	if budget.Reason() != "" || opaque {
+		return texts
+	}
+	if recovered != "" {
+		return append(texts, recovered)
+	}
+	return append(texts, field)
+}
+
+// minOpaqueMediaPayloadLen is the shortest candidate considered at all. It only
+// needs to cover the longest signature below, so it bounds work rather than
+// standing in for a judgement about what media looks like.
+const minOpaqueMediaPayloadLen = 16
+
+// mediaSignatures are leading byte sequences published by binary container
+// formats an MCP image, audio or resource-blob field can carry. PNG and JPEG
+// are classified separately because a magic prefix alone is forgeable.
+// Recognition is positive and deliberately incomplete: an unlisted format is
+// treated as visible text and scanned, which costs scanning and never skips
+// content. Only signatures specific enough that ordinary text cannot produce
+// them are listed, so a two-byte printable prefix such as a bitmap's is
+// deliberately absent.
+var mediaSignatures = [][]byte{
+	{'G', 'I', 'F', '8', '7', 'a'}, // GIF87a
+	{'G', 'I', 'F', '8', '9', 'a'}, // GIF89a
+	{'%', 'P', 'D', 'F', '-'},      // PDF
+	{'O', 'g', 'g', 'S'},           // Ogg
+	{'f', 'L', 'a', 'C'},           // FLAC
+	{0x1a, 0x45, 0xdf, 0xa3},       // Matroska and WebM
+}
+
+var pngSignature = []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+
+// pngIHDREnd is the offset after a canonical PNG signature and IHDR chunk
+// (8 + 4 length + 4 type + 13 data + 4 CRC). Real PNGs put IHDR here; a
+// magic prefix followed by text cannot.
+const pngIHDREnd = 33
+
+// minSmuggledTextRun is the shortest run of text recovered from a recognized
+// media payload that warrants scanning, in scalars of the view that read it. It
+// applies across the whole bounded payload, header bytes included.
+const minSmuggledTextRun = 12
+
+// maxFtypBoxSize rejects an ISO-BMFF size field that cannot be a real ftyp
+// box. Brands plus the 8-byte header fit in tens of bytes; 256 is well above
+// any legitimate ftyp.
+const maxFtypBoxSize = 256
+
+// riffForms are the RIFF container forms carried as media. The four-character
+// form name sits at byte offset 8, after "RIFF" and the chunk size.
+var riffForms = [][]byte{
+	[]byte("WEBP"),
+	[]byte("WAVE"),
+	[]byte("AVI "),
+}
+
+// isOpaqueMediaPayload reports whether a string value under a media key is an
+// encoded BINARY media payload, which is the only thing the exclusion exists to
+// keep out of prompt scanning.
+//
+// Two tests must both pass. The string is shaped like base64 (standard or URL
+// alphabet, optional trailing padding, optional line wrapping), or a data URL
+// that explicitly declares base64. Then its decoded leading bytes must carry a
+// recognized media container signature. MCP specifies its typed image, audio
+// and resource-blob fields as base64 strings, so a declared-base64 payload
+// carrying a real container is the form the exclusion was written for.
+//
+// Failure direction: malformed or unrecognized values are scanned as raw text.
+// A recognized container is read in every text encoding the scanner could be
+// handed (see normalizedMediaText) and the text found is scanned in place of
+// the payload. A value past the message size limit, or text that exhausts the
+// response's media budget, is not guessed at: the budget records it and the
+// caller blocks. A base64-encoded credential has no container signature and is
+// scanned. Unlisted media may still produce false positives on binary noise.
+func isOpaqueMediaPayload(s string) bool {
+	var budget MediaTextBudget
+	opaque, _ := classifyMediaPayload(s, &budget)
+	return opaque && budget.Reason() == ""
+}
+
+// classifyMediaPayload reports whether s is encoded media with no readable text
+// and otherwise returns the text recovered from it. A recognized header only
+// nominates the value; it never decides what is inspected, because a forged
+// header costs an attacker nothing, so the whole decoded value is read.
+//
+// Budget exhaustion is reported on budget, not in the return values.
+func classifyMediaPayload(s string, budget *MediaTextBudget) (bool, string) {
+	payload := s
+	if strings.HasPrefix(s, "data:") {
+		declared, ok := base64DataURLPayload(s)
+		if !ok {
+			// A data URL that does not declare base64, or is not a data URL at
+			// all beyond its prefix, carries visible text.
+			return false, ""
+		}
+		payload = declared
+	}
+	if len(payload) > MaxMediaTextBytes {
+		// Transports refuse a message this large before it reaches a scanner;
+		// a direct caller that hands one over has not been inspected in full.
+		budget.exhaust()
+		return false, ""
+	}
+	if !isBase64MediaRun(payload) {
+		return false, ""
+	}
+	decoded, ok := decodeMediaPayload(payload)
+	if !ok {
+		return false, ""
+	}
+	if _, ok := mediaPayloadAfterHeader(decoded); !ok {
+		return false, ""
+	}
+	recovered := normalizedMediaText(decoded, budget)
+	if budget.Reason() != "" {
+		return false, ""
+	}
+	return recovered == "", recovered
+}
+
+// mediaPayloadAfterHeader reports whether decoded opens with a recognized media
+// header, and the bytes after it. Recognition only nominates the value as
+// media; callers must read all of decoded, because the header's own bytes (a
+// PNG's IHDR span, an ftyp box) are attacker-controlled too.
+// Failure direction: a payload that does not prove its header is scanned.
+func mediaPayloadAfterHeader(decoded []byte) ([]byte, bool) {
+	if rest, ok := pngPayloadAfterIHDR(decoded); ok {
+		return rest, true
+	}
+	if rest, ok := jpegPayloadAfterSOI(decoded); ok {
+		return rest, true
+	}
+	for _, sig := range mediaSignatures {
+		if bytes.HasPrefix(decoded, sig) {
+			return decoded[len(sig):], true
+		}
+	}
+	if bytes.HasPrefix(decoded, []byte("RIFF")) && len(decoded) >= 12 {
+		for _, form := range riffForms {
+			if bytes.Equal(decoded[8:12], form) {
+				return decoded[12:], true
+			}
+		}
+	}
+	return ftypPayloadAfterBox(decoded)
+}
+
+func pngPayloadAfterIHDR(decoded []byte) ([]byte, bool) {
+	if !bytes.HasPrefix(decoded, pngSignature) || len(decoded) < pngIHDREnd {
+		return nil, false
+	}
+	if binary.BigEndian.Uint32(decoded[8:12]) != 13 || string(decoded[12:16]) != "IHDR" {
+		return nil, false
+	}
+	return decoded[pngIHDREnd:], true
+}
+
+func jpegPayloadAfterSOI(decoded []byte) ([]byte, bool) {
+	// JPEG SOI plus the start of the next marker (FF <type>). Type must be a
+	// real segment code; ASCII such as 'I' from "Ignore..." is not.
+	if len(decoded) < 4 || decoded[0] != 0xff || decoded[1] != 0xd8 || decoded[2] != 0xff {
+		return nil, false
+	}
+	if decoded[3] < 0xc0 || decoded[3] > 0xfe {
+		return nil, false
+	}
+	return decoded[4:], true
+}
+
+func ftypPayloadAfterBox(decoded []byte) ([]byte, bool) {
+	// Same size floor as media.DetectType: a 32-bit box length must cover the
+	// 8-byte header plus "ftyp" contents. Cap the size so a huge field cannot
+	// hide trailing text inside a claimed box the prefix never contains.
+	if len(decoded) < 8 || !bytes.Equal(decoded[4:8], []byte("ftyp")) {
+		return nil, false
+	}
+	size := binary.BigEndian.Uint32(decoded[:4])
+	if size < 12 || size > maxFtypBoxSize {
+		return nil, false
+	}
+	if int(size) > len(decoded) {
+		return nil, false
+	}
+	if int(size) == len(decoded) {
+		return nil, true
+	}
+	return decoded[size:], true
+}
+
+// base64DataURLPayload returns the payload of a data URL that explicitly
+// declares base64 encoding. RFC 2397 requires a comma between the metadata and
+// the data, and the base64 form carries a `;base64` parameter last in the
+// metadata. Anything else is not a base64 data URL.
+func base64DataURLPayload(s string) (string, bool) {
+	meta, data, found := strings.Cut(strings.TrimPrefix(s, "data:"), ",")
+	if !found || !strings.HasSuffix(strings.ToLower(meta), ";base64") {
+		return "", false
+	}
+	return data, true
+}
+
+// isBase64MediaRun reports whether s is long enough and drawn only from a
+// base64 alphabet, allowing MIME line wrapping and at most two trailing
+// padding characters.
+func isBase64MediaRun(s string) bool {
+	// A final MIME line ending sits after the padding, so remove it first.
+	s = strings.TrimRight(s, "\r\n")
+	if len(s) < minOpaqueMediaPayloadLen {
+		return false
+	}
+	body := strings.TrimRight(s, "=")
+	if len(s)-len(body) > 2 {
+		return false
+	}
+	chars := 0
+	for i := 0; i < len(body); i++ {
+		switch c := body[i]; {
+		case c >= 'A' && c <= 'Z', c >= 'a' && c <= 'z', c >= '0' && c <= '9',
+			c == '+', c == '/', c == '-', c == '_':
+			chars++
+		case c == '\n', c == '\r':
+			// Line-wrapped (MIME style) base64 is still one payload.
+		default:
+			return false
+		}
+	}
+	return chars >= minOpaqueMediaPayloadLen
+}
+
+// decodeMediaPayload decodes the complete candidate within the existing MCP
+// message limit. Oversized or malformed values remain visible for text scans.
+func decodeMediaPayload(payload string) ([]byte, bool) {
+	if len(payload) > transport.MaxLineSize {
+		return nil, false
+	}
+	compact := payload
+	if strings.ContainsAny(compact, "\r\n") {
+		var b strings.Builder
+		b.Grow(len(payload))
+		for i := 0; i < len(payload); i++ {
+			if payload[i] != '\r' && payload[i] != '\n' {
+				b.WriteByte(payload[i])
+			}
+		}
+		compact = b.String()
+	}
+	compact = strings.TrimRight(compact, "=")
+	enc := base64.RawStdEncoding
+	if strings.ContainsAny(compact, "-_") {
+		enc = base64.RawURLEncoding
+	}
+	decoded, err := enc.DecodeString(compact)
+	if err != nil || len(decoded) == 0 {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// jsonDepthTruncated reports whether raw JSON exceeds the recursive extraction
+// depth cap without returning any extracted strings.
+func jsonDepthTruncated(raw json.RawMessage) bool {
+	var parsed interface{}
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
+		return false
+	}
+	return valueDepthTruncated(parsed, 0)
+}
+
+// valueDepthTruncated walks arbitrary decoded JSON and stops when depth exceeds
+// maxExtractDepth.
+func valueDepthTruncated(v interface{}, depth int) bool {
+	if depth > maxExtractDepth {
+		return true
+	}
+	switch val := v.(type) {
+	case []interface{}:
+		for _, item := range val {
+			if valueDepthTruncated(item, depth+1) {
+				return true
+			}
+		}
+	case map[string]interface{}:
+		for _, item := range val {
+			if valueDepthTruncated(item, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SortedKeys returns the keys of a map in sorted order. Used by JSON extraction
+// functions to ensure deterministic iteration - Go map order is random, so
+// split-secret concat scanning would miss secrets nondeterministically without
+// stable ordering.
+func SortedKeys(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// maxExtractDepth limits recursion in ExtractStringsFromJSON to prevent stack
+// overflow from maliciously deeply-nested JSON.
+const maxExtractDepth = extract.MaxExtractDepth
+
+// MaxExtractDepth exports the extraction depth bound so callers that gate a
+// subtree before it is re-extracted from a higher root can derive their own
+// bound from it rather than restating the number.
+const MaxExtractDepth = maxExtractDepth
+
+// maxExtractKeys bounds how many object keys one extraction contributes to the
+// scanned text. Sized far above any real tool listing and far below what an
+// adversarial one can produce: a server publishing a hundred tools with fifty
+// parameters each stays well inside it, while a message engineered purely for
+// breadth stops here and is reported truncated, which callers already treat as
+// fail-closed. Chosen against a measurement rather than a guess: a 2.6MB
+// listing carrying eighty thousand keys took roughly twenty seconds to scan
+// before this bound existed.
+const maxExtractKeys = 20000
+
+// ExtractStringsForKeys extracts string values only from top-level keys
+// matching the keyPattern regex. Values under non-matching keys are excluded.
+// Nested values under matching keys are extracted recursively.
+// Returns nil if keyPattern is nil (callers must provide a compiled pattern).
+func ExtractStringsForKeys(raw json.RawMessage, keyPattern *regexp.Regexp) []string {
+	return ExtractStringsForKeysResult(raw, keyPattern).Strings
+}
+
+// ExtractStringsForKeysResult extracts string values from matching top-level
+// keys and reports whether recursive extraction hit the depth cap.
+func ExtractStringsForKeysResult(raw json.RawMessage, keyPattern *regexp.Regexp) ExtractStringsResult {
+	var parsed interface{}
+	if err := extract.DecodeJSON(raw, &parsed); err != nil {
+		return ExtractStringsResult{}
+	}
+	m, ok := parsed.(map[string]interface{})
+	if !ok {
+		return ExtractStringsResult{} // arguments must be an object
+	}
+	var result []string
+	truncated := false
+	var extract func(v interface{}, depth int)
+	extract = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			result = append(result, val)
+		case []interface{}:
+			for _, item := range val {
+				extract(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, k := range SortedKeys(val) {
+				extract(val[k], depth+1)
+			}
+		}
+	}
+	if keyPattern == nil {
+		return ExtractStringsResult{}
+	}
+	for _, k := range SortedKeys(m) {
+		if keyPattern != nil && keyPattern.MatchString(k) {
+			extract(m[k], 0)
+		}
+	}
+	return ExtractStringsResult{Strings: result, Truncated: truncated}
+}
+
+// ExtractStringsFromJSON recursively extracts all string values from arbitrary JSON.
+// Only extracts values (not keys) to avoid false positives from field names.
+// Recursion is bounded by maxExtractDepth to prevent stack overflow.
+func ExtractStringsFromJSON(raw json.RawMessage) []string {
+	return ExtractStringsFromJSONResult(raw).Strings
+}
+
+// ExtractStringsFromJSONResult recursively extracts all string values from
+// arbitrary JSON and reports whether extraction hit the nesting cap.
+func ExtractStringsFromJSONResult(raw json.RawMessage) ExtractStringsResult {
+	var result []string
+	var atoms []extract.DLPAtom
+	var positions []int
+	truncated := false
+	var visit func(v interface{}, depth int)
+	visit = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case string:
+			positions = append(positions, len(atoms))
+			result = append(result, val)
+			atoms = append(atoms, extract.DLPAtom{Text: val, Card: val})
+		case json.Number:
+			atoms = append(atoms, extract.DLPAtom{Text: val.String(), Card: jsonnumber.IntegralView(val), Number: true})
+		case bool:
+			value := "false"
+			if val {
+				value = "true"
+			}
+			atoms = append(atoms, extract.DLPAtom{Text: value, Card: value})
+		case nil:
+			atoms = append(atoms, extract.DLPAtom{Text: Null, Card: Null})
+		case []interface{}:
+			for _, item := range val {
+				visit(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, k := range SortedKeys(val) {
+				visit(val[k], depth+1)
+			}
+		}
+	}
+	var parsed interface{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err == nil && json.Valid(raw) {
+		visit(parsed, 0)
+	}
+	return ExtractStringsResult{Strings: result, CardAtoms: atoms, StringPositions: positions, Truncated: truncated}
+}
+
+// ExtractKeysFromJSONResult recursively extracts JSON object keys and reports
+// whether extraction hit the nesting cap. Most response scanning deliberately
+// ignores keys because they are normally structural. Callers that surface a
+// JSON object as agent-visible tool metadata can opt into scanning its keys.
+func ExtractKeysFromJSONResult(raw json.RawMessage) ExtractKeysResult {
+	var parsed interface{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&parsed); err != nil || !json.Valid(raw) {
+		return ExtractKeysResult{}
+	}
+	return ExtractKeysFromValueResult(parsed)
+}
+
+// ExtractKeysFromValueResult walks a value already decoded by extract.DecodeJSON
+// (or the equivalent complete-document, UseNumber decoder above). The value
+// must contain only JSON decoder types, with any removed fields replaced by nil,
+// and must not be mutated during the walk. Depth and key limits still apply.
+func ExtractKeysFromValueResult(parsed any) ExtractKeysResult {
+	var result []string
+	truncated := false
+	var extract func(v interface{}, depth int)
+	extract = func(v interface{}, depth int) {
+		// Depth alone does not bound the work: a wide, shallow document stays
+		// within maxExtractDepth while producing an unbounded number of keys,
+		// and every key is then joined into text that each scanner pattern runs
+		// over. Breadth is bounded here for the same reason depth is, and it
+		// reports through the same Truncated flag, so a caller that already
+		// fails closed on truncation needs no new branch.
+		if depth > maxExtractDepth || len(result) >= maxExtractKeys {
+			truncated = true
+			return
+		}
+		switch val := v.(type) {
+		case []interface{}:
+			for _, item := range val {
+				if len(result) >= maxExtractKeys {
+					truncated = true
+					return
+				}
+				extract(item, depth+1)
+			}
+		case map[string]interface{}:
+			// Compare the object's size against the remaining budget BEFORE
+			// sorting. SortedKeys allocates and sorts every key, which is the
+			// expensive part, so checking afterwards paid the whole cost of a
+			// hostile object and only then refused it.
+			if len(val) > maxExtractKeys-len(result) {
+				truncated = true
+				return
+			}
+			for _, key := range SortedKeys(val) {
+				if len(result) >= maxExtractKeys {
+					truncated = true
+					return
+				}
+				result = append(result, key)
+				extract(val[key], depth+1)
+			}
+		}
+	}
+	extract(parsed, 0)
+	return ExtractKeysResult{Keys: result, Truncated: truncated}
+}

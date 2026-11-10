@@ -1,0 +1,1068 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package recorder_test
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+)
+
+func writeTestEntries(t *testing.T, dir string, sessionID string, count int) {
+	t.Helper()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 1000, // High to avoid auto-checkpoints
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i := range count {
+		transport := testTransport
+		entryType := testType
+		if i%2 == 1 {
+			transport = "mcp-stdio"
+			entryType = "tool_call"
+		}
+		if err := rec.Record(recorder.Entry{
+			SessionID: sessionID,
+			Type:      entryType,
+			Transport: transport,
+			Summary:   fmt.Sprintf("entry %d", i),
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestQuerySession_NoFilter(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 5)
+
+	result, err := recorder.QuerySession(dir, "sess-1", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	// 5 data entries + 1 final checkpoint
+	if len(result.Entries) < 5 {
+		t.Errorf("expected at least 5 entries, got %d", len(result.Entries))
+	}
+	if result.TotalFiles != 1 {
+		t.Errorf("TotalFiles = %d, want 1", result.TotalFiles)
+	}
+	if result.FilesRead != 1 {
+		t.Errorf("FilesRead = %d, want 1", result.FilesRead)
+	}
+}
+
+func TestWalkSessionHistoryMatchesQueryOrder(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "walk-session", 5)
+
+	queried, err := recorder.QuerySession(dir, "walk-session", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	var walked []recorder.Entry
+	if err := recorder.WalkSessionHistory(dir, "walk-session", func(entry recorder.Entry) error {
+		walked = append(walked, entry)
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkSessionHistory: %v", err)
+	}
+	if !reflect.DeepEqual(walked, queried.Entries) {
+		t.Fatalf("walked %d entries differ from QuerySession's %d entries", len(walked), len(queried.Entries))
+	}
+
+	// Query ordering comes from each shard's starting sequence, not directory
+	// enumeration order or lexicographic numeric text order.
+	multiDir := t.TempDir()
+	for _, seq := range []uint64{10, 2} {
+		entry := recorder.Entry{
+			Version: recorder.EntryVersion, Sequence: seq, Timestamp: time.Now().UTC(),
+			SessionID: "multi-walk", Type: testType, Transport: testTransport,
+			Summary: fmt.Sprintf("entry %d", seq), PrevHash: recorder.GenesisHash,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		data, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Join(multiDir, fmt.Sprintf("evidence-multi-walk-%d.jsonl", seq))
+		if err := writeFile(name, append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queried, err = recorder.QuerySession(multiDir, "multi-walk", nil)
+	if err != nil {
+		t.Fatalf("QuerySession(multi-shard): %v", err)
+	}
+	walked = nil
+	if err := recorder.WalkSessionHistory(multiDir, "multi-walk", func(entry recorder.Entry) error {
+		walked = append(walked, entry)
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkSessionHistory(multi-shard): %v", err)
+	}
+	if !reflect.DeepEqual(walked, queried.Entries) {
+		t.Fatalf("multi-shard walk entries %#v differ from QuerySession entries %#v", walked, queried.Entries)
+	}
+}
+
+func TestWalkSessionHistoryFailsClosed(t *testing.T) {
+	t.Run("foreign session entry", func(t *testing.T) {
+		dir := t.TempDir()
+		entry := recorder.Entry{
+			Version: recorder.EntryVersion, Sequence: 0, Timestamp: time.Now().UTC(),
+			SessionID: "other", Type: testType, Transport: testTransport,
+			Summary: "foreign", PrevHash: recorder.GenesisHash,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		data, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeFile(filepath.Join(dir, "evidence-victim-0.jsonl"), append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.WalkSessionHistory(dir, "victim", func(recorder.Entry) error { return nil }); !errors.Is(err, recorder.ErrEvidenceRefused) {
+			t.Fatalf("WalkSessionHistory error = %v, want ErrEvidenceRefused", err)
+		}
+	})
+
+	t.Run("torn tail", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestEntries(t, dir, "torn-session", 1)
+		files, err := filepath.Glob(filepath.Join(dir, "evidence-torn-session-*.jsonl"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("find evidence shard: files=%v err=%v", files, err)
+		}
+		f, err := os.OpenFile(files[0], os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString("{"); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.WalkSessionHistory(dir, "torn-session", func(recorder.Entry) error { return nil }); err == nil {
+			t.Fatal("WalkSessionHistory accepted torn tail")
+		}
+	})
+
+	t.Run("file change during callback", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestEntries(t, dir, "changed-session", 1)
+		files, err := filepath.Glob(filepath.Join(dir, "evidence-changed-session-*.jsonl"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("find evidence shard: files=%v err=%v", files, err)
+		}
+		changed := false
+		err = recorder.WalkSessionHistory(dir, "changed-session", func(recorder.Entry) error {
+			if changed {
+				return nil
+			}
+			changed = true
+			return os.WriteFile(files[0], []byte("changed\n"), 0o600)
+		})
+		if err == nil || !strings.Contains(err.Error(), "evidence file changed during read") {
+			t.Fatalf("WalkSessionHistory error = %v, want evidence file changed during read", err)
+		}
+		// Matching the text is not enough: callers retry or report "no
+		// verdict" only when the error carries the sentinel.
+		if !errors.Is(err, recorder.ErrEvidenceChanged) || !recorder.IsEvidenceUnavailable(err) {
+			t.Fatalf("WalkSessionHistory error = %v, want ErrEvidenceChanged classified as unavailable evidence", err)
+		}
+	})
+}
+
+// TestQuerySession_LegacyAndSingleLocationLayoutMatch is the migration safety
+// property: moving the same legacy shard set beneath one location directory does
+// not change the reader's result.
+func TestQuerySession_LegacyAndSingleLocationLayoutMatch(t *testing.T) {
+	t.Parallel()
+	legacyRoot := t.TempDir()
+	locationRoot := t.TempDir()
+	writeTestEntries(t, legacyRoot, "proxy", 3)
+	locationDir := filepath.Join(locationRoot, "recorder-a", "location-a")
+	if err := os.MkdirAll(locationDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll location directory: %v", err)
+	}
+	entries, err := os.ReadDir(legacyRoot)
+	if err != nil {
+		t.Fatalf("ReadDir legacy root: %v", err)
+	}
+	for _, entry := range entries {
+		data, readErr := fs.ReadFile(os.DirFS(legacyRoot), entry.Name())
+		if readErr != nil {
+			t.Fatalf("ReadFile legacy shard: %v", readErr)
+		}
+		if writeErr := os.WriteFile(filepath.Join(locationDir, entry.Name()), data, 0o600); writeErr != nil {
+			t.Fatalf("WriteFile location shard: %v", writeErr)
+		}
+	}
+
+	legacy, err := recorder.QuerySession(legacyRoot, "proxy", nil)
+	if err != nil {
+		t.Fatalf("QuerySession legacy: %v", err)
+	}
+	migrated, err := recorder.QuerySession(locationRoot, "proxy", nil)
+	if err != nil {
+		t.Fatalf("QuerySession single location: %v", err)
+	}
+	if !reflect.DeepEqual(legacy, migrated) {
+		t.Fatalf("single-location result differs from legacy:\nlegacy=%+v\nmigrated=%+v", legacy, migrated)
+	}
+}
+
+func TestQuerySession_MaxEntriesReadTruncates(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 5)
+
+	result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+		MaxEntriesRead: 2,
+	})
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatal("QuerySession should report truncation")
+	}
+	if result.EntriesRead != 2 {
+		t.Fatalf("EntriesRead = %d, want 2", result.EntriesRead)
+	}
+	if len(result.Entries) != 2 {
+		t.Fatalf("len(Entries) = %d, want 2", len(result.Entries))
+	}
+}
+
+func TestQuerySession_MaxBytesReadTruncatesSkippedLines(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evidence-sess-1-0.jsonl")
+	if err := os.WriteFile(path, []byte(strings.Repeat("\n", 1024)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+		MaxBytesRead: 128,
+	})
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatal("QuerySession did not report byte-limit truncation")
+	}
+	if result.BytesRead <= 128 {
+		t.Fatalf("BytesRead = %d, want evidence that byte limit was reached", result.BytesRead)
+	}
+	if result.EntriesRead != 0 || len(result.Entries) != 0 {
+		t.Fatalf("entries = read %d returned %d, want empty truncated result", result.EntriesRead, len(result.Entries))
+	}
+}
+
+func TestQuerySession_MaxBytesReadTruncatesAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+	first := []byte(`{"v":2,"seq":0,"ts":"2026-01-01T00:00:00Z","session_id":"sess-1","type":"request","transport":"fetch","summary":"first"}` + "\n")
+	second := []byte(`{"v":2,"seq":1,"ts":"2026-01-01T00:00:01Z","session_id":"sess-1","type":"response","transport":"fetch","summary":"second"}` + "\n")
+	maxBytesRead := int64(len(first) + len(second) - 1)
+	for path, data := range map[string][]byte{
+		filepath.Join(dir, "evidence-sess-1-0.jsonl"): first,
+		filepath.Join(dir, "evidence-sess-1-1.jsonl"): second,
+	} {
+		if len(data) >= int(maxBytesRead) {
+			t.Fatalf("%s length = %d, want below aggregate cap %d", filepath.Base(path), len(data), maxBytesRead)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+		MaxBytesRead: maxBytesRead,
+	})
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatal("QuerySession did not report cross-file byte-limit truncation")
+	}
+	if result.TotalFiles != 2 || result.FilesRead != 2 {
+		t.Fatalf("files = total %d read %d, want second file to trigger truncation", result.TotalFiles, result.FilesRead)
+	}
+	if result.BytesRead <= maxBytesRead {
+		t.Fatalf("BytesRead = %d, want evidence that aggregate byte limit was reached", result.BytesRead)
+	}
+	if result.EntriesRead != 1 || len(result.Entries) != 1 {
+		t.Fatalf("entries = read %d returned %d, want only first file before truncation", result.EntriesRead, len(result.Entries))
+	}
+	if result.Entries[0].Sequence != 0 {
+		t.Fatalf("entry sequence = %d, want only first file entry", result.Entries[0].Sequence)
+	}
+}
+
+func TestQuerySession_MaxBytesReadStopsBeforeNextFile(t *testing.T) {
+	dir := t.TempDir()
+	first := []byte(`{"v":2,"seq":0,"ts":"2026-01-01T00:00:00Z","session_id":"sess-1","type":"request","transport":"fetch","summary":"first"}` + "\n")
+	second := []byte(`{"v":2,"seq":1,"ts":"2026-01-01T00:00:01Z","session_id":"sess-1","type":"response","transport":"fetch","summary":"second"}` + "\n")
+	for path, data := range map[string][]byte{
+		filepath.Join(dir, "evidence-sess-1-0.jsonl"): first,
+		filepath.Join(dir, "evidence-sess-1-1.jsonl"): second,
+	} {
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+		MaxBytesRead: int64(len(first)),
+	})
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatal("QuerySession did not report truncation before reading the next file")
+	}
+	if result.FilesRead != 1 || result.EntriesRead != 1 || len(result.Entries) != 1 {
+		t.Fatalf("files=%d entriesRead=%d returned=%d, want only first file read", result.FilesRead, result.EntriesRead, len(result.Entries))
+	}
+	if result.BytesRead != int64(len(first)) {
+		t.Fatalf("BytesRead = %d, want exact first file size %d", result.BytesRead, len(first))
+	}
+}
+
+func TestQuerySession_ZeroReadLimitsUseDefaultPerFileCeilings(t *testing.T) {
+	t.Run("entries", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "evidence-sess-1-0.jsonl")
+		var data strings.Builder
+		for seq := range recorder.MaxEvidenceReadEntries + 1 {
+			_, _ = fmt.Fprintf(&data, `{"v":2,"seq":%d,"ts":"2026-01-01T00:00:00Z","session_id":"sess-1","type":"request"}`+"\n", seq)
+		}
+		if err := os.WriteFile(path, []byte(data.String()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+			MaxEntriesRead: 0,
+		})
+		if err != nil {
+			t.Fatalf("QuerySession: %v", err)
+		}
+		if !result.Truncated {
+			t.Fatal("QuerySession did not report default entry-limit truncation")
+		}
+		if result.EntriesRead != recorder.MaxEvidenceReadEntries {
+			t.Fatalf("EntriesRead = %d, want default ceiling %d", result.EntriesRead, recorder.MaxEvidenceReadEntries)
+		}
+	})
+
+	t.Run("bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "evidence-sess-1-0.jsonl")
+		if err := os.WriteFile(path, []byte(strings.Repeat("\n", int(recorder.MaxEvidenceReadFileBytes)+1)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+			MaxBytesRead: 0,
+		})
+		if err != nil {
+			t.Fatalf("QuerySession: %v", err)
+		}
+		if !result.Truncated {
+			t.Fatal("QuerySession did not report default byte-limit truncation")
+		}
+		if result.BytesRead <= recorder.MaxEvidenceReadFileBytes {
+			t.Fatalf("BytesRead = %d, want evidence that default byte limit was reached", result.BytesRead)
+		}
+	})
+
+	// A zero limit selects the default PER FILE, not a session-wide budget. Each
+	// file here stays under BOTH default ceilings (bytes and entries) while the
+	// pair together exceeds one default byte budget, so a regression that spent a
+	// single shared budget across the session would truncate the second file.
+	t.Run("default byte ceiling applies per file, not per session", func(t *testing.T) {
+		dir := t.TempDir()
+		const entriesPerFile = 6000
+		pad := strings.Repeat("x", 700)
+		targetPerFile := int(recorder.MaxEvidenceReadFileBytes) * 2 / 3
+		for index, name := range []string{"evidence-sess-1-0.jsonl", "evidence-sess-1-1.jsonl"} {
+			var body strings.Builder
+			for n := 0; n < entriesPerFile; n++ {
+				_, _ = fmt.Fprintf(&body,
+					`{"v":2,"seq":%d,"ts":"2026-01-01T00:00:00Z","session_id":"sess-1","type":"request","transport":"fetch","summary":%q}`+"\n",
+					index*entriesPerFile+n, pad)
+			}
+			if body.Len() >= int(recorder.MaxEvidenceReadFileBytes) {
+				t.Fatalf("file %s is %d bytes, must stay under the per-file default %d", name, body.Len(), recorder.MaxEvidenceReadFileBytes)
+			}
+			if body.Len() < targetPerFile/2 {
+				t.Fatalf("file %s is only %d bytes, too small to prove the per-file budget", name, body.Len())
+			}
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body.String()), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if entriesPerFile >= recorder.MaxEvidenceReadEntries {
+			t.Fatalf("entriesPerFile %d must stay under the entry default %d", entriesPerFile, recorder.MaxEvidenceReadEntries)
+		}
+
+		result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{MaxBytesRead: 0})
+		if err != nil {
+			t.Fatalf("QuerySession: %v", err)
+		}
+		if result.Truncated {
+			t.Fatalf("two files each under the default ceilings were truncated: bytes=%d entries=%d", result.BytesRead, result.EntriesRead)
+		}
+		if result.BytesRead <= recorder.MaxEvidenceReadFileBytes {
+			t.Fatalf("BytesRead = %d, want the pair to exceed one default byte ceiling", result.BytesRead)
+		}
+	})
+}
+
+func TestQuerySession_FilterByType(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 6)
+
+	filter := &recorder.QueryFilter{Type: "request"}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	// Entries 0, 2, 4 are requests (even indices)
+	if len(result.Entries) != 3 {
+		t.Errorf("expected 3 request entries, got %d", len(result.Entries))
+	}
+	for _, e := range result.Entries {
+		if e.Type != "request" {
+			t.Errorf("unexpected type %q in filtered results", e.Type)
+		}
+	}
+}
+
+func TestQuerySession_TypeFilterWithMaxEntriesRead(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 1000,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i, entryType := range []string{"request", "action_receipt", "request", "action_receipt"} {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "sess-1",
+			Type:      entryType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("entry %d", i),
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	result, err := recorder.QuerySession(dir, "sess-1", &recorder.QueryFilter{
+		Type:           "action_receipt",
+		MaxEntriesRead: 3,
+	})
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if !result.Truncated {
+		t.Fatal("QuerySession should report truncation when MaxEntriesRead caps total entries read before filtering")
+	}
+	if result.EntriesRead != 3 {
+		t.Fatalf("EntriesRead = %d, want 3", result.EntriesRead)
+	}
+	if len(result.Entries) != 1 {
+		t.Fatalf("len(Entries) = %d, want 1 filtered receipt entry", len(result.Entries))
+	}
+	if result.Entries[0].Type != "action_receipt" || result.Entries[0].Sequence != 1 {
+		t.Fatalf("filtered entry = type %q seq %d, want action_receipt seq 1", result.Entries[0].Type, result.Entries[0].Sequence)
+	}
+}
+
+func TestQuerySession_FilterByTransport(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 6)
+
+	filter := &recorder.QueryFilter{Transport: "mcp-stdio"}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	// Entries 1, 3, 5 are mcp-stdio (odd indices)
+	if len(result.Entries) != 3 {
+		t.Errorf("expected 3 mcp-stdio entries, got %d", len(result.Entries))
+	}
+}
+
+func TestQuerySession_FilterByTimeRange(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 3)
+
+	// All entries should be after epoch
+	filter := &recorder.QueryFilter{
+		After: time.Unix(0, 0),
+	}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) < 3 {
+		t.Errorf("expected at least 3 entries after epoch, got %d", len(result.Entries))
+	}
+
+	// No entries should be in the far future
+	filter = &recorder.QueryFilter{
+		After: time.Now().Add(24 * time.Hour),
+	}
+	result, err = recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) != 0 {
+		t.Errorf("expected 0 entries in the future, got %d", len(result.Entries))
+	}
+}
+
+func TestQuerySession_FilterBySequenceRange(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 5)
+
+	filter := &recorder.QueryFilter{
+		MinSeq:    1,
+		MaxSeq:    3,
+		HasMaxSeq: true,
+	}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	// Should have entries with seq 1, 2, 3
+	if len(result.Entries) != 3 {
+		t.Errorf("expected 3 entries in seq range [1,3], got %d", len(result.Entries))
+	}
+	for _, e := range result.Entries {
+		if e.Sequence < 1 || e.Sequence > 3 {
+			t.Errorf("entry seq %d outside range [1,3]", e.Sequence)
+		}
+	}
+}
+
+func TestQuerySession_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	result, err := recorder.QuerySession(dir, "nonexistent", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(result.Entries))
+	}
+	if result.TotalFiles != 0 {
+		t.Errorf("TotalFiles = %d, want 0", result.TotalFiles)
+	}
+}
+
+func TestQuerySession_NonexistentDir(t *testing.T) {
+	_, err := recorder.QuerySession("/nonexistent/dir", "s1", nil)
+	if err == nil {
+		t.Fatal("expected error for nonexistent directory")
+	}
+}
+
+func TestQuerySession_MultipleFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Use small MaxEntriesPerFile to create multiple files
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 1000,
+		MaxEntriesPerFile:  2,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i := range 5 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "multi",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("entry %d", i),
+		}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	result, err := recorder.QuerySession(dir, "multi", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if result.TotalFiles < 2 {
+		t.Errorf("expected at least 2 files, got %d", result.TotalFiles)
+	}
+	if len(result.Entries) < 5 {
+		t.Errorf("expected at least 5 entries across files, got %d", len(result.Entries))
+	}
+}
+
+func TestListSessions(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "alpha", 2)
+	writeTestEntries(t, dir, "beta", 2)
+
+	sessions, err := recorder.ListSessions(dir)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) < 2 {
+		t.Fatalf("expected at least 2 sessions, got %d: %v", len(sessions), sessions)
+	}
+
+	// Sessions should be sorted
+	found := map[string]bool{}
+	for _, s := range sessions {
+		found[s] = true
+	}
+	if !found["alpha"] {
+		t.Error("missing session 'alpha'")
+	}
+	if !found["beta"] {
+		t.Error("missing session 'beta'")
+	}
+}
+
+func TestListSessions_EmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	sessions, err := recorder.ListSessions(dir)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	if len(sessions) != 0 {
+		t.Errorf("expected 0 sessions, got %d", len(sessions))
+	}
+}
+
+func TestListSessions_NonexistentDir(t *testing.T) {
+	_, err := recorder.ListSessions(filepath.Join(t.TempDir(), "nonexistent"))
+	if err == nil {
+		t.Fatal("expected error for nonexistent directory")
+	}
+}
+
+func TestListSessions_IgnoresNonEvidenceFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "real", 1)
+
+	// Create a non-evidence file
+	nonEvidence := filepath.Join(dir, "notes.txt")
+	if err := writeFile(nonEvidence, []byte("not evidence")); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := recorder.ListSessions(dir)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	for _, s := range sessions {
+		if s == "notes" {
+			t.Error("should not include non-evidence files")
+		}
+	}
+}
+
+func TestQuerySession_CombinedFilters(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 10)
+
+	// Combine type + transport + sequence range
+	filter := &recorder.QueryFilter{
+		Type:      "request",
+		Transport: "fetch",
+		MinSeq:    2,
+		MaxSeq:    8,
+		HasMaxSeq: true,
+	}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	for _, e := range result.Entries {
+		if e.Type != "request" {
+			t.Errorf("type = %q, want request", e.Type)
+		}
+		if e.Transport != "fetch" {
+			t.Errorf("transport = %q, want fetch", e.Transport)
+		}
+		if e.Sequence < 2 || e.Sequence > 8 {
+			t.Errorf("seq %d outside range [2,8]", e.Sequence)
+		}
+	}
+}
+
+func TestQuerySession_FilterByBeforeTime(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 3)
+
+	// Before a time in the far past should return nothing
+	filter := &recorder.QueryFilter{
+		Before: time.Unix(0, 0),
+	}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) != 0 {
+		t.Errorf("expected 0 entries before epoch, got %d", len(result.Entries))
+	}
+
+	// Before a time in the future should return all
+	filter = &recorder.QueryFilter{
+		Before: time.Now().Add(24 * time.Hour),
+	}
+	result, err = recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) < 3 {
+		t.Errorf("expected at least 3 entries before tomorrow, got %d", len(result.Entries))
+	}
+}
+
+func TestQuerySession_FilterBySessionID(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess-1", 3)
+
+	// SessionID filter on QuerySession is redundant (already filtered by filename)
+	// but matchesFilter still checks it
+	filter := &recorder.QueryFilter{
+		SessionID: "sess-1",
+	}
+	result, err := recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) < 3 {
+		t.Errorf("expected at least 3 entries, got %d", len(result.Entries))
+	}
+
+	// Mismatched SessionID should return nothing
+	filter = &recorder.QueryFilter{
+		SessionID: "other-session",
+	}
+	result, err = recorder.QuerySession(dir, "sess-1", filter)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) != 0 {
+		t.Errorf("expected 0 entries for mismatched session, got %d", len(result.Entries))
+	}
+}
+
+func TestQuerySession_DoesNotPrefixMatchSessionIDs(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "sess", 1)
+	writeTestEntries(t, dir, "sess-evil", 3)
+
+	result, err := recorder.QuerySession(dir, "sess", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if result.TotalFiles != 1 {
+		t.Fatalf("TotalFiles = %d, want 1", result.TotalFiles)
+	}
+	for _, e := range result.Entries {
+		if e.SessionID != "sess" {
+			t.Fatalf("returned entry for session %q, want sess", e.SessionID)
+		}
+	}
+
+	result, err = recorder.QuerySession(dir, "sess", &recorder.QueryFilter{MaxEntriesRead: 2})
+	if err != nil {
+		t.Fatalf("QuerySession with read ceiling: %v", err)
+	}
+	if result.TotalFiles != 1 {
+		t.Fatalf("bounded TotalFiles = %d, want 1", result.TotalFiles)
+	}
+}
+
+func TestQuerySession_FailsOnFilenameSessionMismatch(t *testing.T) {
+	dir := t.TempDir()
+	e := recorder.Entry{
+		Version:   recorder.EntryVersion,
+		Sequence:  0,
+		Timestamp: time.Now().UTC(),
+		SessionID: "other",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "mismatched session",
+		PrevHash:  recorder.GenesisHash,
+	}
+	e.Hash = recorder.ComputeHash(e)
+	data, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFile(filepath.Join(dir, "evidence-victim-0.jsonl"), append(data, '\n')); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = recorder.QuerySession(dir, "victim", nil)
+	if err == nil {
+		t.Fatal("expected session mismatch error")
+	}
+	if !strings.Contains(err.Error(), `session_id "other" does not match requested session "victim"`) {
+		t.Fatalf("error = %v", err)
+	}
+	// A verifier maps a refusal of evidence to a verification failure, so
+	// the error must be identifiable as one.
+	if !errors.Is(err, recorder.ErrEvidenceRefused) {
+		t.Fatalf("session mismatch is not ErrEvidenceRefused: %v", err)
+	}
+	if err := recorder.CheckEntrySessions([]recorder.Entry{e}, "other"); err != nil {
+		t.Fatalf("matching session refused: %v", err)
+	}
+}
+
+func TestResolveEvidenceLocation_SymlinkIsEvidenceRefused(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "evidence-victim-0.jsonl")
+	if err := writeFile(target, []byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "evidence-victim-0.jsonl")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err := recorder.ResolveEvidenceLocation(dir, "")
+	if err == nil || !errors.Is(err, recorder.ErrEvidenceRefused) || !strings.Contains(err.Error(), "refuse symlink") {
+		t.Fatalf("symlinked evidence file: %v", err)
+	}
+}
+
+func TestQuerySession_NumericShardSort(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create shard files with numbers that sort wrong lexicographically:
+	// lex order: 1, 10, 2, 20  vs  numeric order: 1, 2, 10, 20
+	shardNums := []int{1, 2, 10, 20}
+	ts := time.Now().UTC()
+	prevHash := recorder.GenesisHash
+	globalSeq := uint64(0)
+
+	for _, sn := range shardNums {
+		name := fmt.Sprintf("evidence-numsort-%d.jsonl", sn)
+		path := filepath.Join(dir, name)
+
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  globalSeq,
+			Timestamp: ts.Add(time.Duration(globalSeq) * time.Second),
+			SessionID: "numsort",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("shard %d", sn),
+			PrevHash:  prevHash,
+		}
+		e.Hash = recorder.ComputeHash(e)
+		prevHash = e.Hash
+		globalSeq++
+
+		data, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeFile(path, append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := recorder.QuerySession(dir, "numsort", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if result.TotalFiles != len(shardNums) {
+		t.Fatalf("TotalFiles = %d, want %d", result.TotalFiles, len(shardNums))
+	}
+
+	// Entries must come back in numeric shard order (seq 0, 1, 2, 3)
+	for i, e := range result.Entries {
+		expectedSeq := uint64(i)
+		if e.Sequence != expectedSeq {
+			t.Errorf("entry %d: seq = %d, want %d (numeric order broken)", i, e.Sequence, expectedSeq)
+		}
+	}
+}
+
+func TestExtractSeqStart_EdgeCases(t *testing.T) {
+	// extractSeqStart is unexported, so we test it indirectly via file sort order.
+	// Create files with edge-case names and verify QuerySession handles them.
+	dir := t.TempDir()
+
+	// Create a file with no dash (should sort as 0)
+	noDash := filepath.Join(dir, "evidence-nodash.jsonl")
+	e := recorder.Entry{
+		Version:   recorder.EntryVersion,
+		Sequence:  0,
+		SessionID: "nodash",
+		Type:      testType,
+		Transport: testTransport,
+		PrevHash:  recorder.GenesisHash,
+	}
+	e.Hash = recorder.ComputeHash(e)
+	data, _ := json.Marshal(e)
+	if err := writeFile(noDash, append(data, '\n')); err != nil {
+		t.Fatal(err)
+	}
+
+	// This file won't match the prefix "evidence-nodash-" so it won't be included
+	// unless the session ID IS "nodash" (it is).
+	// Actually the prefix check is "evidence-" + sessionID + "-", so "evidence-nodash.jsonl"
+	// does NOT match "evidence-nodash-" prefix. Let's test what we can.
+
+	// Test with a properly named file that has non-numeric suffix
+	badNum := filepath.Join(dir, "evidence-edgetest-abc.jsonl")
+	e2 := recorder.Entry{
+		Version:   recorder.EntryVersion,
+		Sequence:  0,
+		SessionID: "edgetest",
+		Type:      testType,
+		Transport: testTransport,
+		PrevHash:  recorder.GenesisHash,
+	}
+	e2.Hash = recorder.ComputeHash(e2)
+	data2, _ := json.Marshal(e2)
+	if err := writeFile(badNum, append(data2, '\n')); err != nil {
+		t.Fatal(err)
+	}
+
+	// QuerySession should still work (extractSeqStart returns 0 for non-numeric)
+	result, err := recorder.QuerySession(dir, "edgetest", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	if len(result.Entries) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(result.Entries))
+	}
+}
+
+func TestQuerySession_CorruptedFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a file with invalid JSON
+	badFile := filepath.Join(dir, "evidence-corrupt-0.jsonl")
+	if err := writeFile(badFile, []byte("not-json\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := recorder.QuerySession(dir, "corrupt", nil)
+	if err == nil {
+		t.Fatal("expected error for corrupted evidence file")
+	}
+}
+
+func TestListSessions_SkipsMalformedFilenames(t *testing.T) {
+	dir := t.TempDir()
+
+	// File with no trailing dash before seq: "evidence-.jsonl"
+	noSession := filepath.Join(dir, "evidence-.jsonl")
+	if err := writeFile(noSession, []byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	// File with just "evidence-X.jsonl" where X has no dash separator
+	singlePart := filepath.Join(dir, "evidence-justname.jsonl")
+	if err := writeFile(singlePart, []byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, err := recorder.ListSessions(dir)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+
+	// "evidence-.jsonl" -> rest="" after trimming, lastDash=-1 -> skip
+	// "evidence-justname.jsonl" -> rest="justname", lastDash=-1 -> skip
+	// Both should be skipped (no sessions found)
+	if len(sessions) != 0 {
+		t.Errorf("expected 0 sessions from malformed files, got %d: %v", len(sessions), sessions)
+	}
+}
+
+func TestQuerySession_DirectoryEntries(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a subdirectory that looks like an evidence file -- should be skipped
+	subdir := filepath.Join(dir, "evidence-sess-0.jsonl")
+	if err := os.MkdirAll(subdir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := recorder.QuerySession(dir, "sess", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	// No actual files, so nothing should be returned
+	if result.TotalFiles != 0 {
+		t.Errorf("TotalFiles = %d, want 0 (directories should be skipped by ReadDir)", result.TotalFiles)
+	}
+}
+
+func writeFile(path string, data []byte) error {
+	return os.WriteFile(path, data, 0o600)
+}
+
+func TestIsRecorderOwnedFile(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		owned bool
+	}{
+		{"evidence-proxy-0.jsonl", true},
+		{"evidence-proxy.run.00112233445566778899aabbccddeeff-3.jsonl", true},
+		{"evidence-proxy-0-raw-00112233445566778899aabbccddeeff.raw.enc", true},
+		{"chain-link-proxy.run.00112233445566778899aabbccddeeff.json", true},
+		{recorder.RunWriterLockPrefix + "proxy.run.00112233445566778899aabbccddeeff" + recorder.RunWriterLockSuffix, true},
+		{"anchor-state.json", true},
+		// Operator outputs that happen to sit beside evidence are not owned.
+		{"bundle.json", false},
+		{"report.md", false},
+		{"chain-link-notes.txt", false},
+		{"evidence-summary.md", false},
+	} {
+		if got := recorder.IsRecorderOwnedFile(tc.name); got != tc.owned {
+			t.Errorf("IsRecorderOwnedFile(%q) = %v, want %v", tc.name, got, tc.owned)
+		}
+	}
+}

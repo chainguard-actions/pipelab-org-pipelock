@@ -1,0 +1,260 @@
+# Pipelock Benchmarks
+
+Receipt-load measurements and raw scanner benchmarks from Go's testing framework. For interpretation and deployment sizing, see [performance.md](performance.md).
+
+## Million-request receipt run
+
+The released 3.7.0 binary, which contains the receipt caching and bounded-search changes in [#1897](https://github.com/pipelab-org/pipelock/pull/1897), completed 1,000,000 measured requests with required receipts after 1,000 warm-up requests. All 5,855,850 expected receipt records were present, including those from warm-up. Throughput and latency exclude warm-up. The complete eight-shard group verified `GROUP_VALID`, with clean shutdown and zero append-lock timeouts. Requests and receipt records are different counts: one request can produce intent, outcome and other configured evidence records.
+
+| Measurement | Observed result |
+|---|---:|
+| Measured requests | 1,000,000 |
+| Warm-up requests (excluded from performance) | 1,000 |
+| Expected receipt records (including warm-up) | 5,855,850 |
+| Missing receipt records | 0 |
+| Signed group shards | 8, `GROUP_VALID` |
+| Throughput | 333 requests/s |
+| Request latency p50 / p95 / p99 | 371 / 671 / 825 ms |
+| Concurrent clients | 128 |
+
+The run used Linux on an Intel i7-10750H with 6 physical cores and 12 hardware threads, an 8-CPU quota cap, `GOMAXPROCS=8`, eight receipt chains and `require_receipts: true`. The tested binary is the published v3.7.0 linux/amd64 release artifact (`pipelock version 3.7.0`, commit `47c14c59`, binary SHA-256 `5664762611582b5c95a18194d082b460aa88a2e344b6177b48a37cd6d6be0822`), extracted from the release archive after the archive matched the published checksums. CPU labels describe quota caps, not dedicated physical cores. Host load was sampled every 15 seconds and the desktop screensaver was held off for the run. The workload is the repository's synthetic [receipt-load harness](../scripts/receipt-load/), and the measurements were collected on October 14, 2026.
+
+A separate 20,000-request calibration of the same binary on the same host, under the same conditions, measured these configurations. Every reported configuration passed integrity with zero missing records. These are calibration results, not confidence intervals or a comparison with another product.
+
+| CPU quota cap | One chain, requests/s | Chains equal to cap, requests/s |
+|---:|---:|---:|
+| 2 | 96 | 95 |
+| 4 | 122 | 192 |
+| 8 | 125 | 351 |
+
+The measured build uses a bounded receipt fragment search. Complete secrets in scanned fields remain checked before signing, and an exact clean-text cache never stores a finding. Splits involving multiple fixed values, dropped enum labels or nonadjacent formatted decision text can fall outside the search. The search also excludes splits into five or more pieces, four pieces outside forward/reverse order, and three pieces on receipts too wide for that search. Process-proven generated IDs are excluded even when their text could complete a secret. Read the [receipt content boundary](guides/receipt-verification.md#receipt-content-boundary) for every bound. The result doesn't prove arbitrary payload detection, every disk-failure mode, unmediated traffic, external anchoring, published verifier availability, or throughput for another build, host or workload. The earlier prototype that omitted content scanning is excluded from these results.
+
+## Methodology
+
+Benchmarks measure the scanner pipeline only, not network I/O. This isolates pipelock's overhead from external fetch latency.
+
+Configuration (balanced defaults):
+- SSRF protection disabled (no DNS lookups in benchmarks)
+- Rate limiting disabled (no time-dependent state)
+- Response scanning: 34 prompt-injection and state/control-poisoning patterns
+- DLP: 65 patterns + BIP-39 seed phrase detection
+
+The scanner and MCP figures below are medians of three runs against the released v3.6.0 tag at commit `3e868ac5d`, using Go 1.26.8 on the hardware listed at the bottom with `GOMAXPROCS=4`. The standard `make bench` run used Go's default one-second benchmark target and `-count=3`. Large-body cases still have high variance: the 256KiB uniform-filler clean case completed only three iterations per sample, and the 20-query URL case completed five or six. These are local CPU costs, not network latency or production request-rate guarantees. Response scanning evaluates its patterns in parallel, so results depend on the CPUs available. Fixture-backed browser and saved JavaScript bundle benchmarks were skipped; they need generated input directories. The BIP-39 and historical parallel-scaling tables below weren't part of this scanner/MCP run.
+
+## Scanner Pipeline (`Scanner.Scan()`)
+
+URL scanning with DNS-based SSRF, rate limiting, and data budget checks disabled: scheme, CRLF injection, path traversal, blocklist, DLP (pre-DNS), path entropy, subdomain entropy, and URL length. DNS resolution, the post-DNS SSRF layer, rate limiting, and data budget enforcement are excluded from these measurements.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| AllowedURL | 24,989 | 8,451 | 116 |
+| BlockedByBlocklist | 2,623 | 744 | 20 |
+| BlockedByDLP | 12,206 | 7,321 | 143 |
+| BlockedByEntropy | 46,189 | 19,591 | 226 |
+| BlockedByURLLength | 140.3 | 64 | 3 |
+| ComplexAllowedURL | 158,048 | 74,146 | 1,040 |
+
+`BenchmarkScan_ManyQueryParamsAllowed` is a separate stress case: a clean allowed URL with 20 query parameters lets every DLP pass run to completion. It measured 206,022,910 ns/op, 43,546,905 B/op, and 841,560 allocs/op. This is a deliberately heavy input, not a typical URL scan.
+
+## Response Scanning (`ScanResponse()`)
+
+Pattern matching for prompt injection on fetched content, across the multi-pass normalization cascade (normalized, invisible-spaced, leetspeak, optional-whitespace, vowel-fold, decode).
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Clean (~90B) | 69,231 | 4,314 | 28 |
+| WithInjection (~100B) | 72,577 | 1,875 | 16 |
+| LargeClean (~10KB) | 3,996,104 | 106,643 | 59 |
+| StateControlClean | 406,017 | 6,373 | 28 |
+| StateControlMatch | 289,576 | 5,457 | 28 |
+
+`BenchmarkScanResponse_Large` adds 64KiB and 256KiB bodies in JSON-like, natural-prose, and uniform-filler shapes. Injection cases place the marker near the start or end of the body.
+
+| Benchmark case | ns/op | B/op | allocs/op |
+|---------------|------:|-----:|----------:|
+| JSON-like 64KiB clean | 27,261,818 | 2,547,904 | 121 |
+| Natural prose 64KiB clean | 24,675,550 | 2,186,193 | 83 |
+| Uniform filler 64KiB clean | 112,550,998 | 14,077,430 | 305 |
+| JSON-like 64KiB injection early | 27,455,395 | 109,487 | 48 |
+| JSON-like 64KiB injection late | 29,656,213 | 106,561 | 46 |
+| Natural prose 64KiB injection early | 31,652,602 | 111,781 | 50 |
+| Natural prose 64KiB injection late | 30,302,209 | 111,704 | 50 |
+| Uniform filler 64KiB injection early | 17,586,189 | 109,255 | 46 |
+| Uniform filler 64KiB injection late | 18,649,873 | 94,591 | 39 |
+| JSON-like 256KiB clean | 106,071,467 | 3,272,900 | 92 |
+| Natural prose 256KiB clean | 96,657,117 | 8,634,370 | 114 |
+| Uniform filler 256KiB clean | 439,808,792 | 53,370,274 | 389 |
+| JSON-like 256KiB injection early | 104,367,053 | 432,130 | 125 |
+| JSON-like 256KiB injection late | 108,889,987 | 441,554 | 132 |
+| Natural prose 256KiB injection early | 115,031,824 | 450,720 | 136 |
+| Natural prose 256KiB injection late | 116,122,309 | 450,698 | 136 |
+| Uniform filler 256KiB injection early | 66,018,966 | 357,436 | 80 |
+| Uniform filler 256KiB injection late | 67,135,313 | 369,257 | 87 |
+
+## Text DLP Scanning (`ScanTextForDLP()`)
+
+DLP pattern matching on arbitrary text (MCP arguments, request bodies). 65 patterns with Aho-Corasick pre-filter.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Clean | 70,923 | 7,777 | 103 |
+| Match | 94,564 | 23,489 | 315 |
+
+## Canary Text Scanning
+
+These cases keep one canary token configured and scan ordinary text or a payload that decodes through several nested layers.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Clean ordinary text | 20,947 | 9,328 | 220 |
+| Nested encoded payload | 35,941 | 11,880 | 201 |
+
+An earlier interleaved comparison measured the clean-text canary path about 54% slower than v3.5.0 in the release-candidate comparison. This tag run has no v3.5.0 control, so it reports the 3.6.0 cost but doesn't remeasure that percentage.
+
+## DLP Pre-Filter
+
+Aho-Corasick prefix automaton. Short-circuits clean text before regex evaluation.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| CleanText (no match) | 578.3 | 104 | 2 |
+| WithPrefix (match) | 539.9 | 104 | 2 |
+
+## Cross-Request Detection
+
+Entropy budget tracking and fragment buffer for detecting secrets split across multiple requests.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| EntropyTracker_Record | 117,618 | 1,137 | 6 |
+| EntropyTracker_RecordMultiSession | 14,424 | 1,103 | 6 |
+| FragmentBuffer_Append | 152.5 | 48 | 1 |
+| FragmentBuffer_AppendAndScan | 8,847,741 | 735,250 | 1,636 |
+| FragmentBufferDeletePrefix | 5,345,191 | 0 | 0 |
+
+## MCP Response Scanning (`mcp.ScanResponse()`)
+
+JSON-RPC 2.0 response parsing + text extraction + prompt injection scanning.
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Clean | 197,401 | 27,988 | 434 |
+| Injection | 154,531 | 34,798 | 521 |
+| ExtractText (5 blocks) | 6,568 | 6,053 | 74 |
+
+## Parallel Samples (`b.RunParallel`, GOMAXPROCS=4)
+
+These are the concurrent `b.RunParallel` cases in the tagged scanner/MCP run. They're single four-CPU measurements repeated three times, not a refreshed scaling curve.
+
+### Scanner
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Parallel_URLScan | 48,851 | 74,090 | 1,040 |
+| Parallel_DLPBlock | 4,201 | 7,314 | 143 |
+| Parallel_ResponseScan | 20,363 | 4,253 | 28 |
+| Parallel_ResponseLarge | 1,137,535 | 103,099 | 59 |
+| Parallel_Blocklist | 859 | 744 | 20 |
+| Parallel_Entropy | 21,758 | 19,578 | 226 |
+
+### MCP
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Parallel_MCPScanClean | 53,527 | 27,509 | 434 |
+| Parallel_MCPScanInjection | 42,064 | 34,307 | 521 |
+| Parallel_ExtractText | 2,446 | 6,052 | 74 |
+
+## Historical Parallel Throughput (`b.RunParallel`, GOMAXPROCS=16)
+
+The following multi-core tables are historical v3.1.0 results and were not refreshed for v3.6.0.
+
+### Scanner
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Parallel_URLScan | 56,929 | 24,863 | 600 |
+| Parallel_DLPBlock | 3,898 | 4,276 | 109 |
+| Parallel_ResponseScan | 186,919 | 8,279 | 68 |
+| Parallel_ResponseLarge | 22,611,580 | 370,125 | 134 |
+| Parallel_Blocklist | 950 | 320 | 6 |
+| Parallel_Entropy | 28,348 | 11,668 | 194 |
+
+### MCP
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| Parallel_MCPScanClean | 181,219 | 14,483 | 186 |
+| Parallel_MCPScanInjection | 33,045 | 7,107 | 130 |
+| Parallel_ExtractText | 3,363 | 5,208 | 73 |
+
+## Other
+
+| Benchmark | ns/op | B/op | allocs/op |
+|-----------|------:|-----:|----------:|
+| ShannonEntropy | 2,233 | 2,120 | 7 |
+| MatchDomain/exact | 2.4 | 0 | 0 |
+| MatchDomain/wildcard | 43 | 48 | 1 |
+
+## Key Takeaways
+
+- **Typical URL scan with DNS-based SSRF, rate limiting, and data budget checks disabled: ~25μs** at the released v3.6.0 tag.
+- Blocklist, DLP, entropy, and URL-length blocks measured ~2.6μs, ~12μs, ~46μs, and ~140ns respectively.
+- The clean-text canary path measured ~21μs with a canary configured. An earlier interleaved v3.5.0 comparison found it about 54% slower in the release-candidate comparison; this run doesn't repeat that comparison.
+- Small response scans measured ~69μs on clean text and ~73μs with injection. The ~10KB clean case measured ~4.0ms. Larger-body costs vary sharply by content shape; the 256KiB uniform-filler clean case completed only three iterations per sample.
+- MCP response scans measured ~197μs clean and ~155μs with injection. Text extraction measured ~6.6μs.
+- The 20-query-parameter allowed-URL stress case measured ~206ms and 43.5MB allocated. This deliberately heavy workload is separate from the typical URL scan and completed only five or six iterations per sample.
+- The multi-core v3.1.0 scaling curves below remain historical. The v3.6.0 run adds four-CPU parallel samples, not a new scaling study.
+
+## Hardware
+
+AMD Ryzen 7 7800X3D (8 cores / 16 threads) / Linux/amd64. Scanner and MCP tables: released v3.6.0 commit `3e868ac5d`, Go 1.26.8, `GOMAXPROCS=4`, standard `make bench` (`-count=3`, default one-second benchmark target); values are medians of three samples. BIP-39 seed-phrase tables: older results, not included in this run. Historical parallel-scaling tables: v3.1.0, Go 1.25, 16 CPUs.
+
+## Running Benchmarks
+
+```bash
+# Released-tag scanner and MCP suite
+GOMAXPROCS=4 make bench
+
+# Example: compare this clean checkout with the previous commit on this host
+git worktree add --detach ../pipelock-bench-base HEAD~1
+BENCH_BASELINE_DIR=../pipelock-bench-base make bench-regression
+
+# Separate utility: refresh a saved historical measurement file intentionally
+make bench-baseline
+
+# Parallel scaling
+go test -run '^$' -bench=BenchmarkParallel -benchtime=3s -cpu=1,2,4,8,16 ./internal/scanner/
+go test -run '^$' -bench=BenchmarkParallel -benchtime=3s -cpu=1,4,8,16 ./internal/mcp/
+
+# Concurrent throughput scaling test (1-64 goroutines, ~28s)
+PIPELOCK_BENCH_SCALING=1 go test -v -run=TestConcurrentThroughputScaling ./internal/scanner/
+
+# Seed phrase detection
+go test -run '^$' -bench=BenchmarkSeed -benchmem ./internal/seedprotect/
+```
+
+`make bench-regression` requires `BENCH_BASELINE_DIR`, a prepared clean checkout at a different commit. The current checkout must also be clean. Choose the reference revision deliberately; the example above uses the previous commit. The command doesn't fetch, check out a ref, or select a release automatically. Before a release freeze, run it from the freshly verified main commit against the intended reference commit and retain both source IDs with the result.
+
+The gate runs sequential rounds on the same host, with identical benchmark arguments: baseline then candidate in odd rounds, candidate then baseline in even rounds. Each invocation uses `-count=1`; the requested `BENCH_COUNT` sets the number of rounds. This preserves the repetition count documented by [Go’s test flags](https://pkg.go.dev/cmd/go#hdr-Testing_flags) while alternating which side runs first. It reduces consistent order bias but does not eliminate changing host conditions. Defaults remain six samples, `100ms` per sample, and all scanner/MCP benchmarks. `BENCH_PATTERN`, `BENCH_PACKAGES`, `BENCH_COUNT` and `BENCH_TIME` select the same workload for both sides. Use the same benchmark definitions and fixtures on both revisions; equal benchmark names alone don't prove equal workloads. Run sequentially on an uncontended host. The gate doesn't measure host contention.
+
+Both modules must resolve the same actual Go version, target OS/architecture, Go build flags/experiments and CGO setting. If automatic toolchain selection differs between the modules, select a compatible shared `GOTOOLCHAIN` and retry. The captured outputs must agree on OS, architecture, CPU model and effective `GOMAXPROCS` for shared benchmarks. Missing or incompatible metadata refuses the comparison. Same-host provenance comes from the paired local execution; recorded machine metadata isn't authenticated host identity.
+
+Each invocation’s raw measurements and stderr, the exact source/build inputs and requested repetition count, and an `execution.jsonl` journal of invocation order are retained in a unique directory under `TMPDIR` (default `$HOME/.cache/pipelock-tmp`), whose path the command prints. Keep that directory outside both checkouts. The journal records each admitted invocation immediately before Go starts, including an invocation that later fails. Successful rounds must pass the metadata checks before the next round starts. After all rounds pass, `baseline.txt` and `current.txt` aggregate the per-invocation outputs for the existing comparator. Existing captures aren't overwritten. These files are diagnostic evidence, not files to commit.
+
+The gate compares the fastest (minimum) `ns/op` for each benchmark using the existing raw-output comparator. It fails for regressions strictly above `BENCH_REGRESSION_THRESHOLD_PCT` (default `50` percent), for missing baseline names on a full run, or when no names overlap. Narrowed runs report omitted names. `benchstat` remains optional display only. This is an advisory maintainer/pre-tag check; real benchmark runs aren't wired into blocking CI.
+
+Historical files such as `bench/scanner-baseline.txt` aren't comparison inputs. An imported file can't establish a matched local pair. `make bench-baseline` (or `--update-baseline`) is a separate explicit utility that writes one measurement to `BENCH_BASELINE`, defaulting to that historical file. It doesn't run the regression gate. A failed comparison never refreshes that file or falls back to its values.
+
+## BIP-39 Seed Phrase Detection (`seedprotect.Detect()`)
+
+Dedicated scanner for BIP-39 mnemonic seed phrases. Uses dictionary lookup + sliding window + SHA-256 checksum validation. Run `go test -run '^$' -bench=BenchmarkSeed -benchmem ./internal/seedprotect/` for current numbers on your hardware.
+
+| Benchmark | ns/op | B/op | allocs/op | Description |
+|-----------|-------|------|-----------|-------------|
+| `SeedDetect_CleanText` | 2,073 | 528 | 3 | Short text with no BIP-39 words (fast bail) |
+| `SeedDetect_ValidPhrase` | 2,832 | 688 | 4 | 12-word valid mnemonic (full pipeline + checksum) |
+| `SeedDetect_LongText` | 2,472,856 | 796,784 | 5,366 | 1000-word text, all BIP-39 words (worst case) |
+| `SeedChecksum` | 118 | 0 | 0 | Checksum validation in isolation |
+
+Clean text bails in ~2μs. Valid phrase detection including checksum takes ~3μs. The 1000-word worst case (all BIP-39 words) is a pathological input that doesn't occur in real traffic. Checksum validation is ~118ns with zero allocations.

@@ -1,0 +1,455 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package signing provides Ed25519 key generation, file signing, and
+// signature verification for securing inter-agent communication.
+package signing
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/atomicfile"
+	"github.com/luckyPipewrench/pipelock/internal/securefile"
+)
+
+// SigExtension is the file extension for detached signature files.
+const SigExtension = ".sig"
+
+// Key file header lines identify the format version.
+const (
+	publicKeyHeader        = "pipelock-ed25519-public-v1"
+	privateKeyHeader       = "pipelock-ed25519-private-v1"
+	privateKeyFileMaxBytes = 16 * 1024
+)
+
+// GenerateKeyPair creates a new Ed25519 key pair using crypto/rand.
+func GenerateKeyPair() (ed25519.PublicKey, ed25519.PrivateKey, error) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generating ed25519 key pair: %w", err)
+	}
+	return pub, priv, nil
+}
+
+// SignFile reads a file and produces a detached Ed25519 signature.
+func SignFile(path string, privKey ed25519.PrivateKey) ([]byte, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading file to sign: %w", err)
+	}
+	return ed25519.Sign(privKey, data), nil
+}
+
+// VerifyFile reads a file and its detached signature, verifying against pubKey.
+// If sigPath is empty, it defaults to path + SigExtension.
+func VerifyFile(path, sigPath string, pubKey ed25519.PublicKey) error {
+	_, err := LoadAndVerifyFile(path, sigPath, pubKey)
+	return err
+}
+
+// LoadAndVerifyFile reads a file and its detached signature, verifies the
+// signature against pubKey, and returns the bytes that were verified.
+// Callers that intend to parse the file after verifying should use the
+// returned bytes rather than re-reading from disk: re-reading opens a
+// TOCTOU window where the file can be replaced between sig verify and
+// parse. If sigPath is empty, it defaults to path + SigExtension.
+func LoadAndVerifyFile(path, sigPath string, pubKey ed25519.PublicKey) ([]byte, error) {
+	if sigPath == "" {
+		sigPath = path + SigExtension
+	}
+
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading file to verify: %w", err)
+	}
+
+	sig, err := LoadSignature(sigPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if !ed25519.Verify(pubKey, data, sig) {
+		return nil, fmt.Errorf("signature verification failed")
+	}
+	return data, nil
+}
+
+// SaveSignature writes a base64-encoded signature to a .sig file.
+// Uses atomic temp+rename to prevent corruption. Permissions are 0o644
+// because signatures are public data used for verification.
+func SaveSignature(sig []byte, path string) error {
+	encoded := base64.StdEncoding.EncodeToString(sig) + "\n"
+	return atomicWrite(path, []byte(encoded), 0o644)
+}
+
+// LoadSignature reads and decodes a base64-encoded .sig file.
+func LoadSignature(path string) ([]byte, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading signature: %w", err)
+	}
+
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("decoding signature: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("invalid signature length: got %d, want %d", len(sig), ed25519.SignatureSize)
+	}
+	return sig, nil
+}
+
+// EncodePublicKey serializes a public key with a versioned header.
+func EncodePublicKey(key ed25519.PublicKey) string {
+	return publicKeyHeader + "\n" + base64.StdEncoding.EncodeToString(key) + "\n"
+}
+
+// PublicKeyHexFromPrivateKey returns the raw 32-byte Ed25519 public key
+// embedded in priv, encoded as 64 lowercase hex characters. Ed25519 private
+// keys carry their public half; callers must derive from the existing key
+// rather than generating a new pair or receipt signer identity changes.
+func PublicKeyHexFromPrivateKey(priv ed25519.PrivateKey) (string, error) {
+	if len(priv) != ed25519.PrivateKeySize {
+		return "", fmt.Errorf("invalid private key length: got %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		return "", fmt.Errorf("derive public key from private key: got public key type %T, want ed25519.PublicKey", priv.Public())
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		return "", fmt.Errorf("derive public key from private key: public key length got %d, want %d", len(pub), ed25519.PublicKeySize)
+	}
+	return hex.EncodeToString(pub), nil
+}
+
+// SavePublicKeyHexFromPrivateKey writes the raw public-key hex derived from
+// priv to path, followed by a newline, using the requested permissions.
+func SavePublicKeyHexFromPrivateKey(priv ed25519.PrivateKey, path string, perm os.FileMode) error {
+	pubHex, err := PublicKeyHexFromPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	return atomicWrite(path, []byte(pubHex+"\n"), perm)
+}
+
+// DecodePublicKey deserializes a public key from the versioned format.
+func DecodePublicKey(encoded string) (ed25519.PublicKey, error) {
+	lines := strings.SplitN(strings.TrimSpace(encoded), "\n", 2)
+	if len(lines) != 2 || lines[0] != publicKeyHeader {
+		return nil, fmt.Errorf("invalid public key format (expected %s header)", publicKeyHeader)
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(lines[1]))
+	if err != nil {
+		return nil, fmt.Errorf("decoding public key: %w", err)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("invalid public key length: got %d, want %d", len(raw), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// ParsePublicKey decodes either the versioned pipelock public key format or a
+// raw hex-encoded Ed25519 public key.
+func ParsePublicKey(encoded string) (ed25519.PublicKey, error) {
+	trimmed := strings.TrimSpace(encoded)
+	if trimmed == "" {
+		return nil, fmt.Errorf("public key is empty")
+	}
+
+	versionedKey, versionedErr := DecodePublicKey(trimmed)
+	if versionedErr == nil {
+		return versionedKey, nil
+	}
+
+	raw, hexErr := hex.DecodeString(trimmed)
+	if hexErr != nil {
+		return nil, fmt.Errorf("invalid public key: %w", versionedErr)
+	}
+	if len(raw) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("invalid public key length: got %d, want %d", len(raw), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(raw), nil
+}
+
+// ValidatePrivateKeyConsistency verifies that an Ed25519 private key's seed
+// actually derives its stored public half. Go represents an ed25519.PrivateKey
+// as seed(32)||public(32), and priv.Public() returns the STORED public half
+// verbatim, so a length-valid but degenerate or tampered key (e.g. all-zero
+// bytes, or one whose public half was swapped) otherwise loads as "valid" and
+// would sign receipts under a key no verifier can validate. Re-deriving the
+// public key from the seed and comparing closes that gap: a key produced by
+// ed25519.GenerateKey or ed25519.NewKeyFromSeed always passes; an all-zero or
+// seed/public-inconsistent key is rejected. Fails closed.
+func ValidatePrivateKeyConsistency(priv ed25519.PrivateKey) error {
+	if len(priv) != ed25519.PrivateKeySize {
+		return fmt.Errorf("invalid private key length: got %d, want %d", len(priv), ed25519.PrivateKeySize)
+	}
+	derived := ed25519.NewKeyFromSeed(priv.Seed())
+	if !bytes.Equal(derived[ed25519.SeedSize:], priv[ed25519.SeedSize:]) {
+		return errors.New("private key seed does not derive its stored public half (corrupt or degenerate key)")
+	}
+	return nil
+}
+
+// EncodePrivateKey serializes a private key with a versioned header.
+func EncodePrivateKey(key ed25519.PrivateKey) string {
+	return privateKeyHeader + "\n" + base64.StdEncoding.EncodeToString(key) + "\n"
+}
+
+// DecodePrivateKey deserializes a private key from the versioned format.
+// DecodePrivateKey accepts two formats:
+//  1. The 2-line versioned format: "pipelock-ed25519-private-v1\n<base64>"
+//  2. The JSON keyfile produced by "pipelock signing key generate":
+//     {"schema_version":1,"purpose":"...","private":"<hex>", ...}
+//
+// Detection is by content: a leading '{' (after whitespace trim) selects JSON.
+func DecodePrivateKey(encoded string) (ed25519.PrivateKey, error) {
+	return decodePrivateKeyForPurpose(encoded, "")
+}
+
+// DecodePrivateKeyForPurpose decodes a private key and, for purpose-bound JSON
+// key files, requires the declared purpose to match. Legacy two-line recorder
+// keys have no purpose field and remain accepted for migration compatibility,
+// so purpose enforcement through this compatibility API is advisory.
+func DecodePrivateKeyForPurpose(encoded string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return decodePrivateKeyForPurpose(encoded, expectedPurpose)
+}
+
+// DecodePrivateKeyForPurposeStrict decodes only a purpose-bound JSON key file
+// and requires its declared purpose to match. It rejects legacy two-line keys,
+// whose lack of purpose metadata cannot provide a hard binding guarantee.
+func DecodePrivateKeyForPurposeStrict(encoded string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	if trimmed := strings.TrimSpace(encoded); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("purpose-bound JSON private key required; legacy key format has no purpose metadata")
+	}
+	return decodePrivateKeyForPurpose(encoded, expectedPurpose)
+}
+
+func decodePrivateKeyForPurpose(encoded string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	trimmed := strings.TrimSpace(encoded)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		return decodePrivateKeyJSON([]byte(trimmed), expectedPurpose)
+	}
+
+	lines := strings.SplitN(trimmed, "\n", 2)
+	if len(lines) != 2 || lines[0] != privateKeyHeader {
+		return nil, fmt.Errorf("invalid private key format (expected %s header or JSON keyfile)", privateKeyHeader)
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(lines[1]))
+	if err != nil {
+		return nil, fmt.Errorf("decoding private key: %w", err)
+	}
+	if len(raw) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("invalid private key length: got %d, want %d", len(raw), ed25519.PrivateKeySize)
+	}
+	priv := ed25519.PrivateKey(raw)
+	if err := ValidatePrivateKeyConsistency(priv); err != nil {
+		return nil, err
+	}
+	return priv, nil
+}
+
+// decodePrivateKeyJSON extracts an ed25519 private key from the JSON keyfile
+// format produced by "pipelock signing key generate". The private key is
+// stored as a 128-char hex string.
+func decodePrivateKeyJSON(data []byte, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	// Minimal struct matching the keyfile schema fields we need.
+	var kf struct {
+		SchemaVersion int    `json:"schema_version"`
+		Purpose       string `json:"purpose"`
+		Private       string `json:"private"`
+		Public        string `json:"public"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&kf); err != nil {
+		return nil, fmt.Errorf("decoding JSON private key file: %w", err)
+	}
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err == nil {
+		return nil, fmt.Errorf("decoding JSON private key file: trailing data after key object")
+	} else if !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("decoding JSON private key file: %w", err)
+	}
+	if kf.SchemaVersion != 1 {
+		return nil, fmt.Errorf("unsupported JSON key file schema_version %d (expected 1)", kf.SchemaVersion)
+	}
+	if expectedPurpose != "" && KeyPurpose(kf.Purpose) != expectedPurpose {
+		return nil, fmt.Errorf("JSON key file purpose mismatch: file=%q expected=%q", kf.Purpose, expectedPurpose)
+	}
+	if kf.Private == "" {
+		return nil, fmt.Errorf("JSON key file missing private field")
+	}
+	privBytes, err := hex.DecodeString(kf.Private)
+	if err != nil {
+		return nil, fmt.Errorf("decoding JSON key file private hex: %w", err)
+	}
+	if len(privBytes) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("JSON key file private key has wrong size: got %d, want %d", len(privBytes), ed25519.PrivateKeySize)
+	}
+	priv := ed25519.PrivateKey(privBytes)
+	// Reject a degenerate or seed/public-inconsistent key (e.g. all-zero bytes)
+	// before any optional declared-public cross-check: the declared check only
+	// proves the file's two halves agree with each other, not that the seed
+	// derives the stored public half.
+	if err := ValidatePrivateKeyConsistency(priv); err != nil {
+		return nil, err
+	}
+	// Cross-check the public key if provided to detect tampered keyfiles.
+	// A present-but-malformed public field is itself a tamper signal, so we
+	// fail closed on it rather than silently skipping the check.
+	if kf.Public != "" {
+		pubBytes, pubErr := hex.DecodeString(kf.Public)
+		if pubErr != nil {
+			return nil, fmt.Errorf("decoding JSON key file public hex: %w", pubErr)
+		}
+		if len(pubBytes) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("JSON key file public key has wrong size: got %d, want %d", len(pubBytes), ed25519.PublicKeySize)
+		}
+		derivedPub, ok := priv.Public().(ed25519.PublicKey)
+		if !ok || !bytes.Equal(derivedPub, pubBytes) {
+			return nil, fmt.Errorf("JSON key file private key does not match public key")
+		}
+	}
+	return priv, nil
+}
+
+// atomicWrite writes data to path via a temporary file and rename.
+func atomicWrite(path string, data []byte, perm os.FileMode) error {
+	return atomicfile.Write(path, data, perm)
+}
+
+// SavePublicKey writes an encoded public key to path with 0o644 permissions.
+func SavePublicKey(key ed25519.PublicKey, path string) error {
+	return atomicWrite(path, []byte(EncodePublicKey(key)), 0o644)
+}
+
+// SavePrivateKey writes an encoded private key to path with 0o600 permissions.
+func SavePrivateKey(key ed25519.PrivateKey, path string) error {
+	return atomicWrite(path, []byte(EncodePrivateKey(key)), 0o600)
+}
+
+// LoadPublicKeyFile reads and decodes a public key from a file.
+func LoadPublicKeyFile(path string) (ed25519.PublicKey, error) {
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading public key: %w", err)
+	}
+	return DecodePublicKey(string(data))
+}
+
+// LoadPublicKey resolves either a filesystem path or an inline public key
+// value. Files may contain the versioned pipelock format or raw hex.
+func LoadPublicKey(pathOrValue string) (ed25519.PublicKey, error) {
+	return loadPublicKey(pathOrValue, func(input string) (string, error) {
+		cleanPath := filepath.Clean(input)
+		_, err := os.Stat(cleanPath)
+		return cleanPath, err
+	})
+}
+
+// LoadPublicKeyAsOpened is LoadPublicKey for a verifier's trust anchors: a
+// file path is read as the operating system opens it. Symlinks are resolved
+// before any lexical cleaning, so "link/../keys/k.hex" names the file under
+// the link's target, as every receipt verifier reads it, rather than the
+// lexical keys/k.hex.
+func LoadPublicKeyAsOpened(pathOrValue string) (ed25519.PublicKey, error) {
+	return loadPublicKey(pathOrValue, filepath.EvalSymlinks)
+}
+
+// loadPublicKey parses an inline key or reads the file resolve returns. A
+// resolve error matching os.ErrNotExist means there is no such file.
+func loadPublicKey(pathOrValue string, resolve func(string) (string, error)) (ed25519.PublicKey, error) {
+	input := strings.TrimSpace(pathOrValue)
+	if input == "" {
+		return nil, fmt.Errorf("public key is empty")
+	}
+
+	// Inline key material is unambiguous and must win over filesystem lookup.
+	// Otherwise an untrusted working directory can replace a pinned literal
+	// with a same-named file.
+	if key, err := ParsePublicKey(input); err == nil {
+		return key, nil
+	}
+
+	filePath, err := resolve(input)
+	if err == nil {
+		data, readErr := os.ReadFile(filepath.Clean(filePath))
+		if readErr != nil {
+			return nil, fmt.Errorf("reading public key: %w", readErr)
+		}
+		key, parseErr := ParsePublicKey(string(data))
+		if parseErr != nil {
+			return nil, fmt.Errorf("parsing public key file: %w", parseErr)
+		}
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("reading public key: %w", err)
+	}
+
+	// If stat fails but input looks like a file path (contains path separators,
+	// starts with '.', or has a file extension), surface the file error directly
+	// instead of falling through to ParsePublicKey which would produce a
+	// confusing "invalid public key" error for typo'd file paths.
+	if strings.ContainsAny(input, "/\\") || strings.HasPrefix(input, ".") || filepath.Ext(input) != "" {
+		return nil, fmt.Errorf("reading public key file %s: %w", filepath.Clean(input), os.ErrNotExist)
+	}
+
+	return ParsePublicKey(input)
+}
+
+// LoadPrivateKeyFile reads and decodes a private key from a file.
+// Kubernetes Secret-volume symlinks are allowed only when the resolved target
+// remains in the link's directory. The read is bounded and race-resistant, and
+// rejects non-regular files, group-writable files, and all world access.
+// Group-read (0o040) is allowed because k8s fsGroup sets it automatically.
+func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
+	return loadPrivateKeyFileForPurpose(path, "")
+}
+
+// LoadPrivateKeyFileForPurpose securely loads a private key and enforces the
+// declared purpose on JSON key files. Legacy two-line keys remain accepted
+// because that format predates purpose binding.
+func LoadPrivateKeyFileForPurpose(path string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return loadPrivateKeyFileForPurpose(path, expectedPurpose)
+}
+
+// LoadPrivateKeyFileForPurposeStrict securely loads a purpose-bound JSON key
+// and rejects legacy keys that cannot prove their intended purpose.
+func LoadPrivateKeyFileForPurposeStrict(path string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return readAndDecodePrivateKeyFile(path, func(encoded string) (ed25519.PrivateKey, error) {
+		return DecodePrivateKeyForPurposeStrict(encoded, expectedPurpose)
+	})
+}
+
+func loadPrivateKeyFileForPurpose(path string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return readAndDecodePrivateKeyFile(path, func(encoded string) (ed25519.PrivateKey, error) {
+		return DecodePrivateKeyForPurpose(encoded, expectedPurpose)
+	})
+}
+
+func readAndDecodePrivateKeyFile(
+	path string,
+	decode func(string) (ed25519.PrivateKey, error),
+) (ed25519.PrivateKey, error) {
+	data, err := securefile.Read(path, securefile.Options{
+		MaxBytes:        privateKeyFileMaxBytes,
+		DisallowedPerms: 0o037,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("reading private key: %w", err)
+	}
+	return decode(string(data))
+}

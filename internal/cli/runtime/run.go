@@ -1,0 +1,544 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	goruntime "runtime"
+	"slices"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
+	"github.com/luckyPipewrench/pipelock/internal/emit"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
+)
+
+// Standard HTTP server timeouts. Used by all internal servers (kill switch API,
+// metrics, reverse proxy, agent listeners) except the Scan API which uses
+// operator-configured values.
+const (
+	configReloadAuditMethod = "CONFIG_RELOAD"
+	dlpWarnAuditMethod      = "DLP_WARN"
+	mcpAuditMethod          = "MCP"
+	serverReadTimeout       = 10 * time.Second
+	serverReadHeaderTimeout = 5 * time.Second
+	serverWriteTimeout      = 10 * time.Second
+	serverIdleTimeout       = 120 * time.Second
+	serverShutdownTimeout   = 5 * time.Second
+
+	// transportUnknown is the fallback transport label when DLPWarnContext
+	// does not carry a transport value.
+	transportUnknown = "unknown"
+)
+
+// dlpWarnLogContext builds the transport-appropriate audit context for a DLP
+// warn event. When the transport-specific constructor cannot build a complete
+// context, the caller should log the returned error and fall back to the
+// best-effort context from dlpWarnFallbackLogContext.
+func dlpWarnLogContext(wc scanner.DLPWarnContext) (audit.LogContext, error) {
+	switch wc.Transport {
+	case "connect":
+		return audit.NewConnectLogContext(wc.Target, wc.ClientIP, wc.RequestID, wc.Agent)
+	case "mcp_stdio", "mcp_http", "mcp_http_upstream", "mcp_input", "mcp_http_listener", "mcp_ws":
+		method := wc.Method
+		if method == "" {
+			method = mcpAuditMethod
+		}
+		return audit.NewMCPLogContext(method, wc.Resource, wc.Agent)
+	default:
+		return audit.NewHTTPLogContext(wc.Method, wc.URL, wc.ClientIP, wc.RequestID, wc.Agent)
+	}
+}
+
+func dlpWarnFallbackLogContext(wc scanner.DLPWarnContext) audit.LogContext {
+	switch {
+	case wc.RequestID != "":
+		return audit.NewRequestLogContext(wc.RequestID)
+	case wc.Resource != "":
+		method := wc.Method
+		if method == "" {
+			method = mcpAuditMethod
+		}
+		return audit.NewResourceLogContext(method, wc.Resource)
+	case wc.Method != "":
+		return audit.NewMethodLogContext(wc.Method)
+	case wc.Transport != "":
+		return audit.NewMethodLogContext(dlpWarnAuditMethod)
+	default:
+		return audit.LogContext{}
+	}
+}
+
+// newHTTPServer creates an http.Server with the standard pipelock timeouts.
+// Callers that need non-default values (e.g. reverse proxy WriteTimeout) can
+// override individual fields after creation.
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadTimeout:       serverReadTimeout,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		WriteTimeout:      serverWriteTimeout,
+		IdleTimeout:       serverIdleTimeout,
+	}
+}
+
+// RunCmd returns the run cobra command. The RunE closure wires flags into
+// a ServerOpts, derives a signal-driven context, and hands off to
+// Server.Start. All lifecycle logic lives in Server (see server.go).
+func RunCmd() *cobra.Command {
+	var configFile string
+	var mode string
+	var listen string
+	var mcpListen string
+	var mcpUpstream string
+	var mcpServerName string
+	var mcpAuthTokenFile string
+	var mcpAllowedOrigins []string
+	var mcpAllowUnauthenticated bool
+	var reverseProxy bool
+	var reverseUpstream string
+	var reverseListen string
+	var captureOutput string
+	var captureDuration time.Duration
+	var captureEscrowKey string
+
+	cmd := &cobra.Command{
+		Use:   "run [flags] [-- AGENT_ARGS...]",
+		Short: "Start the Pipelock proxy",
+		Long: `Start the proxy server that scans and controls agent HTTP traffic.
+
+Supports two proxy modes on the same port:
+  - Fetch proxy:   /fetch?url=... (extracts text, scans responses)
+  - Forward proxy: CONNECT tunnels + absolute-URI (set HTTPS_PROXY, zero agent changes)
+
+Optionally runs an MCP HTTP listener alongside the fetch proxy. The MCP listener
+accepts JSON-RPC POST requests and proxies them to an upstream MCP server with
+bidirectional scanning (DLP, injection, tool poisoning, policy).
+
+The proxy runs until interrupted (SIGINT/SIGTERM). When started with --config,
+file changes (and SIGHUP on Unix) trigger a hot-reload of config and scanner.
+
+Examples:
+  pipelock run                                       # standalone proxy
+  pipelock run --config pipelock.yaml                # with config file (hot-reload)
+  pipelock run --mode strict --listen 0.0.0.0:9999   # override mode and listen address
+  pipelock run --mcp-listen 0.0.0.0:8889 \
+    --mcp-upstream http://mcp-server:3000/mcp \
+    --mcp-auth-token-file /run/pipelock/mcp-listener.token`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			dashIdx := cmd.ArgsLenAtDash()
+			switch {
+			case dashIdx < 0 && len(args) > 0:
+				return fmt.Errorf("unexpected arguments %q; pass agent args after --", args)
+			case dashIdx > 0:
+				return fmt.Errorf("unexpected arguments before --: %q", args[:dashIdx])
+			default:
+				return nil
+			}
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if mcpServerName != "" {
+				if err := config.ValidateMCPServerName(mcpServerName, "--mcp-server-name"); err != nil {
+					return err
+				}
+			}
+			opts := ServerOpts{
+				ConfigFile:              configFile,
+				Mode:                    mode,
+				Listen:                  listen,
+				MCPListen:               mcpListen,
+				MCPUpstream:             mcpUpstream,
+				MCPServerName:           mcpServerName,
+				MCPAuthTokenFile:        mcpAuthTokenFile,
+				MCPAllowedOrigins:       mcpAllowedOrigins,
+				MCPAllowUnauthenticated: mcpAllowUnauthenticated,
+				ReverseProxy:            reverseProxy,
+				ReverseUpstream:         reverseUpstream,
+				ReverseListen:           reverseListen,
+				CaptureOutput:           captureOutput,
+				CaptureDuration:         captureDuration,
+				CaptureEscrowKey:        captureEscrowKey,
+				ModeChanged:             cmd.Flags().Changed("mode"),
+				ListenChanged:           cmd.Flags().Changed("listen"),
+				Stdout:                  cmd.OutOrStdout(),
+				Stderr:                  cmd.ErrOrStderr(),
+			}
+
+			opts.AgentArgs = agentArgsAfterDash(args, cmd.ArgsLenAtDash())
+
+			// Context with signal handling for graceful shutdown. Uses
+			// cmd.Context() as parent so tests can inject a cancellable
+			// context.
+			ctx, cancel := signal.NotifyContext(
+				cmd.Context(),
+				syscall.SIGINT,
+				syscall.SIGTERM,
+			)
+			defer cancel()
+			opts.StartupVerification.Context = ctx
+			srv, err := NewServer(opts)
+			if err != nil {
+				return err
+			}
+
+			return srv.Start(ctx)
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
+	cmd.Flags().StringVarP(&mode, "mode", "m", "balanced", "operating mode: strict, balanced, audit")
+	cmd.Flags().StringVarP(&listen, "listen", "l", "", "listen address (default 127.0.0.1:8888)")
+	cmd.Flags().StringVar(&mcpListen, "mcp-listen", "", "MCP HTTP listener address (e.g. 0.0.0.0:8889)")
+	cmd.Flags().StringVar(&mcpUpstream, "mcp-upstream", "", "upstream MCP server URL for HTTP listener")
+	cmd.Flags().StringVar(&mcpServerName, "mcp-server-name", "", "operator label for an unregistered MCP listener upstream; enables per-server response trust and suppression via target 'mcp://<name>/response'. An upstream registered in mcp_identities supplies its own verified name; an explicit name equal to a registered identity must match it")
+	cmd.Flags().StringVar(&mcpAuthTokenFile, "mcp-auth-token-file", "", "secure file containing the MCP listener bearer token")
+	cmd.Flags().StringArrayVar(&mcpAllowedOrigins, "mcp-allowed-origin", nil, "browser Origin allowed to call the MCP listener (repeatable, exact serialized origin)")
+	cmd.Flags().BoolVar(&mcpAllowUnauthenticated, "mcp-allow-unauthenticated", false, "explicitly allow a non-loopback MCP listener without authentication (network-policy-isolated deployments only)")
+	cmd.Flags().BoolVar(&reverseProxy, "reverse-proxy", false, "enable reverse proxy mode with body scanning")
+	cmd.Flags().StringVar(&reverseUpstream, "reverse-upstream", "", "upstream URL for reverse proxy (e.g. http://localhost:7899)")
+	cmd.Flags().StringVar(&reverseListen, "reverse-listen", ":8890", "listen address for reverse proxy")
+	cmd.Flags().StringVar(&captureOutput, "capture-output", "", "directory to write policy capture files (enables capture mode)")
+	cmd.Flags().DurationVar(&captureDuration, "capture-duration", 0, "capture duration (0 = until interrupted)")
+	cmd.Flags().StringVar(&captureEscrowKey, "capture-escrow-public-key", "", "X25519 public key (hex) for payload sidecar encryption")
+
+	return cmd
+}
+
+func agentArgsAfterDash(args []string, dashIdx int) []string {
+	if dashIdx >= 0 && dashIdx < len(args) {
+		return args[dashIdx:]
+	}
+	return nil
+}
+
+type emitDeliveryObserver interface {
+	SetQueued(float64)
+	RecordDelivered()
+	RecordFailed()
+	RecordDropped()
+	SetLastSuccess(time.Time)
+	SetSpoolBytes(float64)
+}
+
+// BuildEmitSinks creates emit sinks from the current config.
+// Used at startup and during hot-reload.
+func BuildEmitSinks(cfg *config.Config, observers ...emitDeliveryObserver) ([]emit.Sink, error) {
+	var observer emitDeliveryObserver
+	if len(observers) > 0 {
+		observer = observers[0]
+	}
+	return buildEmitSinks(cfg, observer, appendEnterpriseEmitSinks)
+}
+
+type enterpriseSinkAppender func(*config.Config, []emit.Sink, emitDeliveryObserver) ([]emit.Sink, error)
+
+// buildEmitSinks accepts the edition-specific appender as a seam so cleanup of
+// already-created sinks can be verified on Enterprise construction failures.
+func buildEmitSinks(cfg *config.Config, observer emitDeliveryObserver, appendEnterprise enterpriseSinkAppender) ([]emit.Sink, error) {
+	var sinks []emit.Sink
+
+	if cfg.Emit.Webhook.URL != "" {
+		var opts []emit.WebhookOption
+		opts = append(opts, emit.WithMinSeverity(emit.ParseSeverity(cfg.Emit.Webhook.MinSeverity)))
+		if cfg.Emit.Webhook.AuthToken != "" {
+			opts = append(opts, emit.WithBearerToken(cfg.Emit.Webhook.AuthToken))
+		}
+		if cfg.Emit.Webhook.QueueSize > 0 {
+			opts = append(opts, emit.WithQueueSize(cfg.Emit.Webhook.QueueSize))
+		}
+		if cfg.Emit.Webhook.TimeoutSecs > 0 {
+			opts = append(opts, emit.WithWebhookTimeout(time.Duration(cfg.Emit.Webhook.TimeoutSecs)*time.Second))
+		}
+		opts = append(opts, emit.WithWebhookFormat(cfg.Emit.Webhook.Format, cliutil.Version))
+		sinks = append(sinks, emit.NewWebhookSink(cfg.Emit.Webhook.URL, opts...))
+	}
+
+	if cfg.Emit.Syslog.Address != "" {
+		syslogSink, err := emit.NewSyslogSinkFromConfig(
+			cfg.Emit.Syslog.Address,
+			cfg.Emit.Syslog.Facility,
+			cfg.Emit.Syslog.Tag,
+			cfg.Emit.Syslog.MinSeverity,
+			emit.WithSyslogFormat(cfg.Emit.Syslog.Format, cliutil.Version),
+		)
+		if err != nil {
+			// Close already-created sinks to prevent goroutine leaks.
+			for _, s := range sinks {
+				_ = s.Close()
+			}
+			return nil, fmt.Errorf("creating syslog sink: %w", err)
+		}
+		sinks = append(sinks, syslogSink)
+	}
+
+	if cfg.Emit.OTLP.Endpoint != "" {
+		otlpSink, otlpErr := emit.NewOTLPSink(
+			cfg.Emit.OTLP.Endpoint,
+			cliutil.Version,
+			emit.ParseSeverity(cfg.Emit.OTLP.MinSeverity),
+			cfg.Emit.OTLP.Headers,
+			time.Duration(cfg.Emit.OTLP.TimeoutSeconds)*time.Second,
+			cfg.Emit.OTLP.QueueSize,
+			cfg.Emit.OTLP.Gzip,
+		)
+		if otlpErr != nil {
+			for _, s := range sinks {
+				_ = s.Close()
+			}
+			return nil, fmt.Errorf("creating otlp sink: %w", otlpErr)
+		}
+		if cfg.Emit.OTLP.AgentThreatDetectionEmit {
+			otlpSink.EnableAgentThreatDetection()
+		}
+		sinks = append(sinks, otlpSink)
+	}
+	var err error
+	sinks, err = appendEnterprise(cfg, sinks, observer)
+	if err != nil {
+		for _, sink := range sinks {
+			_ = sink.Close()
+		}
+		return nil, err
+	}
+
+	return applyEmitFilter(sinks, cfg.Emit.Filter), nil
+}
+
+func applyEmitFilter(sinks []emit.Sink, cfg config.EmitFilter) []emit.Sink {
+	filter := emit.Filter{
+		Actions:       cfg.Actions,
+		DecisionTypes: cfg.DecisionTypes,
+		Agents:        cfg.Agents,
+	}
+	if !filter.Enabled() {
+		return sinks
+	}
+	wrapped := make([]emit.Sink, 0, len(sinks))
+	for _, sink := range sinks {
+		wrapped = append(wrapped, emit.NewFilteringSink(sink, filter))
+	}
+	return wrapped
+}
+
+// activateEmitSinks activates each sink, preferring an Activate() error result
+// over the legacy void Start(), and returns the joined activation errors so the
+// caller can fail closed when a configured audit sink cannot start.
+func activateEmitSinks(sinks []emit.Sink) error {
+	var activationErrors []error
+	for i, sink := range sinks {
+		if activator, ok := sink.(interface{ Activate() error }); ok {
+			if err := activator.Activate(); err != nil {
+				activationErrors = append(activationErrors, fmt.Errorf("sink %d (%T): %w", i, sink, err))
+			}
+			continue
+		}
+		if starter, ok := sink.(interface{ Start() }); ok {
+			starter.Start()
+		}
+	}
+	return errors.Join(activationErrors...)
+}
+
+// activationConflictKeys returns the durable-state paths a sink guards (spool,
+// cursor, lock), or nil, so a reload can close an outgoing sink before
+// activating a replacement that would share the same state.
+func activationConflictKeys(sink emit.Sink) []string {
+	if keyed, ok := sink.(interface{ ActivationConflictKeys() []string }); ok {
+		return keyed.ActivationConflictKeys()
+	}
+	return nil
+}
+
+// activationKeysConflict reports whether two durable-state keys refer to the
+// same resource, by canonical path (case-insensitively on Windows) or, for
+// existing files, by inode via os.SameFile (catching hard links and symlinks).
+func activationKeysConflict(left, right string) bool {
+	if left == right || (goruntime.GOOS == "windows" && strings.EqualFold(left, right)) {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
+}
+
+// activateReplacementEmitSinks activates a replacement set before publication.
+// Forwarders sharing any durable state identity are the exception: their
+// outgoing sink must release its state first. The returned map marks old sinks
+// already closed.
+// On activation failure the caller does not swap, so every non-conflicting old
+// sink keeps serving; a shared-state forwarder remains loudly degraded because
+// it cannot be restarted after releasing its lock.
+func activateReplacementEmitSinks(oldSinks, newSinks []emit.Sink) (map[int]bool, error) {
+	var newKeys []string
+	for _, sink := range newSinks {
+		for _, key := range activationConflictKeys(sink) {
+			if key != "" {
+				newKeys = append(newKeys, key)
+			}
+		}
+	}
+	preclosed := make(map[int]bool)
+	var closeErrors []error
+	for i, sink := range oldSinks {
+		conflicts := false
+		for _, oldKey := range activationConflictKeys(sink) {
+			if oldKey == "" {
+				continue
+			}
+			for _, newKey := range newKeys {
+				if conflicts = activationKeysConflict(oldKey, newKey); conflicts {
+					break
+				}
+			}
+			if conflicts {
+				break
+			}
+		}
+		if !conflicts {
+			continue
+		}
+		preclosed[i] = true
+		if err := sink.Close(); err != nil {
+			closeErrors = append(closeErrors, fmt.Errorf("close conflicting old sink %d (%T): %w", i, sink, err))
+		}
+	}
+	if err := errors.Join(closeErrors...); err != nil {
+		return preclosed, err
+	}
+	return preclosed, activateEmitSinks(newSinks)
+}
+
+// RedactEndpoint strips userinfo, query, and fragment from an endpoint URL
+// to prevent leaking tokens/secrets in startup logs.
+func RedactEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid>"
+	}
+	if u.Opaque != "" {
+		// An opaque URL ("http:user:pass@host") keeps everything after the
+		// scheme in Opaque, credentials included, so none of it is shown.
+		return u.Scheme + ":<redacted>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// AgentHandler wraps a proxy handler with a context-injected agent profile.
+// Requests through this handler are identified by the bound port, not by
+// the X-Pipelock-Agent header, making them spoof-proof.
+func AgentHandler(profile string, handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := edition.WithAgentOverride(r.Context(), profile)
+		handler.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// AgentListenersChanged returns true if any agent's listener addresses differ
+// between old and new config. Listener sockets bind at startup and cannot be
+// rebound at runtime, so changes require a restart.
+func AgentListenersChanged(oldCfg, newCfg *config.Config) bool {
+	if len(oldCfg.Agents) != len(newCfg.Agents) {
+		// Agent count changed; check if any had listeners.
+		for _, p := range oldCfg.Agents {
+			if len(p.Listeners) > 0 {
+				return true
+			}
+		}
+		for _, p := range newCfg.Agents {
+			if len(p.Listeners) > 0 {
+				return true
+			}
+		}
+		return false
+	}
+	for name, oldProfile := range oldCfg.Agents {
+		newProfile, ok := newCfg.Agents[name]
+		if !ok {
+			if len(oldProfile.Listeners) > 0 {
+				return true
+			}
+			continue
+		}
+		if !slices.Equal(oldProfile.Listeners, newProfile.Listeners) {
+			return true
+		}
+	}
+	// Check for new agents with listeners.
+	for name, newProfile := range newCfg.Agents {
+		if _, ok := oldCfg.Agents[name]; !ok && len(newProfile.Listeners) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// ReloadPanicHandler captures panics during config reload, reports them to
+// Sentry, and logs the error. Extracted from the reload goroutine for
+// testability.
+func ReloadPanicHandler(r any, sentryClient *plsentry.Client, logger *audit.Logger, configFile string) {
+	if r == nil {
+		return
+	}
+	reloadErr := fmt.Errorf("panic during config reload: %v", r)
+	if sentryClient != nil {
+		sentryClient.CaptureError(reloadErr)
+	}
+	if logger != nil {
+		logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, configFile), reloadErr)
+	}
+}
+
+// PreserveAgentListeners keeps the new config's agent listener state
+// consistent with the actually-bound sockets from startup. Three cases:
+//
+//  1. Agent in both configs: copy old listeners into new entry.
+//  2. Listener-bearing agent removed: re-add old entry so the bound
+//     socket keeps its policy (prevents fallback to default profile).
+//  3. Listener-bearing agent added: strip listeners (can't bind without
+//     restart).
+func PreserveAgentListeners(oldCfg, newCfg *config.Config) {
+	if newCfg.Agents == nil {
+		newCfg.Agents = make(map[string]config.AgentProfile)
+	}
+
+	// Case 1 + 2: iterate old agents.
+	for name, oldProfile := range oldCfg.Agents {
+		if newProfile, ok := newCfg.Agents[name]; ok {
+			// Case 1: agent in both configs. Preserve old listeners,
+			// keep other new config fields.
+			newProfile.Listeners = oldProfile.Listeners
+			newCfg.Agents[name] = newProfile
+		} else if len(oldProfile.Listeners) > 0 {
+			// Case 2: listener-bearing agent removed. Socket is still
+			// bound, so re-add the full old entry to prevent policy
+			// downgrade on the spoof-proof port.
+			newCfg.Agents[name] = oldProfile
+		}
+	}
+
+	// Case 3: new agents with listeners that weren't in old config.
+	// Can't bind sockets without restart, so strip the listeners.
+	for name, newProfile := range newCfg.Agents {
+		if _, ok := oldCfg.Agents[name]; !ok && len(newProfile.Listeners) > 0 {
+			newProfile.Listeners = nil
+			newCfg.Agents[name] = newProfile
+		}
+	}
+}

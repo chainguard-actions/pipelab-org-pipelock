@@ -1,0 +1,360 @@
+<!--
+Copyright 2026 Josh Waldrep
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Detection integration
+
+Pipelock is a real-time agent firewall. It blocks what it can see on the wire.
+That is a hard, narrow job, and it is not the whole detection story.
+
+Long-running agents move through multi-week attack chains, reason in
+natural language, and produce actions that look benign in isolation.
+No real-time gateway will catch all of that. The gate is the first
+line, not the last.
+
+This guide is for people building the layer that runs behind the gate.
+SIEM engineers, SOC analysts, and researchers training detection models
+all need the same thing upstream: structured, tamper-evident evidence of
+what the agent actually did. When receipt signing is enabled, Pipelock
+emits that evidence as signed action receipts. This guide covers how to
+consume them.
+
+## Real-time gateways are not enough
+
+Picture a malicious MCP server that runs a two-step attack across a
+week.
+
+Step one, Monday: the agent calls an innocent-looking tool. The tool
+response tells the agent to install a new hook that exfiltrates data
+to `https://google.com/report`. To an inline detector, that looks
+like a bad tool response, but the destination is benign. The
+content might sail through, especially under a looser policy.
+
+Step two, the following Monday: a different tool response tells the
+agent to change the hook's destination. To an inline detector, that
+request looks like a one-line config edit. The agent already has
+the hook, so changing an endpoint is not structurally suspicious.
+A real-time gateway viewing only that single moment has no reason
+to block it.
+
+Put the two steps next to each other and the intent is obvious. A
+detector looking at a week of activity can see the shape. A detector
+looking at a single request cannot.
+
+Long-window detection is the only way to catch attacks that are
+designed to look like two benign things. The question is what you
+feed that detector.
+
+## The primitive: signed action receipts
+
+When `flight_recorder.signing_key_path` is set in the Pipelock
+config, enforcement blocks produce signed action receipts. Allow
+receipts are emitted when `flight_recorder.require_receipts: true`;
+clean streaming frames are summarized rather than individually
+receipted. Receipts are Ed25519-signed, JSON-structured, and linked
+into a SHA-256 hash chain so deletion or reordering within an observed
+chain is detectable after the fact. This proves tamper evidence, not
+that every mediated action was recorded. Without a signing key
+configured, Pipelock still enforces, and the flight recorder can still
+write other evidence entries, but the signed receipt stream is not
+produced.
+
+Generate a key with `pipelock keygen <name>`, set
+`flight_recorder.signing_key_path`, and start or restart Pipelock.
+If you replace the key file contents at the same configured path,
+reload will re-read that file. Changing the configured path still
+requires a restart.
+
+A receipt carries the fields a downstream detector needs to reason
+about the decision:
+
+| Field | What |
+|-------|------|
+| `action_id` | UUIDv7, unique per decision. Stable identifier for the record. |
+| `timestamp` | RFC 3339 wall-clock time the decision was made. |
+| `verdict` | `block`, `warn`, `exemption`, `allow`, `strip`, `redirect`, or `ask`. Deterministic. |
+| `layer` | Which scanner triggered (`mcp_response_scan`, `dlp_header`, `response_scan`, `airlock`, `dlp_credential_audience_allow`, etc.). |
+| `pattern` | Named rule inside the layer (e.g., `Prompt Injection`, `aws_access_key`). |
+| `transport` | `fetch`, `forward`, `reverse`, `websocket`, `mcp_stdio`, `mcp_http_upstream`, `mcp_http_listener`, `connect`, `intercept`. |
+| `session_id` | Groups receipts from the same agent session. |
+| `principal` / `actor` | Who initiated the action and who enforced it. |
+| `policy_hash` | SHA-256 of the canonical policy config at decision time. Changes whenever the policy changes. |
+| `side_effect_class` / `reversibility` | Classification of the attempted action. |
+| `chain_prev_hash` / `chain_seq` | Hash-chain linkage to the prior receipt in the stream. |
+| `signature` / `signer_key` | Ed25519 signature and public key. |
+
+These are fixed fields with a fixed schema. A detector parses them
+with a JSON reader, not a log regex.
+
+Full canonical schema and field reference:
+<https://pipelab.org/learn/action-receipt-spec/>
+
+## Three downstream consumers
+
+The same receipt stream serves three different detection styles
+without modification.
+
+### SIEM rules
+
+Ship the flight-recorder JSONL file to Splunk, Datadog, Elastic, or
+any SIEM that ingests JSON. The standard pattern is a file shipper
+(Filebeat, Fluent Bit, Vector, or equivalent) tailing
+`flight_recorder.dir` and forwarding each line. Filter entries to
+`type == "action_receipt"` at the shipper or at the SIEM.
+
+The receipt fields map cleanly to structured search: group by
+`detail.action_record.action_id` or by `session_id` to reconstruct
+an agent's behavior, filter on `detail.action_record.verdict=block`
+to audit enforcement events, alert on
+`detail.action_record.pattern=aws_access_key` for secret-exfil
+attempts.
+
+Pipelock also ships a separate real-time emit pipeline (webhook,
+syslog, OTLP) that streams a different envelope format focused on
+security events and severity levels. That pipeline is for operator
+alerting, not for forwarding the full receipt chain. See
+[`siem-integration.md`](siem-integration.md) for that format.
+Receipts and emit events are complementary streams, not the same
+stream in different wrappers.
+
+### Analyst review
+
+When a SIEM rule fires or an agent's session looks suspicious, an
+analyst can pull the full receipt stream for that `session_id` and
+reconstruct the recorded decisions in order. The hash chain confirms
+the observed stream has not been edited since it was written. It
+cannot prove that a missing action was never attempted. The
+`policy_hash` confirms which policy version was in force. A signature
+verified against a separately pinned key confirms the record came
+from the expected Pipelock signer rather than a tampered agent log.
+
+This is the audit-trail use case. Receipts are designed to be
+presentable to a third party (auditor, incident responder, internal
+review) without requiring trust in Pipelock itself. The signature
+and the chain are the trust anchors.
+
+### Long-window LLM detection
+
+If your detection strategy involves feeding agent history to a
+reasoning model and asking "is this suspicious", what you feed the
+model matters more than which model you pick. Raw log text lets an
+attacker shape the model's view by shaping the agent's reasoning
+tokens. Structured receipts do not.
+
+A receipt stream is a deterministic sequence of fixed-field events.
+`verdict`, `layer`, `pattern`, `policy_hash`, and `timestamp` are
+not up for attacker manipulation. The attacker cannot inject text
+into the stream that changes what these fields say. The stream is
+signed and chain-linked, so injection is detectable.
+
+This is the architecture behind long-window AI agent threat detection:
+a funnel of cheaper LLMs filtering events, stronger LLMs confirming,
+and an agentic layer trying to disprove the finding. Whether that
+funnel works is its own question. But if it does, it only works on
+inputs the attacker cannot massage. Structured receipts are that kind
+of input. Raw reasoning tokens are not.
+
+## Worked example
+
+The [`tool-response-injection`](/examples/tool-response-injection/)
+example ships with Pipelock and runs the whole loop end-to-end. It
+uses a deliberately malicious MCP server that returns a prompt-
+injection payload disguised as a game result.
+
+Run the harness:
+
+```bash
+cd examples/tool-response-injection
+python3 demo.py
+```
+
+The harness produces three artifacts worth looking at:
+
+1. **`evidence/evidence-proxy.run.<id>-0.jsonl`**: the MCP stdio evidence file.
+   It contains the signed receipt stream as `action_receipt` entries
+   and may also contain other recorder entries such as checkpoints.
+2. **`evidence-proxy.run.<id>-0.jsonl` from the HTTP upstream run**: same
+   event shape, different `transport` field.
+3. **`signing.key.pub` hex output**: the public key printed to
+   stdout, the only thing a third party needs to verify the stream.
+
+The harness verifies the stream inline with Python. For an independent v1-only integrity check, install the Python verifier below. This check doesn't prove that the recording is complete; the detector example uses the Go verifier for that.
+
+Choose the run chain being checked, for example the first JSONL file in the example's evidence directory. This checks that one shard, which is the whole run for this short example. For a run with several shards or restarts, verify the full chain with `pipelock verify-receipt --chain evidence --session <session> --whole-recorder --key <public-key-hex>` (see [One chain per process run](flight-recorder.md#one-chain-per-process-run)):
+
+```bash
+EVIDENCE_FILE="$(find evidence -maxdepth 1 -type f -name 'evidence-proxy.run.*-0.jsonl' -print -quit)"
+```
+
+```bash
+pip install pipelock-verify
+python -m pipelock_verify "$EVIDENCE_FILE" --key <public-key-hex>
+```
+
+Or use the Go CLI that ships with Pipelock:
+
+```bash
+pipelock verify-receipt "$EVIDENCE_FILE" --whole-recorder --key <public-key-hex>
+```
+
+`pipelock-verify` checks only ActionReceipt v1 integrity. It exits 1 on a signature failure, chain break, or reordering in that chain, and exits 0 when that chain verifies. It doesn't prove that the recording is complete.
+
+`pipelock verify-receipt` also checks the recorder hash chain and the EvidenceReceipt v2 chain. Handle its exit 3 (valid prefix, end unproven) separately from exit 1 (invalid evidence). The Python and Go commands aren't interchangeable completeness checks. The Go command above uses `--whole-recorder`.
+For an intact single-file run in the per-run session format, with trusted keys,
+its outcomes are:
+
+| Flags | Recorder state | Result | Exit |
+|-------|----------------|--------|------|
+| `--whole-recorder` | Valid transcript-root seal and signed trailing checkpoint | End proven | 0 |
+| `--whole-recorder` | Missing seal (live or interrupted run) | `INCOMPLETE`, then `VALID PREFIX, END UNPROVEN` | 3 |
+| `--whole-recorder --allow-prefix` | Missing seal | Prefix accepted; end still unproven | 0 |
+| `--whole-recorder --require-seal` | Missing seal | Invalid evidence, even with `--allow-prefix` | 1 |
+
+Keep `--allow-prefix` off when a detector requires a completed recording.
+Older shared-session recordings remain end-unproven even with a seal. Removing
+`--whole-recorder` checks the receipt subsequences instead of every recorder entry;
+a run with v2 receipts remains `VALID PREFIX, END UNPROVEN` (exit 3) even after a
+clean stop. See the [seal limitations](flight-recorder.md#completeness-anchor-transcript-root)
+for the full recorder verification contract.
+
+### Consuming receipts in a detector
+
+Once the stream verifies, a downstream detector reads it like any
+JSONL source. This is a complete working example:
+
+This small-file example holds one recording in memory and verifies a private temporary copy of those bytes. It parses the captured bytes, so later changes to the source file don't change what the detector consumes.
+
+```python
+"""Verify a pipelock receipt stream, then route each verified receipt
+to a pluggable handler for whatever downstream detector runs on.
+
+Requires: the Pipelock Go CLI on PATH
+Run: python verify_and_route.py evidence.jsonl <public-key-hex>
+"""
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Callable, Iterator
+
+
+def verified_receipts(path: str, pubkey_hex: str) -> Iterator[dict]:
+    """Yield each receipt only if the full stream verifies.
+
+    Evidence files can contain non-receipt entries (checkpoints, other
+    event types). We filter for type == "action_receipt" and carry the
+    outer envelope's session_id into the yielded record, since it is
+    the primary grouping key detectors use."""
+    # Keep the bytes being verified, even if the source file changes later.
+    contents = Path(path).read_bytes()
+    with tempfile.TemporaryDirectory() as directory:
+        snapshot = Path(directory) / Path(path).name
+        snapshot.write_bytes(contents)
+        check = subprocess.run(
+            [
+                "pipelock", "verify-receipt", str(snapshot),
+                "--whole-recorder", "--require-seal", "--key", pubkey_hex,
+            ],
+            capture_output=True,
+            text=True,
+        )
+    if check.returncode != 0:
+        raise RuntimeError(
+            f"verification failed: {check.stderr.strip() or check.stdout.strip()}"
+        )
+    for line in contents.splitlines():
+        if not line.strip():
+            continue
+        entry = json.loads(line)
+        if entry.get("type") != "action_receipt":
+            continue
+        record = entry["detail"]["action_record"]
+        record.setdefault("session_id", entry.get("session_id"))
+        yield record
+
+
+def default_handler(receipt: dict) -> None:
+    """Replace this with your SIEM forwarder, alert pipeline, or
+    feature extractor for an LLM classifier."""
+    print(
+        f"{receipt['timestamp']} {receipt.get('session_id', '-'):24s} "
+        f"{receipt['transport']:20s} {receipt['verdict']:10s} "
+        f"{receipt.get('layer', '-'):24s} {receipt.get('pattern', '-')}"
+    )
+
+
+def route(path: str, pubkey_hex: str, handler: Callable[[dict], None]) -> None:
+    for receipt in verified_receipts(path, pubkey_hex):
+        handler(receipt)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        sys.exit("usage: verify_and_route.py <path> <public-key-hex>")
+    route(sys.argv[1], sys.argv[2], default_handler)
+```
+
+Replace `default_handler` with whatever your pipeline needs:
+
+```python
+def route_to_siem(receipt: dict) -> None:
+    if receipt["verdict"] == "block":
+        forward_to_siem(receipt)
+    if receipt["layer"] == "mcp_response_scan":
+        score_for_llm_funnel(receipt)
+```
+
+The shape of the consumer is up to you. The shape of the input is
+fixed by the receipt spec.
+
+## What this does not solve
+
+This is the important section. Signed receipts solve one narrow
+problem. They do not solve several others.
+
+**Compromised mediators can still lie.** A receipt proves Pipelock
+recorded a decision. It does not prove Pipelock made the right
+decision. If a scanner pattern is wrong, the signed record is a
+signed wrong answer.
+
+**Real-time gateways still miss multi-week attacks.** The worked
+example above catches a prompt-injection payload in a single tool
+response because that payload is visible in flight. A slow-boiling
+attack where each individual step looks benign needs a long-window
+detector running on the receipt stream, not a faster gateway.
+
+**Receipts are input to detection, not a substitute for it.** A
+stream of signed records does not tell you which sessions are
+compromised. Someone or something still has to look at the stream
+and make that call. What receipts give you is a trustworthy place
+to look.
+
+**Agent-side attacks are out of scope.** Pipelock sees what the
+agent tries to do on the network. If an attacker has already
+compromised the agent process itself (code execution, same-user
+file access, shared memory), the receipts can document what the
+agent then tried to do, but they cannot prevent the compromise or
+retroactively verify the agent's internal state.
+
+**Same-user deployments have a known ceiling.** If Pipelock runs
+as the same Unix user as the agent, the agent can delete or
+truncate the receipt file. The `demo_capability_separation.py`
+script in the harness demonstrates this limit directly. Running
+Pipelock under a separate user (or in a separate container) is a
+deployment-level fix, not a product-level one.
+
+## Where to go from here
+
+- **Receipt format spec:** <https://pipelab.org/learn/action-receipt-spec/>
+- **Verification mechanics:** [`receipt-verification.md`](receipt-verification.md)
+- **SIEM transport options:** [`siem-integration.md`](siem-integration.md)
+- **Transport coverage matrix:** [`receipt-transports.md`](receipt-transports.md)
+- **Worked example:** [`examples/tool-response-injection/`](/examples/tool-response-injection/)
+- **PyPI verifier:** <https://pypi.org/project/Pipelock-verify/>
+
+If you are integrating Pipelock receipts into a detection pipeline
+and run into something the spec does not cover, open an issue at
+<https://github.com/pipelab-org/pipelock/issues>.

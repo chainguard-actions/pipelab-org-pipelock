@@ -1,0 +1,385 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import test from "node:test";
+import {
+  applyEvidenceProvenanceRecipe,
+  EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+  EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST,
+  EVIDENCE_PROVENANCE_PROFILE_V3_DIGEST,
+  EVIDENCE_PROVENANCE_PROFILE_V4_DIGEST,
+  EVIDENCE_PROVENANCE_PROFILE_V5_DIGEST,
+  supportedOperationKindsForProfile,
+} from "../src/provenance.js";
+import { findPackageRoot } from "./paths.js";
+
+type Vector = {
+  id: string;
+  processed_bytes?: number;
+  input_b64: string;
+  output_b64?: string;
+  want_error?: string;
+  recipe?: unknown[];
+  transform_profile_digest?: string;
+};
+const packageRoot = findPackageRoot(import.meta.url);
+const corpusPath = resolve(
+  packageRoot,
+  "../../conformance/testdata/transform-profile/evidence-provenance-v1.json",
+);
+const corpusPathV2 = resolve(
+  packageRoot,
+  "../../conformance/testdata/transform-profile/evidence-provenance-v2.json",
+);
+const corpusPathV3 = resolve(
+  packageRoot,
+  "../../conformance/testdata/transform-profile/evidence-provenance-v3.json",
+);
+const corpusPathV4 = corpusPathV3.replace("v3.json", "v4.json");
+const corpus = JSON.parse(readFileSync(corpusPath, "utf8")) as {
+  profile_digest: string;
+  operation_coverage: string[];
+  vectors: Vector[];
+};
+
+test("evidence provenance: v5 HTML5 full-table parity", () => {
+  const table = JSON.parse(
+    readFileSync(resolve(packageRoot, "../../conformance/testdata/html5/parity-v5.json"), "utf8"),
+  ) as {
+    vectors: { input: string; output: string }[];
+  };
+  assert.ok(table.vectors.length > 0);
+  const divergences: string[][] = [];
+  for (const vector of table.vectors) {
+    const got = Buffer.from(
+      applyEvidenceProvenanceRecipe(Buffer.from(vector.input), {
+        transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V5_DIGEST,
+        operations: [{ kind: "html_entity_decode" }],
+      }),
+    );
+    const want = Buffer.from(vector.output);
+    if (!got.equals(want))
+      divergences.push([vector.input, want.toString("base64"), got.toString("base64")]);
+  }
+  console.log("HTML5_DIVERGENCES:" + JSON.stringify(divergences));
+  assert.equal(
+    divergences.length,
+    0,
+    `${divergences.length} HTML5 divergences across ${table.vectors.length} cases`,
+  );
+  console.log(`PASS: ${table.vectors.length} HTML5 cases, zero divergences`);
+});
+
+test("evidence provenance: pinned corpus profile and every operation are exercised", () => {
+  assert.equal(corpus.profile_digest, EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST);
+  const seen = new Set(
+    corpus.vectors
+      .filter((v) => !v.want_error)
+      .flatMap((v) => (v.recipe ?? []).map((op) => (op as { kind: string }).kind)),
+  );
+  assert.deepEqual([...seen].sort(), [...corpus.operation_coverage].sort());
+  assert.deepEqual(
+    [...supportedOperationKindsForProfile(EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST)].sort(),
+    [...corpus.operation_coverage].sort(),
+  );
+});
+
+for (const vector of corpus.vectors)
+  test(`evidence provenance: ${vector.id}`, () => {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
+      transform_profile_digest: vector.transform_profile_digest ?? corpus.profile_digest,
+      operations: vector.recipe ?? [],
+    };
+    if (vector.want_error) {
+      assert.throws(
+        () => applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        (error: unknown) => error instanceof Error && error.message.includes(vector.want_error!),
+        vector.id,
+      );
+      return;
+    }
+    assert.equal(
+      Buffer.from(
+        applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+      ).toString("base64"),
+      vector.output_b64,
+    );
+  });
+
+test("evidence provenance: v2 corpus executes every vector byte-exactly", () => {
+  const v2 = JSON.parse(readFileSync(corpusPathV2, "utf8")) as {
+    profile_digest: string;
+    vectors: Vector[];
+  };
+  assert.equal(v2.profile_digest, EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST);
+  for (const vector of v2.vectors) {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
+      transform_profile_digest: vector.transform_profile_digest ?? v2.profile_digest,
+      operations: vector.recipe ?? [],
+    };
+    if (vector.want_error) {
+      assert.throws(
+        () => applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        (error: unknown) => error instanceof Error && error.message.includes(vector.want_error!),
+        vector.id,
+      );
+      continue;
+    }
+    assert.equal(
+      Buffer.from(
+        applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+      ).toString("base64"),
+      vector.output_b64,
+      vector.id,
+    );
+  }
+});
+
+test("evidence provenance: v3 corpus executes every vector byte-exactly", () => {
+  const v3 = JSON.parse(readFileSync(corpusPathV3, "utf8")) as {
+    profile_digest: string;
+    vectors: Vector[];
+  };
+  assert.equal(v3.profile_digest, EVIDENCE_PROVENANCE_PROFILE_V3_DIGEST);
+  assert.ok(v3.vectors.length > 0, "v3 corpus has no vectors");
+  for (const vector of v3.vectors) {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
+      transform_profile_digest: vector.transform_profile_digest ?? v3.profile_digest,
+      operations: vector.recipe ?? [],
+    };
+    if (vector.want_error) {
+      assert.throws(
+        () => applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        (error: unknown) => error instanceof Error && error.message.includes(vector.want_error!),
+        vector.id,
+      );
+    } else {
+      assert.equal(
+        Buffer.from(
+          applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        ).toString("base64"),
+        vector.output_b64,
+        vector.id,
+      );
+    }
+  }
+});
+
+test("evidence provenance: v1 rejects the v2-only alphanumeric operation", () => {
+  assert.throws(
+    () =>
+      applyEvidenceProvenanceRecipe(Buffer.from("AKIA" + "----ABCDEFGHIJKLMNOP"), {
+        transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+        operations: [{ kind: "ascii_alphanumeric_strip" }],
+      }),
+    /unsupported by transform profile/u,
+  );
+});
+
+test("evidence provenance: HTML5 named entities decode repeatedly", () => {
+  const recipe = {
+    transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+    operations: [{ kind: "html_entity_decode" }],
+  };
+  const result = applyEvidenceProvenanceRecipe(
+    Buffer.from("&amp;CounterClockwiseContourIntegral;", "utf8"),
+    recipe,
+  );
+  assert.equal(Buffer.from(result).toString("utf8"), "∳");
+});
+
+test("evidence provenance: Unicode 15 tables pin newer code points as opaque", () => {
+  const unicodeData = JSON.parse(
+    readFileSync(resolve(packageRoot, "node_modules/@unicode/unicode-15.0.0/package.json"), "utf8"),
+  ) as { version: string };
+  assert.equal(unicodeData.version, "2.0.2");
+
+  // U+1C89 was assigned in Unicode 16. Native Node 24 (Unicode 17) maps it
+  // to U+1C8A; profile v1 must leave it untouched under Unicode 15.
+  const result = applyEvidenceProvenanceRecipe(Buffer.from("\u{1C89}", "utf8"), {
+    transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+    operations: [{ kind: "lowercase" }],
+  });
+  assert.equal(Buffer.from(result).toString("utf8"), "\u{1C89}");
+});
+
+test("evidence provenance: execution limits reject unbounded verifier work", () => {
+  assert.throws(
+    () =>
+      applyEvidenceProvenanceRecipe(Buffer.from("value"), {
+        transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+        operations: Array.from({ length: 33 }, () => ({ kind: "identity" })),
+      }),
+    /exceeds 32 operations/u,
+  );
+
+  const token = `%${"25".repeat(500)}`;
+  assert.throws(
+    () =>
+      applyEvidenceProvenanceRecipe(Buffer.from(token.repeat(1500)), {
+        transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+        operations: [{ kind: "query_unescape" }],
+      }),
+    /cumulative processing budget/u,
+  );
+});
+
+// Profile v2 mirrors the scanner's current per-alphabet keep-set. Profile v1
+// remains the historical allow-list, so this change is selected by digest.
+test("v2 encoded token normalization strips non-ASCII whitespace separators", () => {
+  for (const separator of ["\u00a0", "\u1680", "\u3000", "\ufeff"]) {
+    const output = applyEvidenceProvenanceRecipe(Buffer.from(`SG${separator}k=`), {
+      transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST,
+      operations: [{ kind: "encoded_token_normalize", alphabet: "base64_standard" }],
+    });
+    assert.equal(Buffer.from(output).toString(), "SGk=");
+  }
+});
+
+test("URL authority delimiter must immediately follow the scheme", () => {
+  assert.throws(
+    () =>
+      applyEvidenceProvenanceRecipe(Buffer.from("https:api.vendor.example/path://x"), {
+        transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+        operations: [{ kind: "url_component", component: "hostname" }],
+      }),
+    /invalid absolute URL/u,
+  );
+});
+
+// Unicode marks U+001C..U+001F as White_Space=Yes, but Go's unicode.IsSpace
+// excludes them and this profile follows Go. A verifier that strips them
+// produces a different view than the Go reference for byte-identical input, and
+// therefore a different commitment. This case is pinned because the whole suite
+// passed while the divergence was live: nothing exercised these four code
+// points, so the bug was invisible to 310 green tests.
+test("whitespace_compact keeps the information separators Go retains", () => {
+  const separators = "\u001c\u001d\u001e\u001f";
+  const input = "abc" + separators + "de f";
+  const recipe = {
+    transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+    operations: [{ kind: "whitespace_compact" }],
+  };
+
+  const out = applyEvidenceProvenanceRecipe(Buffer.from(input, "utf8"), recipe);
+  const text = Buffer.from(out).toString("utf8");
+
+  // The ASCII space is compacted away; the four separators survive, matching
+  // Go codepoints [97 98 99 28 29 30 31 100 101 102].
+  assert.equal(text, "abc" + separators + "def");
+  for (let cp = 0x1c; cp <= 0x1f; cp += 1) {
+    assert.ok(
+      text.includes(String.fromCodePoint(cp)),
+      `U+${cp.toString(16).toUpperCase().padStart(4, "0")} must be retained to match Go`,
+    );
+  }
+});
+
+// A malformed absolute URL carries a scheme but no literal "://" authority.
+// indexOf then returns -1 and the slice started at index 2, so this verifier
+// returned a fabricated hostname ("tps") while Go rejected the same input and
+// Rust fabricated something else ("https"). A proof built on it would commit to
+// a source view that never existed. Pinned so the rejection cannot regress.
+test("url_component hostname rejects a malformed authority like Go", () => {
+  const recipe = {
+    transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST,
+    operations: [{ kind: "url_component", component: "hostname" }],
+  };
+
+  assert.throws(
+    () => applyEvidenceProvenanceRecipe(Buffer.from("https:api.vendor.example", "utf8"), recipe),
+    /invalid absolute URL/,
+  );
+
+  const ok = applyEvidenceProvenanceRecipe(
+    Buffer.from("https://api.vendor.example/x", "utf8"),
+    recipe,
+  );
+  assert.equal(Buffer.from(ok).toString("utf8"), "api.vendor.example");
+});
+
+test("evidence provenance: v4 corpus executes every vector byte-exactly", () => {
+  const v4 = JSON.parse(readFileSync(corpusPathV4, "utf8")) as {
+    profile_digest: string;
+    vectors: Vector[];
+  };
+  assert.equal(v4.profile_digest, EVIDENCE_PROVENANCE_PROFILE_V4_DIGEST);
+  assert.ok(v4.vectors.length > 0, "v4 corpus has no vectors");
+  for (const vector of v4.vectors) {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
+      transform_profile_digest: vector.transform_profile_digest ?? v4.profile_digest,
+      operations: vector.recipe ?? [],
+    };
+    if (vector.want_error) {
+      assert.throws(
+        () => applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        (error: unknown) => error instanceof Error && error.message.includes(vector.want_error!),
+        vector.id,
+      );
+    } else {
+      assert.equal(
+        Buffer.from(
+          applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        ).toString("base64"),
+        vector.output_b64,
+        vector.id,
+      );
+    }
+  }
+});
+
+test("evidence provenance v4: nested UTF-8 charges intermediate byte counts", () => {
+  const charges: number[] = [];
+  const output = applyEvidenceProvenanceRecipe(
+    Buffer.from("%C3%25A9"),
+    {
+      transform_profile_digest: EVIDENCE_PROVENANCE_PROFILE_V4_DIGEST,
+      operations: [{ kind: "query_unescape" }],
+    },
+    (bytes) => charges.push(bytes),
+  );
+  assert.equal(Buffer.from(output).toString("utf8"), "é");
+  assert.deepEqual(charges, [8, 8, 4, 2]);
+});
+
+test("evidence provenance: v5 corpus executes every vector byte-exactly", () => {
+  const v5 = JSON.parse(readFileSync(corpusPathV3.replace("v3.json", "v5.json"), "utf8")) as {
+    profile_digest: string;
+    vectors: Vector[];
+  };
+  assert.equal(v5.profile_digest, EVIDENCE_PROVENANCE_PROFILE_V5_DIGEST);
+  assert.ok(v5.vectors.length > 0, "v5 corpus has no vectors");
+  for (const vector of v5.vectors) {
+    const recipe: { transform_profile_digest: string; operations: unknown[] } = {
+      transform_profile_digest: vector.transform_profile_digest ?? v5.profile_digest,
+      operations: vector.recipe ?? [],
+    };
+    if (vector.want_error) {
+      assert.throws(
+        () => applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe),
+        (error: unknown) => error instanceof Error && error.message.includes(vector.want_error!),
+        vector.id,
+      );
+    } else {
+      const charges: number[] = [];
+      assert.equal(
+        Buffer.from(
+          applyEvidenceProvenanceRecipe(Buffer.from(vector.input_b64, "base64"), recipe, (bytes) =>
+            charges.push(bytes),
+          ),
+        ).toString("base64"),
+        vector.output_b64,
+        vector.id,
+      );
+      if (vector.processed_bytes !== undefined)
+        assert.equal(
+          charges.reduce((a, b) => a + b, 0),
+          vector.processed_bytes,
+          vector.id,
+        );
+    }
+  }
+});

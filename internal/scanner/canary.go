@@ -1,0 +1,303 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+)
+
+// compiledCanaryToken stores normalized canary values for fast matching.
+type compiledCanaryToken struct {
+	name                    string
+	normalizedLower         string
+	canonicalLower          string
+	partialWindows          knownValueWindowIndex
+	canonicalPartialWindows knownValueWindowIndex
+}
+
+func compileCanaryTokens(cfg config.CanaryTokens, budget *knownValueWindowBudget) ([]compiledCanaryToken, error) {
+	if !cfg.Enabled || len(cfg.Tokens) == 0 {
+		return nil, nil
+	}
+	out := make([]compiledCanaryToken, 0, len(cfg.Tokens))
+	normalizedValues := make([]string, 0, len(cfg.Tokens))
+	for _, token := range cfg.Tokens {
+		normalized := strings.ToLower(normalize.ForDLP(token.Value))
+		if normalized == "" {
+			continue
+		}
+		normalizedValues = append(normalizedValues, normalized)
+		out = append(out, compiledCanaryToken{
+			name:            token.Name,
+			normalizedLower: normalized,
+			canonicalLower:  strings.ToLower(canonicalizeCanaryText(normalized)),
+		})
+	}
+	// Windows shared between two canaries are a common stem, not a disclosure
+	// of either; they are excluded the same way as for environment secrets.
+	windows, err := buildKnownValueWindows(budget, normalizedValues)
+	if err != nil {
+		return nil, fmt.Errorf("normalized canary windows: %w", err)
+	}
+	canonicalCount := make(map[string]int, len(out))
+	for i := range out {
+		out[i].partialWindows = windows[out[i].normalizedLower]
+		// URL-shaped originals stay whole-value-only after canonicalization.
+		// canonicalizeCanaryText strips "://", and knownValueWindows would
+		// then emit partial windows for the public scheme/host/path stem.
+		if strings.Contains(out[i].normalizedLower, "://") || out[i].canonicalLower == "" {
+			continue
+		}
+		canonicalCount[out[i].canonicalLower]++
+	}
+	canonicalValues := make([]string, 0, len(canonicalCount))
+	for value, n := range canonicalCount {
+		if n == 1 {
+			canonicalValues = append(canonicalValues, value)
+		}
+	}
+	canonicalWindows, err := buildKnownValueWindows(budget, canonicalValues)
+	if err != nil {
+		return nil, fmt.Errorf("canonical canary windows: %w", err)
+	}
+	for i := range out {
+		if strings.Contains(out[i].normalizedLower, "://") || out[i].canonicalLower == "" {
+			continue
+		}
+		if canonicalCount[out[i].canonicalLower] != 1 {
+			continue
+		}
+		out[i].canonicalPartialWindows = canonicalWindows[out[i].canonicalLower]
+	}
+	return out, nil
+}
+
+// scanCanaryText scans text for configured canary tokens. It owns DLP
+// normalization, then checks URL-decoded, encoded, and separator-canonicalized
+// views. Span labels name the lowercased/canonicalized view that was indexed.
+func (s *Scanner) scanCanaryText(text string) []TextDLPMatch {
+	var decodes decodingMemo
+	return s.scanCanaryTextWithDecodes(text, &decodes)
+}
+
+func (s *Scanner) scanCanaryTextWithDecodes(text string, decodes *decodingMemo) []TextDLPMatch {
+	if len(s.canaryTokens) == 0 || text == "" {
+		return nil
+	}
+
+	cleaned := decodes.normalize(text)
+	if cleaned == "" && !normalize.ContainsTags(text) {
+		return nil
+	}
+
+	var matches []TextDLPMatch
+	segmentViews := textDLPEncodingSegmentViews(cleaned)
+	if normalize.ContainsTags(text) {
+		for _, d := range decodes.decode(text, true) {
+			label := spanViewLabel(d.encoding+"_decoded", ViewDLPNormalized)
+			normalized := decodes.normalize(d.text)
+			matches = append(matches, s.matchCanaryTokens(normalized, d.encoding, false, label)...)
+			matches = append(matches, s.matchCanaryDecimalView(normalized, label)...)
+			if collapsed := canonicalizeCanaryText(normalized); collapsed != "" && collapsed != normalized {
+				matches = append(matches, s.matchCanaryTokens(normalized, d.encoding, true, label)...)
+			}
+			if d.encoding == encodingUnicodeTags {
+				segmentViews = appendUniqueTextDLPViews(segmentViews, textDLPEncodingSegmentViews(decodes.normalize(d.text))...)
+			}
+		}
+	}
+	matches = append(matches, s.matchCanaryTokens(cleaned, "", false, ViewDLPNormalized)...)
+	matches = append(matches, s.matchCanaryDecimalView(cleaned, ViewDLPNormalized)...)
+
+	if decoded := IterativeDecode(cleaned); decoded != cleaned {
+		label := spanViewLabel("url_decoded", ViewDLPNormalized)
+		matches = append(matches, s.matchCanaryTokens(decoded, "url", false, label)...)
+		matches = append(matches, s.matchCanaryDecimalView(decoded, label)...)
+		segmentViews = appendUniqueTextDLPViews(segmentViews, textDLPEncodingSegmentViews(decoded)...)
+	}
+	if decoded := iterativePercentDecode(cleaned); decoded != cleaned {
+		segmentViews = appendUniqueTextDLPViews(segmentViews, textDLPEncodingSegmentViews(decoded)...)
+	}
+	if decoded := decodes.decodeHTML(cleaned); decoded != cleaned {
+		label := spanViewLabel("html_decoded", ViewDLPNormalized)
+		matches = append(matches, s.matchCanaryTokens(decoded, encodingHTML, false, label)...)
+		matches = append(matches, s.matchCanaryDecimalView(decoded, label)...)
+	}
+	if strings.Contains(cleaned, ".") {
+		dotless := removeHostnameDots(cleaned)
+		if dotless != cleaned {
+			matches = append(matches, s.matchCanaryTokens(dotless, "subdomain", false, spanViewLabel("dotless_hostname", ViewDLPNormalized))...)
+		}
+	}
+	if collapsed := canonicalizeCanaryText(cleaned); collapsed != "" && collapsed != cleaned {
+		matches = append(matches, s.matchCanaryTokens(cleaned, "split", true, ViewDLPNormalized)...)
+	}
+
+	// Walk the bounded recursive decode fixpoint, not a single pass. Ordinary
+	// text DLP and the core response scanner already use this decoder in the
+	// same shape; a canary matcher that stopped at one layer meant a single
+	// extra wrapper hid the one token whose whole purpose is to prove an
+	// exfiltration path. The fixpoint's candidate and byte bounds terminate it,
+	// and the candidates are already generated for DLP, so this adds substring
+	// checks rather than decode work.
+	decodedViews := decodes.decode(cleaned, true)
+	if text != cleaned && hasTextEncoding(text) {
+		decodedViews = append(append([]decodedResult(nil), decodedViews...), decodes.decode(text, true)...)
+	}
+	for _, d := range decodedViews {
+		if d.encoding == encodingUnicodeTags {
+			d.text = decodes.normalize(d.text)
+			segmentViews = appendUniqueTextDLPViews(segmentViews, textDLPEncodingSegmentViews(d.text)...)
+		}
+		label := spanViewLabel(d.encoding+"_decoded", ViewDLPNormalized)
+		matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, false, label)...)
+		if d.encoding == encodingUnicodeTags {
+			if collapsed := canonicalizeCanaryText(d.text); collapsed != "" && collapsed != d.text {
+				matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, true, label)...)
+			}
+		}
+		// A decimal-code spelling can itself arrive wrapped in another
+		// encoding; the known-value search runs on every decoded view, not
+		// only the first, for the same reason ordinary token matching does.
+		matches = append(matches, s.matchCanaryDecimalView(d.text, label)...)
+	}
+
+	for _, view := range segmentViews {
+		segments := textDLPSegments(view.text)
+		for _, seg := range segments {
+			if len(seg) < 8 {
+				continue
+			}
+			// Same recursion for the per-segment view: the whole-text and
+			// segment loops are separate call sites, so leaving this one
+			// single-pass would keep a query-value bypass open.
+			for _, d := range decodes.decode(seg, true) {
+				if d.encoding == encodingUnicodeTags {
+					d.text = decodes.normalize(d.text)
+				}
+				label := spanViewLabel(d.encoding+"_decoded", view.viewLabel)
+				matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, false, label)...)
+				if d.encoding == encodingUnicodeTags {
+					if collapsed := canonicalizeCanaryText(d.text); collapsed != "" && collapsed != d.text {
+						matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, true, label)...)
+					}
+				}
+				matches = append(matches, s.matchCanaryDecimalView(d.text, label)...)
+			}
+			if collapsed := canonicalizeCanaryText(seg); collapsed != "" && collapsed != seg {
+				matches = append(matches, s.matchCanaryTokens(seg, "split", true, view.viewLabel)...)
+			}
+		}
+	}
+
+	return deduplicateMatches(matches)
+}
+
+// matchCanaryTokens checks a pre-built view for canary token matches. It always
+// indexes a lowercased view and, for split matches, a canonicalized lowercased
+// view, so the span label must include those final transforms.
+func (s *Scanner) matchCanaryTokens(text, encoding string, canonical bool, inputViewLabel string) []TextDLPMatch {
+	if len(s.canaryTokens) == 0 || text == "" {
+		return nil
+	}
+
+	haystack := strings.ToLower(text)
+	if canonical {
+		haystack = strings.ToLower(canonicalizeCanaryText(haystack))
+		if haystack == "" {
+			return nil
+		}
+	}
+
+	var matches []TextDLPMatch
+	for _, token := range s.canaryTokens {
+		needle := token.normalizedLower
+		if canonical {
+			needle = token.canonicalLower
+		}
+		if needle == "" {
+			continue
+		}
+		if start := strings.Index(haystack, needle); start >= 0 {
+			end := start + len(needle)
+			patternName := "Canary Token (" + token.name + ")"
+			matches = append(matches, TextDLPMatch{
+				PatternName: patternName,
+				Severity:    "critical",
+				Encoded:     encoding,
+				span:        newMatchSpan(start, end, canaryMatchViewLabel(inputViewLabel, canonical), patternName, "", ""),
+			})
+			continue
+		}
+		windows := token.partialWindows
+		if canonical {
+			windows = token.canonicalPartialWindows
+		}
+		// Only coordinates are used here. Build the result's view label after
+		// a match, rather than allocating metadata for every clean view.
+		if start, end, length, _, ok := indexKnownValueSubstring(needle, windows, []spanTextView{{text: haystack}}); ok {
+			patternName := "Canary Token (" + token.name + ")"
+			matches = append(matches, TextDLPMatch{
+				PatternName: patternName,
+				Severity:    "critical",
+				Encoded:     encoding,
+				PartialLen:  length,
+				span:        newMatchSpan(start, end, canaryMatchViewLabel(inputViewLabel, canonical), patternName, "", ""),
+			})
+		}
+	}
+
+	return matches
+}
+
+func canaryMatchViewLabel(inputViewLabel string, canonical bool) string {
+	if canonical {
+		return canonicalLowerViewLabel(inputViewLabel)
+	}
+	return lowerViewLabel(inputViewLabel)
+}
+
+// canonicalizeCanaryText collapses separators commonly used to split tokens
+// across URL/path/query boundaries.
+//
+//pipelock:provenance-transform canary_canonicalize
+func canonicalizeCanaryText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '.', '/', '\\', '?', '&', '=', ' ', '\t', '\n', '\r',
+			':', ';', ',', '-', '_', '@', '%', '+', '#':
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// matchCanaryDecimalView runs the ORDINARY canary matcher over the text a
+// decimal character-code run spells. The earlier shape encoded each token into
+// one exact spelling and searched for that, which missed every variation the
+// wire actually carries: "65, 75" with comma-and-space separators, a
+// lower-cased token, and the integral float and exponent forms JSON permits.
+// Decoding once and reusing the existing matcher gets separator, case and
+// number-form handling from code that already had it, and leaves one place to
+// fix instead of four.
+//
+// This does NOT reopen the false-positive risk that made encode-and-search the
+// rule for pattern DLP. The decoded text is compared only against KNOWN values,
+// so it matches only when a numeric run literally spells a token the operator
+// planted; it never reaches the pattern set. The decoder's own run floor also
+// means ordinary short numeric telemetry decodes to nothing at all.
+func (s *Scanner) matchCanaryDecimalView(text, inputViewLabel string) []TextDLPMatch {
+	if len(s.canaryTokens) == 0 || text == "" {
+		return nil
+	}
+	decoded := decodeDecimalCharacterCodes(text)
+	if decoded == "" {
+		return nil
+	}
+	return s.matchCanaryTokens(decoded, encodingDecimal, false, spanViewLabel("decimal_decoded", inputViewLabel))
+}

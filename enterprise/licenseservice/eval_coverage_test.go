@@ -1,0 +1,550 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package licenseservice
+
+import (
+	"errors"
+	"strings"
+	"testing"
+	"time"
+)
+
+// mintParams builds a valid EvalMintParams for order o / email e.
+func mintParams(orderID, email string) EvalMintParams {
+	exp := time.Now().Add(evalTokenLifetime)
+	return EvalMintParams{
+		Entitlement: &Entitlement{
+			SubscriptionID:   orderID,
+			CustomerEmail:    email,
+			Tier:             tierEnterpriseEval,
+			BillingInterval:  billingIntervalOneTime,
+			Status:           statusActive,
+			CurrentPeriodEnd: exp,
+		},
+		Issuance:     LicenseIssuance{LicenseID: "lic_" + orderID, SubscriptionID: orderID, ExpiresAt: exp, IssuedAt: time.Now()},
+		EvalOrder:    &EvalOrder{OrderID: orderID, NormalizedEmail: email, FulfillmentState: fulfillmentMinted, RevocationState: revocationNone, RefundState: refundStateNone, LicenseID: "lic_" + orderID},
+		WebhookMsgID: "msg_" + orderID,
+		EventType:    EventOrderPaid,
+	}
+}
+
+func TestFulfillEvalMint_RefusesNonMintableStates(t *testing.T) {
+	tests := []struct {
+		name string
+		seed *EvalOrder
+	}{
+		{"already minted", &EvalOrder{OrderID: "o", NormalizedEmail: "a@b.com", FulfillmentState: fulfillmentMinted, LicenseID: "lic_prev"}},
+		{"already refunded", &EvalOrder{OrderID: "o", NormalizedEmail: "a@b.com", RefundState: refundStateFull, FulfillmentState: fulfillmentRevoked, RevocationState: revocationApplied}},
+		{"revocation pending", &EvalOrder{OrderID: "o", NormalizedEmail: "a@b.com", RevocationState: revocationPendingNoLicense, FulfillmentState: fulfillmentRevoked}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := openTestDB(t)
+			ctx := t.Context()
+			if err := db.UpsertEvalOrder(ctx, tt.seed); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+			err := db.FulfillEvalMint(ctx, mintParams("o", "a@b.com"))
+			if !errors.Is(err, ErrEvalOrderNotMintable) {
+				t.Fatalf("err = %v, want ErrEvalOrderNotMintable", err)
+			}
+			ent, _ := db.GetBySubscriptionID(ctx, "o")
+			if ent != nil {
+				t.Errorf("entitlement created despite non-mintable state: %+v", ent)
+			}
+		})
+	}
+}
+
+func TestFulfillEvalMint_CommitsAtomically(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	if err := db.FulfillEvalMint(ctx, mintParams("o", "a@b.com")); err != nil {
+		t.Fatalf("FulfillEvalMint: %v", err)
+	}
+	ent, _ := db.GetBySubscriptionID(ctx, "o")
+	if ent == nil || ent.Tier != tierEnterpriseEval {
+		t.Fatalf("entitlement not committed: %+v", ent)
+	}
+	committed, _ := db.WebhookCommitted(ctx, "msg_o")
+	if !committed {
+		t.Error("webhook not marked committed in mint tx")
+	}
+	eo, _ := db.GetEvalOrder(ctx, "o")
+	if eo == nil || eo.FulfillmentState != fulfillmentMinted {
+		t.Errorf("eval order not minted: %+v", eo)
+	}
+}
+
+func TestFulfillEvalMint_RejectsSecondActiveEmailAtCommit(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	if err := db.FulfillEvalMint(ctx, mintParams("order_first", "buyer@example.com")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FulfillEvalMint(ctx, mintParams("order_second", "buyer@example.com")); !errors.Is(err, ErrActiveTrialExists) {
+		t.Fatalf("second mint = %v, want active eval refusal", err)
+	}
+	ent, err := db.GetBySubscriptionID(ctx, "order_second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ent != nil {
+		t.Fatal("second eval entitlement committed")
+	}
+}
+
+func TestFulfillEvalMint_RejectsIncompleteParams(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.FulfillEvalMint(t.Context(), EvalMintParams{}); err == nil {
+		t.Error("expected error for incomplete params")
+	}
+}
+
+func TestRecordPendingOneTimeTrialRefundRevokesAlreadyIssuedTrial(t *testing.T) {
+	s := newTestSetup(t)
+	const orderID = "order_pending_refund_after_issue"
+	seedOneTimeTrial(t, s.db, orderID, true)
+
+	err := s.handler.recordPendingOneTimeTrialRefund(t.Context(), &PolarOrder{ID: orderID}, refundStateFull, "msg_pending_refund_after_issue", EventOrderRefunded)
+	if err != nil {
+		t.Fatalf("recordPendingOneTimeTrialRefund: %v", err)
+	}
+	entitlement, err := s.db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil || entitlement == nil || entitlement.Status != statusRevoked {
+		t.Fatalf("trial entitlement after pending refund = %+v, %v; want revoked", entitlement, err)
+	}
+	var revocations int
+	if err := s.db.db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM license_revocations WHERE subscription_id = ?`, orderID).Scan(&revocations); err != nil {
+		t.Fatalf("count trial revocations: %v", err)
+	}
+	if revocations != 1 {
+		t.Fatalf("trial refund revocations = %d, want 1", revocations)
+	}
+	committed, err := s.db.WebhookCommitted(t.Context(), "msg_pending_refund_after_issue")
+	if err != nil || !committed {
+		t.Fatalf("pending refund webhook committed = %t, %v; want true", committed, err)
+	}
+}
+
+func TestRecordPendingOneTimeTrialRefundRefusesNonTrialEntitlement(t *testing.T) {
+	s := newTestSetup(t)
+	const orderID = "order_pending_refund_non_trial"
+	ent := testEntitlement(orderID)
+	if err := s.db.Upsert(t.Context(), ent); err != nil {
+		t.Fatalf("seed non-trial entitlement: %v", err)
+	}
+	order := &PolarOrder{ID: orderID}
+	order.Customer.Email = ent.CustomerEmail
+
+	err := s.handler.recordPendingOneTimeTrialRefund(t.Context(), order, refundStateFull, "msg_pending_refund_non_trial", EventOrderRefunded)
+	if !errors.Is(err, ErrPendingRefundNotOneTimeTrial) {
+		t.Fatalf("recordPendingOneTimeTrialRefund error = %v, want ErrPendingRefundNotOneTimeTrial", err)
+	}
+	// The refusal must happen before the transaction commits, or the guard row
+	// and eval order outlive a refund this service declined, and the stale
+	// pending marker then blocks a later legitimate trial for this order.
+	var guards int
+	if err := s.db.db.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM trial_order_guards WHERE order_id = ?`, orderID).Scan(&guards); err != nil {
+		t.Fatalf("count trial_order_guards: %v", err)
+	}
+	if guards != 0 {
+		t.Fatalf("trial_order_guards rows = %d, want 0 after a refused refund", guards)
+	}
+	var orders int
+	if err := s.db.db.QueryRowContext(t.Context(),
+		`SELECT COUNT(*) FROM eval_orders WHERE order_id = ?`, orderID).Scan(&orders); err != nil {
+		t.Fatalf("count eval_orders: %v", err)
+	}
+	if orders != 0 {
+		t.Fatalf("eval_orders rows = %d, want 0 after a refused refund", orders)
+	}
+	committed, err := s.db.WebhookCommitted(t.Context(), "msg_pending_refund_non_trial")
+	if err != nil || committed {
+		t.Fatalf("non-trial refund webhook committed = %t, %v; want false", committed, err)
+	}
+	stored, err := s.db.GetBySubscriptionID(t.Context(), orderID)
+	if err != nil || stored == nil || stored.Status != statusActive {
+		t.Fatalf("non-trial entitlement after refund refusal = %+v, %v; want active", stored, err)
+	}
+}
+
+func TestValidateEvalOrderStates_RejectsInvalid(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	bad := []*EvalOrder{
+		{OrderID: "r", NormalizedEmail: "a@b.com", RefundState: "weird"},
+		{OrderID: "v", NormalizedEmail: "a@b.com", RevocationState: "weird"},
+	}
+	for _, eo := range bad {
+		if err := db.UpsertEvalOrder(ctx, eo); err == nil {
+			t.Errorf("expected validation error for %+v", eo)
+		}
+	}
+}
+
+func TestResendEvalIfNeeded_NoopWhenAlreadySent(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_1"); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if s.emailHits.Load() != 1 {
+		t.Fatalf("email hits after mint = %d, want 1", s.emailHits.Load())
+	}
+	// Delivery already succeeded → resend path must not send again.
+	if err := s.handler.resendEvalIfNeeded(ctx, testEvalOrderID); err != nil {
+		t.Fatalf("resend: %v", err)
+	}
+	if s.emailHits.Load() != 1 {
+		t.Errorf("email hits after resend = %d, want 1 (already sent)", s.emailHits.Load())
+	}
+}
+
+func TestResendEvalIfNeeded_NoopForUnknownOrder(t *testing.T) {
+	s := newEvalTestSetup(t)
+	if err := s.handler.resendEvalIfNeeded(t.Context(), "order_does_not_exist"); err != nil {
+		t.Errorf("resend for unknown order should be a no-op, got %v", err)
+	}
+	if s.emailHits.Load() != 0 {
+		t.Errorf("email hits = %d, want 0", s.emailHits.Load())
+	}
+}
+
+func TestHandleOrderPaid_InvalidEmailDenied(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	body := strings.ReplaceAll(defaultEvalOrderJSON(orderStatusPaid), testEvalEmail, "not-an-email")
+	s.orderJSON.Store(&body)
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_1"); err != nil {
+		t.Fatalf("should not hard-error on invalid email: %v", err)
+	}
+	ent, _ := s.db.GetBySubscriptionID(ctx, testEvalOrderID)
+	if ent != nil {
+		t.Errorf("minted despite invalid email: %+v", ent)
+	}
+	eo, _ := s.db.GetEvalOrder(ctx, testEvalOrderID)
+	if eo == nil || eo.FulfillmentState != fulfillmentGatedDenied {
+		t.Errorf("eval order = %+v, want gated_denied", eo)
+	}
+}
+
+func TestHandleOrderRefund_BeforePaidRecordsPending(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	refundBody := defaultEvalOrderJSON(orderStatusRefunded)
+	s.orderJSON.Store(&refundBody)
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_refund"); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	eo, _ := s.db.GetEvalOrder(ctx, testEvalOrderID)
+	if eo == nil {
+		t.Fatal("eval order not recorded on refund-before-paid")
+	}
+	if eo.RevocationState != revocationPendingNoLicense || eo.FulfillmentState != fulfillmentRevoked {
+		t.Errorf("eval order = %+v, want revoked/pending_no_license", eo)
+	}
+}
+
+func TestHandleOrderRefund_NonEvalOrderIgnored(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	// Refunded order whose product is not in the eval allowlist.
+	body := strings.ReplaceAll(defaultEvalOrderJSON(orderStatusRefunded), testEvalProductID, "prod_other")
+	body = strings.ReplaceAll(body, `"pipelock_tier": "enterprise_eval"`, `"pipelock_tier": "pro"`)
+	s.orderJSON.Store(&body)
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_refund"); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	eo, _ := s.db.GetEvalOrder(ctx, testEvalOrderID)
+	if eo != nil {
+		t.Errorf("non-eval refunded order should not create an eval_order record: %+v", eo)
+	}
+	committed, _ := s.db.WebhookCommitted(ctx, "msg_refund")
+	if !committed {
+		t.Error("non-eval refund webhook should still be marked committed")
+	}
+}
+
+func TestHandleOrderRefund_MetadataEvalRecordsPendingEvenWhenUnallowlisted(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+
+	body := strings.ReplaceAll(defaultEvalOrderJSON(orderStatusRefunded), testEvalProductID, "prod_other")
+	s.orderJSON.Store(&body)
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_refund"); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+
+	eo, _ := s.db.GetEvalOrder(ctx, testEvalOrderID)
+	if eo == nil {
+		t.Fatal("metadata-marked eval refund should record a pending eval_order")
+	}
+	if eo.RevocationState != revocationPendingNoLicense {
+		t.Errorf("RevocationState = %q, want %q", eo.RevocationState, revocationPendingNoLicense)
+	}
+
+	paid := strings.ReplaceAll(defaultEvalOrderJSON(orderStatusPaid), testEvalProductID, "prod_other")
+	s.orderJSON.Store(&paid)
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_paid"); err != nil {
+		t.Fatalf("paid after refund: %v", err)
+	}
+	ent, _ := s.db.GetBySubscriptionID(ctx, testEvalOrderID)
+	if ent != nil {
+		t.Errorf("minted after metadata-marked refund-before-paid: %+v", ent)
+	}
+}
+
+func TestHandleOrderRefund_NoRefundComponentMarksCommitted(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	// order.updated with no refund: paid body, no refund.
+	if err := s.handler.HandleOrderRefundEvent(ctx, &PolarWebhookEvent{Type: EventOrderUpdated, Data: evalPaidEvent().Data}, "msg_upd"); err != nil {
+		t.Fatalf("updated: %v", err)
+	}
+	committed, _ := s.db.WebhookCommitted(ctx, "msg_upd")
+	if !committed {
+		t.Error("no-refund order.updated should be marked committed")
+	}
+}
+
+// TestHandleOrderPaid_AlreadyMintedNewDeliveryResends covers the crash-recovery
+// branch: an order was minted, but a *new* delivery id arrives (the prior
+// dedupe marker was lost). It must not mint again — it marks the new delivery
+// committed and resends only if the email never landed.
+func TestHandleOrderPaid_AlreadyMintedNewDeliveryResends(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_1"); err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	first, _ := s.db.GetBySubscriptionID(ctx, testEvalOrderID)
+
+	// New delivery id for the same already-minted order.
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_2"); err != nil {
+		t.Fatalf("second delivery: %v", err)
+	}
+	second, _ := s.db.GetBySubscriptionID(ctx, testEvalOrderID)
+	if first.LastLicenseID != second.LastLicenseID {
+		t.Errorf("re-minted on new delivery of minted order: %q -> %q", first.LastLicenseID, second.LastLicenseID)
+	}
+	committed, _ := s.db.WebhookCommitted(ctx, "msg_2")
+	if !committed {
+		t.Error("new delivery for minted order should be marked committed")
+	}
+}
+
+func TestEvalStore_ClosedDBErrors(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := db.GetEvalOrder(ctx, "o"); err == nil {
+		t.Error("GetEvalOrder on closed db should error")
+	}
+	if err := db.UpsertEvalOrder(ctx, &EvalOrder{OrderID: "o", NormalizedEmail: "a@b.com"}); err == nil {
+		t.Error("UpsertEvalOrder on closed db should error")
+	}
+	if _, err := db.WebhookCommitted(ctx, "m"); err == nil {
+		t.Error("WebhookCommitted on closed db should error")
+	}
+	if err := db.MarkWebhookCommitted(ctx, "m", "t", "o"); err == nil {
+		t.Error("MarkWebhookCommitted on closed db should error")
+	}
+	if _, err := db.CountActiveEvalForEmail(ctx, "a@b.com", time.Now()); err == nil {
+		t.Error("CountActiveEvalForEmail on closed db should error")
+	}
+	if err := db.FulfillEvalMint(ctx, mintParams("o", "a@b.com")); err == nil {
+		t.Error("FulfillEvalMint on closed db should error")
+	}
+}
+
+func TestHandleOrderPaid_PolarFetchFailureRetries(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	// An order body that fails to parse as an order makes GetOrder return an error.
+	bad := `{not json`
+	s.orderJSON.Store(&bad)
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_1"); err == nil {
+		t.Error("expected error when order fetch fails (so Polar retries)")
+	}
+	// Same for the refund path.
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_2"); err == nil {
+		t.Error("expected error when refund order fetch fails")
+	}
+}
+
+func TestHandlers_ClosedDBError(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	if err := s.db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := s.handler.HandleOrderPaidEvent(ctx, evalPaidEvent(), "msg_1"); err == nil {
+		t.Error("HandleOrderPaidEvent should error when the dedupe lookup fails")
+	}
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_2"); err == nil {
+		t.Error("HandleOrderRefundEvent should error when the dedupe lookup fails")
+	}
+}
+
+func TestHandleOrderRefund_DuplicateIsNoop(t *testing.T) {
+	s := newEvalTestSetup(t)
+	ctx := t.Context()
+	refundBody := defaultEvalOrderJSON(orderStatusRefunded)
+	s.orderJSON.Store(&refundBody)
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_refund"); err != nil {
+		t.Fatalf("refund: %v", err)
+	}
+	// Replay same delivery id: dedupe short-circuits.
+	if err := s.handler.HandleOrderRefundEvent(ctx, evalRefundEvent(), "msg_refund"); err != nil {
+		t.Fatalf("refund replay: %v", err)
+	}
+}
+
+func TestCountActiveTrialForEmailClosedDB(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, err := db.CountActiveTrialForEmail(t.Context(), "a@b.com", time.Now()); err == nil {
+		t.Error("CountActiveTrialForEmail on closed db should error")
+	}
+}
+
+func TestCountActiveTierForEmailRejectsNonTrialTier(t *testing.T) {
+	db := openTestDB(t)
+	_, err := db.CountActiveTierForEmail(t.Context(), tierEnterprise, "tier@example.com", time.Now())
+	if err == nil || !strings.Contains(err.Error(), "not a trial tier") {
+		t.Fatalf("CountActiveTierForEmail non-trial tier error = %v, want refusal", err)
+	}
+}
+
+func TestCountActiveTrialForEmailCanonicalizesLegacyRows(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	now := time.Now()
+	periodEnd := now.Add(10 * 24 * time.Hour)
+	legacyUmlaut := "ÜSER@Example.com"
+
+	rows := []*Entitlement{
+		{
+			SubscriptionID:   "order_legacy_ascii",
+			CustomerEmail:    "DELTA@Example.com",
+			ProductID:        "prod_trial_free",
+			Tier:             tierTrial,
+			Status:           statusActive,
+			CurrentPeriodEnd: periodEnd,
+		},
+		{
+			SubscriptionID:   "order_legacy_umlaut",
+			CustomerEmail:    legacyUmlaut,
+			ProductID:        "prod_trial_free",
+			Tier:             tierTrial,
+			Status:           statusActive,
+			CurrentPeriodEnd: periodEnd,
+		},
+		{
+			SubscriptionID:   "order_legacy_garbage",
+			CustomerEmail:    "not-an-email",
+			ProductID:        "prod_trial_free",
+			Tier:             tierTrial,
+			Status:           statusActive,
+			CurrentPeriodEnd: periodEnd,
+		},
+		{
+			SubscriptionID:   "order_expired_umlaut",
+			CustomerEmail:    legacyUmlaut,
+			ProductID:        "prod_trial_free",
+			Tier:             tierTrial,
+			Status:           statusActive,
+			CurrentPeriodEnd: now.Add(-time.Hour),
+		},
+	}
+	// Seed the entitlement rows directly. These represent state written BEFORE
+	// active_trial_slots existed, including two active trials on one canonical
+	// email, which is exactly what the counter has to canonicalize. Upsert now
+	// enforces one active trial per canonical email, so it cannot construct the
+	// legacy state this test is about.
+	for _, row := range rows {
+		if err := upsertEntitlement(ctx, db.db, row); err != nil {
+			t.Fatalf("seed %s: %v", row.SubscriptionID, err)
+		}
+	}
+
+	got, err := db.CountActiveTrialForEmail(ctx, "delta@example.com", now)
+	if err != nil {
+		t.Fatalf("ascii legacy count: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("ascii legacy count = %d, want 1", got)
+	}
+
+	got, err = db.CountActiveTrialForEmail(ctx, "üser@example.com", now)
+	if err != nil {
+		t.Fatalf("non-ASCII legacy count: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("non-ASCII legacy count = %d, want 1", got)
+	}
+
+	got, err = db.CountActiveTrialForEmail(ctx, "other@example.com", now)
+	if err != nil {
+		t.Fatalf("unrelated email count: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("unrelated email count = %d, want 0 (garbage and expired rows must not match)", got)
+	}
+}
+
+func TestCollectTrialEmailsScanAndIterErrors(t *testing.T) {
+	got, err := collectTrialEmails(&stubTrialRows{emails: []string{"DELTA@Example.com", "not-an-email"}})
+	if err != nil {
+		t.Fatalf("happy path: %v", err)
+	}
+	if len(got) != 2 || got[0] != "DELTA@Example.com" || got[1] != "not-an-email" {
+		t.Fatalf("happy path emails = %#v", got)
+	}
+
+	if _, err := collectTrialEmails(&stubTrialRows{emails: []string{"a@example.com"}, scanErr: errors.New("scan failed")}); err == nil {
+		t.Fatal("scan error must fail closed")
+	}
+	if _, err := collectTrialEmails(&stubTrialRows{iterErr: errors.New("iter failed")}); err == nil {
+		t.Fatal("iteration error must fail closed")
+	}
+}
+
+type stubTrialRows struct {
+	emails  []string
+	idx     int
+	scanErr error
+	iterErr error
+}
+
+func (s *stubTrialRows) Next() bool {
+	if s.idx >= len(s.emails) {
+		return false
+	}
+	s.idx++
+	return true
+}
+
+func (s *stubTrialRows) Scan(dest ...any) error {
+	if s.scanErr != nil {
+		return s.scanErr
+	}
+	ptr, ok := dest[0].(*string)
+	if !ok {
+		return errors.New("scan dest is not *string")
+	}
+	*ptr = s.emails[s.idx-1]
+	return nil
+}
+
+func (s *stubTrialRows) Err() error { return s.iterErr }

@@ -1,0 +1,390 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package proxy
+
+import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// escapedAgentBlob is agentBlob with its first character written as a JSON
+// unicode escape. The escape is capital K (U+004B); a lowercase escape decodes
+// to a different string and cannot stand in for this value.
+func escapedAgentBlob() string {
+	return string([]byte{0x5c}) + "u004B" + agentBlob[1:]
+}
+
+func decodedEscapedAgentBlob() string {
+	return "K" + agentBlob[1:]
+}
+
+func newSentIssuerProxy(t *testing.T) (*Proxy, *config.Config) {
+	t.Helper()
+	cfg := config.Defaults()
+	cfg.TLSInterception.Enabled = true
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	p, err := New(cfg, audit.NewNop(), sc, metrics.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	return p, cfg
+}
+
+// No untrusted grade may read or mutate learned IDs, even when the default
+// state projection would place it in the same bucket as a configured agent.
+func TestIssuerSentIdentityIsolation(t *testing.T) {
+	for _, defaultName := range []string{"", "recipient"} {
+		for _, auth := range []envelope.ActorAuth{envelope.ActorAuthUnknown, envelope.ActorAuthSelfDeclared, envelope.ActorAuthMatched, envelope.ActorAuthBound, envelope.ActorAuthConfigDefault} {
+			for _, transport := range []string{"intercept", "forward", "fetch", "websocket"} {
+				t.Run(defaultName+"/"+string(auth)+"/"+transport, func(t *testing.T) {
+					p, cfg := newSentIssuerProxy(t)
+					cfg.DefaultAgentIdentity = defaultName
+					origin, _ := url.Parse("https://api.vendor.example/items")
+					s := p.issuerStoreForUnmediatedSend()
+					const agent = "recipient"
+					const client = "192.0.2.1"
+					trusted := sessionKeyFor(cfg, agent, client, envelope.ActorAuthBound)
+					s.recordSent(trusted, origin, nil, nil, true, time.Now())
+					s.mintServerID(trusted, origin, serverIDListed, time.Now())
+					if !s.serverIDIssued(trusted, origin, serverIDListed) {
+						t.Fatal("positive control missing")
+					}
+					req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, origin.String(), strings.NewReader(agentBlob))
+					req.Header.Set("X-Criteria", agentBlob)
+					ic := &InterceptContext{Proxy: p, Config: cfg, Agent: agent, ClientIP: client, ActorAuth: auth}
+					if got := ic.issuerServerIDStore() != nil; got != auth.TrustedForIdentity() {
+						t.Fatalf("accessor eligibility = %v", got)
+					}
+					switch transport {
+					case "intercept":
+						recordIssuerRequestSent(ic, req, nil)
+					case "forward":
+						p.recordIssuerForwardSent(cfg, agent, client, auth, req, nil)
+					case "fetch":
+						u := *origin
+						u.Path += "/" + agentBlob
+						p.recordIssuerFetchSent(cfg, agent, client, auth, &u)
+					case "websocket":
+						p.taintIssuerSessionForStream(cfg, agent, client, auth, origin)
+					}
+					if transport != "fetch" && s.serverIDIssued(trusted, origin, serverIDListed) == auth.TrustedForIdentity() {
+						t.Fatal("own taint or untrusted DoS isolation failed")
+					}
+					s.mintServerID(trusted, origin, agentBlob, time.Now())
+					if s.serverIDIssued(trusted, origin, agentBlob) == auth.TrustedForIdentity() {
+						t.Fatal("send history crossed trust boundary or own reflection minted")
+					}
+					peer := sessionKeyFor(cfg, "peer", client, envelope.ActorAuthBound)
+					s.recordSent(peer, origin, nil, nil, true, time.Now())
+					s.mintServerID(peer, origin, serverIDOther, time.Now())
+					if !s.serverIDIssued(peer, origin, serverIDOther) {
+						t.Fatal("taint crossed bound identities on shared IP")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestIssuerSentIncompleteCallerLocal(t *testing.T) {
+	origin, _ := url.Parse("https://api.vendor.example/items")
+	for _, cause := range []string{"unread body", "request limit", "session limit", "websocket"} {
+		t.Run(cause, func(t *testing.T) {
+			p, cfg := newSentIssuerProxy(t)
+			s := p.issuerStoreForUnmediatedSend()
+			sender := sessionKeyFor(cfg, "sender", "192.0.2.1", envelope.ActorAuthBound)
+			peer := sessionKeyFor(cfg, "peer", "192.0.2.1", envelope.ActorAuthBound)
+			for _, key := range []string{sender, peer} {
+				s.recordSent(key, origin, nil, nil, true, time.Now())
+				s.mintServerID(key, origin, serverIDListed, time.Now())
+			}
+			var body []byte
+			known := true
+			switch cause {
+			case "unread body":
+				known = false
+			case "request limit":
+				body = []byte(strings.Repeat(serverIDOther+" ", issuerSentMaxTokensPerRequest+1))
+			case "session limit":
+				for i := 0; i < issuerSentMaxEntries; i++ {
+					var digest [32]byte
+					digest[0], digest[1] = byte(i), byte(i>>8)
+					s.sent[sender][digest] = struct{}{}
+				}
+				body = []byte(agentBlob)
+			}
+			if cause == "websocket" {
+				p.taintIssuerSessionForStream(cfg, "sender", "192.0.2.1", envelope.ActorAuthBound, origin)
+			} else {
+				s.recordSent(sender, origin, nil, body, known, time.Now())
+			}
+			if s.serverIDIssued(sender, origin, serverIDListed) {
+				t.Fatal("own ID survived incomplete history")
+			}
+			s.mintServerID(sender, origin, serverIDOther, time.Now())
+			if s.serverIDIssued(sender, origin, serverIDOther) {
+				t.Fatal("own taint failed open on later listing")
+			}
+			if !s.serverIDIssued(peer, origin, serverIDListed) {
+				t.Fatal("peer lost allowance")
+			}
+		})
+	}
+}
+
+func TestIssuerSentJSONTextOutsideRawBody(t *testing.T) {
+	origin, err := url.Parse("https://api.vendor.example/v1/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	escaped := escapedAgentBlob()
+	if decodedEscapedAgentBlob() != agentBlob {
+		t.Fatalf("escape fixture decodes to %q, want %q", decodedEscapedAgentBlob(), agentBlob)
+	}
+	object := `{"query":"` + escaped + `"}`
+	query := url.Values{}
+	query.Set("criteria", object)
+	withQuery, err := url.Parse("https://api.vendor.example/v1/filters?" + query.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	form := "criteria=" + url.QueryEscape(object)
+
+	cases := []struct {
+		name   string
+		target *url.URL
+		header http.Header
+		body   string
+	}{
+		{name: "query", target: withQuery},
+		{name: "header", target: origin, header: http.Header{"X-Criteria": {object}}},
+		{name: "form field", target: origin, body: form},
+		{name: "json body", target: origin, body: object},
+		{name: "json key", target: origin, body: `{"` + escaped + `":"x"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestServerIDStore(t)
+			target := tc.target
+			if target == nil {
+				target = origin
+			}
+			s.recordSent("a", target, tc.header, []byte(tc.body), true, now)
+			s.mintServerID("a", origin, agentBlob, now)
+			if s.serverIDIssued("a", origin, agentBlob) {
+				t.Fatal("JSON-decoded value was minted")
+			}
+		})
+	}
+}
+
+func TestIssuerSentUserinfo(t *testing.T) {
+	origin, err := url.Parse("https://api.vendor.example/v1/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	withUser, err := url.Parse("https://api.vendor.example/notes/index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withUser.User = url.UserPassword("agent", agentBlob)
+
+	t.Run("store", func(t *testing.T) {
+		s := newTestServerIDStore(t)
+		s.recordSent("a", withUser, nil, nil, true, now)
+		s.mintServerID("a", origin, agentBlob, now)
+		if s.serverIDIssued("a", origin, agentBlob) {
+			t.Fatal("URL userinfo password was minted")
+		}
+	})
+
+	t.Run("fetch helper", func(t *testing.T) {
+		p, cfg := newSentIssuerProxy(t)
+		p.recordIssuerFetchSent(cfg, "mail-agent", "127.0.0.1", envelope.ActorAuthBound, withUser)
+		store := p.issuerStoreForUnmediatedSend()
+		session := sessionKeyFor(cfg, "mail-agent", "127.0.0.1", envelope.ActorAuthBound)
+		store.mintServerID(session, origin, agentBlob, now)
+		if store.serverIDIssued(session, origin, agentBlob) {
+			t.Fatal("a /fetch userinfo password was minted")
+		}
+	})
+
+	t.Run("client delivers userinfo as basic auth", func(t *testing.T) {
+		var user, pass string
+		var ok bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			user, pass, ok = r.BasicAuth()
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		t.Cleanup(srv.Close)
+		u, err := url.Parse(srv.URL + "/notes/index")
+		if err != nil {
+			t.Fatal(err)
+		}
+		u.User = url.UserPassword("agent", agentBlob)
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, u.String(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if !ok || user != "agent" || pass != agentBlob {
+			t.Fatalf("origin saw user=%q pass=%q ok=%v", user, pass, ok)
+		}
+	})
+
+	t.Run("top-level high entropy userinfo is blocked by the URL scan", func(t *testing.T) {
+		cfg := config.Defaults()
+		cfg.Internal = nil // no DNS; this checks whether userinfo itself is scored
+		sc := scanner.MustNew(cfg)
+		t.Cleanup(sc.Close)
+		result := sc.Scan(context.Background(), "https://agent:"+agentBlob+"@api.vendor.example/notes/index")
+		if result.Allowed || result.Scanner != scanner.ScannerEntropy {
+			t.Fatalf("userinfo URL not refused by entropy: %+v", result)
+		}
+	})
+}
+
+func TestIssuerSentStaleTunnel(t *testing.T) {
+	p, cfg := newSentIssuerProxy(t)
+	pinned := p.issuerCookieRuntime.Load()
+	if pinned == nil || pinned.query == nil {
+		t.Fatal("positive control: issuer runtime missing")
+	}
+	ic := &InterceptContext{
+		Proxy:         p,
+		Config:        cfg,
+		Agent:         "mail-agent",
+		ClientIP:      "127.0.0.1",
+		ActorAuth:     envelope.ActorAuthBound,
+		IssuerRuntime: pinned,
+	}
+	// An enabled reload keeps the query store and publishes a new runtime
+	// pointer. Tunnels admitted before the reload keep the old pointer.
+	p.issuerCookieRuntime.Store(&issuerCookieRuntime{cfg: cfg, store: pinned.store, query: pinned.query})
+	if ic.issuerQueryStore() != nil {
+		t.Fatal("positive control: pinned runtime still matches")
+	}
+	origin, err := url.Parse("https://api.vendor.example/v1/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, origin.String(), strings.NewReader(agentBlob))
+	recordIssuerRequestSent(ic, req, []byte(agentBlob))
+	session := sessionKeyFor(cfg, ic.Agent, ic.ClientIP, ic.ActorAuth)
+	live := p.issuerCookieRuntime.Load().query
+	now := time.Now()
+	live.mintServerID(session, origin, agentBlob, now)
+	if live.serverIDIssued(session, origin, agentBlob) {
+		t.Fatal("a value sent on a stale tunnel was minted")
+	}
+	live.mintServerID(session, origin, serverIDListed, now)
+	if !live.serverIDIssued(session, origin, serverIDListed) {
+		t.Fatal("stale-tunnel recording tainted the session or blocked a value it did not send")
+	}
+}
+
+// A tunnel admitted while the feature was off keeps forwarding after a reload
+// turns it on. Its sends must reach the live store, or a value it carried
+// could later mint as an ID.
+func TestIssuerSentTunnelOpenedWhileDisabled(t *testing.T) {
+	p, cfg := newSentIssuerProxy(t)
+	off := *cfg
+	off.RequestBodyScanning.IssuerBoundSessionCookies = false
+	if issuerCookieEnabled(&off) {
+		t.Fatal("positive control: disabling the setting did not disable the feature")
+	}
+	ic := &InterceptContext{
+		Proxy:     p,
+		Config:    &off,
+		Agent:     "mail-agent",
+		ClientIP:  "127.0.0.1",
+		ActorAuth: envelope.ActorAuthBound,
+	}
+	if ic.issuerQueryStore() != nil {
+		t.Fatal("positive control: a tunnel with the feature off saw the store")
+	}
+	origin, err := url.Parse("https://api.vendor.example/v1/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, origin.String(), strings.NewReader(agentBlob))
+	recordIssuerRequestSent(ic, req, []byte(agentBlob))
+	session := sessionKeyFor(cfg, ic.Agent, ic.ClientIP, ic.ActorAuth)
+	live := p.issuerCookieRuntime.Load().query
+	live.mintServerID(session, origin, agentBlob, time.Now())
+	if live.serverIDIssued(session, origin, agentBlob) {
+		t.Fatal("a value sent on a tunnel opened while the feature was off was minted")
+	}
+}
+
+func TestIssuerSentMultipartAndChunkedBody(t *testing.T) {
+	origin, err := url.Parse("https://api.vendor.example/v1/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s := newTestServerIDStore(t)
+	multipart := "--bound\r\nContent-Disposition: form-data; name=\"payload\"\r\n\r\n" + agentBlob + "\r\n--bound--\r\n"
+	s.recordSent("a", origin, nil, []byte(multipart), true, now)
+	s.mintServerID("a", origin, agentBlob, now)
+	if s.serverIDIssued("a", origin, agentBlob) {
+		t.Fatal("a multipart field was minted")
+	}
+}
+
+// A chunked request body (no Content-Length) through the intercept proxy is
+// buffered before forwarding, so the value it carries is recorded as sent and
+// never mints when the origin lists it back.
+func TestInterceptChunkedBodyRecordedAsSent(t *testing.T) {
+	h := newWebPlatformHarness(t)
+	api, hits := newMailAPI(t)
+	const agent = "mail-agent"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, api.URL+"/filters",
+		io.MultiReader(strings.NewReader(`{"criteria":{"query":"`), strings.NewReader(agentBlob), strings.NewReader(`"}}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = -1 // chunked transfer encoding
+	resp := interceptAndRequestWithRecorder(t, interceptRequestOptions{
+		Upstream: api, Cache: h.cache, Pool: h.pool, Config: h.cfg, Scanner: h.sc,
+		Logger: h.logger, Metrics: h.m, Request: req, Proxy: h.p,
+		Agent: agent, ActorAuth: envelope.ActorAuthBound,
+	})
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("chunked create = %d", resp.StatusCode)
+	}
+	if got := h.send(api, http.MethodGet, "/filters", agent, "", ""); got != http.StatusOK {
+		t.Fatalf("list = %d", got)
+	}
+	if got := h.send(api, http.MethodDelete, "/filters/"+agentBlob, agent, "", ""); got != http.StatusForbidden {
+		t.Fatalf("chunked-body reflection as id = %d, want 403", got)
+	}
+	if hits("DELETE /filters/"+agentBlob) != 0 {
+		t.Fatal("a value sent in a chunked body reached upstream as an id")
+	}
+}

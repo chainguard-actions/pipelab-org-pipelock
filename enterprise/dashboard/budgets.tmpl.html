@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  {{template "dashboardFavicon" .}}
+  <title>Pipelock Agent Budgets</title>
+  <style>
+    :root {
+      --accent:#00e5a0;
+      --bg:#09090b;
+      --bg-elevated:#0e0e11;
+      --border:rgba(255,255,255,0.07);
+      --border-strong:rgba(255,255,255,0.13);
+      --text:#e2e8f0;
+      --text-muted:#94a3b8;
+      --text-dim:#64748b;
+      --warn:#f59e0b;
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { min-width: 0; padding: 24px; }
+    .panel { max-width: 1320px; margin: 0 auto; }
+    h1 { margin: 0 0 4px; font-size: 20px; }
+    h2 { margin: 0; font-size: 15px; color: var(--text-muted); }
+    {{template "dashboardStyles" .}}
+    .note { color: var(--text-dim); font-size: 12px; margin: 10px 0 0; }
+    .empty {
+      border: 1px dashed var(--border-strong);
+      border-radius: 10px;
+      padding: 28px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+    .agent {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      padding: 16px 18px;
+      margin-bottom: 16px;
+    }
+    .agent-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+    .agent-name { font-weight: 600; font-size: 15px; }
+    .tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid var(--border-strong);
+      color: var(--text-muted);
+    }
+    .cols { display: flex; flex-wrap: wrap; gap: 24px; }
+    .col { min-width: 260px; flex: 1; }
+    .col h3 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { text-align: left; padding: 4px 10px 4px 0; font-size: 13px; vertical-align: top; }
+    th { color: var(--text-dim); font-weight: 500; }
+    .metric td:first-child { color: var(--text-muted); width: 42%; }
+    .metric td:last-child { font-variant-numeric: tabular-nums; }
+    .sessions { margin-top: 10px; overflow-x: auto; }
+    .sessions table { min-width: 420px; }
+    .sessions th, .sessions td { border-bottom: 1px solid var(--border); }
+    .none { color: var(--text-dim); font-size: 12.5px; }
+    code { color: var(--text-muted); }
+  </style>
+</head>
+<body>
+  {{template "dashboardHeader" .Nav}}
+  <main>
+    <div class="panel">
+      <header class="page-head">
+        <div class="eyebrow mono">Runtime &middot; Budgets</div>
+        <h1>Per-agent budgets</h1>
+        <p class="lead">Budget pressure proves {{ .Claim }}. It {{ .NonClaim }}. Read-only; this page does not change limits, sessions, or enforcement state.</p>
+        <div class="summary mono"><b>{{len .Agents}}</b> agent{{if ne (len .Agents) 1}}s{{end}} with loaded budget rows{{if .Truncated}} &middot; truncated{{end}}</div>
+      </header>
+      {{ if .HasSnapshotFreshness }}
+        <p class="note">
+          Snapshot produced at {{ .SnapshotFreshness.ProducedAtDisplay }} (age {{ .SnapshotFreshness.AgeDisplay }}{{ if .SnapshotFreshness.Stale }}, stale{{ end }}).
+        </p>
+      {{ end }}
+
+      {{ if not .SourceConfigured }}
+        <div class="empty">Budget pressure proves only mediated per-agent budget consumption from the configured budget snapshot source. No budget source is connected for this dashboard. Start <code>pipelock dashboard serve</code> with <code>--runtime-snapshot-file</code>, or write the budget snapshot to <code>--receipt-dir/dashboard/runtime-snapshot.json</code>.</div>
+      {{ else if .SourceUnavailable }}
+        <div class="empty">Budget pressure proves only mediated per-agent budget consumption from the configured budget snapshot source. A budget source is configured, but its snapshot is missing, invalid, oversized, future-dated, or stale. Fix the configured <code>--runtime-snapshot-file</code> or refresh the default <code>--receipt-dir/dashboard/runtime-snapshot.json</code> snapshot.</div>
+      {{ else if not .Agents }}
+        <div class="empty">Budget pressure proves only mediated per-agent budget consumption from the configured budget snapshot source. The source is connected, but the loaded snapshot has no agents with configured forward-proxy budgets. Configure agent budgets in the runtime that writes <code>--runtime-snapshot-file</code>.</div>
+      {{ else }}
+        {{ range .Agents }}
+          <div class="agent">
+            <div class="agent-head">
+              <span class="agent-name">{{ .Agent }}</span>
+              {{ if .ForwardConfigured }}<span class="tag">forward budget</span>{{ end }}
+            </div>
+            <div class="cols">
+              <div class="col">
+                <h3>Forward proxy</h3>
+                {{ if .ForwardConfigured }}
+                  <table class="metric">
+                    <tr><td>Requests (used / limit)</td><td>{{ .RequestsDisplay }}</td></tr>
+                    <tr><td>Bytes (used / limit)</td><td>{{ .BytesDisplay }}</td></tr>
+                    <tr><td>Unique domains (used / limit)</td><td>{{ .DomainsDisplay }}</td></tr>
+                    <tr><td>Window</td><td>{{ .WindowDisplay }}</td></tr>
+                    <tr><td>Window started</td><td>{{ .WindowStartDisplay }}</td></tr>
+                  </table>
+                {{ else }}
+                  <p class="none">No forward-proxy budget configured.</p>
+                {{ end }}
+              </div>
+            </div>
+          </div>
+        {{ end }}
+        {{ if .Truncated }}<p class="note">Output truncated to the first {{ len .Agents }} agents.</p>{{ end }}
+      {{ end }}
+
+      {{ if not .RawAllowed }}
+        <p class="note">Session identifiers are redacted in this view. Authorize the raw view to see them.</p>
+      {{ end }}
+    </div>
+  </main>
+</body>
+</html>
+<!-- Copyright 2026 Pipelock contributors -->
+<!-- SPDX-License-Identifier: Elastic-2.0 -->
+<!-- Licensed under the Elastic License 2.0; see LICENSE.enterprise. -->

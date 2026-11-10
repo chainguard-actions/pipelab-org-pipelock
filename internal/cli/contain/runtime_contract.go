@@ -1,0 +1,723 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/launchcontract"
+	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
+)
+
+// The runtime contract is the complete set of proxy + CA configuration the
+// contained pipelock-agent user needs so that common tooling (curl, python,
+// node, git, npm, pip, go, cargo) routes through the Pipelock proxy and trusts
+// the Pipelock MITM CA. Before this existed, only clients that honored the
+// handful of env vars baked into plk-launch worked; anything that ignored
+// HTTPS_PROXY (notably node/undici) or read its own config file looked
+// "broken" with a generic network error.
+//
+// The proxy/CA names come from internal/launchcontract. This file adds the
+// containment-specific policy and identity assignments. plk-launch, the
+// /etc/profile.d login-shell script, the pipelock-* utility wrappers, and the
+// `contain doctor` self-test all derive from runtimeContractVars so the
+// surfaces never drift.
+
+const (
+	// contractNoProxy is the exact NO_PROXY/no_proxy value injected for the
+	// contained agent. Loopback v4, the localhost name, and loopback v6 (::1)
+	// so an IPv6-first client does not try to proxy a local dial. Everything
+	// else flows through Pipelock. Any deviation is a policy regression caught
+	// by verify probe 7.
+	contractNoProxy = "127.0.0.1,localhost,::1"
+
+	// defaultUndiciShimPath is the CommonJS shim node loads via
+	// NODE_OPTIONS=--require so its built-in fetch()/undici clients honor
+	// HTTPS_PROXY. It lives under the agent-traversable /etc/pipelock/contain
+	// directory so the contained user can read it at exec time.
+	defaultUndiciShimPath = "/etc/pipelock/contain/undici-shim.cjs"
+
+	// defaultProfileScriptPath exports the full contract for any login shell
+	// (e.g. `sudo -iu pipelock-agent`). plk-launch and the wrappers force the
+	// contract regardless; this closes the interactive/login-shell gap.
+	defaultProfileScriptPath = "/etc/profile.d/pipelock-contain.sh"
+
+	// modeProfileScript is group-readable, not world-readable: the file is
+	// owned root:<agent-group> so only the contained agent's login shell can
+	// source it. The script holds only public proxy URLs and CA paths, but
+	// scoping it to the agent group avoids a repo-wide 0o644 exception and keeps
+	// it off every other user's login path.
+	modeProfileScript os.FileMode = 0o640
+
+	// modeAgentConfig is owner-only; the per-tool config files live in the
+	// agent's home and only the agent reads them.
+	modeAgentConfig os.FileMode = 0o600
+)
+
+// pipelockUtilityWrappers are the known-good, proxy+CA-correct wrappers placed
+// on the contained agent's PATH. Unlike the plk-* allow-list wrappers (which
+// gate which agent tools may run), these force a correct runtime contract for
+// the common HTTP clients even when the caller's environment is incomplete.
+var pipelockUtilityWrappers = []string{"pipelock-curl", "pipelock-python", "pipelock-node"}
+
+// contractVar is one name/value pair in the runtime contract.
+type contractVar struct {
+	name  string
+	value string
+}
+
+// proxyURLFor builds the loopback proxy URL baked into the contract.
+func proxyURLFor(port int) string {
+	return "http://127.0.0.1:" + strconv.Itoa(port)
+}
+
+// agentHomeDir returns the contained agent's home directory. Mirrors the
+// --home-dir passed to useradd in stepCreateUser. The field is overridable so
+// tests can target a tmp dir; it defaults to /home/<agent> via the
+// installEnv constructor.
+func agentHomeDir(env *installEnv) string {
+	if env.agentHome != "" {
+		return env.agentHome
+	}
+	return "/home/" + env.agentUserName
+}
+
+// undiciShimPathOrDefault resolves the shim path, tolerating a zero-value
+// installEnv (tests that build partial structs).
+func undiciShimPathOrDefault(env *installEnv) string {
+	if env.undiciShimPath != "" {
+		return env.undiciShimPath
+	}
+	return defaultUndiciShimPath
+}
+
+// profileScriptPathOrDefault resolves the profile.d path with the same
+// zero-value tolerance.
+func profileScriptPathOrDefault(env *installEnv) string {
+	if env.profileScriptPath != "" {
+		return env.profileScriptPath
+	}
+	return defaultProfileScriptPath
+}
+
+// runtimeContractVars returns the COMPLETE ordered proxy/CA env matrix for the
+// contained agent. Order matters: uppercase NO_PROXY precedes lowercase
+// no_proxy so verify's extractNoProxy keys off the canonical assignment, and
+// the proxy/CA blocks are grouped for readability in the rendered scripts.
+//
+// Covered surfaces:
+//   - generic libs honoring *_PROXY (curl, wget, go, requests-with-env)
+//   - python requests/certifi via REQUESTS_CA_BUNDLE
+//   - openssl/python ssl via SSL_CERT_FILE
+//   - curl/libcurl via CURL_CA_BUNDLE
+//   - git via GIT_SSL_CAINFO
+//   - cargo via CARGO_HTTP_CAINFO / CARGO_HTTP_PROXY
+//   - pip via PIP_CERT
+//   - npm lifecycle-script suppression via npm_config_ignore_scripts
+//   - node http/https modules via *_PROXY + NODE_EXTRA_CA_CERTS, and node's
+//     built-in fetch()/undici via NODE_USE_ENV_PROXY on node versions that
+//     support it, plus the NODE_OPTIONS require shim fallback.
+func runtimeContractVars(env *installEnv) []contractVar {
+	proxy := proxyURLFor(env.proxyPort)
+	caBundle := env.caBundlePath
+	shim := undiciShimPathOrDefault(env)
+
+	vars := launchcontract.Vars(launchcontract.Contain, proxy, contractNoProxy, caBundle, "")
+	result := make([]contractVar, 0, len(vars)+3)
+	for _, v := range vars {
+		switch v.Name {
+		case "NODE_EXTRA_CA_CERTS":
+			// Preserve containment's npm policy and the original assignment order.
+			result = append(result, contractVar{"npm_config_ignore_scripts", "1"})
+		case "NODE_USE_ENV_PROXY":
+			result = append(result, contractVar{"NODE_OPTIONS", "--require " + shim})
+		}
+		result = append(result, contractVar{v.Name, v.Value})
+	}
+	return append(result, contractVar{"XAUTHORITY", displayAuthorityPath(env)})
+}
+
+// containedLaunchIdentityVars returns the identity block that LEADS the
+// contained launch environment. It is the single source of truth for that
+// block, consumed by both containLaunchEnv (the `contain run` Go launcher) and
+// launchExecEnvLines (the installed plk-launch wrapper) so the two launch paths
+// can never disagree on who the tool runs as.
+func containedLaunchIdentityVars(agentUserName, homeDir string) []contractVar {
+	return []contractVar{
+		{"HOME", homeDir},
+		{"USER", agentUserName},
+		{"LOGNAME", agentUserName},
+		{"SHELL", "/bin/bash"},
+	}
+}
+
+// containLaunchEnv returns the exact environment used by `pipelock contain
+// run` when it execs plk-launch directly, bypassing sudo's env filtering. It is
+// derived from the same building blocks the installed wrapper renders
+// (containedLaunchIdentityVars + runtimeContractVars + the posture-proof export
+// + PATH); TestLaunchPathsShareEnvNameSet enforces that the two paths export the
+// same ordered set of names so they cannot drift.
+//
+// postureProofPath is the resolved path this run wrote its signed posture
+// capsule to; it is exported as PIPELOCK_POSTURE_PROOF so an emitter running in
+// the contained child binds the exact capsule this run produced instead of
+// silently falling back to the default path (and grading containment UNKNOWN)
+// when --posture-output points elsewhere. An empty value falls back to the
+// default proof path.
+func containLaunchEnv(agentUserName, homeDir string, proxyPort int, postureProofPath, display string) []string {
+	var env []string
+	for _, v := range containedLaunchIdentityVars(agentUserName, homeDir) {
+		env = append(env, v.name+"="+v.value)
+	}
+	for _, v := range runtimeContractVars(&installEnv{
+		proxyPort:    proxyPort,
+		caBundlePath: defaultCABundlePath,
+		caExportPath: defaultCAExportPath,
+	}) {
+		env = append(env, v.name+"="+v.value)
+	}
+	env = append(env, posturebinding.RuntimeProofEnv+"="+resolvedPostureProofPath(postureProofPath))
+	env = append(env, "DISPLAY="+display)
+	env = append(env, "PATH="+agentExecPath(agentUserName))
+	return env
+}
+
+// resolvedPostureProofPath returns the posture proof path to export, defaulting
+// to the canonical contain-run proof location when no explicit path is set.
+func resolvedPostureProofPath(postureProofPath string) string {
+	if strings.TrimSpace(postureProofPath) == "" {
+		return posturebinding.DefaultContainRunProofPath
+	}
+	return postureProofPath
+}
+
+// shellSafeValue reports whether v can appear unquoted after `env NAME=` in a
+// bash command. Conservative: anything outside this set gets single-quoted.
+func shellSafeValue(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9':
+			continue
+		}
+		switch r {
+		case '_', '.', '/', ':', ',', '=', '@', '%', '+', '-':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// envAssign renders a single `NAME=value` token safe for `env` in bash. Values
+// with shell-significant characters (e.g. the space in NODE_OPTIONS) are
+// single-quoted; the common proxy URLs and paths render bare.
+func envAssign(name, value string) string {
+	if shellSafeValue(value) {
+		return name + "=" + value
+	}
+	return name + "=" + shellQuote(value)
+}
+
+// launchExecEnvLines renders the `exec env -i`-style block that plk-launch uses
+// to run the resolved tool under the full runtime contract.
+//
+// `env -i` (not plain `env`) is deliberate and is the fix for the operator->agent
+// env leak: plk-launch runs after sudo, which leaves ~two dozen operator
+// variables standing (DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, SUDO_*, ...). Plain
+// `env` would pass every one of them through to the contained tool. `env -i`
+// starts from an empty environment and rebuilds ONLY the identity block, the
+// proxy/CA runtime contract, the posture-proof binding, and PATH - the same set
+// containLaunchEnv assembles for the `contain run` Go path, so the two launch
+// paths agree. This is fail-closed for confidentiality: a variable not on this
+// list never reaches the agent. The availability tradeoff is that ambient
+// niceties like TERM/LANG are not forwarded either; this already matches the
+// `contain run` path (containLaunchEnv never set them), so it is not a new
+// regression relative to the primary path.
+//
+// HOME and PATH are rendered specially (HOME is fixed, PATH expands the
+// AGENT_PATH shell var); PIPELOCK_POSTURE_PROOF is forwarded from the caller
+// when set (contain run sets it) or bound to the default, because `env -i`
+// clears the caller's value and it must be re-asserted here or the child grades
+// containment UNKNOWN.
+func launchExecEnvLines(env *installEnv) []string {
+	lines := []string{"exec env -i \\"}
+	for _, v := range containedLaunchIdentityVars(env.agentUserName, agentHomeDir(env)) {
+		lines = append(lines, "    "+envAssign(v.name, v.value)+" \\")
+	}
+	for _, v := range runtimeContractVars(env) {
+		lines = append(lines, "    "+envAssign(v.name, v.value)+" \\")
+	}
+	lines = append(lines,
+		"    "+posturebinding.RuntimeProofEnv+`="${`+posturebinding.RuntimeProofEnv+":-"+posturebinding.DefaultContainRunProofPath+`}" \`,
+		`    DISPLAY="${DISPLAY:-`+managedDisplayFallback(env)+`}" \`,
+		`    PATH="$AGENT_PATH" \`,
+		`    "$TARGET" "$@"`,
+	)
+	return lines
+}
+
+// managedDisplayFallback names the managed display used when the operator's
+// own DISPLAY is unset. plk-launch runs under `env -i`, so DISPLAY is unset
+// on every invocation regardless of what a login shell exported; the
+// operator's value is recovered by contain run / the contained-launch
+// wrapper passing DISPLAY through explicitly before this script execs.
+func managedDisplayFallback(env *installEnv) string {
+	if env.displayEnabled {
+		return displayName(env.displayNumber)
+	}
+	return ""
+}
+
+// renderProfileScript renders /etc/profile.d/pipelock-contain.sh. Sourced by
+// login shells of the contained agent; exports the same contract plus the
+// agent PATH so an interactive `sudo -iu pipelock-agent` session is also
+// proxy-correct.
+func renderProfileScript(env *installEnv) string {
+	lines := []string{
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"# Sourced from /etc/profile.d; only the contained agent should inherit",
+		"# the Pipelock proxy + CA runtime contract.",
+		"_pipelock_contain_user=\"$(id -un 2>/dev/null || true)\"",
+		"if [ \"$_pipelock_contain_user\" != " + shellQuote(env.agentUserName) + " ]; then",
+		"    return 0 2>/dev/null || exit 0",
+		"fi",
+		"unset _pipelock_contain_user",
+		"PATH=" + shellQuote(agentExecPath(env.agentUserName)),
+		"export PATH",
+	}
+	for _, v := range runtimeContractVars(env) {
+		lines = append(lines, "export "+v.name+"="+shellQuote(v.value))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// renderUndiciShim is the static CommonJS shim node loads via
+// NODE_OPTIONS=--require. It installs a global undici ProxyAgent so node's
+// built-in fetch() and undici-based clients honor HTTPS_PROXY. Best-effort: if
+// undici is not a resolvable module, http/https-module traffic still honors
+// the proxy via the *_PROXY env vars, so the shim degrades silently. The
+// upstream TLS cert (signed by the Pipelock CA) is trusted via
+// NODE_EXTRA_CA_CERTS, so the proxied request validates.
+func renderUndiciShim() string {
+	return `'use strict';
+// Managed by ` + "`pipelock contain install`" + `. Installs a global undici
+// ProxyAgent so node's built-in fetch() and undici clients route through the
+// Pipelock proxy. node ignores HTTPS_PROXY for fetch() unless a global
+// dispatcher is set. Best-effort: if undici cannot be required, http/https
+// module traffic still honors the *_PROXY env vars.
+try {
+  const undici = require('undici');
+  const proxy =
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy ||
+    process.env.ALL_PROXY ||
+    process.env.all_proxy;
+  if (
+    proxy &&
+    undici &&
+    typeof undici.setGlobalDispatcher === 'function' &&
+    typeof undici.ProxyAgent === 'function'
+  ) {
+    undici.setGlobalDispatcher(new undici.ProxyAgent(proxy));
+  }
+} catch (err) {
+  // undici not installed as a resolvable module; nothing to do.
+}
+`
+}
+
+// renderUtilityWrapper emits a known-good wrapper that forces the full runtime
+// contract before exec'ing the real tool, so the tool is proxy+CA-correct even
+// when the caller's environment is incomplete. The real binary is resolved via
+// the agent PATH at runtime (command -v) so the wrapper does not hardcode a
+// distro-specific path. `tool` is the binary to run (curl/python3/node); the
+// wrapper is named pipelock-<short>.
+func renderUtilityWrapper(env *installEnv, tool string) string {
+	var assigns []string
+	for _, v := range runtimeContractVars(env) {
+		assigns = append(assigns, "    "+envAssign(v.name, v.value)+" \\")
+	}
+	header := []string{
+		shebangBash(env),
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"# Forces the Pipelock proxy + CA runtime contract, then execs " + tool + ".",
+		"set -euo pipefail",
+		"",
+		"AGENT_PATH=" + agentExecPath(env.agentUserName),
+		`BIN="$(PATH="$AGENT_PATH" command -v ` + tool + `)" || {`,
+		`    echo "pipelock wrapper: ` + tool + ` not found in PATH" >&2`,
+		`    exit 127`,
+		`}`,
+		"",
+		"exec env \\",
+		"    " + envAssign("HOME", agentHomeDir(env)) + " \\",
+	}
+	footer := []string{
+		`    PATH="$AGENT_PATH" \`,
+		`    "$BIN" "$@"`,
+		"",
+	}
+	return strings.Join(append(append(header, assigns...), footer...), "\n")
+}
+
+// realToolForUtilityWrapper maps a pipelock-<short> wrapper name to the binary
+// it should resolve and exec.
+func realToolForUtilityWrapper(name string) (string, bool) {
+	switch name {
+	case "pipelock-curl":
+		return "curl", true
+	case "pipelock-python":
+		return "python3", true
+	case "pipelock-node":
+		return "node", true
+	default:
+		return "", false
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Per-tool config files written into the agent home. These cover the
+// non-env exec paths: git/npm/pip/cargo read their own config regardless of
+// whether a process inherited the proxy env, so a bare
+// `sudo -u pipelock-agent git clone ...` is proxy-correct.
+// ---------------------------------------------------------------------------
+
+// agentToolConfig is one config file rendered into the agent home.
+type agentToolConfig struct {
+	rel    string // path relative to the agent home
+	render func(env *installEnv) string
+}
+
+func agentToolConfigs() []agentToolConfig {
+	return []agentToolConfig{
+		{".gitconfig", renderAgentGitConfig},
+		{".npmrc", renderAgentNpmrc},
+		{filepath.Join(".config", "pip", "pip.conf"), renderAgentPipConf},
+		{filepath.Join(".cargo", "config.toml"), renderAgentCargoConfig},
+	}
+}
+
+func renderAgentGitConfig(env *installEnv) string {
+	proxy := proxyURLFor(env.proxyPort)
+	return strings.Join([]string{
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"[http]",
+		"\tproxy = " + proxy,
+		"\tsslCAInfo = " + env.caBundlePath,
+		"[https]",
+		"\tproxy = " + proxy,
+		"",
+	}, "\n")
+}
+
+func renderAgentNpmrc(env *installEnv) string {
+	proxy := proxyURLFor(env.proxyPort)
+	return strings.Join([]string{
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"proxy=" + proxy,
+		"https-proxy=" + proxy,
+		"cafile=" + env.caBundlePath,
+		"ignore-scripts=true",
+		"",
+	}, "\n")
+}
+
+func renderAgentPipConf(env *installEnv) string {
+	proxy := proxyURLFor(env.proxyPort)
+	return strings.Join([]string{
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"[global]",
+		"proxy = " + proxy,
+		"cert = " + env.caBundlePath,
+		"",
+	}, "\n")
+}
+
+func renderAgentCargoConfig(env *installEnv) string {
+	proxy := proxyURLFor(env.proxyPort)
+	return strings.Join([]string{
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"[http]",
+		"proxy = \"" + proxy + "\"",
+		"cainfo = \"" + env.caBundlePath + "\"",
+		"",
+	}, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Install steps for the runtime contract artifacts.
+// ---------------------------------------------------------------------------
+
+// stepWriteUndiciShim writes the node undici shim. It must run BEFORE the
+// launch wrapper and profile script are USED at runtime (the contract sets
+// NODE_OPTIONS=--require <shim>; a missing file would make every node
+// invocation fail), so it is ordered before stepWriteLaunchWrapper.
+func stepWriteUndiciShim() step {
+	return step{
+		name: "write-undici-shim",
+		desc: "write node undici proxy shim (" + defaultUndiciShimPath + ")",
+		apply: func(_ context.Context, env *installEnv) (bool, error) {
+			path := undiciShimPathOrDefault(env)
+			// The /etc/pipelock/contain dir is created + chmod'd by
+			// stepWriteToolsList, which precedes this step; mkdirAll here is a
+			// no-op safety net so the step is order-independent.
+			if err := env.mkdirAll(filepath.Dir(path), modeDirTraversable); err != nil {
+				return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+			}
+			body := renderUndiciShim()
+			if existing, err := env.readFile(path); err == nil && string(existing) == body {
+				// Re-assert mode on rerun: NODE_OPTIONS=--require points here, so
+				// an unreadable shim would break every node invocation.
+				if cerr := env.chmod(path, modeAllowListReadable); cerr != nil {
+					return false, fmt.Errorf("chmod %s: %w", path, cerr)
+				}
+				return false, nil
+			}
+			if err := backupAndWrite(env, path, []byte(body), modeAllowListReadable); err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+		undo: func(_ context.Context, env *installEnv) error {
+			return restoreBackup(env, undiciShimPathOrDefault(env))
+		},
+	}
+}
+
+// stepWriteProfileScript writes /etc/profile.d/pipelock-contain.sh so login
+// shells of the contained agent inherit the contract.
+func stepWriteProfileScript() step {
+	return step{
+		name: "write-profile-script",
+		desc: "write login-shell runtime contract (" + defaultProfileScriptPath + ")",
+		apply: func(_ context.Context, env *installEnv) (bool, error) {
+			path := profileScriptPathOrDefault(env)
+			// Owned root:<agent-group> so only the agent can source it. Group is
+			// the agent's primary group (useradd --user-group => gid == agent).
+			_, gid, err := uidGidFor(env, env.agentUserName)
+			if err != nil {
+				return false, fmt.Errorf("resolve %s group: %w", env.agentUserName, err)
+			}
+			if err := env.mkdirAll(filepath.Dir(path), modeDirTraversable); err != nil {
+				return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+			}
+			body := renderProfileScript(env)
+			if existing, rerr := env.readFile(path); rerr == nil && string(existing) == body {
+				// Re-assert mode + ownership on rerun so a drifted profile script
+				// can't silently stop applying to the agent.
+				if err := env.chmod(path, modeProfileScript); err != nil {
+					return false, fmt.Errorf("chmod %s: %w", path, err)
+				}
+				if err := env.chown(path, 0, gid); err != nil {
+					return false, fmt.Errorf("chown %s: %w", path, err)
+				}
+				return false, nil
+			}
+			if err := backupAndWrite(env, path, []byte(body), modeProfileScript); err != nil {
+				return false, err
+			}
+			// The new script is on disk; report it applied so rollback
+			// restores the previous one instead of leaving it half-owned.
+			if err := env.chown(path, 0, gid); err != nil {
+				return true, fmt.Errorf("chown %s: %w", path, err)
+			}
+			return true, nil
+		},
+		undo: func(_ context.Context, env *installEnv) error {
+			return restoreBackup(env, profileScriptPathOrDefault(env))
+		},
+	}
+}
+
+// stepWriteUtilityWrappers writes the pipelock-curl/python/node known-good
+// wrappers onto the agent PATH.
+func stepWriteUtilityWrappers() step {
+	var touched []string
+	return step{
+		name: "write-utility-wrappers",
+		desc: "write pipelock-curl/python/node proxy-correct wrappers",
+		apply: func(_ context.Context, env *installEnv) (bool, error) {
+			touched = nil
+			for _, name := range pipelockUtilityWrappers {
+				tool, ok := realToolForUtilityWrapper(name)
+				if !ok {
+					return false, fmt.Errorf("unknown utility wrapper %q", name)
+				}
+				path := filepath.Join(env.wrapperDir, name)
+				body := renderUtilityWrapper(env, tool)
+				restoreTouched := func(cause error) (bool, error) {
+					return restoreTouchedInline(env, touched, cause)
+				}
+				if existing, err := env.readFile(path); err == nil && string(existing) == body {
+					// Re-assert the executable bit on rerun so a drifted wrapper
+					// can't become non-executable.
+					if cerr := env.chmod(path, modeWrapperExec); cerr != nil {
+						return restoreTouched(fmt.Errorf("chmod %s: %w", path, cerr))
+					}
+					continue
+				}
+				if err := backupAndWrite(env, path, []byte(body), modeWrapperExec); err != nil {
+					return restoreTouched(fmt.Errorf("write %s: %w", path, err))
+				}
+				touched = append(touched, path)
+			}
+			return len(touched) > 0, nil
+		},
+		undo: func(_ context.Context, env *installEnv) error {
+			var errs []error
+			for i := len(touched) - 1; i >= 0; i-- {
+				if err := restoreBackup(env, touched[i]); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
+		},
+	}
+}
+
+// stepWriteAgentToolConfigs writes git/npm/pip/cargo config into the agent
+// home so config-reading tools are proxy-correct on every exec path, including
+// a bare `sudo -u pipelock-agent <tool>` that inherits no proxy env. Files are
+// owned by the agent (0600) so only the agent reads them.
+func stepWriteAgentToolConfigs() step {
+	var touched []string
+	return step{
+		name: "write-agent-tool-configs",
+		desc: "write git/npm/pip/cargo proxy config into the agent home",
+		apply: func(_ context.Context, env *installEnv) (bool, error) {
+			touched = nil
+			uid, gid, err := uidGidFor(env, env.agentUserName)
+			if err != nil {
+				return false, fmt.Errorf("resolve %s uid: %w", env.agentUserName, err)
+			}
+			home := agentHomeDir(env)
+			// touched includes a config whose chown just failed, so the
+			// inline restore puts that one back too.
+			restore := func(cause error) (bool, error) {
+				return restoreTouchedInline(env, touched, cause)
+			}
+			for _, cfg := range agentToolConfigs() {
+				path := filepath.Join(home, cfg.rel)
+				dir := filepath.Dir(path)
+				if err := ensureAgentConfigDir(env, dir, uid, gid); err != nil {
+					return restore(err)
+				}
+				body := cfg.render(env)
+				if existing, err := env.readFile(path); err == nil && string(existing) == body {
+					// Re-assert ownership without following a swapped symlink.
+					if cerr := chownAgentConfigFile(env, path, uid, gid); cerr != nil {
+						return restore(fmt.Errorf("chown %s: %w", path, cerr))
+					}
+					continue
+				}
+				if err := backupAndWrite(env, path, []byte(body), modeAgentConfig); err != nil {
+					return restore(fmt.Errorf("write %s: %w", path, err))
+				}
+				touched = append(touched, path)
+				if err := chownAgentConfigFile(env, path, uid, gid); err != nil {
+					return restore(fmt.Errorf("chown %s: %w", path, err))
+				}
+			}
+			return len(touched) > 0, nil
+		},
+		undo: func(_ context.Context, env *installEnv) error {
+			var errs []error
+			for i := len(touched) - 1; i >= 0; i-- {
+				if err := restoreBackup(env, touched[i]); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
+		},
+	}
+}
+
+func chownAgentConfigFile(env *installEnv, path string, uid, gid int) error {
+	clean := filepath.Clean(path)
+	if err := ensureAgentConfigLeaf(env, clean); err != nil {
+		return err
+	}
+	if err := env.lchown(clean, uid, gid); err != nil {
+		return err
+	}
+	return ensureAgentConfigLeaf(env, clean)
+}
+
+func ensureAgentConfigLeaf(env *installEnv, path string) error {
+	info, err := env.lstat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing privileged chown", path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s exists and is not a regular file", path)
+	}
+	return nil
+}
+
+func ensureAgentConfigDir(env *installEnv, dir string, uid, gid int) error {
+	cleanHome := filepath.Clean(agentHomeDir(env))
+	cleanDir := filepath.Clean(dir)
+	if !filepath.IsAbs(cleanHome) || !filepath.IsAbs(cleanDir) {
+		return fmt.Errorf("agent config dir %s must be absolute under %s", cleanDir, cleanHome)
+	}
+	rel, err := filepath.Rel(cleanHome, cleanDir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("agent config dir %s is outside agent home %s", cleanDir, cleanHome)
+	}
+	if err := ensureSafeDirectory(env, cleanDir); err != nil {
+		return err
+	}
+	if err := env.mkdirAll(cleanDir, modeDirPrivate); err != nil {
+		return fmt.Errorf("mkdir %s: %w", cleanDir, err)
+	}
+
+	cur := cleanHome
+	if err := chownAgentConfigDir(env, cur, uid, gid); err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		cur = filepath.Join(cur, part)
+		if err := chownAgentConfigDir(env, cur, uid, gid); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chownAgentConfigDir(env *installEnv, dir string, uid, gid int) error {
+	info, err := env.lstat(dir)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", dir, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing privileged chown", dir)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s exists and is not a directory", dir)
+	}
+	if err := env.lchown(dir, uid, gid); err != nil {
+		return fmt.Errorf("chown %s: %w", dir, err)
+	}
+	return nil
+}

@@ -1,0 +1,665 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"context"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+const (
+	testCanaryName = "aws_canary"
+)
+
+func testCanaryValue() string {
+	return "AKIA" + "IOSFODNN7" + "CANARY1"
+}
+
+// testCanaryValueSpecial returns a canary with URL-encodable characters.
+// Uses / and = which percent-encode to %2F and %3D - characters that
+// url.QueryUnescape decodes unambiguously (unlike + which becomes space).
+func testCanaryValueSpecial() string {
+	return "sk_test/CANARY=secret" + "Value"
+}
+
+func testCanaryScanner() *Scanner {
+	cfg := testConfig()
+	// A canary is configured independently of ambient secret discovery. Tests
+	// must not accidentally enable its URL fallback through the test runner's env.
+	cfg.DLP.ScanEnv = false
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{
+		{
+			Name:   testCanaryName,
+			Value:  testCanaryValue(),
+			EnvVar: "AWS_CANARY_KEY",
+		},
+		{
+			Name:  "special_canary",
+			Value: testCanaryValueSpecial(),
+		},
+	}
+	return MustNew(cfg)
+}
+
+func TestScan_CanaryWithoutKnownSecrets(t *testing.T) {
+	const marker = "browser-fixture/marker=only"
+	for _, tt := range []struct {
+		name    string
+		enabled bool
+		tokens  bool
+		value   string
+		blocked bool
+	}{
+		{name: "plain", enabled: true, tokens: true, value: marker, blocked: true},
+		{name: "url_encoded", enabled: true, tokens: true, value: url.QueryEscape(marker), blocked: true},
+		{name: "disabled", tokens: true, value: marker},
+		{name: "empty_tokens", enabled: true, value: marker},
+		{name: "unrelated", enabled: true, tokens: true, value: "ordinary-fixture-value"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.DLP.ScanEnv = false
+			cfg.DLP.SecretsFile = ""
+			cfg.CanaryTokens.Enabled = tt.enabled
+			if tt.tokens {
+				cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "browser-fixture", Value: marker}}
+			}
+			s := MustNew(cfg)
+			defer s.Close()
+			if len(s.envSecrets) != 0 || len(s.fileSecrets) != 0 {
+				t.Fatal("test requires no environment or file secrets")
+			}
+			target := "https://api.vendor.example/fixture?value=" + tt.value
+			result := s.Scan(context.Background(), target)
+			if result.Allowed == tt.blocked {
+				t.Fatalf("Allowed=%t, want %t: %s", result.Allowed, !tt.blocked, result.Reason)
+			}
+			if !tt.blocked {
+				return
+			}
+			if result.Scanner != ScannerDLP || !strings.Contains(result.Reason, "Canary Token (browser-fixture)") {
+				t.Fatalf("unexpected attribution: %+v", result)
+			}
+			matches := s.scanCanaryText(target)
+			if len(matches) == 0 || onlyResultSpan(t, result) != matches[0].Span() {
+				t.Fatalf("URL fallback must retain the shared canary span: %v", result.Spans())
+			}
+		})
+	}
+}
+
+func TestScan_CanaryKnownSecretPriorityUnchanged(t *testing.T) {
+	const marker = "browser-fixture-canary-marker"
+	const ordinary = "unrelated-fixture-secret"
+	for _, tt := range []struct {
+		name string
+		env  []string
+		file []string
+		want string
+	}{
+		{name: "env_match", env: []string{marker}, want: "environment variable leak detected"},
+		{name: "file_match", file: []string{marker}, want: "known secret leak detected"},
+		{name: "env_unrelated", env: []string{ordinary}, want: "Canary Token (browser-fixture)"},
+		{name: "file_unrelated", file: []string{ordinary}, want: "Canary Token (browser-fixture)"},
+		{name: "env_before_file", env: []string{marker}, file: []string{marker}, want: "environment variable leak detected"},
+		// The historical env helper's canary fallback precedes file matching.
+		{name: "existing_env_canary_before_file", env: []string{ordinary}, file: []string{marker}, want: "Canary Token (browser-fixture)"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.DLP.ScanEnv = false
+			cfg.CanaryTokens.Enabled = true
+			cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "browser-fixture", Value: marker}}
+			s := MustNew(cfg)
+			defer s.Close()
+			// Only generated literal test values; no real environment/file reads.
+			s.envSecrets, s.fileSecrets = tt.env, tt.file
+			result := s.Scan(context.Background(), "https://api.vendor.example/fixture?value="+marker)
+			if result.Allowed || result.Scanner != ScannerDLP || !strings.Contains(result.Reason, tt.want) {
+				t.Fatalf("want %q attribution, got %+v", tt.want, result)
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_CanaryBypassCoverage(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	canary := testCanaryValue()
+	specialCanary := testCanaryValueSpecial()
+	tests := []struct {
+		name        string
+		text        string
+		wantEncoded string
+		wantCanary  string // which canary name to expect in match
+	}{
+		{
+			// url.QueryEscape is a no-op on pure alphanumeric canaries.
+			// Use a canary with special chars to actually exercise percent-decoding.
+			name:        "url_encoded_special",
+			text:        url.QueryEscape(specialCanary),
+			wantEncoded: "url",
+			wantCanary:  "special_canary",
+		},
+		{
+			name:        "base64_encoded",
+			text:        base64.StdEncoding.EncodeToString([]byte(canary)),
+			wantEncoded: "base64",
+			wantCanary:  testCanaryName,
+		},
+		{
+			name:        "base64_encoded_spaces_in_structured_text",
+			text:        `{"payload":"` + splitEncodedTokenForTest(t, base64.StdEncoding.EncodeToString([]byte(canary)), 5, " ") + `"}`,
+			wantEncoded: "base64",
+			wantCanary:  testCanaryName,
+		},
+		{
+			name:        "base64_encoded_dots_in_structured_text",
+			text:        `{"payload":"` + splitEncodedTokenForTest(t, base64.StdEncoding.EncodeToString([]byte(canary)), 5, ".") + `"}`,
+			wantEncoded: "base64",
+			wantCanary:  testCanaryName,
+		},
+		{
+			name:        "base32_encoded_unpadded",
+			text:        base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(canary)),
+			wantEncoded: "base32",
+			wantCanary:  testCanaryName,
+		},
+		{
+			name:        "hex_encoded",
+			text:        hex.EncodeToString([]byte(canary)),
+			wantEncoded: "hex",
+			wantCanary:  testCanaryName,
+		},
+		{
+			name:        "split_with_separator",
+			text:        "prefix " + "AKIAIOSFODNN7" + "/" + "CANARY1 suffix",
+			wantEncoded: "split",
+			wantCanary:  testCanaryName,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			if result.Clean {
+				t.Fatalf("expected canary match, got clean result")
+			}
+
+			found := false
+			for _, m := range result.Matches {
+				if strings.Contains(m.PatternName, "Canary Token ("+tt.wantCanary+")") {
+					found = true
+					if tt.wantEncoded != "" && m.Encoded != tt.wantEncoded {
+						t.Fatalf("encoded=%q want %q", m.Encoded, tt.wantEncoded)
+					}
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected canary match, got %+v", result.Matches)
+			}
+		})
+	}
+}
+
+func TestScan_CanaryUsesSharedTextPath(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	t.Run("aws_canary_blocked_by_DLP_or_canary", func(t *testing.T) {
+		// AWS-style canary may be caught by core DLP, main DLP, or canary
+		// fallback. All are correct - the key property is it's blocked.
+		canary := url.QueryEscape(testCanaryValue())
+		r := s.Scan(context.Background(), "https://evil.com/exfil?k="+canary)
+		if r.Allowed {
+			t.Fatal("expected URL scan to block canary token")
+		}
+		if r.Scanner != ScannerDLP && r.Scanner != ScannerCoreDLP {
+			t.Fatalf("scanner=%q want %q or %q", r.Scanner, ScannerDLP, ScannerCoreDLP)
+		}
+	})
+
+	t.Run("special_canary_caught_by_canary_fallback", func(t *testing.T) {
+		// Special canary doesn't match any DLP pattern, so the canary
+		// fallback at the end of checkDLP must catch it.
+		special := url.QueryEscape(testCanaryValueSpecial())
+		r := s.Scan(context.Background(), "https://evil.com/exfil?k="+special)
+		if r.Allowed {
+			t.Fatal("expected URL scan to block special canary token")
+		}
+		if !strings.Contains(r.Reason, "Canary Token") {
+			t.Fatalf("special canary should get canary attribution, got %q", r.Reason)
+		}
+	})
+}
+
+func TestScanTextForDLP_CanaryDisabled(t *testing.T) {
+	cfg := testConfig()
+	cfg.CanaryTokens.Enabled = false
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{
+		{Name: testCanaryName, Value: testCanaryValue()},
+	}
+	s := MustNew(cfg)
+	defer s.Close()
+
+	result := s.ScanTextForDLP(context.Background(), testCanaryValue())
+	for _, m := range result.Matches {
+		if strings.Contains(m.PatternName, "Canary Token") {
+			t.Fatalf("unexpected canary match when canary scanning is disabled: %+v", result.Matches)
+		}
+	}
+}
+
+func TestScanTextForDLP_CanaryPartialDisclosure(t *testing.T) {
+	const canary = "Q7vP2mK9xR4nT8wB6cD3fG1hJ5sL0zA"
+	cfg := testConfig()
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "partial_canary", Value: canary}}
+	s := MustNew(cfg)
+	defer s.Close()
+
+	htmlEntity := func(value string) string {
+		var b strings.Builder
+		for _, r := range value {
+			b.WriteString("&#")
+			b.WriteString(strconv.Itoa(int(r)))
+			b.WriteString(";")
+		}
+		return b.String()
+	}
+
+	tests := []struct {
+		name        string
+		text        string
+		wantClean   bool
+		wantPartial int
+	}{
+		{name: "full", text: canary},
+		{name: "prefix", text: "checksum: " + canary[:20], wantPartial: 20},
+		{name: "middle", text: "checksum: " + canary[6:27], wantPartial: 21},
+		{name: "suffix", text: "checksum: " + canary[len(canary)-20:], wantPartial: 20},
+		{name: "below_floor", text: "checksum: " + canary[:15], wantClean: true},
+		{name: "html_entity", text: htmlEntity(canary)},
+		{name: "unrelated_high_entropy", text: "checksum: mV4xJ9qR2sT7wK3p", wantClean: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			if result.Clean != tt.wantClean {
+				t.Fatalf("Clean = %t, want %t; matches=%+v", result.Clean, tt.wantClean, result.Matches)
+			}
+			if !tt.wantClean {
+				if result.Matches[0].PatternName != "Canary Token (partial_canary)" {
+					t.Fatalf("pattern=%q must stay stable for name-keyed consumers", result.Matches[0].PatternName)
+				}
+				if result.Matches[0].PartialLen != tt.wantPartial {
+					t.Fatalf("partial=%d, want %d; matches=%+v", result.Matches[0].PartialLen, tt.wantPartial, result.Matches)
+				}
+			}
+			if !tt.wantClean {
+				span := result.Matches[0].Span()
+				if !span.Valid() || span.ByteEnd-span.ByteStart < minKnownSecretSubstringLen {
+					t.Fatalf("partial canary span=%+v must retain the matched region", span)
+				}
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_LowEntropyCanaryPartialDisclosureIgnored(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.Patterns = nil
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "low_entropy", Value: "passwordpasswordpasswordpassword"}}
+	s := MustNew(cfg)
+	defer s.Close()
+
+	result := s.ScanTextForDLP(context.Background(), "checksum: passwordpassword")
+	if !result.Clean {
+		t.Fatalf("low-entropy partial canary must remain clean, got %+v", result.Matches)
+	}
+}
+
+// TestCanary_NestedEncodingIsDetected covers the recursive-decode gap. Ordinary
+// DLP walks the bounded recursive decode fixpoint, but the canary matcher used
+// the single-pass decoder, so one extra encoding layer hid the token entirely.
+// A canary exists precisely to prove an exfiltration path, so a single wrapper
+// defeating it is the worst place for this asymmetry.
+func TestCanary_NestedEncodingIsDetected(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	canary := testCanaryValue()
+	once := base64.StdEncoding.EncodeToString([]byte(canary))
+	twice := base64.StdEncoding.EncodeToString([]byte(once))
+	thrice := base64.StdEncoding.EncodeToString([]byte(twice))
+
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{name: "single_layer_control", text: once},
+		{name: "double_layer", text: twice},
+		{name: "triple_layer", text: thrice},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			matches := s.scanCanaryText(tc.text)
+			if len(matches) == 0 {
+				t.Fatalf("no canary match for %s; a wrapped canary must still be detected", tc.name)
+			}
+		})
+	}
+}
+
+// TestCanary_NestedEncodingInQuerySegment covers the per-segment path. The
+// whole-text and segment loops are separate call sites, so fixing only the
+// first leaves a query-value bypass open.
+func TestCanary_NestedEncodingInQuerySegment(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	once := base64.StdEncoding.EncodeToString([]byte(testCanaryValue()))
+	twice := base64.StdEncoding.EncodeToString([]byte(once))
+
+	matches := s.scanCanaryText("GET /upload?blob=" + twice + "&mode=sync")
+	if len(matches) == 0 {
+		t.Fatal("no canary match for a doubly-encoded query value")
+	}
+}
+
+func TestScanTextForDLP_CanonicalCanaryKeepsURLAndSharedStemExclusions(t *testing.T) {
+	stem := "Q7vP2mK9xR4nT8wB6cD3"
+	first := stem + "-fG1hJ5sL0zAqW2eR"
+	second := stem + "_9uY6tR3eW1qZ8xC7"
+	urlCanary := strings.Join([]string{"https://example.com/a/", stem, "fG1hJ5sL0zA"}, "")
+
+	cfg := testConfig()
+	cfg.DLP.Patterns = nil
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{
+		{Name: "first", Value: first},
+		{Name: "second", Value: second},
+		{Name: "url_canary", Value: urlCanary},
+	}
+	s := MustNew(cfg)
+	defer s.Close()
+
+	// Hyphens force the canonical path. The shared stem is 20 bytes after
+	// separators are stripped; that is not a disclosure of either canary.
+	if r := s.ScanTextForDLP(context.Background(), "checksum: "+stem[:10]+"-"+stem[10:]); !r.Clean {
+		t.Fatalf("shared canonical stem must stay clean, got %+v", r.Matches)
+	}
+	if r := s.ScanTextForDLP(context.Background(), "checksum: "+first); r.Clean {
+		t.Fatal("whole first canary must still match")
+	}
+
+	// Canonicalization strips ://, so a URL-shaped canary would otherwise get
+	// partial windows on the public host path. Naming that path is not a leak.
+	if r := s.ScanTextForDLP(context.Background(), "docs live at https://example.com/a/readme"); !r.Clean {
+		t.Fatalf("URL-shaped canary public prefix must stay clean, got %+v", r.Matches)
+	}
+	if r := s.ScanTextForDLP(context.Background(), "token is "+urlCanary); r.Clean {
+		t.Fatal("whole URL-shaped canary must still be detected")
+	}
+}
+
+func TestScanTextForDLP_CanonicalCanaryCollisionDropsPartialWindows(t *testing.T) {
+	stem := "Q7vP2mK9xR4nT8wB6cD3"
+	hyphen := stem + "-fG1hJ5sL0zA"
+	underscore := stem + "_fG1hJ5sL0zA"
+
+	cfg := testConfig()
+	cfg.DLP.Patterns = nil
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{
+		{Name: "hyphen", Value: hyphen},
+		{Name: "underscore", Value: underscore},
+	}
+	s := MustNew(cfg)
+	defer s.Close()
+
+	frag := (stem + "fG1hJ5sL0zA")[:20]
+	if r := s.ScanTextForDLP(context.Background(), "checksum: "+frag[:10]+"-"+frag[10:]); !r.Clean {
+		t.Fatalf("canonical -/_ collision must not partial-match, got %+v", r.Matches)
+	}
+	for _, canary := range []string{hyphen, underscore} {
+		if r := s.ScanTextForDLP(context.Background(), "token is "+canary); r.Clean {
+			t.Fatalf("whole canary %q must still match", canary)
+		}
+	}
+	tokens, err := compileCanaryTokens(cfg.CanaryTokens, newKnownValueWindowBudget(maxKnownValueWindowEntries))
+	if err != nil {
+		t.Fatalf("compile canary tokens: %v", err)
+	}
+	for _, tok := range tokens {
+		if tok.canonicalPartialWindows.len() != 0 {
+			t.Fatalf("colliding canonical canary %q kept partial windows", tok.name)
+		}
+	}
+}
+
+func TestCompileCanaryTokens_URLTokenDoesNotInheritTwinWindows(t *testing.T) {
+	stem := "Q7vP2mK9xR4nT8wB6cD3"
+	urlCanary := "https://example.com/a/" + stem
+	cfg := config.CanaryTokens{
+		Enabled: true,
+		Tokens: []config.CanaryToken{
+			{Name: "url_canary", Value: urlCanary},
+			{Name: "url_canonical_twin", Value: canonicalizeCanaryText(urlCanary)},
+		},
+	}
+	tokens, err := compileCanaryTokens(cfg, newKnownValueWindowBudget(maxKnownValueWindowEntries))
+	if err != nil {
+		t.Fatalf("compile canary tokens: %v", err)
+	}
+	for _, tok := range tokens {
+		if strings.Contains(tok.normalizedLower, "://") && tok.canonicalPartialWindows.len() != 0 {
+			t.Fatalf("URL-shaped canary %q inherited canonical partial windows", tok.name)
+		}
+	}
+}
+
+// BenchmarkScanCanaryText_Clean measures the canary path on ordinary text with
+// canary tokens configured. benchConfig deliberately has none, so the existing
+// text-DLP benchmarks never enter this code.
+func BenchmarkScanCanaryText_Clean(b *testing.B) {
+	cfg := testConfig()
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "bench_canary", Value: testCanaryValue()}}
+	s := MustNew(cfg)
+	b.Cleanup(s.Close)
+
+	const text = "GET /v1/models?stream=true HTTP/1.1 host api.vendor.example accept application/json"
+	b.ResetTimer()
+	for b.Loop() {
+		s.scanCanaryText(text)
+	}
+}
+
+// BenchmarkScanCanaryText_NestedEncoded measures the worst realistic case for
+// the recursive decode: a payload that genuinely decodes several layers deep.
+func BenchmarkScanCanaryText_NestedEncoded(b *testing.B) {
+	cfg := testConfig()
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "bench_canary", Value: testCanaryValue()}}
+	s := MustNew(cfg)
+	b.Cleanup(s.Close)
+
+	text := base64.StdEncoding.EncodeToString([]byte(
+		base64.StdEncoding.EncodeToString([]byte(
+			base64.StdEncoding.EncodeToString([]byte(testCanaryValue()))))))
+	b.ResetTimer()
+	for b.Loop() {
+		s.scanCanaryText(text)
+	}
+}
+
+// TestCanary_DecimalCharacterCodesAreDetected covers the last known-value
+// spelling the canary matcher lacked: the token written as decimal character
+// codes. Configured secrets already matched this way; the canary did not.
+func TestCanary_DecimalCharacterCodesAreDetected(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	canary := testCanaryValue()
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "comma", text: "payload: " + decimalCharacterCodes(canary, ",")},
+		{name: "space", text: "payload: " + decimalCharacterCodes(canary, " ")},
+		{name: "inside json array", text: `{"bytes":[` + decimalCharacterCodes(canary, ",") + `]}`},
+		// The spellings the wire actually carries. Encoding the token into one
+		// exact form and searching for it missed every one of these.
+		{name: "comma and space separators", text: "payload: " + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", ", ")},
+		{name: "lower-cased token", text: "payload: " + decimalCharacterCodes(strings.ToLower(canary), ",")},
+		{name: "integral float codes", text: "payload: " + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", ".0,") + ".0"},
+		{name: "exponent codes", text: "payload: " + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", "e0,") + "e0"},
+		{name: "newline separated", text: "payload:\n" + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", ",\n")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			if result.Clean {
+				t.Fatal("canary spelled as decimal character codes must be detected")
+			}
+			match := result.Matches[0]
+			if match.PatternName != "Canary Token ("+testCanaryName+")" || match.Encoded != encodingDecimal {
+				t.Fatalf("match = (%q, %q), want canary with decimal encoding; matches=%+v", match.PatternName, match.Encoded, result.Matches)
+			}
+			if !match.Span().Valid() {
+				t.Fatalf("match must carry a valid span, got %+v", match.Span())
+			}
+		})
+	}
+
+	// Ordinary numeric data that happens to share a prefix of the code
+	// sequence must stay clean: only the whole value matches.
+	partial := decimalCharacterCodes(canary[:8], ",")
+	if result := s.ScanTextForDLP(context.Background(), "samples: "+partial+",255,0,0"); !result.Clean {
+		t.Fatalf("a partial code sequence must not match, got %+v", result.Matches)
+	}
+}
+
+// A decimal-code spelling wrapped in another encoding must still be found:
+// the known-value search runs on every decoded view, as token matching does.
+func TestCanary_DecimalCharacterCodesInsideEncodings(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	codes := decimalCharacterCodes(testCanaryValue(), ",")
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "url encoded commas", text: "payload=" + strings.ReplaceAll(codes, ",", "%2C")},
+		{name: "base64 wrapped", text: "blob: " + base64.StdEncoding.EncodeToString([]byte(codes))},
+		{name: "html entity commas", text: "payload: " + strings.ReplaceAll(codes, ",", "&#44;")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			if result.Clean {
+				t.Fatal("encoded decimal-code canary must be detected")
+			}
+			// The span's view label carries the transform chain that had to be
+			// peeled to reach the value, which is where this repository records
+			// provenance; the encoding field names the innermost spelling.
+			span := result.Matches[0].Span()
+			if !strings.Contains(span.ViewLabel, "decimal_decoded") {
+				t.Fatalf("view label = %q, want the decimal decode in the chain; matches=%+v", span.ViewLabel, result.Matches)
+			}
+			if result.Matches[0].Encoded != encodingDecimal {
+				t.Fatalf("match encoding = %q, want %q; matches=%+v", result.Matches[0].Encoded, encodingDecimal, result.Matches)
+			}
+		})
+	}
+}
+
+// A digit fused onto the front or back of a code run changes the character that
+// run spells, so the run no longer carries the canary as a WHOLE value.
+//
+// It may still carry most of it, and that is deliberate: 19 of these 20
+// characters in order is a partial disclosure of a planted token, which the
+// shipped partial-window matching exists to catch. An earlier version of this
+// test demanded no match at all and was wrong about which direction is safe.
+// What must never happen is a whole-value match on a run that does not spell
+// the value, or any canary match on ordinary numeric data.
+func TestCanary_DecimalCodesInsideLargerNumbers(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	canary := testCanaryValue()
+	codes := decimalCharacterCodes(canary, ",")
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "leading digit", text: "value: 1" + codes},
+		{name: "trailing digit", text: "value: " + codes + "9"},
+		{name: "leading decimal point", text: "value: 1." + codes},
+		{name: "trailing decimal point", text: "value: " + codes + ".5"},
+		{name: "exponent marker", text: "value: 1e" + codes},
+		{name: "negative sign", text: "value: -" + codes},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			for _, m := range result.Matches {
+				if strings.HasPrefix(m.PatternName, "Canary Token (") && m.PartialLen == 0 {
+					t.Fatalf("a run that does not spell the value must not match it whole, got %+v", m)
+				}
+			}
+		})
+	}
+
+	// Ordinary numeric data must produce nothing at all.
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "telemetry", text: "samples: 1,2,3,4,5,6,7,8,9,10,255,255,255,0,0,128"},
+		{name: "pixel data", text: "[12,45,200,255,12,45,200,255,12,45,200,255]"},
+	} {
+		t.Run("no_match_"+tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			for _, m := range result.Matches {
+				if strings.HasPrefix(m.PatternName, "Canary Token (") {
+					t.Fatalf("ordinary numeric data must not match a canary, got %+v", m)
+				}
+			}
+		})
+	}
+
+	// Control: the whole value at real boundaries still matches as a whole.
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "json array", text: `{"bytes":[` + codes + `]}`},
+		{name: "surrounded by spaces", text: "value: " + codes + " end"},
+		{name: "quoted", text: `"` + codes + `"`},
+	} {
+		t.Run("control_"+tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			whole := false
+			for _, m := range result.Matches {
+				if strings.HasPrefix(m.PatternName, "Canary Token (") && m.PartialLen == 0 {
+					whole = true
+				}
+			}
+			if !whole {
+				t.Fatalf("the whole value at a real boundary must match whole, got %+v", result.Matches)
+			}
+		})
+	}
+}

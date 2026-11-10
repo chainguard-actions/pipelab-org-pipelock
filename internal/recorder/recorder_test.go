@@ -1,0 +1,2929 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package recorder_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"golang.org/x/crypto/nacl/box"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+const (
+	testSessionID  = "test-session"
+	testTransport  = "fetch"
+	testType       = "request"
+	testCheckpoint = "checkpoint"
+)
+
+func TestRecorder_Dir(t *testing.T) {
+	t.Run("returns_configured_dir", func(t *testing.T) {
+		dir := t.TempDir()
+		rec, err := recorder.New(recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 100,
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		if rec.Dir() != dir {
+			t.Errorf("Dir() = %q, want %q", rec.Dir(), dir)
+		}
+	})
+
+	t.Run("nil_recorder_returns_empty", func(t *testing.T) {
+		var rec *recorder.Recorder
+		if rec.Dir() != "" {
+			t.Errorf("nil Dir() = %q, want empty", rec.Dir())
+		}
+	})
+
+	t.Run("disabled_recorder_returns_empty", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{
+			Enabled: false,
+			Dir:     "/some/dir",
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		if rec.Dir() != "" {
+			t.Errorf("disabled Dir() = %q, want empty", rec.Dir())
+		}
+	})
+}
+
+func TestRecorder_EntryObserver(t *testing.T) {
+	t.Run("observes_flushed_entry", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{
+			Enabled:            true,
+			Dir:                t.TempDir(),
+			CheckpointInterval: 100,
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		observer := &testEntryObserver{}
+		rec.SetObserver(observer)
+		if err := rec.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   "observer proof",
+		}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+		observer.mu.Lock()
+		defer observer.mu.Unlock()
+		if len(observer.entries) != 1 {
+			t.Fatalf("observed entries = %d, want 1", len(observer.entries))
+		}
+		if observer.entries[0].Summary != "observer proof" {
+			t.Fatalf("observed summary = %q", observer.entries[0].Summary)
+		}
+	})
+
+	t.Run("observer_panic_isolated", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{
+			Enabled:            true,
+			Dir:                t.TempDir(),
+			CheckpointInterval: 100,
+		}, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		rec.SetObserver(panicEntryObserver{})
+		if err := rec.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   "panic proof",
+		}); err != nil {
+			t.Fatalf("Record with panicking observer: %v", err)
+		}
+	})
+
+	t.Run("disabled_recorder_ignores_observer", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{Enabled: false}, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		observer := &testEntryObserver{}
+		rec.SetObserver(observer)
+		if err := rec.Record(recorder.Entry{Summary: "nop"}); err != nil {
+			t.Fatalf("Record disabled: %v", err)
+		}
+		if len(observer.entries) != 0 {
+			t.Fatalf("disabled recorder observed %d entries, want 0", len(observer.entries))
+		}
+	})
+}
+
+func TestRecorder_FileMode(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		mode      os.FileMode
+		wantMode  os.FileMode
+		wantError string
+	}{
+		{name: "default_owner_only", wantMode: 0o600},
+		{name: "group_read", mode: 0o640, wantMode: 0o640},
+		{name: "group_read_write", mode: 0o660, wantMode: 0o660},
+		{name: "world_read_rejected", mode: 0o644, wantError: "unsafe"},
+		{name: "execute_rejected", mode: 0o700, wantError: "unsafe"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			rec, err := recorder.New(recorder.Config{
+				Enabled:  true,
+				Dir:      dir,
+				FileMode: tt.mode,
+			}, nil, nil)
+			if tt.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("New error = %v, want substring %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+
+			if err := rec.Record(recorder.Entry{
+				SessionID: testSessionID,
+				Type:      testType,
+				Transport: testTransport,
+				Summary:   "file mode proof",
+			}); err != nil {
+				t.Fatalf("Record: %v", err)
+			}
+			if err := rec.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			path := filepath.Join(dir, "evidence-test-session-0.jsonl")
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("Stat: %v", err)
+			}
+			if got := info.Mode().Perm(); got != tt.wantMode {
+				t.Fatalf("mode = %04o, want %04o", got, tt.wantMode)
+			}
+		})
+	}
+}
+
+func TestRecorder_HashChain(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Record 3 entries
+	for i := range 3 {
+		err := rec.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("request %d", i),
+		})
+		if err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Read back and verify chain
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-test-session-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	// 3 entries + 1 final checkpoint
+	if len(entries) < 3 {
+		t.Fatalf("expected at least 3 entries, got %d", len(entries))
+	}
+
+	if entries[0].PrevHash != recorder.GenesisHash {
+		t.Errorf("first entry PrevHash = %q, want %q", entries[0].PrevHash, recorder.GenesisHash)
+	}
+	if entries[0].Hash != entries[1].PrevHash {
+		t.Error("chain break between entries 0 and 1")
+	}
+	if entries[1].Hash != entries[2].PrevHash {
+		t.Error("chain break between entries 1 and 2")
+	}
+
+	// Verify all hashes are correct
+	for _, e := range entries {
+		computed := recorder.ComputeHash(e)
+		if e.Hash != computed {
+			t.Errorf("hash mismatch at seq %d: got %s, computed %s", e.Sequence, e.Hash, computed)
+		}
+	}
+
+	// Full chain verification
+	if err := recorder.VerifyChain(entries); err != nil {
+		t.Fatalf("VerifyChain: %v", err)
+	}
+}
+
+func TestRecorder_ResumeChainAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	newRecorder := func() *recorder.Recorder {
+		rec, recErr := recorder.New(recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 1000,
+			SignCheckpoints:    true,
+		}, nil, priv)
+		if recErr != nil {
+			t.Fatalf("recorder.New(): %v", recErr)
+		}
+		return rec
+	}
+
+	rec1 := newRecorder()
+	for i := 0; i < 2; i++ {
+		if err := rec1.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("entry-%d", i),
+			Detail:    map[string]any{"idx": i},
+		}); err != nil {
+			t.Fatalf("rec1.Record(%d): %v", i, err)
+		}
+	}
+	if err := rec1.Close(); err != nil {
+		t.Fatalf("rec1.Close(): %v", err)
+	}
+
+	rec2 := newRecorder()
+	if err := rec2.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "entry-2",
+		Detail:    map[string]any{"idx": 2},
+	}); err != nil {
+		t.Fatalf("rec2.Record(): %v", err)
+	}
+	if err := rec2.Close(); err != nil {
+		t.Fatalf("rec2.Close(): %v", err)
+	}
+
+	result, err := recorder.QuerySession(dir, testSessionID, nil)
+	if err != nil {
+		t.Fatalf("QuerySession(): %v", err)
+	}
+	if len(result.Entries) != 5 {
+		t.Fatalf("entry count = %d, want 5", len(result.Entries))
+	}
+	if err := recorder.VerifyChain(result.Entries, pub); err != nil {
+		t.Fatalf("VerifyChain(): %v", err)
+	}
+	for i, entry := range result.Entries {
+		if entry.Sequence != uint64(i) {
+			t.Fatalf("entry[%d].Sequence = %d, want %d", i, entry.Sequence, i)
+		}
+	}
+}
+
+func TestRecorder_Redaction(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	recCfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             true,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(recCfg, sc.ScanTextForDLP, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Record entry with a fake AWS key in detail
+	// Build fake cred at runtime to avoid gosec G101
+	fakeKey := "AK" + "IA" + "IOSFODNN7EXAMPLE"
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "request with secret",
+		Detail:    map[string]string{"url": "https://example.com/?key=" + fakeKey},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-test-session-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	// At least the data entry (plus possibly a checkpoint)
+	if len(entries) < 1 {
+		t.Fatal("expected at least 1 entry")
+	}
+
+	detailJSON, _ := json.Marshal(entries[0].Detail)
+	detailStr := string(detailJSON)
+	if strings.Contains(detailStr, fakeKey) {
+		t.Error("secret should be redacted from detail")
+	}
+	if !strings.Contains(detailStr, "[REDACTED:") {
+		t.Error("detail should contain redaction marker")
+	}
+	if !strings.Contains(detailStr, `"redacted":true`) {
+		t.Error("detail should be wrapped in redaction envelope")
+	}
+}
+
+func TestRecorder_RedactionDisabled(t *testing.T) {
+	dir := t.TempDir()
+	recCfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(recCfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	secret := "my-secret-value-12345"
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "no redaction",
+		Detail:    map[string]string{"data": secret},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-test-session-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) < 1 {
+		t.Fatal("expected at least 1 entry")
+	}
+	detailJSON, _ := json.Marshal(entries[0].Detail)
+	if !strings.Contains(string(detailJSON), secret) {
+		t.Error("with redaction disabled, secret should be preserved")
+	}
+}
+
+func TestRecorder_SignedCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 3,
+		SignCheckpoints:    true,
+	}
+	rec, err := recorder.New(cfg, nil, priv)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Record 3 entries to trigger checkpoint
+	for i := range 3 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "s1",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("r%d", i),
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-s1-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+
+	// Find checkpoint entries
+	var foundCheckpoint bool
+	for _, e := range entries {
+		if e.Type != testCheckpoint {
+			continue
+		}
+		foundCheckpoint = true
+
+		// Unmarshal the checkpoint detail
+		detailJSON, err := json.Marshal(e.Detail)
+		if err != nil {
+			t.Fatalf("marshal detail: %v", err)
+		}
+		var cpDetail recorder.CheckpointDetail
+		if err := json.Unmarshal(detailJSON, &cpDetail); err != nil {
+			t.Fatalf("unmarshal checkpoint detail: %v", err)
+		}
+		if cpDetail.Signature == "" {
+			t.Error("checkpoint should have a signature")
+			continue
+		}
+
+		sig, err := hex.DecodeString(cpDetail.Signature)
+		if err != nil {
+			t.Fatalf("decode signature: %v", err)
+		}
+
+		// The signature is over the PrevHash of the checkpoint entry
+		// (which represents the chain state just before the checkpoint)
+		if !ed25519.Verify(pub, []byte(e.PrevHash), sig) {
+			t.Error("checkpoint signature verification failed")
+		}
+	}
+	if !foundCheckpoint {
+		t.Error("no checkpoint entry found")
+	}
+}
+
+func TestRecorder_CheckpointSurvivesShardRotation(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		shardSize  int
+		interval   int
+		entryCount int
+	}{
+		{name: "one_entry_shards", shardSize: 1, interval: 100, entryCount: 1},
+		{name: "full_shard", shardSize: 2, interval: 100, entryCount: 2},
+		{name: "partial_shard_control", shardSize: 3, interval: 100, entryCount: 2},
+		{name: "checkpoint_before_rotation", shardSize: 2, interval: 1, entryCount: 2},
+		{name: "threshold_and_rotation", shardSize: 1, interval: 2, entryCount: 3},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			dir := t.TempDir()
+			publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for cycle := range 2 {
+				rec, err := recorder.New(recorder.Config{
+					Enabled:            true,
+					Dir:                dir,
+					CheckpointInterval: testCase.interval,
+					MaxEntriesPerFile:  testCase.shardSize,
+					SignCheckpoints:    true,
+				}, nil, privateKey)
+				if err != nil {
+					t.Fatalf("New, cycle %d: %v", cycle, err)
+				}
+				t.Cleanup(func() { _ = rec.Close() })
+				for range testCase.entryCount {
+					if err := rec.Record(recorder.Entry{
+						SessionID: testSessionID,
+						Type:      testType,
+						Transport: testTransport,
+						Summary:   "checkpoint rotation proof",
+					}); err != nil {
+						t.Fatalf("Record, cycle %d: %v", cycle, err)
+					}
+				}
+				if err := rec.Close(); err != nil {
+					t.Fatalf("Close, cycle %d: %v", cycle, err)
+				}
+				if err := rec.Close(); err != nil {
+					t.Fatalf("second Close, cycle %d: %v", cycle, err)
+				}
+				files, err := filepath.Glob(filepath.Join(dir, "evidence-*.jsonl"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				var entries []recorder.Entry
+				for _, path := range files {
+					shard, err := recorder.ReadEntries(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					entries = append(entries, shard...)
+				}
+				sort.Slice(entries, func(left, right int) bool {
+					return entries[left].Sequence < entries[right].Sequence
+				})
+				if len(entries) == 0 || entries[len(entries)-1].Type != testCheckpoint {
+					t.Fatalf("cycle %d: persisted chain does not end in a checkpoint", cycle)
+				}
+				if err := recorder.VerifyChain(entries, publicKey); err != nil {
+					t.Fatalf("cycle %d: persisted chain verification: %v", cycle, err)
+				}
+				entryCount := 0
+				for _, entry := range entries {
+					if entry.Type == testType {
+						entryCount++
+					}
+				}
+				if want := (cycle + 1) * testCase.entryCount; entryCount != want {
+					t.Fatalf("persisted records = %d, want %d", entryCount, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRecorder_UnsignedCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 2,
+		SignCheckpoints:    false,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i := range 2 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "s1",
+			Type:      testType,
+			Summary:   fmt.Sprintf("r%d", i),
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-s1-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+
+	for _, e := range entries {
+		if e.Type != testCheckpoint {
+			continue
+		}
+		detailJSON, _ := json.Marshal(e.Detail)
+		var cpDetail recorder.CheckpointDetail
+		if err := json.Unmarshal(detailJSON, &cpDetail); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if cpDetail.Signature != "" {
+			t.Error("unsigned checkpoint should have empty signature")
+		}
+	}
+}
+
+func TestRecorder_Retention(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 100,
+		RetentionDays:      1,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Create two old evidence files for one session. Retention must not remove
+	// JSONL shards because they are the verifiable hash-chain spine.
+	oldFile := filepath.Join(dir, "evidence-old-session-0.jsonl")
+	if err := os.WriteFile(oldFile, []byte(`{"v":1}`+"\n"), filePermissions); err != nil {
+		t.Fatal(err)
+	}
+	oldAnchor := filepath.Join(dir, "evidence-old-session-1.jsonl")
+	if err := os.WriteFile(oldAnchor, []byte(`{"v":1}`+"\n"), filePermissions); err != nil {
+		t.Fatal(err)
+	}
+	singleOld := filepath.Join(dir, "evidence-single-old-session-0.jsonl")
+	if err := os.WriteFile(singleOld, []byte(`{"v":1}`+"\n"), filePermissions); err != nil {
+		t.Fatal(err)
+	}
+	// Set modification time to 2 days ago
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(oldFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(oldAnchor, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(singleOld, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a recent evidence file
+	recentFile := filepath.Join(dir, "evidence-recent-session-0.jsonl")
+	if err := os.WriteFile(recentFile, []byte(`{"v":1}`+"\n"), filePermissions); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := rec.ExpireOldFiles()
+	if err != nil {
+		t.Fatalf("ExpireOldFiles: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("expected 0 removed, got %d", removed)
+	}
+
+	// Verify all JSONL evidence remains available for full-chain verification.
+	if _, err := os.Stat(oldFile); err != nil {
+		t.Error("old JSONL shard should still exist")
+	}
+	if _, err := os.Stat(oldAnchor); err != nil {
+		t.Error("newest old session file should still exist")
+	}
+	if _, err := os.Stat(singleOld); err != nil {
+		t.Error("single old session shard should still exist")
+	}
+	if _, err := os.Stat(recentFile); err != nil {
+		t.Error("recent file should still exist")
+	}
+
+	_ = rec.Close()
+}
+
+func TestRecorder_RetentionKeepsRotatedJSONLChainVerifiable(t *testing.T) {
+	dir := t.TempDir()
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+		MaxEntriesPerFile:  2,
+		RetentionDays:      1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	for i := range 3 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "retained-chain",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("entry %d", i),
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	full, err := recorder.QuerySession(dir, "retained-chain", nil)
+	if err != nil {
+		t.Fatalf("QuerySession before expiry: %v", err)
+	}
+	if full.TotalFiles != 2 {
+		t.Fatalf("total files before expiry = %d, want 2", full.TotalFiles)
+	}
+	if err := recorder.VerifyChain(full.Entries); err != nil {
+		t.Fatalf("VerifyChain before expiry: %v", err)
+	}
+
+	old := time.Now().Add(-48 * time.Hour)
+	for _, seqStart := range []string{"0", "2"} {
+		path := filepath.Join(dir, "evidence-retained-chain-"+seqStart+".jsonl")
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("Chtimes %s: %v", filepath.Base(path), err)
+		}
+	}
+
+	reopened, err := recorder.New(recorder.Config{
+		Enabled:       true,
+		Dir:           dir,
+		RetentionDays: 1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New reopened: %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	removed, err := reopened.ExpireOldFiles()
+	if err != nil {
+		t.Fatalf("ExpireOldFiles: %v", err)
+	}
+	if removed != 0 {
+		t.Fatalf("removed JSONL chain shards = %d, want 0", removed)
+	}
+
+	retained, err := recorder.QuerySession(dir, "retained-chain", nil)
+	if err != nil {
+		t.Fatalf("QuerySession after expiry: %v", err)
+	}
+	if retained.TotalFiles != 2 {
+		t.Fatalf("total files after expiry = %d, want 2", retained.TotalFiles)
+	}
+	if err := recorder.VerifyChain(retained.Entries); err != nil {
+		t.Fatalf("VerifyChain after expiry: %v", err)
+	}
+}
+
+func TestRecorder_RetentionConcurrentPassesKeepJSONLAndDeleteRawOnce(t *testing.T) {
+	dir := t.TempDir()
+	oldJSONL := filepath.Join(dir, "evidence-concurrent-0.jsonl")
+	if err := os.WriteFile(oldJSONL, []byte(`{"v":1}`+"\n"), filePermissions); err != nil {
+		t.Fatalf("WriteFile JSONL: %v", err)
+	}
+	oldRaw := filepath.Join(dir, "evidence-concurrent-0.raw.enc")
+	if err := os.WriteFile(oldRaw, []byte("encrypted"), filePermissions); err != nil {
+		t.Fatalf("WriteFile raw: %v", err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	for _, path := range []string{oldJSONL, oldRaw} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("Chtimes %s: %v", filepath.Base(path), err)
+		}
+	}
+
+	recA, err := recorder.New(recorder.Config{
+		Enabled:       true,
+		Dir:           dir,
+		RetentionDays: 1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New A: %v", err)
+	}
+	defer func() { _ = recA.Close() }()
+	recB, err := recorder.New(recorder.Config{
+		Enabled:       true,
+		Dir:           dir,
+		RetentionDays: 1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New B: %v", err)
+	}
+	defer func() { _ = recB.Close() }()
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	removed := make(chan int, 2)
+	for _, rec := range []*recorder.Recorder{recA, recB} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			n, err := rec.ExpireOldFiles()
+			if err != nil {
+				errs <- err
+				return
+			}
+			removed <- n
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	close(removed)
+	for err := range errs {
+		t.Fatalf("ExpireOldFiles: %v", err)
+	}
+	totalRemoved := 0
+	for n := range removed {
+		totalRemoved += n
+	}
+	if totalRemoved != 1 {
+		t.Fatalf("total removed = %d, want exactly one raw sidecar", totalRemoved)
+	}
+	if _, err := os.Stat(oldJSONL); err != nil {
+		t.Fatalf("JSONL chain shard was removed: %v", err)
+	}
+	if _, err := os.Stat(oldRaw); !os.IsNotExist(err) {
+		t.Fatalf("old raw sidecar stat = %v, want not exist", err)
+	}
+}
+
+func TestRecorder_RetentionDisabled(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+		RetentionDays:      0,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	removed, err := rec.ExpireOldFiles()
+	if err != nil {
+		t.Fatalf("ExpireOldFiles: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("expected 0 removed with retention disabled, got %d", removed)
+	}
+}
+
+func TestRecorder_FileRotation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 100,
+		MaxEntriesPerFile:  3,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Write enough entries to force rotation
+	for i := range 5 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "s1",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("entry %d", i),
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Should have multiple JSONL files
+	dirEntries, _ := os.ReadDir(dir)
+	jsonlCount := 0
+	for _, de := range dirEntries {
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			jsonlCount++
+		}
+	}
+	if jsonlCount < 2 {
+		t.Errorf("expected at least 2 JSONL files after rotation, got %d", jsonlCount)
+	}
+}
+
+func TestRecorder_RawEscrow(t *testing.T) {
+	dir := t.TempDir()
+
+	// Generate X25519 key pair
+	recipientPub, recipientPriv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             true,
+		CheckpointInterval: 100,
+		RawEscrow:          true,
+		EscrowPublicKey:    hex.EncodeToString(recipientPub[:]),
+	}
+
+	// Use a mock redact function that always redacts entry content. The
+	// session handle is validated at acquisition and must stay clean.
+	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		if strings.Contains(text, testSessionID) {
+			return scanner.TextDLPResult{Clean: true}
+		}
+		return scanner.TextDLPResult{
+			Clean: false,
+			Matches: []scanner.TextDLPMatch{
+				{PatternName: "AWS Access Key"},
+			},
+		}
+	}
+
+	rec, err := recorder.New(cfg, redactFn, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	secret := "my-secret-data"
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "escrow test",
+		Detail:    map[string]string{"secret": secret},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Verify escrow file exists
+	dirEntries, _ := os.ReadDir(dir)
+	var escrowFile string
+	for _, de := range dirEntries {
+		if strings.HasSuffix(de.Name(), ".raw.enc") {
+			escrowFile = filepath.Join(dir, de.Name())
+			break
+		}
+	}
+	if escrowFile == "" {
+		t.Fatal("no escrow file found")
+	}
+
+	// Verify entry has RawRef
+	var jsonlFile string
+	for _, de := range dirEntries {
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			jsonlFile = filepath.Join(dir, de.Name())
+			break
+		}
+	}
+	entries, err := recorder.ReadEntries(jsonlFile)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) < 1 {
+		t.Fatal("expected at least 1 entry")
+	}
+	if entries[0].RawRef == "" {
+		t.Error("entry should have RawRef pointing to escrow file")
+	}
+
+	// Decrypt the escrow file
+	payload, err := os.ReadFile(filepath.Clean(escrowFile))
+	if err != nil {
+		t.Fatalf("reading escrow: %v", err)
+	}
+
+	const keySize = 32
+	const nonceSize = 24
+	if len(payload) < keySize+nonceSize+box.Overhead {
+		t.Fatal("escrow payload too short")
+	}
+
+	var ephPub [keySize]byte
+	copy(ephPub[:], payload[:keySize])
+	rest := payload[keySize:]
+
+	var nonce [nonceSize]byte
+	copy(nonce[:], rest[:nonceSize])
+
+	decrypted, ok := box.Open(nil, rest[nonceSize:], &nonce, &ephPub, recipientPriv)
+	if !ok {
+		t.Fatal("failed to decrypt escrow")
+	}
+
+	if !strings.Contains(string(decrypted), secret) {
+		t.Error("decrypted escrow should contain original secret")
+	}
+}
+
+func TestRecorder_RawEscrowInvalidKey(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:         true,
+		Dir:             dir,
+		RawEscrow:       true,
+		EscrowPublicKey: "not-hex",
+	}
+
+	_, err := recorder.New(cfg, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid escrow key")
+	}
+}
+
+func TestRecorder_RawEscrowWrongKeyLength(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:         true,
+		Dir:             dir,
+		RawEscrow:       true,
+		EscrowPublicKey: hex.EncodeToString([]byte("too-short")),
+	}
+
+	_, err := recorder.New(cfg, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for wrong key length")
+	}
+}
+
+func TestRecorder_CloseIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := rec.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("second Close should be idempotent: %v", err)
+	}
+}
+
+func TestRecorder_RecordAfterClose(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Summary:   "after close",
+	})
+	if err == nil {
+		t.Fatal("expected error when recording after close")
+	}
+}
+
+func TestRecorder_DefaultCheckpointInterval(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled: true,
+		Dir:     dir,
+		// CheckpointInterval left at 0 -- should use default
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Should not panic or error with default interval
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Summary:   "test",
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+}
+
+func TestRecorder_NilDetail(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             true,
+		CheckpointInterval: 100,
+	}
+
+	// Redact function that should not be called for nil detail
+	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		return scanner.TextDLPResult{Clean: true}
+	}
+
+	rec, err := recorder.New(cfg, redactFn, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Summary:   "nil detail",
+		Detail:    nil,
+	})
+	if err != nil {
+		t.Fatalf("Record with nil detail: %v", err)
+	}
+}
+
+func TestRecorder_ResumeIgnoresUnrelatedDirectoryNoise(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i <= recorder.MaxEvidenceReadDirectoryEntries; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("noise-%03d.txt", i))
+		if err := os.WriteFile(path, []byte("x"), filePermissions); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: "resume-dir-cap",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "must fail closed before unbounded directory scan",
+		Detail:    map[string]string{"safe": "value"},
+	})
+	if err != nil {
+		t.Fatalf("Record with unrelated directory noise: %v", err)
+	}
+}
+
+// The directory-entry ceiling deliberately does NOT apply to resume. It exists
+// so a truncated read cannot present partial evidence as complete, which is a
+// real hazard for query, verification and the dashboard, and it remains
+// enforced on those paths. Resume reads shards newest first until one yields
+// a tail entry, each read bounded per file, and never verifies the chain, so
+// the count ceiling bought no integrity there and instead bricked receipt
+// emission permanently once a directory grew past it.
+//
+// This test previously asserted the opposite. It is inverted rather than
+// deleted so the policy change stays visible to anyone reading the history.
+// Availability past the cap is covered with a real tail in
+// TestRecorder_ResumeSucceedsPastDirectoryCap; here every shard is empty, so
+// the expected outcome is genesis, not a count refusal.
+func TestRecorder_ResumeIsNotCappedByMatchingSessionFileCount(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i <= recorder.MaxEvidenceReadDirectoryEntries; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("evidence-matching-cap-%d.jsonl", i))
+		if err := os.WriteFile(path, []byte(""), filePermissions); err != nil {
+			t.Fatalf("WriteFile(%q): %v", path, err)
+		}
+	}
+
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: "matching-cap",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "shard count alone must not refuse the write",
+		Detail:    map[string]string{"safe": "value"},
+	})
+	if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("Record refused on shard count: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("Record with over-cap empty shards: %v", err)
+	}
+}
+
+func TestRecorder_ResumeAcceptsOverCapLegacyTailRead(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evidence-resume-tail-cap-0.jsonl")
+	file, err := os.OpenFile(filepath.Clean(path), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePermissions)
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer func() { _ = file.Close() }()
+
+	var written int64
+	for seq := uint64(0); written <= recorder.MaxEvidenceReadFileBytes; seq++ {
+		entry := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  seq,
+			Timestamp: time.Unix(1712345678, 0).UTC(),
+			SessionID: "resume-tail-cap",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   strings.Repeat("x", 512<<10),
+			Detail:    map[string]string{"safe": "value"},
+			PrevHash:  recorder.GenesisHash,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		line, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatalf("Marshal entry: %v", err)
+		}
+		line = append(line, '\n')
+		n, err := file.Write(line)
+		if err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		written += int64(n)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: "resume-tail-cap",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "must resume through a bounded tail read",
+		Detail:    map[string]string{"safe": "value"},
+	})
+	if err != nil {
+		t.Fatalf("Record after over-cap legacy shard: %v", err)
+	}
+}
+
+func TestRecordClearsCallerRawDetailBeforeHashing(t *testing.T) {
+	dir := t.TempDir()
+	rec, err := recorder.New(recorder.Config{Enabled: true, Dir: dir, CheckpointInterval: 100}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Record(recorder.Entry{SessionID: "raw-clear", Type: testType, Transport: testTransport, Summary: "fresh", Detail: map[string]string{"fresh": "value"}, RawDetail: json.RawMessage(`{"stale":true}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-raw-clear-0.jsonl"))
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("ReadEntries = %d, %v", len(entries), err)
+	}
+	if string(entries[0].RawDetail) != `{"fresh":"value"}` {
+		t.Fatalf("stored raw detail = %s, want fresh caller Detail", entries[0].RawDetail)
+	}
+	if err := recorder.VerifyChain(entries); err != nil {
+		t.Fatalf("VerifyChain: %v", err)
+	}
+}
+
+func TestRecorder_ResumeAcceptsLegacyShardPastEntryReadCap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evidence-resume-entry-cap-0.jsonl")
+
+	var input strings.Builder
+	for seq := uint64(0); seq <= recorder.MaxEvidenceReadEntries; seq++ {
+		entry := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  seq,
+			Timestamp: time.Unix(1712345678, 0).UTC(),
+			SessionID: "resume-entry-cap",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   "tail entry cap",
+			Detail:    map[string]string{"safe": "value"},
+			PrevHash:  recorder.GenesisHash,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		line, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatalf("Marshal entry: %v", err)
+		}
+		input.Write(line)
+		input.WriteByte('\n')
+	}
+	if err := os.WriteFile(path, []byte(input.String()), filePermissions); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 100,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: "resume-entry-cap",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "must resume from one bounded tail entry",
+		Detail:    map[string]string{"safe": "value"},
+	})
+	if err != nil {
+		t.Fatalf("Record after legacy shard past entry read cap: %v", err)
+	}
+	nextPath := filepath.Join(dir, fmt.Sprintf("evidence-resume-entry-cap-%d.jsonl", recorder.MaxEvidenceReadEntries+1))
+	if _, err := os.Stat(nextPath); err != nil {
+		t.Fatalf("next resumed shard %q: %v", filepath.Base(nextPath), err)
+	}
+}
+
+func TestComputeFileHash(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.jsonl")
+	content := []byte("test content\n")
+	if err := os.WriteFile(path, content, filePermissions); err != nil {
+		t.Fatal(err)
+	}
+
+	hash, err := recorder.ComputeFileHash(path)
+	if err != nil {
+		t.Fatalf("ComputeFileHash: %v", err)
+	}
+	if len(hash) != 64 {
+		t.Errorf("hash length = %d, want 64", len(hash))
+	}
+
+	// Same file should produce same hash
+	hash2, err := recorder.ComputeFileHash(path)
+	if err != nil {
+		t.Fatalf("second ComputeFileHash: %v", err)
+	}
+	if hash != hash2 {
+		t.Error("same file should produce same hash")
+	}
+}
+
+func TestComputeFileHash_RejectsOverCapFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "oversized.jsonl")
+	content := strings.Repeat("x", int(recorder.MaxEvidenceReadFileBytes)+1)
+	if err := os.WriteFile(path, []byte(content), filePermissions); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := recorder.ComputeFileHash(path)
+	if !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("ComputeFileHash error = %v, want ErrEvidenceReadLimitExceeded", err)
+	}
+}
+
+func TestRecorder_RecordRejectsSingleEntryOverReadCap(t *testing.T) {
+	dir := t.TempDir()
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: "oversized-entry",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   strings.Repeat("x", int(recorder.MaxEvidenceReadFileBytes)+1),
+		Detail:    map[string]string{"safe": "value"},
+	})
+	if !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("Record oversized entry error = %v, want ErrEvidenceReadLimitExceeded", err)
+	}
+
+	if err := rec.Record(recorder.Entry{
+		SessionID: "oversized-entry",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "small entry after rejected oversized entry",
+		Detail:    map[string]string{"safe": "value"},
+	}); err != nil {
+		t.Fatalf("Record after rejected oversized entry: %v", err)
+	}
+}
+
+func TestRecorder_RecordRecoversAfterClearlyOversizedEntry(t *testing.T) {
+	dir := t.TempDir()
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	err = rec.Record(recorder.Entry{
+		SessionID: "overlong-entry",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   strings.Repeat("x", recorder.MaxEntryLineBytes+1),
+	})
+	if !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("Record overlong entry error = %v, want ErrEvidenceReadLimitExceeded", err)
+	}
+	if !errors.Is(err, recorder.ErrSerializedEntryTooLarge) {
+		t.Fatalf("Record overlong entry error = %v, want deterministic pre-write size error", err)
+	}
+
+	if err := rec.Record(recorder.Entry{
+		SessionID: "overlong-entry",
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "small entry after rejected overlong entry",
+	}); err != nil {
+		t.Fatalf("Record after rejected overlong entry: %v", err)
+	}
+}
+
+func TestRecorder_RecordRotatesBeforeEvidenceReadCap(t *testing.T) {
+	dir := t.TempDir()
+	rec, err := recorder.New(recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+		MaxEntriesPerFile:  100,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	for i := range 10 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "byte-rotation",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   strings.Repeat("x", 900<<10),
+			Detail:    map[string]string{"idx": fmt.Sprintf("%d", i)},
+		}); err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	files, err := filepath.Glob(filepath.Join(dir, "evidence-byte-rotation-*.jsonl"))
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("evidence file count = %d, want 2", len(files))
+	}
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("Stat(%q): %v", path, err)
+		}
+		if info.Size() > recorder.MaxEvidenceReadFileBytes {
+			t.Fatalf("%s size = %d, want <= %d", filepath.Base(path), info.Size(), recorder.MaxEvidenceReadFileBytes)
+		}
+		if _, err := recorder.ComputeFileHash(path); err != nil {
+			t.Fatalf("ComputeFileHash(%q): %v", path, err)
+		}
+	}
+}
+
+func TestReadEvidenceFileBounded_RejectsOverCapFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "oversized.jsonl")
+	if err := os.WriteFile(path, []byte("over-cap"), filePermissions); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := recorder.ReadEvidenceFileBounded(path, 4)
+	if !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		t.Fatalf("ReadEvidenceFileBounded error = %v, want ErrEvidenceReadLimitExceeded", err)
+	}
+}
+
+func TestReadEvidenceFileBounded_DefaultLimitReadsSmallFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "evidence.jsonl")
+	content := []byte("small evidence\n")
+	if err := os.WriteFile(path, content, filePermissions); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := recorder.ReadEvidenceFileBounded(path, 0)
+	if err != nil {
+		t.Fatalf("ReadEvidenceFileBounded: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("ReadEvidenceFileBounded = %q, want %q", got, content)
+	}
+}
+
+func TestReadEvidenceFileBounded_RejectsNonRegularPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "not-regular")
+	if err := os.Mkdir(path, 0o750); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	if _, err := recorder.ReadEvidenceFileBounded(path, 4); err == nil || !strings.Contains(err.Error(), "non-regular") {
+		t.Fatalf("ReadEvidenceFileBounded error = %v, want non-regular error", err)
+	}
+}
+
+func TestComputeFileHash_NotFound(t *testing.T) {
+	_, err := recorder.ComputeFileHash("/nonexistent/file")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestRecorder_RedactionCleanResult(t *testing.T) {
+	dir := t.TempDir()
+
+	// Redact function that always returns clean (no matches)
+	cleanFn := func(_ context.Context, _ string) scanner.TextDLPResult {
+		return scanner.TextDLPResult{Clean: true}
+	}
+
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             true,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, cleanFn, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Detail should be preserved when DLP says clean
+	detail := map[string]string{"safe": "content"}
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "clean content",
+		Detail:    detail,
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-test-session-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+	if len(entries) < 1 {
+		t.Fatal("expected at least 1 entry")
+	}
+	detailJSON, _ := json.Marshal(entries[0].Detail)
+	if !strings.Contains(string(detailJSON), "content") {
+		t.Error("clean detail should be preserved")
+	}
+}
+
+func TestRecorder_RedactionMarshalError(t *testing.T) {
+	dir := t.TempDir()
+
+	// Redact function - won't be called since marshal of channel fails. The
+	// session handle is validated at acquisition and must stay clean.
+	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		if strings.Contains(text, testSessionID) {
+			return scanner.TextDLPResult{Clean: true}
+		}
+		return scanner.TextDLPResult{Clean: false, Matches: []scanner.TextDLPMatch{
+			{PatternName: "test"},
+		}}
+	}
+
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             true,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, redactFn, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Use a type that json.Marshal can handle but is interesting
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "marshal test",
+		Detail:    map[string]int{"count": 42},
+	})
+	if err != nil {
+		t.Fatalf("Record should succeed: %v", err)
+	}
+}
+
+func TestRecorder_EscrowWithoutKey(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		RawEscrow:          true,
+		EscrowPublicKey:    "", // No key provided
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Should still record without error (escrow silently skipped)
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "no escrow key",
+		Detail:    map[string]string{"data": "value"},
+	})
+	if err != nil {
+		t.Fatalf("Record: %v", err)
+	}
+}
+
+func TestRecorder_ConcurrentRecords(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             false,
+		CheckpointInterval: 100,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const goroutines = 10
+	const entriesPerGoroutine = 5
+	errs := make(chan error, goroutines*entriesPerGoroutine)
+	var wg sync.WaitGroup
+
+	for g := range goroutines {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := range entriesPerGoroutine {
+				err := rec.Record(recorder.Entry{
+					SessionID: testSessionID,
+					Type:      testType,
+					Transport: testTransport,
+					Summary:   fmt.Sprintf("goroutine %d entry %d", id, j),
+				})
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+	close(errs)
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	for err := range errs {
+		t.Errorf("concurrent Record error: %v", err)
+	}
+}
+
+func TestRecorder_RetentionRemovesEscrowFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:       true,
+		Dir:           dir,
+		RetentionDays: 1,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Create old escrow file
+	oldEscrow := filepath.Join(dir, "evidence-old-0.raw.enc")
+	if err := os.WriteFile(oldEscrow, []byte("encrypted"), filePermissions); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(oldEscrow, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := rec.ExpireOldFiles()
+	if err != nil {
+		t.Fatalf("ExpireOldFiles: %v", err)
+	}
+	if removed != 1 {
+		t.Errorf("expected 1 removed, got %d", removed)
+	}
+}
+
+func TestRecorder_ExpireIgnoresNonEvidenceFiles(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:       true,
+		Dir:           dir,
+		RetentionDays: 1,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer func() { _ = rec.Close() }()
+
+	// Create an old non-evidence file
+	otherFile := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(otherFile, []byte("notes"), filePermissions); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(otherFile, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := rec.ExpireOldFiles()
+	if err != nil {
+		t.Fatalf("ExpireOldFiles: %v", err)
+	}
+	if removed != 0 {
+		t.Error("should not remove non-evidence files")
+	}
+}
+
+func TestRecorder_NewInvalidDir(t *testing.T) {
+	cfg := recorder.Config{
+		Enabled: true,
+		Dir:     "/proc/nonexistent/impossible/path",
+	}
+	_, err := recorder.New(cfg, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for invalid directory")
+	}
+}
+
+func TestRecorder_RawEscrowPerEntry(t *testing.T) {
+	dir := t.TempDir()
+
+	recipientPub, recipientPriv, err := box.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	// Always-redact function so every entry gets escrow written. The session
+	// handle is validated at acquisition and must stay clean.
+	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		if strings.Contains(text, testSessionID) {
+			return scanner.TextDLPResult{Clean: true}
+		}
+		return scanner.TextDLPResult{
+			Clean: false,
+			Matches: []scanner.TextDLPMatch{
+				{PatternName: "test-pattern"},
+			},
+		}
+	}
+
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		Redact:             true,
+		CheckpointInterval: 1000, // High to avoid auto-checkpoints
+		RawEscrow:          true,
+		EscrowPublicKey:    hex.EncodeToString(recipientPub[:]),
+	}
+
+	rec, err := recorder.New(cfg, redactFn, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const entryCount = 3
+	secrets := make([]string, entryCount)
+	for i := range entryCount {
+		secrets[i] = fmt.Sprintf("secret-payload-%d", i)
+		err := rec.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("entry %d", i),
+			Detail:    map[string]string{"data": secrets[i]},
+		})
+		if err != nil {
+			t.Fatalf("Record(%d): %v", i, err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Read entries to get RawRefs
+	var jsonlFile string
+	dirEntries, _ := os.ReadDir(dir)
+	for _, de := range dirEntries {
+		if strings.HasSuffix(de.Name(), ".jsonl") {
+			jsonlFile = filepath.Join(dir, de.Name())
+			break
+		}
+	}
+	if jsonlFile == "" {
+		t.Fatal("no JSONL file found")
+	}
+
+	entries, err := recorder.ReadEntries(jsonlFile)
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+
+	// Verify each data entry has a unique escrow file with correct content
+	const keySize = 32
+	const nonceSize = 24
+	seenFiles := make(map[string]bool)
+	dataIdx := 0
+	for _, e := range entries {
+		if e.Type == testCheckpoint {
+			continue
+		}
+		if e.RawRef == "" {
+			t.Errorf("entry seq %d: missing RawRef", e.Sequence)
+			continue
+		}
+		if seenFiles[e.RawRef] {
+			t.Errorf("entry seq %d: RawRef %q duplicates a previous entry", e.Sequence, e.RawRef)
+		}
+		seenFiles[e.RawRef] = true
+
+		escrowPath := filepath.Join(dir, e.RawRef)
+		payload, err := os.ReadFile(filepath.Clean(escrowPath))
+		if err != nil {
+			t.Errorf("entry seq %d: reading escrow %s: %v", e.Sequence, e.RawRef, err)
+			continue
+		}
+
+		if len(payload) < keySize+nonceSize+box.Overhead {
+			t.Errorf("entry seq %d: escrow payload too short", e.Sequence)
+			continue
+		}
+
+		var ephPub [keySize]byte
+		copy(ephPub[:], payload[:keySize])
+		rest := payload[keySize:]
+		var nonce [nonceSize]byte
+		copy(nonce[:], rest[:nonceSize])
+
+		decrypted, ok := box.Open(nil, rest[nonceSize:], &nonce, &ephPub, recipientPriv)
+		if !ok {
+			t.Errorf("entry seq %d: failed to decrypt escrow", e.Sequence)
+			continue
+		}
+
+		if !strings.Contains(string(decrypted), secrets[dataIdx]) {
+			t.Errorf("entry seq %d: decrypted escrow does not contain %q, got %q",
+				e.Sequence, secrets[dataIdx], string(decrypted))
+		}
+		dataIdx++
+	}
+
+	if len(seenFiles) != entryCount {
+		t.Errorf("expected %d unique escrow files, got %d", entryCount, len(seenFiles))
+	}
+}
+
+func TestRecorder_SessionID_Validation(t *testing.T) {
+	t.Run("rejects empty session ID", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 100,
+		}
+		rec, err := recorder.New(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		err = rec.Record(recorder.Entry{
+			SessionID: "",
+			Type:      testType,
+			Summary:   "empty session",
+		})
+		if err == nil {
+			t.Fatal("expected error for empty session ID")
+		}
+		if !strings.Contains(err.Error(), "session_id required") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("rejects mismatched session ID", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 100,
+		}
+		rec, err := recorder.New(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		// First entry establishes session identity
+		err = rec.Record(recorder.Entry{
+			SessionID: "session-alpha",
+			Type:      testType,
+			Summary:   "first",
+		})
+		if err != nil {
+			t.Fatalf("first Record: %v", err)
+		}
+
+		// Second entry with different session ID must be rejected
+		err = rec.Record(recorder.Entry{
+			SessionID: "session-beta",
+			Type:      testType,
+			Summary:   "wrong session",
+		})
+		if err == nil {
+			t.Fatal("expected error for mismatched session ID")
+		}
+		if !strings.Contains(err.Error(), "session_id mismatch") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("accepts consistent session IDs", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 100,
+		}
+		rec, err := recorder.New(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		for i := range 3 {
+			err := rec.Record(recorder.Entry{
+				SessionID: "consistent-session",
+				Type:      testType,
+				Summary:   fmt.Sprintf("entry %d", i),
+			})
+			if err != nil {
+				t.Fatalf("Record(%d): %v", i, err)
+			}
+		}
+	})
+
+	t.Run("rejects session ID with path traversal", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			CheckpointInterval: 100,
+		}
+		rec, err := recorder.New(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		for _, malicious := range []string{
+			"../../../../tmp/pwn",
+			"..\\windows\\system32",
+			"legit/but-slashed",
+		} {
+			err := rec.Record(recorder.Entry{
+				SessionID: malicious,
+				Type:      testType,
+				Summary:   "traversal attempt",
+			})
+			if err == nil {
+				t.Errorf("expected error for session ID %q", malicious)
+			}
+			if !strings.Contains(err.Error(), "path separator") {
+				t.Errorf("expected path separator error for %q, got: %v", malicious, err)
+			}
+		}
+	})
+}
+
+func TestRecorder_EscrowFailure_FailsClosed(t *testing.T) {
+	t.Run("escrow write failure prevents entry", func(t *testing.T) {
+		dir := t.TempDir()
+
+		recipientPub, _, err := box.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+
+		cfg := recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			Redact:             false,
+			CheckpointInterval: 100,
+			RawEscrow:          true,
+			EscrowPublicKey:    hex.EncodeToString(recipientPub[:]),
+		}
+		rec, err := recorder.New(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		defer func() { _ = rec.Close() }()
+
+		// Remove the evidence directory after construction so
+		// escrow file writes fail (directory no longer exists).
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
+		}
+
+		err = rec.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   "should fail",
+			Detail:    map[string]string{"key": "value"},
+		})
+		if err == nil {
+			t.Fatal("expected error when escrow write fails")
+		}
+		if !strings.Contains(err.Error(), "escrow") {
+			t.Errorf("error should mention escrow, got: %v", err)
+		}
+	})
+
+	t.Run("no JSONL entry written on escrow failure", func(t *testing.T) {
+		dir := t.TempDir()
+
+		recipientPub, _, err := box.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("GenerateKey: %v", err)
+		}
+
+		cfg := recorder.Config{
+			Enabled:            true,
+			Dir:                dir,
+			Redact:             false,
+			CheckpointInterval: 100,
+			RawEscrow:          true,
+			EscrowPublicKey:    hex.EncodeToString(recipientPub[:]),
+		}
+		rec, err := recorder.New(cfg, nil, nil)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+
+		// Remove the evidence directory so escrow writes fail
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatalf("RemoveAll: %v", err)
+		}
+
+		_ = rec.Record(recorder.Entry{
+			SessionID: testSessionID,
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   "fail",
+			Detail:    map[string]string{"key": "value"},
+		})
+		_ = rec.Close()
+
+		// Re-create dir to check for leaked files
+		_ = os.MkdirAll(dir, 0o750)
+		dirEntries, _ := os.ReadDir(dir)
+		for _, de := range dirEntries {
+			if strings.HasSuffix(de.Name(), ".jsonl") {
+				t.Error("JSONL file should not exist when escrow failed")
+			}
+		}
+	})
+}
+
+func TestRecorder_Nop_WhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled: false,
+		Dir:     dir,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Record should succeed silently
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Summary:   "nop",
+	})
+	if err != nil {
+		t.Fatalf("Record on nop recorder: %v", err)
+	}
+
+	// Close should succeed
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close on nop recorder: %v", err)
+	}
+
+	// ExpireOldFiles should succeed
+	removed, err := rec.ExpireOldFiles()
+	if err != nil {
+		t.Fatalf("ExpireOldFiles on nop recorder: %v", err)
+	}
+	if removed != 0 {
+		t.Errorf("expected 0 removed, got %d", removed)
+	}
+
+	// No files should be created
+	dirEntries, _ := os.ReadDir(dir)
+	for _, de := range dirEntries {
+		t.Errorf("no-op recorder created file: %s", de.Name())
+	}
+}
+
+func TestRecorder_SafeUint64_Boundary(t *testing.T) {
+	// Test via New with boundary config values that exercise safeUint64.
+	tests := []struct {
+		name               string
+		checkpointInterval int
+		maxEntries         int
+	}{
+		{
+			name:               "zero checkpoint uses default",
+			checkpointInterval: 0,
+			maxEntries:         0,
+		},
+		{
+			name:               "negative checkpoint uses default",
+			checkpointInterval: -1,
+			maxEntries:         -5,
+		},
+		{
+			name:               "very large checkpoint is capped",
+			checkpointInterval: 1<<53 + 1,
+			maxEntries:         1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := recorder.Config{
+				Enabled:            true,
+				Dir:                dir,
+				CheckpointInterval: tc.checkpointInterval,
+				MaxEntriesPerFile:  tc.maxEntries,
+			}
+			rec, err := recorder.New(cfg, nil, nil)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer func() { _ = rec.Close() }()
+
+			// Should be able to record without panic
+			err = rec.Record(recorder.Entry{
+				SessionID: testSessionID,
+				Type:      testType,
+				Transport: testTransport,
+				Summary:   "boundary test",
+			})
+			if err != nil {
+				t.Fatalf("Record: %v", err)
+			}
+		})
+	}
+}
+
+func TestRecorder_WriteEntryToRemovedDir(t *testing.T) {
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// First record opens the file
+	err = rec.Record(recorder.Entry{
+		SessionID: testSessionID,
+		Type:      testType,
+		Transport: testTransport,
+		Summary:   "first",
+	})
+	if err != nil {
+		t.Fatalf("first Record: %v", err)
+	}
+
+	// Remove the evidence directory to cause subsequent write errors
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("RemoveAll: %v", err)
+	}
+
+	// Closing should encounter a flush error since the underlying file is gone
+	err = rec.Close()
+	// We accept either an error or success (OS-dependent behavior for deleted-but-open files)
+	// On Linux, the file handle remains valid even after directory removal,
+	// so this tests the closeFile code path rather than guaranteeing error.
+	_ = err
+}
+
+func TestRecorder_CloseFile_NilFile(t *testing.T) {
+	// Close on a recorder that never opened a file (no records written)
+	dir := t.TempDir()
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 1000,
+	}
+	rec, err := recorder.New(cfg, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Close without writing anything -- exercises closeFile with nil file
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close on empty recorder: %v", err)
+	}
+}
+
+func TestRecorder_VerifyChain_Errors(t *testing.T) {
+	t.Run("empty chain is valid", func(t *testing.T) {
+		if err := recorder.VerifyChain(nil); err != nil {
+			t.Errorf("empty chain should be valid: %v", err)
+		}
+	})
+
+	t.Run("wrong version", func(t *testing.T) {
+		entries := []recorder.Entry{
+			{
+				Version:  99,
+				Sequence: 0,
+				PrevHash: recorder.GenesisHash,
+				Hash:     "anything",
+			},
+		}
+		err := recorder.VerifyChain(entries)
+		if err == nil {
+			t.Fatal("expected error for wrong version")
+		}
+		if !strings.Contains(err.Error(), "unsupported version") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("hash mismatch", func(t *testing.T) {
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      testType,
+			PrevHash:  recorder.GenesisHash,
+			Hash:      "wrong-hash",
+		}
+		err := recorder.VerifyChain([]recorder.Entry{e})
+		if err == nil {
+			t.Fatal("expected error for hash mismatch")
+		}
+		if !strings.Contains(err.Error(), "hash mismatch") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("first entry bad prevhash", func(t *testing.T) {
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      testType,
+			PrevHash:  "not-genesis",
+		}
+		e.Hash = recorder.ComputeHash(e)
+		err := recorder.VerifyChain([]recorder.Entry{e})
+		if err == nil {
+			t.Fatal("expected error for bad first entry PrevHash")
+		}
+		if !strings.Contains(err.Error(), "first entry PrevHash") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("chain break between entries", func(t *testing.T) {
+		e0 := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      testType,
+			PrevHash:  recorder.GenesisHash,
+		}
+		e0.Hash = recorder.ComputeHash(e0)
+
+		e1 := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  1,
+			SessionID: "s1",
+			Type:      testType,
+			PrevHash:  "wrong-link",
+		}
+		e1.Hash = recorder.ComputeHash(e1)
+
+		err := recorder.VerifyChain([]recorder.Entry{e0, e1})
+		if err == nil {
+			t.Fatal("expected error for chain break")
+		}
+		if !strings.Contains(err.Error(), "chain break") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestRecorder_ReadEntries_Errors(t *testing.T) {
+	t.Run("nonexistent file", func(t *testing.T) {
+		_, err := recorder.ReadEntries("/nonexistent/file.jsonl")
+		if err == nil {
+			t.Fatal("expected error for nonexistent file")
+		}
+	})
+
+	t.Run("invalid JSON line", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "bad.jsonl")
+		if err := os.WriteFile(path, []byte("not json\n"), filePermissions); err != nil {
+			t.Fatal(err)
+		}
+		_, err := recorder.ReadEntries(path)
+		if err == nil {
+			t.Fatal("expected error for invalid JSON")
+		}
+		if !strings.Contains(err.Error(), "parsing entry") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("wrong entry version", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "bad-version.jsonl")
+		line := `{"v":99,"seq":0,"ts":"2026-03-28T12:00:00Z","session_id":"s1","type":"request","transport":"fetch","summary":"test","detail":null,"prev_hash":"genesis","hash":"abc"}` + "\n"
+		if err := os.WriteFile(path, []byte(line), filePermissions); err != nil {
+			t.Fatal(err)
+		}
+		_, err := recorder.ReadEntries(path)
+		if err == nil {
+			t.Fatal("expected error for wrong version")
+		}
+		if !strings.Contains(err.Error(), "unsupported entry version") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("empty lines are skipped", func(t *testing.T) {
+		dir := t.TempDir()
+
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			SessionID: "s1",
+			Type:      testType,
+			Transport: testTransport,
+			PrevHash:  recorder.GenesisHash,
+		}
+		e.Hash = recorder.ComputeHash(e)
+		data, _ := json.Marshal(e)
+
+		path := filepath.Join(dir, "with-blanks.jsonl")
+		content := "\n" + string(data) + "\n\n"
+		if err := os.WriteFile(path, []byte(content), filePermissions); err != nil {
+			t.Fatal(err)
+		}
+
+		entries, err := recorder.ReadEntries(path)
+		if err != nil {
+			t.Fatalf("ReadEntries: %v", err)
+		}
+		if len(entries) != 1 {
+			t.Errorf("expected 1 entry, got %d", len(entries))
+		}
+	})
+}
+
+func TestRecorder_VerifyCheckpoints_Errors(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("missing signature", func(t *testing.T) {
+		cpDetail := recorder.CheckpointDetail{
+			EntryCount: 1,
+			Signature:  "", // missing
+		}
+		detailJSON, _ := json.Marshal(cpDetail)
+		var detail any
+		_ = json.Unmarshal(detailJSON, &detail)
+
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      "checkpoint",
+			PrevHash:  recorder.GenesisHash,
+			Detail:    detail,
+		}
+		e.Hash = recorder.ComputeHash(e)
+
+		err := recorder.VerifyCheckpoints([]recorder.Entry{e}, pub)
+		if err == nil {
+			t.Fatal("expected error for missing signature")
+		}
+		if !strings.Contains(err.Error(), "missing signature") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("invalid hex signature", func(t *testing.T) {
+		cpDetail := recorder.CheckpointDetail{
+			EntryCount: 1,
+			Signature:  "not-valid-hex!!!",
+		}
+		detailJSON, _ := json.Marshal(cpDetail)
+		var detail any
+		_ = json.Unmarshal(detailJSON, &detail)
+
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      "checkpoint",
+			PrevHash:  recorder.GenesisHash,
+			Detail:    detail,
+		}
+		e.Hash = recorder.ComputeHash(e)
+
+		err := recorder.VerifyCheckpoints([]recorder.Entry{e}, pub)
+		if err == nil {
+			t.Fatal("expected error for invalid hex")
+		}
+	})
+
+	t.Run("wrong signature", func(t *testing.T) {
+		// Sign with the real key but different data
+		badSig := ed25519.Sign(priv, []byte("wrong-data"))
+		cpDetail := recorder.CheckpointDetail{
+			EntryCount: 1,
+			Signature:  hex.EncodeToString(badSig),
+		}
+		detailJSON, _ := json.Marshal(cpDetail)
+		var detail any
+		_ = json.Unmarshal(detailJSON, &detail)
+
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      "checkpoint",
+			PrevHash:  recorder.GenesisHash,
+			Detail:    detail,
+		}
+		e.Hash = recorder.ComputeHash(e)
+
+		err := recorder.VerifyCheckpoints([]recorder.Entry{e}, pub)
+		if err == nil {
+			t.Fatal("expected error for wrong signature")
+		}
+		if !strings.Contains(err.Error(), "verification failed") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("skips non-checkpoint entries", func(t *testing.T) {
+		e := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  0,
+			SessionID: "s1",
+			Type:      testType, // not a checkpoint
+			PrevHash:  recorder.GenesisHash,
+		}
+		e.Hash = recorder.ComputeHash(e)
+
+		// Should succeed: no checkpoints to verify
+		err := recorder.VerifyCheckpoints([]recorder.Entry{e}, pub)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestRecorder_VerifyChain_WithPubKey(t *testing.T) {
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := recorder.Config{
+		Enabled:            true,
+		Dir:                dir,
+		CheckpointInterval: 2,
+		SignCheckpoints:    true,
+	}
+	rec, err := recorder.New(cfg, nil, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 3 {
+		if err := rec.Record(recorder.Entry{
+			SessionID: "s1",
+			Type:      testType,
+			Transport: testTransport,
+			Summary:   fmt.Sprintf("r%d", i),
+		}); err != nil {
+			t.Fatalf("Record: %v", err)
+		}
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	entries, err := recorder.ReadEntries(filepath.Join(dir, "evidence-s1-0.jsonl"))
+	if err != nil {
+		t.Fatalf("ReadEntries: %v", err)
+	}
+
+	// VerifyChain with pubKey should also check checkpoint signatures
+	if err := recorder.VerifyChain(entries, pub); err != nil {
+		t.Fatalf("VerifyChain with pubKey: %v", err)
+	}
+
+	// VerifyChain with nil pubKey should skip checkpoint verification
+	if err := recorder.VerifyChain(entries, nil); err != nil {
+		t.Fatalf("VerifyChain with nil pubKey: %v", err)
+	}
+}
+
+func TestRecorder_ReceiptRedaction(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	// Build fake cred at runtime to avoid gosec G101
+	fakeKey := "AK" + "IA" + "IOSFODNN7EXAMPLE"
+
+	tests := []struct {
+		name            string
+		entryType       string
+		detail          any
+		wantRecordError bool
+		wantFullRedact  bool
+	}{
+		{
+			name:      "receipt target field is redacted",
+			entryType: "action_receipt",
+			detail: map[string]any{
+				"version": 1,
+				"action_record": map[string]any{
+					"target":      "https://example.com/?key=" + fakeKey,
+					"verdict":     "block",
+					"action_type": "read",
+					"transport":   testTransport,
+					"action_id":   "test-id-123",
+				},
+				"signature":  "ed25519:deadbeef",
+				"signer_key": "cafebabe",
+			},
+			wantRecordError: true,
+		},
+		{
+			name:      "receipt without secrets is preserved",
+			entryType: "action_receipt",
+			detail: map[string]any{
+				"version": 1,
+				"action_record": map[string]any{
+					"target":      "https://example.com/safe",
+					"verdict":     "allow",
+					"action_type": "read",
+					"transport":   testTransport,
+					"action_id":   "test-id-456",
+				},
+				"signature":  "ed25519:deadbeef",
+				"signer_key": "cafebabe",
+			},
+		},
+		{
+			name:            "v2 signed receipt with secret is rejected",
+			entryType:       "evidence_receipt",
+			detail:          map[string]any{"record_type": "evidence_receipt_v2", "payload": map[string]any{"rule_id": fakeKey}, "signature": "ed25519:deadbeef", "signer_key": "cafebabe"},
+			wantRecordError: true,
+		},
+		{
+			name:      "v2 signed receipt without secrets is preserved",
+			entryType: "evidence_receipt",
+			detail:    map[string]any{"record_type": "evidence_receipt_v2", "payload": map[string]any{"rule_id": "safe-rule"}, "signature": "ed25519:deadbeef", "signer_key": "cafebabe"},
+		},
+		{
+			name:            "unmarshalable signed receipt is rejected",
+			entryType:       "action_receipt",
+			detail:          func() {},
+			wantRecordError: true,
+		},
+		{
+			name:           "non-receipt entry gets full redaction",
+			entryType:      "request",
+			detail:         map[string]string{"url": "https://example.com/?key=" + fakeKey},
+			wantFullRedact: true,
+		},
+		{
+			name:      "receipt without action_record falls back to full redaction",
+			entryType: "action_receipt",
+			// Malformed receipt: missing action_record key triggers fallback
+			detail:          map[string]string{"target": "https://example.com/?key=" + fakeKey},
+			wantRecordError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalDetail, marshalErr := json.Marshal(tt.detail)
+			if marshalErr != nil && !tt.wantRecordError {
+				t.Fatalf("marshal original detail: %v", marshalErr)
+			}
+			subDir := t.TempDir()
+			subCfg := recorder.Config{
+				Enabled:            true,
+				Dir:                subDir,
+				Redact:             true,
+				CheckpointInterval: 100,
+			}
+			subRec, err := recorder.New(subCfg, sc.ScanTextForDLP, nil)
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer func() { _ = subRec.Close() }()
+
+			err = subRec.Record(recorder.Entry{
+				SessionID: testSessionID,
+				Type:      tt.entryType,
+				Transport: testTransport,
+				Summary:   "test entry",
+				Detail:    tt.detail,
+			})
+			if tt.wantRecordError {
+				if err == nil || (!strings.Contains(err.Error(), "refusing to record unverifiable redaction") && !strings.Contains(err.Error(), "scan signed receipt detail before recording")) {
+					t.Fatalf("Record error = %v, want signed receipt redaction refusal", err)
+				}
+				if closeErr := subRec.Close(); closeErr != nil {
+					t.Fatalf("Close: %v", closeErr)
+				}
+				entries, readErr := recorder.ReadEntries(filepath.Join(subDir, "evidence-test-session-0.jsonl"))
+				if errors.Is(readErr, os.ErrNotExist) {
+					return
+				}
+				if readErr != nil {
+					t.Fatalf("ReadEntries: %v", readErr)
+				}
+				for _, entry := range entries {
+					if entry.Type == tt.entryType {
+						t.Fatalf("rejected signed receipt was persisted: %+v", entry)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Record: %v", err)
+			}
+			if err := subRec.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			entries, err := recorder.ReadEntries(filepath.Join(subDir, "evidence-test-session-0.jsonl"))
+			if err != nil {
+				t.Fatalf("ReadEntries: %v", err)
+			}
+			if len(entries) < 1 {
+				t.Fatal("expected at least 1 entry")
+			}
+
+			detailJSON, _ := json.Marshal(entries[0].Detail)
+			detailStr := string(detailJSON)
+			if !tt.wantFullRedact && (tt.entryType == "action_receipt" || tt.entryType == "evidence_receipt") && !bytes.Equal(detailJSON, originalDetail) {
+				t.Fatalf("clean signed receipt detail changed after recording:\n got: %s\nwant: %s", detailJSON, originalDetail)
+			}
+
+			if tt.wantFullRedact {
+				// Non-receipt: entire detail replaced with redaction wrapper
+				if strings.Contains(detailStr, fakeKey) {
+					t.Error("secret should be redacted from non-receipt detail")
+				}
+				if !strings.Contains(detailStr, "[REDACTED:") {
+					t.Error("detail should contain redaction marker")
+				}
+				if !strings.Contains(detailStr, `"redacted":true`) {
+					t.Error("detail should be wrapped in redaction envelope")
+				}
+			}
+
+			// Clean receipt (no secrets): no modifications
+			if !tt.wantRecordError && !tt.wantFullRedact && tt.entryType == "action_receipt" {
+				detailMap, ok := entries[0].Detail.(map[string]any)
+				if !ok {
+					t.Fatal("receipt detail should be a map")
+				}
+				ar, arOK := detailMap["action_record"].(map[string]any)
+				if !arOK {
+					t.Fatal("receipt should preserve action_record structure")
+				}
+				if _, hasRF := ar["redacted_fields"]; hasRF {
+					t.Error("clean receipt should not have redacted_fields")
+				}
+				if target, ok := ar["target"].(string); !ok || target != "https://example.com/safe" {
+					t.Errorf("clean receipt target should be preserved, got %v", ar["target"])
+				}
+			}
+		})
+	}
+}
+
+// filePermissions for test file creation.
+const filePermissions = 0o600
+
+type testEntryObserver struct {
+	mu      sync.Mutex
+	entries []recorder.Entry
+}
+
+func (o *testEntryObserver) ObserveRecorderEntry(entry recorder.Entry) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.entries = append(o.entries, entry)
+}
+
+type panicEntryObserver struct{}
+
+func (panicEntryObserver) ObserveRecorderEntry(recorder.Entry) {
+	panic("observer panic")
+}
+
+// TestNew_SignCheckpointsWithoutKeyFailsClosed pins the sign-without-a-key
+// footgun: SignCheckpoints defaults on, so a persisted recorder with no signing
+// key would silently write empty-signature checkpoints that later verification
+// rejects as "missing signature". New must refuse to build such a recorder,
+// while still allowing the two honest configurations (a real key, or an
+// explicitly unsigned recorder) and the non-persisting default (Dir == "").
+func TestNew_SignCheckpointsWithoutKeyFailsClosed(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	t.Run("dir set, sign on, no key -> error", func(t *testing.T) {
+		_, err := recorder.New(recorder.Config{Enabled: true, Dir: t.TempDir(), SignCheckpoints: true}, nil, nil)
+		if err == nil {
+			t.Fatal("expected error for sign_checkpoints without a signing key")
+		}
+		if !strings.Contains(err.Error(), "sign_checkpoints") {
+			t.Fatalf("error = %q, want it to mention sign_checkpoints", err)
+		}
+	})
+
+	t.Run("dir set, sign on, wrong-length key -> error", func(t *testing.T) {
+		// A non-nil but truncated key must be rejected too: it would pass a bare
+		// nil check and then panic (or sign unverifiably) at checkpoint time.
+		_, err := recorder.New(recorder.Config{Enabled: true, Dir: t.TempDir(), SignCheckpoints: true}, nil, ed25519.PrivateKey{1, 2, 3})
+		if err == nil {
+			t.Fatal("expected error for a wrong-length signing key")
+		}
+		if !strings.Contains(err.Error(), "sign_checkpoints") {
+			t.Fatalf("error = %q, want it to mention sign_checkpoints", err)
+		}
+	})
+
+	t.Run("dir set, sign on, key provided -> ok", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: t.TempDir(), SignCheckpoints: true}, nil, priv)
+		if err != nil {
+			t.Fatalf("New with key: %v", err)
+		}
+		_ = rec.Close()
+	})
+
+	t.Run("dir set, sign explicitly off, no key -> ok (unsigned recorder)", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: t.TempDir(), SignCheckpoints: false}, nil, nil)
+		if err != nil {
+			t.Fatalf("New unsigned: %v", err)
+		}
+		_ = rec.Close()
+	})
+
+	t.Run("no dir, sign on, no key -> ok (non-persisting)", func(t *testing.T) {
+		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: "", SignCheckpoints: true}, nil, nil)
+		if err != nil {
+			t.Fatalf("New non-persisting: %v", err)
+		}
+		_ = rec.Close()
+	})
+
+	t.Run("no dir, sign on, no key -> no cwd persistence", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Chdir(dir)
+
+		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: " \t", SignCheckpoints: true}, nil, nil)
+		if err != nil {
+			t.Fatalf("New non-persisting: %v", err)
+		}
+		if err := rec.Record(recorder.Entry{
+			SessionID: "empty-dir",
+			Type:      "decision",
+			Summary:   "should be discarded",
+		}); err != nil {
+			t.Fatalf("Record non-persisting: %v", err)
+		}
+		if err := rec.Close(); err != nil {
+			t.Fatalf("Close non-persisting: %v", err)
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
+		}
+		if len(entries) != 0 {
+			names := make([]string, 0, len(entries))
+			for _, entry := range entries {
+				names = append(names, entry.Name())
+			}
+			t.Fatalf("non-persisting recorder wrote files in cwd: %v", names)
+		}
+	})
+}

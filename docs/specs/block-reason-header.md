@@ -1,0 +1,233 @@
+# X-Pipelock-Block-Reason Header Schema (v1)
+
+When pipelock blocks an outbound request, the response carries a small set of HTTP headers that explain *why* in machine-readable form. Agents that read these headers can react intelligently — back off, switch tools, surface the right error to the user — instead of treating every block as an opaque 403.
+
+This document is the canonical schema. Once an agent in production reads `dlp_match`, the vocabulary is locked. Renaming a code in v2 breaks every consumer.
+
+> **Status:** the v1 schema, validators, and production emit sites are shipped. The production-path matrix test (`internal/blockreason/production_path_matrix_test.go`) fails the build if a reason code has no production emit site or documented non-HTTP exemption.
+
+## Header set
+
+Blocked proxy HTTP responses include `X-Pipelock-Request-ID` with the ID recorded for the block and `X-Pipelock-Operator` with exactly `pipelock explain event <id>`. This includes WebSocket handshake refusals and both the absolute-URI 403 and JSON 503 kill-switch responses. These headers do not depend on the opt-in `explain_blocks` setting, which still controls additional prose hints. Verdicts, status codes, and schema version 1 are unchanged.
+
+The ID must match the shared `receiptcontent.ValidRequestID` shape: `req-` followed by a lowercase canonical UUIDv7 or a decimal fallback counter. Both headers are omitted when the recorded ID is empty or malformed. Pipelock supplies its recorded ID; it never copies a client header or request URL into these fields. Shape validation is not proof of origin or a signed receipt.
+
+| Header | Required | Example | Meaning |
+|---|---|---|---|
+| `X-Pipelock-Block-Reason` | yes (on every block) | `dlp_match` | Machine-readable reason code. See vocabulary below. |
+| `X-Pipelock-Block-Reason-Version` | yes (on every block) | `1` | Schema version. Increment for breaking changes. |
+| `X-Pipelock-Block-Reason-Severity` | yes (on every block) | `critical` | Matches pipelock's existing severity vocabulary: `info`, `warn`, `critical`. |
+| `X-Pipelock-Block-Reason-Retry` | yes (on every block) | `none` | Retry hint: `none` (permanent), `transient` (retry with backoff), `policy` (retry only after policy change). |
+| `X-Pipelock-Block-Reason-Layer` | optional | `dlp` | Scanner pipeline layer label. Uses `internal/scanner/` `Scanner*` constants verbatim so operators can correlate header-driven agent behavior with their existing audit logs and Prometheus labels. See the layer-label vocabulary below. |
+| `X-Pipelock-Block-Reason-Receipt` | optional | `0190a3c4-1234-7abc-89ab-0123456789ab` | Receipt ID for fetching the matching receipt (via the receipt-transports endpoint) for additional context. Either a 26-character Crockford-base32 ULID (`0-9` plus `A-Z` minus `I`, `L`, `O`, `U`) **or** a canonical 36-character hyphenated UUIDv7 — the receipt subsystem's correlation handle (`action_id`) uses that UUIDv7 form. Both accepted forms are fixed-length and drawn from a bounded alphabet, so the slot stays opaque and attacker-controlled metadata cannot reach agent-visible response headers. |
+| `X-Pipelock-Receipt` | optional | `0190a3c4-1234-7abc-89ab-0123456789ab` | The proxy-minted `action_id` of a receipt successfully recorded before this response was written. It is a caller correlation handle, never proof by itself; verify the signed receipt before relying on it. Browser callers can read it when the proxy exposes it with `Access-Control-Expose-Headers: X-Pipelock-Receipt`. |
+
+"Every block" means every block that returns HTTP headers, and that includes buffered reverse-proxy response-side blocks, which also put a prose reason in the JSON body's `block_reason` field. A block on a streaming response comes after the upstream headers are sent and can't add them. Absent headers are treated as a generic block. Agents that don't read the headers continue to work unchanged, because the headers are purely additive.
+
+## Layer-label vocabulary
+
+The optional `X-Pipelock-Block-Reason-Layer` header reuses `internal/scanner/` `Scanner*` constants verbatim. These are intentionally short — they exist to correlate with audit logs and Prometheus labels, not to be human-friendly. The reason code (the main `X-Pipelock-Block-Reason` header) carries the human-friendlier vocabulary.
+
+| Layer label (header) | Source constant | Approximate reason mapping |
+|---|---|---|
+| `scheme` | `scanner.ScannerScheme` | `scheme_blocked` |
+| `blocklist` | `scanner.ScannerBlocklist` | `domain_blocklist` |
+| `dlp` | `scanner.ScannerDLP` | `dlp_match`, `redaction_failure` |
+| `entropy` | `scanner.ScannerEntropy` | `path_entropy`, `query_entropy` |
+| `body_entropy` | `scanner.AuditBodyEntropy` / proxy body layer | `body_entropy` |
+| `subdomain_entropy` | `scanner.ScannerSubdomainEntropy` | `subdomain_entropy` |
+| `ssrf` | `scanner.ScannerSSRF` | `ssrf_private_ip`, `ssrf_metadata`, `ssrf_dns_rebind` |
+| `ratelimit` | `scanner.ScannerRateLimit` | `rate_limit` |
+| `length` | `scanner.ScannerLength` | `url_length` |
+| `databudget` | `scanner.ScannerDataBudget` | `data_budget` |
+| `parser` | `scanner.ScannerParser` | `parse_error` |
+| `response_scan` | proxy response-scan layer | `prompt_injection` |
+| `response_scan_error` | proxy response-scan layer | `parse_error` (response could not be fully scanned; fail-closed) |
+| `body_prompt_injection` | proxy request-body scan layer | `prompt_injection` (outbound request body) |
+
+Layers without a `Scanner*` constant (MCP layer, posture layer) leave the layer header unset; the reason code already conveys the layer at the granularity agents need.
+
+## Reason vocabulary (v1)
+
+Reason codes are lowercase snake_case. The v1 set is derived from existing pipelock block paths — every code below maps to an existing block path that the follow-up transport PR will wire to emit this header.
+
+### Egress / network layer
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `scheme_blocked` | URL scheme other than http/https. | `warn` | `none` |
+| `domain_blocklist` | Hostname matched the configured blocklist. | `critical` | `policy` |
+| `ssrf_private_ip` | Resolved IP is in private/loopback/link-local range. Also emitted when DNS resolution fails, including when nested query-parameter destinations exceed their shared resolution budget; that case is resolver availability and a retry may succeed even though this reports `none`. | `critical` | `none` |
+| `ssrf_metadata` | Resolved IP is a cloud metadata endpoint (169.254.169.254, etc.). | `critical` | `none` |
+| `ssrf_dns_rebind` | DNS resolution flipped between scan and dial (TOCTOU). | `critical` | `transient` |
+| `path_entropy` | URL path entropy exceeded configured ceiling (covert channel signal). | `warn` | `policy` |
+| `query_entropy` | URL query key or value entropy exceeded the configured ceiling. | `warn` | `policy` |
+| `subdomain_entropy` | Hostname subdomain entropy exceeded configured ceiling. | `warn` | `policy` |
+| `url_length` | URL length exceeded configured ceiling. | `warn` | `policy` |
+| `rate_limit` | Per-session, tunnel-capacity, or per-base-domain rate limit exceeded (every subdomain of a site shares one URL-scanner budget). | `warn` | `transient` |
+| `data_budget` | Per-session data budget exceeded, the URL scanner's per-base-domain `fetch_proxy.monitoring.max_data_per_minute` budget exceeded, or (HTTP 503) the session store is at capacity (`session capacity exhausted; wait for session recovery or increase max_sessions`); raise `session_profiling.max_sessions` for a store refusal. An MCP listener registry refusal for an unauthenticated legacy client also returns HTTP 503 with layer `session_capacity`: `MCP listener client-registry capacity exhausted (4096 clients); wait for listener idle expiry (24h) or session end`. Its fixed 4,096-client limit is independent of `max_sessions`; retained clients free slots on listener idle expiry or session end. A verified principal refused at that registry limit is reported as `session_binding` with layer `mcp_listener_session` and pattern `listener_principal_state_capacity` instead. The MCP HTTP listener sends its session-store and legacy registry capacity refusals with severity `critical` and retry `transient`, not the row defaults. | `warn` | `policy` |
+| `response_size` | Response exceeded the configured scan ceiling. Use only the remedies named by the blocking path. Where supported, `response_scanning.size_exempt_domains` allows a bounded scan; `response_scanning.exempt_domains` streams complete responses unscanned only when response scanning is enabled and the response is not declared SVG. On forward, TLS-intercepted, and reverse traffic, every `206` and `304` is refused with `response_incomplete` before response-scan exemptions, Shield exemptions, media policy, or budget truncation. On TLS intercept, `tls_interception.passthrough_domains` skips interception and body scanning after an accepted configuration change and a new CONNECT. | `warn` | `policy` |
+| `response_incomplete` | Forward, TLS-intercepted, or reverse proxy origin returned a partial (`206`) or not-modified (`304`) response without approval of a complete representation. Request the complete resource. Browser Shield exemptions skip rewriting only and cannot bypass this refusal. | `warn` | `none` |
+
+### Content / payload layer
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `dlp_match` | Outbound payload matched a DLP pattern (secret, credential, PII). | `critical` | `none` |
+| `body_entropy` | Body, WebSocket frame, or A2A payload matched the opaque-content detector: entropy exceeded the configured ceiling or a long all-hex value was observed. | `warn` | `policy` |
+| `prompt_injection` | Inbound response, or an outbound request body (layer `body_prompt_injection`), matched an injection pattern. | `critical` | `none` |
+| `redaction_failure` | Outbound redaction stage encountered an unrecoverable parse error and fail-closed. | `critical` | `transient` |
+| `media_policy` | Image / audio / video policy block (size, type, count). | `warn` | `policy` |
+
+### MCP / tool layer
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `tool_policy_deny` | An `mcp_tool_policy` rule denied the call. | `critical` | `policy` |
+| `tool_chain_blocked` | A configured tool-chain detection sequence triggered. | `critical` | `none` |
+| `tool_poisoning` | A poisoned tool description or rug-pull drift was detected. | `critical` | `none` |
+| `session_binding` | The current call's tool inventory diverged from the session's pinned baseline, or the MCP listener refused client state: a stateful request without an authenticated principal or session token (`listener_session_token_required`), a verified principal refused at the listener registry limit (`listener_principal_state_capacity`, retry `transient`), or a legacy session token used on the current protocol (`legacy_listener_token_on_current_protocol`). | `critical` | `policy` |
+
+### Posture / runtime layer
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `airlock_active` | Adaptive enforcement escalated this session into the airlock tier. | `critical` | `transient` |
+| `kill_switch_active` | A kill-switch activation source is active (config, API, Conductor remote kill, Conductor stale bundle, uncertain Conductor apply, SIGUSR1, or sentinel file). | `critical` | `transient` |
+| `envelope_verify_failed` | Inbound mediation envelope did not verify (signature / replay / trust). | `critical` | `none` |
+| `outbound_envelope_failed` | Outbound envelope injection / refresh / signing failed before the request left pipelock. Distinct from `envelope_verify_failed` so agents can tell inbound verification from outbound emission. | `critical` | `transient` |
+| `receipt_emission_failed` | `flight_recorder.require_receipts` is enabled and Pipelock could not emit the allow-path receipt before forwarding. The action is denied so there is no unreceipted upstream traffic. | `critical` | `transient` |
+| `redirect_scan_denied` | A followed redirect target was denied by the scanner pipeline (SSRF, blocklist, etc.). Distinct from the same scanner firing pre-redirect so clients can detect open-redirect probes. | `critical` | `none` |
+| `authority_mismatch` | Posture-capsule authority did not match the request's claimed authority. | `critical` | `policy` |
+| `escalation_level` | Adaptive `block_all` applies to the session and destination scope. Refusals use this reason even when a scanner also found a problem. | `critical` | `transient` |
+| `session_anomaly` | Session profiling marked the session as anomalous (`session_profiling.anomaly_action=block`). Distinct from `airlock_active` so receipts and headers agree on the enforcement source. | `critical` | `transient` |
+| `cross_request_deny` | Cross-request entropy / fragment-reassembly (CEE) denied the request because a multi-request payload was reconstructed. Distinct from `dlp_match` so clients can tell single-request DLP from cross-request reconstruction. | `critical` | `none` |
+
+### Generic
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `parse_error` | Unparseable input on a fail-closed surface, or a response that could not be fully scanned (layer `response_scan_error`; HTTP 503 on fetch and forward proxy). | `warn` | `none` |
+| `timeout` | Scanner or HITL timed out (fail-closed default). | `warn` | `transient` |
+| `pattern_unavailable` | Scanner pattern set unavailable at startup; fail-closed until ready. | `warn` | `transient` |
+| `not_enabled` | Endpoint exists but the feature is disabled in config. | `info` | `policy` |
+| `bad_request` | Malformed client request (missing parameter, invalid URL, etc.). | `info` | `none` |
+| `compressed_response` | Response used an encoding Pipelock cannot decode (e.g. br, zstd, stacked, or malformed; gzip and deflate are decoded and scanned). Change the upstream's encoding, or add the host to `tls_interception.passthrough_domains` if it is trusted. | `warn` | `policy` |
+| `browser_shield_oversize` | Response body exceeded the configured Browser Shield size limit. Operator must raise the limit or exempt the host to clear the block. | `warn` | `policy` |
+| `browser_shield_uninspectable` | Browser Shield could not safely decode a declared or detected UTF-16 response, scan-head mode refused a valid UTF-16 response because a partial character stream is not safely inspectable, or fetch received a partial (`206`) response that Shield would have to rewrite. Correct the upstream encoding, request the complete resource, raise the Browser Shield size limit so the full response can be inspected, or use the existing whole-host `browser_shield.exempt_domains` control to skip Shield rewriting for the host. That exemption cannot bypass the earlier `response_incomplete` refusal on forward, TLS-intercepted, or reverse proxy traffic. | `warn` | `policy` |
+| `block_reason_overflow` | Internal sentinel: the block-emit metadata itself was malformed (oversized Reason value, etc.). Pipelock falls back to this rather than silently downgrading to `parse_error` so audit fidelity is preserved. Agents should treat this as a malformed-block signal worth logging. | `warn` | `transient` |
+
+### Contract / learn-and-lock layer
+
+Emitted by the runtime evaluator when an active learn-and-lock contract claims jurisdiction over the request. The first four are real blocks; `contract_observed_only` is an info-tier annotation surfaced by shadow / capture modes when the contract path would have produced a non-allow live verdict but the configured mode does not enforce. `contract_observed_only` never appears on a 4xx response surface — it travels only on receipts and drift telemetry.
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `contract_default_deny` | Active contract claims jurisdiction (at least one host has an enforce rule with comparable evidence) and no allow rule matched the request. | `critical` | `none` |
+| `contract_enforce_default` | Active contract has an enforce rule that matched the request's host but no rule matched the full method / path / action shape. | `critical` | `none` |
+| `contract_non_default_port` | Active contract enforce rule matched the host but the request used a non-default port (rule scope excludes non-443 / non-80). | `warn` | `none` |
+| `contract_invalid_path` | Active contract enforce rule matched the host but the request path failed RFC 3986 canonicalization. | `warn` | `retry-with-canonical-path` |
+| `contract_observed_only` | Shadow / capture annotation: contract path would have blocked under live mode but the configured mode did not enforce. Never emitted on a block surface. | `info` | `none` |
+
+### Request policy layer
+
+Emitted by the `request_policy` operation safety rail: even within otherwise-allowed traffic, an operator (or signed bundle) rule names a dangerous outbound API operation and denies it. The layer is default-allow; rules block or warn only. It is not a `Scanner*` pipeline layer, so blocks leave `X-Pipelock-Block-Reason-Layer` unset and the reason code conveys the layer (the same convention the MCP and contract layers follow).
+
+| Code | When | Severity | Retry |
+|---|---|---|---|
+| `request_policy_deny` | A `request_policy` rule denied a named-dangerous outbound API operation. | `critical` | `policy` |
+
+Warn/shadow `request_policy` telemetry is not a block surface and does not emit this header. Enforced `request_policy_deny` blocks carry `severity: critical`.
+
+## Severity
+
+Aligns with `internal/config/schema.go` constants:
+
+- `info` — informational; agent can ignore or surface as a status line.
+- `warn` — agent should log and continue, but the operator may want to investigate.
+- `critical` — the block represents a real security event. Agent should not retry without an operator-driven policy change.
+
+The `info` / `warn` / `critical` values match pipelock's existing emit pipeline (`Emit.MinSeverity`, etc.). Reusing the same vocabulary lets operators correlate header-driven agent behavior with their existing emit / receipt streams.
+
+## Retry hints
+
+- `none` — the block is permanent for the current request. Retrying without changing the input will produce the same block. Examples: `dlp_match`, `ssrf_private_ip`, `prompt_injection`.
+- `transient` — the underlying condition is time-bound. A retry after backoff may succeed. Examples: `rate_limit`, `airlock_active`, `kill_switch_active`, `dns_rebind` (resolver may stabilize).
+- `policy` — only retry after the operator changes pipelock policy. Examples: `domain_blocklist`, `tool_policy_deny`, `data_budget`.
+- `retry-with-canonical-path` — the input as posed will not succeed because it carries a non-canonical URL path. The agent SHOULD canonicalize the request path (RFC 3986 dot-segment removal, percent-encoding normalization) and retry; no operator change is required. Today emitted only by `contract_invalid_path`.
+
+## Privacy
+
+The header is **operational metadata only**. The following must never appear in any header value:
+
+- Matched secret content. The reason `dlp_match` is fine; the matched substring is not.
+- DLP pattern names that would identify the regex (e.g. `aws_access_key_id`). Pattern fingerprints are too tight a signal because they invite probing.
+- Agent identifiers, session IDs, or any user-attributable data.
+- Internal IPs, private hostnames, or cluster-internal details.
+
+The optional `X-Pipelock-Block-Reason-Receipt` header carries an opaque receipt ID — either a 26-character Crockford-base32 ULID or a canonical 36-character hyphenated UUIDv7 (the `action_id` form the receipt subsystem emits). The blockreason package's `WithReceipt` validator enforces both fixed-length, bounded-alphabet shapes; non-conforming receipts are rejected at construction so call sites cannot smuggle arbitrary strings into the slot. The receipt itself (fetched separately via the receipt-transports endpoint) may contain richer context, but the header value is just the opaque ID.
+
+The required header values (`Reason`, `Severity`, `Retry`) are validated against fixed allowlists at construction. The `Layer` value is restricted to ASCII alphanumeric and underscore (the shape of `internal/scanner/Scanner*` constants). Any value that does not match its validator is rejected before the header reaches the wire.
+
+## Versioning
+
+The schema version sits in `X-Pipelock-Block-Reason-Version`. v1 covers everything in this document. Breaking changes — renames, removed codes, semantic shifts — increment the version. Additive changes (new codes, new optional headers) leave the version unchanged.
+
+Agents should treat unknown reason codes as a generic block at the declared severity. Agents should treat unknown versions as a generic block.
+
+### Adaptive decision details
+
+When `block_all` applies, all refusals on the transport use one fixed adaptive response. HTTP returns `403` with `escalation_level`, layer `session_deny`, the canonical severity and retry values, and a fixed body in that transport's text or JSON format. It omits detector hints and optional correlation, operator-command and receipt headers. Fetch does not echo the target URL or agent. WebSocket relay closes use `1008` and the same `escalation_level` JSON payload toward both client and upstream; client-to-server frames still use random masking keys as RFC 6455 requires. MCP returns error `-32001` with a fixed session-deny message and no detector data, preserving JSON-RPC request IDs and notification suppression. An MCP SSE stream that has already started keeps its HTTP status and carries the `-32001` error as an event. A refusal follows the session's level when the refusal is delivered to the caller. The HTTP proxies and withheld MCP replies record a finding's signal before refusing, so a finding that reaches `block_all` already gets the fixed response. Ordinary MCP responses are scored after the message writer accepts them. The HTTP listener buffers JSON replies and projects the refusal after scoring, so a threshold-crossing JSON refusal is uniform too. Stdio and SSE writers have already delivered the refusal when scoring raises the level; those threshold-crossing replies keep their detector reason. Below `block_all`, the detector's usual reason and hints remain available. The kill switch is the exception: it runs before any scanner, so it keeps `kill_switch_active`, its MCP error `-32004` and the operator's message during `block_all`.
+
+Scanners retain their existing execution order, audit events, metrics, receipts and adaptive signals. This contract covers the refusal's contents, not timing or access to operator evidence. Keep logs, receipts, metrics and stats outside an untrusted caller's reach.
+
+Outside `block_all`, an adaptive block gives the caller its enforcement category and guidance to ask the operator to inspect or reset the session. HTTP paths with a fixed block body carry that guidance in the optional `X-Pipelock-Adaptive-Detail` header. Caller-facing messages contain no adaptive score, threshold, level, or timer settings.
+
+The full explanation stays in operator diagnostics: category, enforcement-scope score, configured initial `escalation_threshold`, level, and recovery settings. HTTP audit events retain the request ID for correlation. MCP proxies write diagnostic details to stderr so stdio stdout remains a JSON-RPC stream.
+
+The diagnostic threshold is the configured initial threshold, rather than the next escalation edge. Recovery drops one level after `level_duration_seconds` without another escalation, on the next recovery check. Clean-request score decay alone does not clear a level. `clean_requests_to_deescalate: 0` disables the optional clean streak recovery path.
+
+## Transport coverage
+
+HTTP-capable block paths emit the same v1 schema; only the framing differs (HTTP headers vs WebSocket close-frame JSON). MCP JSON-RPC-only blocks preserve the same reason vocabulary in error metadata where there is no HTTP response surface.
+
+| Transport | Mechanism |
+|---|---|
+| Forward proxy (CONNECT + absolute-URI) | HTTP response headers on the 403/etc. |
+| TLS-intercept (MITM) | HTTP response headers on the synthetic block response. |
+| Fetch endpoint (`/fetch?url=...`) | HTTP response headers on the 403 JSON body. |
+| Reverse proxy (`pipelock run --reverse-listen`) | HTTP response headers on request-side blocks and on buffered response-side blocks (prompt injection, media policy, a compressed or unscannable body, a scan error, Browser Shield `browser_shield_uninspectable`). The JSON body's `block_reason` field describes the reason in prose, except the full-response policy uses the canonical `response_incomplete` code. A streaming (SSE) response block happens after the upstream headers are sent, so it carries neither the headers nor the JSON body. |
+| MCP HTTP / SSE | HTTP response headers on the 403. |
+| WebSocket | Close-frame reason payload as a JSON document carrying the same fields (see below). |
+
+### WebSocket close-frame payload
+
+WebSocket blocks happen via close frames, not response headers. The close-frame `Reason` field carries a UTF-8 JSON document with the same shape as the headers:
+
+```json
+{
+  "block_reason": "dlp_match",
+  "version": "1",
+  "severity": "critical",
+  "retry": "none",
+  "layer": "dlp",
+  "receipt": "01HZ8..."
+}
+```
+
+Adaptive closes use the same block category and request ID fields. Scores, thresholds, and timer settings remain in operator diagnostics, which the request ID locates.
+
+Per RFC 6455 the close-frame reason payload is limited to 123 bytes. A block payload also carries `request_id` when its recorded ID matches the shared shape and fits alongside `block_reason`. If the JSON exceeds the limit, fields drop in this order: `receipt`, `layer`, `retry`, `severity`, `version`, `request_id`. The reason is never dropped to make room for optional metadata. The request ID locates the full explanation in the audit log. After upgrade there are no HTTP headers; the operator can run `pipelock explain event <request_id>` using the surviving ID.
+
+MCP stdio is not covered. There is no HTTP layer to attach headers to; MCP-stdio errors flow through the JSON-RPC error envelope. Block-reason taxonomy in JSON-RPC errors is tracked separately.
+
+## Compatibility
+
+- Client-facing WebSocket closes for recorded blocks use the v1 JSON payload documented above. Clients must read `block_reason` instead of matching strings such as `kill switch active` or `injection detected`. Clients must also accept plain-text close reasons: oversized individual frames, compressed frames and invalid UTF-8 still use that format. Close status codes are unchanged: policy violations use 1008, fragment protocol errors use 1002, and oversized reassembled messages use 1009. Outside `block_all`, upstream-facing close reasons remain plain text; the audit event and receipt retain the specific diagnostic text, joined to the client payload by `request_id`.
+- Agents that ignore the header continue to work. The 403 status code and existing JSON body are unchanged.
+- Agents that read the header but don't recognize a code or severity should fall back to "generic block" handling.
+- Adding a new reason code is an additive change. Removing or renaming a code is a breaking change requiring a version bump.
+
+## Why design first
+
+Once an agent in production reads `dlp_match`, renaming the code to `secret_detected` later breaks that agent. The header is operator-facing — long-lived, hard to migrate. Locking the vocabulary before any code commits to it is the only honest path. v2.4 ships v1; v2 (if ever needed) will be a deliberate, versioned migration.

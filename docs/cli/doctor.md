@@ -1,0 +1,77 @@
+# `pipelock doctor`
+
+`pipelock doctor` reports whether configured protections are actually enforceable in the current local topology. It is a claim-audit command: it distinguishes "enabled in YAML" from "reachable by the running Pipelock process" and from "blocking enforcement."
+
+```sh
+pipelock doctor --config /etc/pipelock/pipelock.yaml
+pipelock doctor --config /etc/pipelock/pipelock.yaml --json
+pipelock doctor --config /etc/pipelock/pipelock.yaml --check-ports
+pipelock doctor --config /etc/pipelock/pipelock.yaml --startup
+```
+
+The command does not make network requests. It checks local config, file readability, selected environment variables, and deployment prerequisites that can be inferred from the current process.
+
+## What It Checks
+
+| Check | Surface | What it reports |
+|---|---|---|
+| `http_proxy` | HTTP | Whether at least one fetch, forward, WebSocket, or reverse-proxy listener is configured and whether global `enforce` is blocking. |
+| `tls_interception` | HTTP | Whether TLS interception is enabled and the configured CA certificate/key are readable. |
+| `tls_interception_coverage` | HTTP | Warns when the forward proxy is enabled without TLS interception, because CONNECT HTTPS bodies remain opaque. This warning does not depend on content-scanner settings. |
+| `request_body_scanning` | HTTP | Whether request-body scanning is enabled with blocking action. |
+| `browser_shield` | HTTP | Whether Browser Shield is enabled and whether HTTPS body visibility depends on TLS interception. |
+| `mcp_wrapper_scanning` | MCP | Which wrapper-dependent MCP features are configured and need proof that the agent launches through `pipelock mcp proxy` or a Pipelock MCP listener. |
+| `taint.mcp_recorder` | Config | Session recorder prerequisites for both HTTP and MCP; informational even when session profiling is disabled. |
+| `taint.mcp_listener` | MCP | Caller-binding limits. Anonymous current-protocol listener calls are request-local only; cross-request taint protection isn't active. A config-only report never proves a live recorder. |
+| `taint.mcp_origin`, `taint.mcp_recovery` | MCP | Subprocess stdio's undeclared-origin default (`internal_generated`), lack of inline terminal approval, and the scopes of usable taint recovery. Admin task boundaries and runtime grants are rejected for every MCP session; source trust doesn't clear hostile history. |
+| `taint.mcp_finding_kinds` | MCP | Explains wording-only, mixed and unattributed hostile causes. This config-only check has no live session history. |
+| `mcp_binary_integrity` | MCP | Whether binary integrity is enabled, has a manifest path, and the manifest is readable. |
+| `mcp_tool_provenance` | MCP | Whether tool-provenance enforcement is configured and still depends on live `tools/list` traffic through the MCP wrapper/listener path. |
+| `mcp_identities` | MCP | How many verified local services are registered under `mcp_identities`, and for each one its name, what it matches (scheme, host, path), whether it declares a session header, how many mapped files and control-environment pins it carries, and the acknowledgment binding mode it produces (`verified-local-session`). On a non-Linux host this warns, because a launch whose upstream matches a registration refuses to start where the kernel owner of the connection cannot be verified. |
+| `file_sentry` | MCP | Whether every configured file_sentry watch subtree can be traversed by the current user, without installing watches. An access and traversal preflight, so it cannot see failures that appear only when a watch is registered, such as descriptor exhaustion. Strict incomplete coverage fails, as does a configuration where no root survives `ignore_patterns`; best-effort incomplete coverage and a budget-truncated traversal warn. |
+| `config_suppress_semantics` | Config | Whether each `suppress:` entry can actually affect an enabled scanner, or is inert (unknown pattern name, response-only pattern with response scanning off, or DLP pattern with no suppress-consulting scanner enabled). |
+| `config_exemption_semantics` | Config | Whether configured exemptions are inert or carry broader trust than intended. A response-scanning host exemption can still downgrade core findings when response scanning is disabled. |
+| `config_action_divergence` | Config | Whether an independently enabled sub-detector carries an action weaker than the section enclosing it, so findings from that sub-detector resolve to the weaker value. Advisory: a weaker child is often the right operational choice, and this changes no enforcement decision. |
+| `config_semantics` | Config | A semantic config finding whose category this release does not record a check name for. It names no specific knob, so read the detail rather than assuming which setting to edit. |
+| `flight_recorder` | Config | Whether the flight recorder is enabled, has a `dir`, and that directory is readable, writable, and within its evidence file-count health limit. A missing but potentially creatable directory warns; persistence remains unverified. This check does not validate the signing key. |
+| `license_status` | Config | Whether a configured license key verifies. Expired or revoked keys fail; other verification errors warn, as do signatures that can't be verified without a public key. |
+| `available_unconfigured_knobs` | Config | Informational list of security-relevant optional settings that are available but not configured. |
+| `sentry` | Host | Whether Sentry telemetry is enabled and a DSN is present without printing the DSN value. |
+| `direct_egress_boundary` | Host | Reminder that proxy env vars are not a wall; direct egress requires `pipelock contain`, sandboxing, NetworkPolicy, firewalling, or equivalent controls. |
+| `startup_dlp_secrets_file` | Host | With `--startup`, whether `dlp.secrets_file` loads for the current user. |
+| `startup_tls_ca` | Host | With `--startup`, whether the configured TLS interception CA certificate and key parse. |
+| `port_collisions:*` | Host | With `--check-ports`, whether configured listener ports are already held by another process. On Linux, this uses `/proc/net/tcp*` plus `/proc/<pid>/fd`; run as root when cross-user process ownership hides PID details. Non-Linux hosts report the check as unavailable. |
+
+## Semantic Config Validation (Inert Exemptions)
+
+Pipelock has several exemption knobs, and the same word (`exempt_domains`, `suppress`) means different things to different scanners. An exemption that parses cleanly but no enabled scanner consults is *inert*: the block silently persists, which is worse than no exemption because it trains an operator to believe a false positive is fixed when it is not.
+
+`doctor` validates this from the loaded config and warns when a remediation cannot work:
+
+- **Unknown proxy pattern name.** A `suppress:` entry whose `rule` matches no active DLP pattern (`dlp.patterns` plus defaults) and no `response_scanning.patterns` name is inert for the proxy enforcement path. It may still match `pipelock audit` / `pipelock git` project findings if those commands emit the same rule name. **Fix:** correct the rule name to match a real proxy pattern, keep audit/git-only suppressions in the config used for those commands, or remove the entry.
+- **Suppress on a disabled response scanner.** A `suppress:` entry naming a response-scanning pattern while `response_scanning.enabled: false`. The only scanners that match that pattern are off, so the suppress is inert. **Fix:** enable `response_scanning`, or remove the entry.
+- **Suppress on a DLP pattern with no suppress-consulting DLP scanner.** A `suppress:` entry naming a DLP pattern while neither `request_body_scanning` nor `response_scanning.sse_streaming` is enabled. Plain `response_scanning.enabled` does not make DLP-pattern suppressions effective because response scanning uses `response_scanning.patterns`, a separate namespace. URL-query DLP would still match the pattern, but **URL-query DLP does not consult `suppress:`** — it only honors per-pattern `dlp.patterns[].exempt_domains`. **Fix:** to exempt a URL-query match, set `dlp.patterns[].exempt_domains` on the pattern. (`suppress:` is also consulted by the `pipelock audit` and `pipelock git` project/secret scanners, so the entry is not universally dead — this warning is scoped to the proxy enforcement path `doctor` reports on.)
+- **Exemption on a disabled scanner.** `response_scanning.exempt_domains` set while `response_scanning.enabled: false` is not inert: the immutable core response floor still runs with `enabled: false`, and a core finding on a listed host is downgraded to `warn`. Remove the entry unless you mean to relax the floor for that host. `adaptive_enforcement.exempt_domains` set while `adaptive_enforcement.enabled: false` has no such floor and is genuinely inert. **Fix:** for adaptive enforcement, enable the scanner or remove the exemption list; for response scanning, remove the entry or accept the relaxed core floor.
+
+These checks are deliberately conservative: a warning is emitted only when inertness is provable from the loaded config model. Ambiguous cases are not flagged.
+
+## Exit Codes
+
+| Exit code | Meaning |
+|---|---|
+| 0 | No failures or warnings. |
+| 1 | At least one warning. The deployment may be usable, but the report found a claim that needs proof or tightening. |
+| 2 | Config load failed or at least one check failed. |
+
+Default settings can produce warnings, so a valid default config does not necessarily exit 0. Read each warning before using `doctor` as a CI gate.
+
+## Operator Notes
+
+- Run without `sudo` when checking service-user file readability. When run as root, DAC checks reflect root's view and may make unreadable service files look reachable. The file-sentry check names the user it checked; run it as the service user before a restart.
+- `doctor` does not prove that an agent launcher has consumed `PIPELOCK_MCP_PROXY_URL` or `PIPELOCK_MCP_CONFIG`; it tells you that MCP wrapper-dependent protections require that proof.
+- `doctor` does not prove Kubernetes NetworkPolicy enforcement. Pair it with cluster smoke tests for direct-egress fail-closed behavior.
+- Use `--startup` on the host where Pipelock runs, with its mounted files present. It adds secrets-file loading and TLS CA parsing checks; it does not test every runtime prerequisite. Config-only `pipelock check` validates config shape and path permissions without parsing the configured secrets or TLS CA files. With `--url`, it also loads the configured secrets file.
+- Use `--no-color` to disable colored terminal output.
+- Use `--json` for CI gates and dashboards. The JSON report includes per-check `configured`, `reachable`, `enforcing`, `detail`, and `next` fields.
+
+The taint checks are informational and do not add warnings or affect the exit status. With session profiling disabled, neither the HTTP proxy nor MCP has a session taint recorder; enable session profiling and restart to provide one. Config guidance cannot prove listener state admission or capacity. Other doctor warnings and failures still determine the exit status.

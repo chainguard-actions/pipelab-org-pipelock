@@ -1,0 +1,119 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package envelope
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// ErrReplayCacheCapacity reports that accepting a new nonce would evict
+// still-valid replay state and make a prior request replayable.
+var ErrReplayCacheCapacity = errors.New("signature replay cache capacity exhausted; cannot safely verify nonce")
+
+// ErrReplayStateUnavailable means a clock rollback or skew change has made
+// previously pruned signatures valid again. New signatures are also refused
+// until their expiration passes the retained boundary.
+var ErrReplayStateUnavailable = errors.New("signature replay state unavailable after a clock or skew change; correct the clock and wait for signature expiry to pass the retained high-water mark")
+
+// ErrReplayCacheRequired reports missing or uninitialized nonce protection.
+var ErrReplayCacheRequired = errors.New("an initialized signature replay cache is required")
+
+// ReplayCache is a bounded, nonce-keyed in-process cache for inbound envelope
+// verification. It is safe for concurrent use.
+type ReplayCache struct {
+	*replayState
+	window time.Duration
+	max    int
+	nowFn  func() time.Time
+}
+
+type replayState struct {
+	mu           sync.Mutex
+	entries      map[string]time.Time // signed expiration, before skew
+	maxSkew      time.Duration
+	prunedExpiry time.Time
+}
+
+func NewReplayCache(window time.Duration, maxEntries int) *ReplayCache {
+	return newReplayCache(window, maxEntries, time.Now)
+}
+
+func newReplayCache(window time.Duration, maxEntries int, nowFn func() time.Time) *ReplayCache {
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	if maxEntries <= 0 {
+		maxEntries = 10000
+	}
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+	return &ReplayCache{
+		replayState: &replayState{entries: make(map[string]time.Time)},
+		window:      window,
+		max:         maxEntries,
+		nowFn:       nowFn,
+	}
+}
+
+func (c *ReplayCache) CheckAndStore(nonce string, expires time.Time) error {
+	return c.CheckAndStoreWithSkew(nonce, expires, 0)
+}
+
+func (c *ReplayCache) initialized() bool {
+	return c != nil && c.replayState != nil && c.entries != nil && c.nowFn != nil && c.window > 0 && c.max > 0
+}
+
+func (c *ReplayCache) CheckAndStoreWithSkew(nonce string, expires time.Time, skew time.Duration) error {
+	if !c.initialized() {
+		return ErrReplayCacheRequired
+	}
+	if nonce == "" {
+		return fmt.Errorf("signature nonce is required")
+	}
+	if skew < 0 {
+		skew = 0
+	}
+
+	now := c.nowFn().UTC()
+	if expires.IsZero() {
+		expires = now.Add(c.window)
+	}
+	if !expires.After(now.Add(-skew)) {
+		return fmt.Errorf("signature expired")
+	}
+	// Retain through the full accepted validity interval, including signer
+	// clock lead. Capacity exhaustion rejects new nonces instead of shortening
+	// protection for signatures that can still verify.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.maxSkew = max(c.maxSkew, skew)
+
+	for n, exp := range c.entries {
+		if !exp.Add(c.maxSkew).After(now) {
+			delete(c.entries, n)
+			if exp.After(c.prunedExpiry) {
+				c.prunedExpiry = exp
+			}
+		}
+	}
+	// A relaxed skew or a clock rollback must not revive signatures whose
+	// nonce may already have been forgotten. Retain one conservative boundary
+	// instead of an unbounded set of expired nonces.
+	if !expires.After(c.prunedExpiry) {
+		return fmt.Errorf("%w (retained expiry: %s)", ErrReplayStateUnavailable, c.prunedExpiry.UTC().Format(time.RFC3339Nano))
+	}
+	if _, ok := c.entries[nonce]; ok {
+		return fmt.Errorf("signature replay detected")
+	}
+	if len(c.entries) >= c.max {
+		return ErrReplayCacheCapacity
+	}
+
+	c.entries[nonce] = expires
+	return nil
+}

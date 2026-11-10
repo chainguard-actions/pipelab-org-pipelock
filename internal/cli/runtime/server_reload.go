@@ -1,0 +1,1414 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"reflect"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtimeconfig"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/emit"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+var errReceiptGroupKeyRotation = errors.New("receipt group signing key changed; restart required")
+
+// Reload applies a single hot-reload cycle against newCfg. Mirrors the
+// goroutine body the pre-refactor RunCmd launched from reloader.Changes():
+// gates restart-only fields, resolves runtime policy on a clone, runs
+// ValidateReload, blocks strict-mode downgrades, swaps scanner + emit
+// sinks + kill switch state, and dedups fsnotify + SIGHUP event stacking.
+//
+// Errors returned here correspond to the reload-rejected branches the
+// original code logged via logger.LogError and then `return`-ed on, plus the
+// "proxy kept the previous config" fail-safe path when proxy.Reload aborts its
+// internal swap. Silent no-ops (dedup, restart-only field changes) return nil.
+func (s *Server) Reload(newCfg *config.Config) (err error) {
+	fireReloadLockHook(false)
+	s.reloadMu.Lock()
+	fireReloadLockHook(true)
+	defer s.reloadMu.Unlock()
+	err = s.reloadLocked(newCfg)
+	s.notifyReloadStatusLocked()
+	return err
+}
+
+// reloadLocked applies a validated runtime configuration while reloadMu is
+// held by the caller. Keeping the activation body behind this seam lets
+// Conductor preserve follower-local state from the current live config under
+// the same lock, so a concurrent operator reload cannot be overwritten by a
+// stale pre-apply snapshot.
+func (s *Server) reloadLocked(newCfg *config.Config) (err error) {
+	return s.reloadLockedWithPolicyRestore(newCfg, false)
+}
+
+func (s *Server) reloadLockedWithPolicyRestore(newCfg *config.Config, restoringPriorPolicy bool) (err error) {
+	attempt := &reloadAttempt{before: s.liveConfig()}
+	if newCfg != nil {
+		attempt.sourceHash = newCfg.Hash()
+		newCfg = newCfg.Clone()
+	}
+	defer func() { s.finishReloadLocked(attempt, err) }()
+	return s.executeReloadLocked(newCfg, restoringPriorPolicy, attempt)
+}
+
+func (s *Server) executeReloadLocked(newCfg *config.Config, restoringPriorPolicy bool, attempt *reloadAttempt) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ReloadPanicHandler(r, s.sentry, s.logger, s.opts.ConfigFile)
+			err = fmt.Errorf("panic during config reload: %v", r)
+		}
+	}()
+
+	// Reload is also called directly by the Conductor apply boundary and tests,
+	// not only by the file reloader. Reject reserved, unenforced DoW limits before
+	// any restart-only preservation or license teardown can mutate runtime state.
+	// The file reloader already validates through config.Load, but this boundary
+	// must remain fail-closed for every caller.
+	if newCfg == nil {
+		return errors.New("rejected: invalid config reload: config is nil")
+	}
+	// Candidate normalization and lapse must never mutate an active or caller-
+	// owned config, including when the candidate is rejected later.
+	newCfg = newCfg.Clone()
+	if credentialErr := newCfg.ResolveRuntimeCredentials(); credentialErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", credentialErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if _, validationErr := newCfg.DestinationGrantSet(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if validationErr := newCfg.ValidateExpiryAuthorizations(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if _, validationErr := newCfg.LapseExpiredScannerExceptions(time.Now()); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if validationErr := newCfg.ValidateReservedDoWLimits(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if validationErr := newCfg.ValidateSuppressions(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	// Host patterns get the same treatment, for the same reason: the file
+	// reloader validates through config.Load, but the Conductor apply boundary
+	// enters here directly and this seam must stay fail-closed for every
+	// caller. A pattern that reaches the live scanner unvalidated can match a
+	// host the operator never wrote.
+	if validationErr := newCfg.ValidateHostPatterns(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: invalid host pattern: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	// Startup refuses block on this listener, so a reload that asks for it is
+	// requesting enforcement this runtime cannot provide. Reject the whole
+	// reload atomically and record it through the reload audit path; applying
+	// the rest while quietly keeping the old file sentry settings would report a
+	// policy rollout as successful when its enforcement never arrived.
+	if fileSentryErr := validateServerFileSentry(newCfg); fileSentryErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", fileSentryErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if s.containmentManaged {
+		if containmentErr := validateContainmentMetricsConfig(newCfg); containmentErr != nil {
+			s.containmentMetricsDenied.Store(true)
+			s.reportContainmentMetricsDrift(newCfg, "reload", containmentErr)
+			return fmt.Errorf("rejected: invalid containment metrics configuration: %w", containmentErr)
+		}
+	}
+
+	oldCfg := s.proxy.CurrentConfig()
+	if s.receiptShardSet != nil && oldCfg != nil && oldCfg.FlightRecorder.SigningKeyPath != "" &&
+		oldCfg.FlightRecorder.SigningKeyPath == newCfg.FlightRecorder.SigningKeyPath {
+		key, keyErr := signing.LoadPrivateKeyFile(oldCfg.FlightRecorder.SigningKeyPath)
+		if keyErr == nil && fmt.Sprintf("%x", key.Public()) != s.receiptShardSet.ProcessEmitter().SignerKeyHex() {
+			// Teardown drains listeners before sealing all old-key shards and
+			// publishing their close. The next process opens the successor.
+			s.receiptRotationRequested.Store(true)
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: flight_recorder signing key changed with receipt_chains=%d; closing the old-key group and restarting\n", oldCfg.FlightRecorder.ReceiptChainCount())
+			_ = s.Shutdown(context.Background())
+			return errReceiptGroupKeyRotation
+		}
+	}
+	loopbackServicesChanged := false
+	publishedServicesChanged := false
+	agentEntitlementLost := false
+	flightRecorderAnchorChanged := oldCfg != nil && !reflect.DeepEqual(oldCfg.FlightRecorder.Anchor, newCfg.FlightRecorder.Anchor)
+	if oldCfg != nil {
+		// Block fetch_proxy.listen changes via reload. The listener binds at
+		// startup and cannot rebind at runtime; preserve the live address so the
+		// config object does not drift from the actual socket.
+		if oldCfg.FetchProxy.Listen != newCfg.FetchProxy.Listen {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: fetch_proxy.listen changed from %q to %q - requires restart, ignoring\n",
+				oldCfg.FetchProxy.Listen, newCfg.FetchProxy.Listen)
+			attempt.restart = append(attempt.restart, "fetch_proxy.listen")
+			newCfg.FetchProxy.Listen = oldCfg.FetchProxy.Listen
+		}
+		// Block enabling forward proxy via reload. WriteTimeout is set
+		// at server start and cannot change at runtime; tunnels would
+		// be killed prematurely. Restart to enable.
+		if !oldCfg.ForwardProxy.Enabled && newCfg.ForwardProxy.Enabled {
+			rejectErr := fmt.Errorf("rejected: forward proxy cannot be enabled via reload (requires restart)")
+			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+			return rejectErr
+		}
+		// Block enabling WebSocket proxy via reload for the same
+		// reason: WriteTimeout must be 0 at server start.
+		if !oldCfg.WebSocketProxy.Enabled && newCfg.WebSocketProxy.Enabled {
+			rejectErr := fmt.Errorf("rejected: WebSocket proxy cannot be enabled via reload (requires restart)")
+			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+			return rejectErr
+		}
+		// Block api_listen changes via reload. The API server binds at
+		// startup and can't rebind at runtime.
+		if oldCfg.KillSwitch.APIListen != newCfg.KillSwitch.APIListen {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: kill_switch.api_listen changed from %q to %q — requires restart, ignoring\n",
+				oldCfg.KillSwitch.APIListen, newCfg.KillSwitch.APIListen)
+			attempt.restart = append(attempt.restart, "kill_switch.api_listen")
+			newCfg.KillSwitch.APIListen = oldCfg.KillSwitch.APIListen
+		}
+		// The authenticated handler and its routes are built only at startup.
+		// A first token cannot make that absent control plane live on reload.
+		if s.proxy.SessionAPI() == nil && newCfg.EffectiveKillSwitchAPIToken() != "" {
+			attempt.restart = append(attempt.restart, "kill_switch.api_token")
+		}
+		// Block metrics_listen changes via reload. The metrics server
+		// binds at startup and can't rebind at runtime.
+		if oldCfg.MetricsListen != newCfg.MetricsListen {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: metrics_listen changed from %q to %q — requires restart, ignoring\n",
+				oldCfg.MetricsListen, newCfg.MetricsListen)
+			attempt.restart = append(attempt.restart, "metrics_listen")
+			newCfg.MetricsListen = oldCfg.MetricsListen
+			if s.containmentManaged {
+				newCfg.Containment.MetricsExposure = oldCfg.Containment.MetricsExposure
+			}
+		}
+		// Display provisioning owns a systemd unit and Unix sockets. A config
+		// reload cannot switch those resources; contain install does that.
+		if !reflect.DeepEqual(oldCfg.Containment.Display, newCfg.Containment.Display) {
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: containment.display changed — run `pipelock contain install`; ignoring until install")
+			attempt.restart = append(attempt.restart, "containment.display")
+			newCfg.Containment.Display = oldCfg.Containment.Display
+		}
+		// Config reload only swaps the in-memory Config.Containment.LoopbackServices
+		// value; it never touches the kernel nftables state. The declared set
+		// only reaches the agent's actual egress boundary through
+		// `pipelock contain reload-nft-rules` (the same command the boot-time
+		// containment persistence unit runs on every boot), which re-renders
+		// the managed block from the managed config. Warn once per reload so an
+		// operator who edits loopback_services and reloads Pipelock, but never
+		// runs reconciliation, is told the change has not taken effect yet --
+		// do not reject the reload over it, since the config value itself is
+		// valid and the drift is only between config and kernel state.
+		// Only NOTE it here. The warning itself is emitted after the config is
+		// published, because several checks below this point can still reject
+		// the candidate: telling an operator that the reload updated policy,
+		// and then refusing the reload, describes something that did not
+		// happen and points them at a reconciliation command with nothing to
+		// reconcile.
+		loopbackServicesChanged = s.containmentManaged &&
+			!reflect.DeepEqual(oldCfg.Containment.LoopbackServices, newCfg.Containment.LoopbackServices)
+		// Published services are reconciled by the same command and are
+		// equally untouched by a config reload.
+		publishedServicesChanged = s.containmentManaged &&
+			!reflect.DeepEqual(oldCfg.Containment.PublishedServices, newCfg.Containment.PublishedServices)
+		// The daemon has no acknowledgement from external firewall
+		// reconciliation. A repeated candidate cannot erase that uncertainty.
+		if loopbackServicesChanged || slices.Contains(s.reloadOutcome.RestartRequiredFields, "containment.loopback_services") {
+			attempt.restart = append(attempt.restart, "containment.loopback_services")
+		}
+		if publishedServicesChanged || slices.Contains(s.reloadOutcome.RestartRequiredFields, "containment.published_services") {
+			attempt.restart = append(attempt.restart, "containment.published_services")
+		}
+		// Emit sinks own live workers, queues, network connections and, for the
+		// durable forwarder, exclusive spool/cursor locks. Replacing them after
+		// the proxy publishes a candidate can make Reload return an error after
+		// the candidate policy and kill-switch state are already live. Replacing
+		// them before publication is not generally safe either: a same-state
+		// forwarder must close the old worker before the replacement can acquire
+		// its lock. Keep the whole coupled block restart-only so a successful
+		// reload has one honest effective configuration and the live audit path
+		// is never torn down by a candidate that may fail.
+		if !reflect.DeepEqual(oldCfg.Emit, newCfg.Emit) {
+			attemptedHash := newCfg.Emit.Fingerprint()
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: emit settings changed — live sink workers require restart, ignoring")
+			s.logger.LogConfigReload("ignored", "emit settings restart-only", attemptedHash)
+			attempt.restart = append(attempt.restart, "emit")
+			newCfg.Emit = oldCfg.Emit
+		}
+		// Block scan_api listener setting changes via reload. The Scan
+		// API server binds at startup and cannot rebind or reconfigure
+		// connection limits / deadlines at runtime.
+		if oldCfg.ScanAPI.Listen != newCfg.ScanAPI.Listen ||
+			oldCfg.ScanAPI.ConnectionLimit != newCfg.ScanAPI.ConnectionLimit ||
+			oldCfg.ScanAPI.Timeouts.Read != newCfg.ScanAPI.Timeouts.Read ||
+			oldCfg.ScanAPI.Timeouts.Write != newCfg.ScanAPI.Timeouts.Write {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: scan_api listener settings changed — requires restart, ignoring\n")
+			attempt.restart = append(attempt.restart, "scan_api")
+			newCfg.ScanAPI.Listen = oldCfg.ScanAPI.Listen
+			newCfg.ScanAPI.ConnectionLimit = oldCfg.ScanAPI.ConnectionLimit
+			newCfg.ScanAPI.Timeouts = oldCfg.ScanAPI.Timeouts
+		}
+		if conductorRuntimeChanged(oldCfg, newCfg) {
+			attemptedHash := newCfg.Hash()
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: conductor settings changed — requires restart, ignoring\n")
+			// Surface to the audit channel as well as stderr. Conductor
+			// settings sit on the trust boundary with Boss: silently
+			// preserving them on reload is the right choice, but an
+			// operator (or attacker with config write) attempting the
+			// change should leave a record an SOC tool can find.
+			s.logger.LogConfigReload("ignored", "conductor settings restart-only", attemptedHash)
+			attempt.restart = append(attempt.restart, "conductor")
+			newCfg.Conductor = oldCfg.Conductor
+		}
+		// The contract loader owns the roster root, active-store watcher, and
+		// enforcement mode. Proxy.Reload would otherwise rebuild and publish a
+		// loader from this new block, allowing a config reload to replace the
+		// root of trust after the gate has already enforced a contract. Keep the
+		// full block atomic and restart-only: its values are coupled loader inputs,
+		// not independently reloadable tuning knobs.
+		if oldCfg.LearnLock != newCfg.LearnLock {
+			attemptedHash := newCfg.Hash()
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: learn_lock settings changed — contract loader trust and watcher require restart, ignoring")
+			s.logger.LogConfigReload("ignored", "learn_lock settings restart-only", attemptedHash)
+			attempt.restart = append(attempt.restart, "learn_lock")
+			newCfg.LearnLock = oldCfg.LearnLock
+		}
+		if oldCfg.EvidenceProvenance != newCfg.EvidenceProvenance {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: evidence_provenance.commitment_keyring_path changed — keyring is loaded at startup, ignoring (restart required)\n")
+			attempt.restart = append(attempt.restart, "evidence_provenance")
+			newCfg.EvidenceProvenance = oldCfg.EvidenceProvenance
+		}
+		// Block recorder-binding changes via reload. The recorder (and its
+		// receipt/audit chain) is built once at Start; reload swaps config and
+		// scanner but never rebuilds the recorder, so path/key/retention/etc.
+		// changes would leave the live config disagreeing with the running
+		// recorder. require_receipts is the exception: it changes only whether
+		// an emit failure escalates an otherwise-allowed request to a block, so
+		// it is safe and intentionally reloadable. Containment evidence is read
+		// while the emitter starts, so its requirement remains restart-only.
+		//
+		// This also keeps Conductor policy-bundle apply working: a signed bundle
+		// carries enforcement-only config (flight_recorder is not an allowlisted
+		// bundle section), so the bundle's loaded config omits flight_recorder.
+		// Preserving the follower's existing block means conductor.enabled - which
+		// requires a signed flight recorder - still validates after the apply.
+		oldFR := oldCfg.FlightRecorder
+		newFR := newCfg.FlightRecorder
+		oldFR.RequireReceipts = newFR.RequireReceipts
+		oldFR.EvidenceHealth.SelfAuditInterval = newFR.EvidenceHealth.SelfAuditInterval
+		oldFR.EvidenceHealth.MaxAnchorLag = newFR.EvidenceHealth.MaxAnchorLag
+		oldFR.Anchor = newFR.Anchor
+		if !reflect.DeepEqual(oldFR, newFR) {
+			if oldCfg.FlightRecorder.ReceiptChainCount() != newCfg.FlightRecorder.ReceiptChainCount() {
+				liveChains := oldCfg.FlightRecorder.ReceiptChainCount()
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.receipt_chains changed; restart required; continuing with %d\n", liveChains)
+			} else if oldCfg.FlightRecorder.RequireContainmentEvidence != newCfg.FlightRecorder.RequireContainmentEvidence {
+				_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_containment_evidence changed, but posture evidence is checked when signed receipts start. Ignoring the change until restart.")
+			} else if oldCfg.FlightRecorder.SigningKeyPath != newCfg.FlightRecorder.SigningKeyPath {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.signing_key_path changed from %q to %q — receipt chain cannot rotate at runtime, ignoring (restart required)\n",
+					oldCfg.FlightRecorder.SigningKeyPath, newCfg.FlightRecorder.SigningKeyPath)
+			} else if !boolPtrEqual(oldCfg.FlightRecorder.EvidenceHealth.Enabled, newCfg.FlightRecorder.EvidenceHealth.Enabled) {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.evidence_health.enabled changed — evidence health loop is built at startup and cannot rebind at runtime, ignoring (restart required)\n")
+			} else {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder settings changed — recorder is built at startup and cannot rebind at runtime, ignoring (restart required)\n")
+			}
+			requireReceipts := newCfg.FlightRecorder.RequireReceipts
+			evidenceHealth := newCfg.FlightRecorder.EvidenceHealth
+			anchorCfg := newCfg.FlightRecorder.Anchor
+			attempt.restart = append(attempt.restart, "flight_recorder")
+			newCfg.FlightRecorder = oldCfg.FlightRecorder
+			newCfg.FlightRecorder.RequireReceipts = requireReceipts
+			newCfg.FlightRecorder.EvidenceHealth.SelfAuditInterval = evidenceHealth.SelfAuditInterval
+			newCfg.FlightRecorder.EvidenceHealth.MaxAnchorLag = evidenceHealth.MaxAnchorLag
+			newCfg.FlightRecorder.Anchor = anchorCfg
+		}
+		// require_receipts reloads freely, but it only has an emitter to gate on
+		// when a recorder was built at Start (the recorder is restart-only).
+		// Enabling it without one fails EVERY request closed with
+		// receipt_emission_failed - a total egress black-hole from a config
+		// edit. NewServer already refuses to start in exactly that state
+		// (server.go, "instead of as an all-403 outage at runtime"); honouring
+		// it on reload produced the outage startup exists to prevent, so the
+		// enable is ignored here and joins its restart-only recorder siblings.
+		//
+		// This is not a downgrade. No emitter means no receipt is written
+		// either way, so the alternative is not "receipts enforced" but "no
+		// traffic at all"; the reachable outcomes are unreceipted traffic or
+		// none. Restarting with a configured recorder is what actually grants
+		// the operator's intent, and the startup guard then enforces it hard.
+		//
+		// Scoped to the ENABLE transition when no restart-time recorder backing
+		// exists. If the recorder and key are already bound but the current
+		// emitter is absent or unhealthy, proxy.Reload stages a replacement
+		// emitter before publishing the config. Let that recovery run: it either
+		// installs a healthy emitter and applies the enable atomically or rejects
+		// the reload while the old posture remains live.
+		if newCfg.FlightRecorder.RequireReceipts && !s.liveReceiptEmitterReady() {
+			if oldCfg.FlightRecorder.RequireReceipts {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_receipts is enabled but the current signed receipt emitter is unhealthy — the reload will attempt to rebuild it and will be rejected if recovery fails; the required posture remains fail-closed.\n")
+			} else if s.recorder == nil || strings.TrimSpace(newCfg.FlightRecorder.SigningKeyPath) == "" {
+				attemptedHash := newCfg.Hash()
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_receipts cannot be enabled at runtime without a healthy live signed receipt emitter — the recorder is built at startup, so every request would fail closed with receipt_emission_failed. Ignoring (restart required). Configure flight_recorder.dir + signing_key_path, fix any receipt-chain resume error, and restart.\n")
+				// Surface to the audit channel as well as stderr: an operator
+				// who asked for receipt enforcement and did not get it must be
+				// able to see that from a monitoring tool, not only from a
+				// process's stderr.
+				s.logger.LogConfigReload("ignored", "require_receipts enable without live receipt emitter restart-only", attemptedHash)
+				attempt.restart = append(attempt.restart, "flight_recorder.require_receipts")
+				newCfg.FlightRecorder.RequireReceipts = oldCfg.FlightRecorder.RequireReceipts
+			}
+		}
+		// Block file_sentry changes via reload. The watcher is built
+		// once at Start from the startup snapshot; reloading would
+		// leave the old watcher armed on stale paths while the live
+		// config reported the new ones. Restart to apply.
+		if !reflect.DeepEqual(oldCfg.FileSentry, newCfg.FileSentry) {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: file_sentry settings changed — watcher cannot rebind at runtime, ignoring (restart required)\n")
+			attempt.restart = append(attempt.restart, "file_sentry")
+			newCfg.FileSentry = oldCfg.FileSentry
+		}
+		if !reflect.DeepEqual(oldCfg.DashboardSnapshot, newCfg.DashboardSnapshot) {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: dashboard_snapshot settings changed — writer is built at startup and cannot rebind at runtime, ignoring (restart required)\n")
+			attempt.restart = append(attempt.restart, "dashboard_snapshot")
+			newCfg.DashboardSnapshot = oldCfg.DashboardSnapshot
+		}
+		// These blocks are startup-only, so a changed value is pending restart,
+		// not an activation. Preserve the running value so the drift is
+		// recomputed on every reload; preserving before ValidateReload means this
+		// branch owns the operator warning, like its siblings above.
+		if !reflect.DeepEqual(oldCfg.HealthWatchdog, newCfg.HealthWatchdog) {
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: health_watchdog config changes require restart — ignored on reload")
+			attempt.restart = append(attempt.restart, "health_watchdog")
+			newCfg.HealthWatchdog = oldCfg.HealthWatchdog
+		}
+		if !reflect.DeepEqual(oldCfg.Sandbox, newCfg.Sandbox) {
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: sandbox config changes require restart — ignored on reload")
+			attempt.restart = append(attempt.restart, "sandbox")
+			newCfg.Sandbox = oldCfg.Sandbox
+		}
+		if oldCfg.Sentry.DSN != newCfg.Sentry.DSN {
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: sentry.dsn changes require restart — ignored on reload")
+			attempt.restart = append(attempt.restart, "sentry.dsn")
+			newCfg.Sentry.DSN = oldCfg.Sentry.DSN
+		}
+
+		if !reflect.DeepEqual(oldCfg.Sentry, newCfg.Sentry) {
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: sentry settings require restart; preserving the startup client settings")
+			attempt.restart = append(attempt.restart, "sentry")
+			newCfg.Sentry = oldCfg.Sentry
+		}
+
+		// Dedupe identical-hash reload EVENTS within a short window.
+		// fsnotify + SIGHUP stack up so a single `echo cfg > path;
+		// kill -HUP` sequence triggers two reload Changes() events in
+		// quick succession; the second is pure noise. Switch to a
+		// time-windowed dedup keyed on the LAST EMITTED reload event:
+		// the first of a stacked pair still logs, any event with the
+		// same hash inside 2s skips silently.
+		// Compensation and uncertain applies must execute: a failed restoration
+		// may publish another config without updating the last-success marker.
+		// Hash() identifies source-file bytes, not the effective in-memory
+		// candidate. Direct reload callers can change policy while retaining
+		// the same raw bytes, so only deduplicate an identical candidate.
+		if !restoringPriorPolicy && (s.killswitch == nil || !s.killswitch.ConductorApplyFailure()) && s.shouldSkipReload(newCfg.Hash()) && !flightRecorderAnchorChanged && oldCfg.Hash() == newCfg.Hash() && sameRuntimeConfig(oldCfg, newCfg) {
+			return nil
+		}
+
+		// Block ALL reverse proxy changes via reload. The listener binds at
+		// startup, the upstream is pinned in the handler, and the submit-profile
+		// SSRF-safe dialer is installed on the transport at init - none of these
+		// rebind at runtime. A field-by-field check missed profile, allowed
+		// methods/paths, trusted_upstream, body cap, and timeout; flipping
+		// profile on reload would activate the submit gate while the dial path
+		// stayed startup-frozen (a real security weakening). Compare the whole
+		// struct so any change is preserved until restart, matching the
+		// restart-required warning in reloadwarn.go.
+		if !reflect.DeepEqual(oldCfg.ReverseProxy, newCfg.ReverseProxy) {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: reverse_proxy settings changed — requires restart, ignoring\n")
+			attempt.restart = append(attempt.restart, "reverse_proxy")
+			newCfg.ReverseProxy = oldCfg.ReverseProxy
+		}
+		// Block agent listener changes via reload. Listener sockets
+		// are bound at startup and cannot be rebound at runtime. Warn
+		// and preserve old listener config.
+		//
+		// Respect the license gate: if EnforceLicenseGate disabled
+		// agents on reload, do not re-add them via listener
+		// preservation.
+		// EnforceLicenseGate strips named agents but intentionally preserves
+		// _default. Detect loss of non-default profiles instead of a nil agents
+		// map so reload cannot re-add stripped named agents when _default remains.
+		agentsRevokedByLicense := hasNamedAgentProfiles(oldCfg.Agents) && !hasNamedAgentProfiles(newCfg.Agents)
+		licenseInputsChanged := !config.SameLicenseInputs(oldCfg, newCfg)
+
+		// Re-verify the NEW license inputs ONCE and classify the result so both
+		// paid surfaces — agent listeners and the Conductor follower — make the
+		// SAME decision. License inputs are restart-only: a reload never
+		// activates a new license. So an UNVERIFIABLE new input (unreadable or
+		// malformed CRL, intermediate, public key, or token) leaves the effective
+		// entitlement intact and must NOT tear down a running surface — that would
+		// be a denial-of-service on an operator typo, not fail-closed security.
+		// Only PROVEN loss (revoked, expired, or a cleanly-verified token that no
+		// longer carries the feature) tears a surface down. Genuine runtime
+		// revocation/expiry of the ACTIVE license is still enforced independently
+		// by the CRL watcher and the expiry timer, against the effective license
+		// state. EnforceLicenseGate (run during Load) stays strictly fail-closed
+		// because at startup there is no prior entitlement to preserve; this
+		// reload-only precision is the only place an old-vs-new baseline exists.
+		reloadLicenseChecked := agentsRevokedByLicense || licenseInputsChanged
+		var (
+			reloadLic   license.License
+			reloadClass = license.ReloadVerified
+		)
+		if reloadLicenseChecked {
+			reloadLic, reloadClass = license.ClassifyReloadWithOptions(license.FleetVerifyInputs{
+				LicenseKey:       newCfg.LicenseKey,
+				PublicKeyHex:     newCfg.LicensePublicKey,
+				CRLFile:          newCfg.LicenseCRLFile,
+				IntermediateFile: newCfg.LicenseIntermediateFile,
+				IntermediateCert: newCfg.LicenseIntermediateCert,
+				RequireSet:       true,
+				Require:          newCfg.LicenseRequireIntermediateResolved,
+				MaxAge:           newCfg.LicenseCRLMaxAgeResolved,
+			})
+		}
+		conductorFleetLost := oldCfg.Conductor.Enabled && reloadLicenseChecked &&
+			reloadClass.ProvesLoss(reloadLic, license.FeatureFleet)
+
+		switch {
+		case agentsRevokedByLicense && reloadClass.ProvesLoss(reloadLic, license.FeatureAgents):
+			agentEntitlementLost = true
+			// License gate disabled agents on reload and the loss is PROVEN
+			// (revoked / expired / downgraded). Shut down already-bound listener
+			// servers so the agent ports stop accepting traffic.
+			s.shutdownAgentServers()
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: license revoked agents, shutting down agent listeners\n")
+		case agentsRevokedByLicense || licenseInputsChanged:
+			// Either the new license inputs are UNVERIFIABLE (agents were stripped
+			// at Load but the effective entitlement is unchanged — a fat-fingered
+			// path must not DoS a licensed surface) or the inputs simply changed.
+			// Both are restart-only: preserve ALL old license state and the old
+			// agents so a reload can neither activate nor deactivate licensed
+			// features without a restart. Preserving the input fields themselves is
+			// mandatory; otherwise the new values commit to the live config and a
+			// later unrelated reload sees no diff and silently applies the staged
+			// license.
+			attempt.restart = append(attempt.restart, "license")
+			preserveLicenseInputsRestartOnly(newCfg, oldCfg)
+			if agentsRevokedByLicense {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: new license inputs could not be verified (unreadable/malformed CRL, intermediate, or token); effective license unchanged, preserving licensed surfaces — requires restart for license re-verification\n")
+			} else {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: license key inputs changed (license_key, license_file, license_crl_file, license_intermediate_file, or license_public_key) - requires restart for license re-verification\n")
+			}
+		case AgentListenersChanged(oldCfg, newCfg):
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: agents[*].listeners changed — requires restart, ignoring listener changes\n")
+			attempt.restart = append(attempt.restart, "agents.listeners")
+			PreserveAgentListeners(oldCfg, newCfg)
+		}
+
+		if conductorFleetLost {
+			// New license inputs PROVE the fleet entitlement is gone: stop the
+			// running Conductor follower fail-closed. Detection keeps running;
+			// Conductor stays down until restart.
+			s.teardownConductor("reload revoked fleet entitlement")
+		} else if oldCfg.Conductor.Enabled && reloadLicenseChecked && reloadClass == license.ReloadUnverifiable {
+			// Conductor stays up: unverifiable new inputs cannot PROVE the fleet
+			// entitlement was lost, so tearing the follower down here would be a
+			// DoS on an operator typo. Warn for SOC visibility — the conductor
+			// analogue of the agents preserve path above.
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: new license inputs could not be verified; Conductor fleet entitlement unchanged, follower stays running — requires restart for license re-verification\n")
+		}
+		// Carry forward runtime-derived license warning metadata. These claims
+		// are set after token verification at startup, not parsed from YAML.
+		// Always preserve the old values until restart.
+		newCfg.LicenseExpiresAt = oldCfg.LicenseExpiresAt
+		newCfg.LicenseIssuedAt = oldCfg.LicenseIssuedAt
+		newCfg.LicenseTier = oldCfg.LicenseTier
+		newCfg.LicenseID = oldCfg.LicenseID
+		newCfg.LicenseCRLExpiresAt = oldCfg.LicenseCRLExpiresAt
+		newCfg.LicenseCRLSHA256 = oldCfg.LicenseCRLSHA256
+		newCfg.LicenseRevoked = oldCfg.LicenseRevoked
+		newCfg.LicenseRevocationReason = oldCfg.LicenseRevocationReason
+		newCfg.LicenseAgentsFeature = oldCfg.LicenseAgentsFeature
+		if !hasNamedAgentProfiles(newCfg.Agents) {
+			newCfg.LicenseAgentsFeature = false
+		}
+	}
+
+	// A declared loopback service authorizes an extra hole in the agent's
+	// egress boundary, so a candidate whose declaration does not validate
+	// must not become the live policy. The file reloader validates through
+	// config.Load; a caller handing Reload an in-memory config does not, and
+	// the whole-config re-validation just below only collects warnings.
+	//
+	// This runs HERE, after the restart-only fields are preserved, rather
+	// than with the fail-closed checks at the top of this function. The
+	// declaration is validated against the proxy port, which is read from
+	// fetch_proxy.listen, and a reload cannot rebind the listener: the
+	// candidate's value is discarded and the live address restored above.
+	// Validating before that restore checks the declaration against a port
+	// the process will never listen on, so a service colliding with the
+	// ACTUAL proxy port passes and is published.
+	//
+	// An expired entry is a lapsed grant, not a malformed one: it is dropped
+	// from the candidate's effective set (never exposed or rendered) and
+	// reported after publication, while every other defect still rejects.
+	if _, validationErr := newCfg.LapseExpiredContainmentGrants(time.Now()); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+
+	// Surface advisory warnings on reload the same way NewServer does at
+	// startup. The Reloader discards warnings from Load()'s internal
+	// Validate() call, so re-run the idempotent validator after deduping
+	// stacked reload events and after preserving restart-only fields.
+	if reloadWarns, _ := newCfg.ValidateWithWarnings(); len(reloadWarns) > 0 {
+		for _, wn := range reloadWarns {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: %s: %s\n", wn.Field, wn.Message)
+		}
+	}
+
+	// Resolve runtime policy on a clone of the newly loaded config so
+	// the reloaded cfg stored in the proxy reflects the same
+	// bundle-merge + auto-enable pipeline startup uses and its
+	// canonical hash is computed fresh. The live runtime mode tracks
+	// the startup flags: reload cannot toggle MCP listener or forward
+	// proxy enablement (both gated above).
+	var reloadBundleResult *rules.LoadResult
+	newCfg, resolveInfo := runtimeconfig.ResolveAndReportConfig(newCfg, config.RuntimeResolveOpts{
+		Mode: s.runtimeMode,
+		MergeBundles: func(c *config.Config) {
+			reloadBundleResult = rules.MergeIntoConfig(c, cliutil.Version)
+		},
+		DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
+	}, nil, reloadRuntimeModeLabel(s.runtimeMode))
+	runtimeconfig.EmitResolveInfoLogs(s.opts.Stderr, resolveInfo, reloadRuntimeModeLabel(s.runtimeMode))
+	reportReloadRuleBundleResult(s.opts.Stderr, s.logger, newCfg, reloadBundleResult)
+	if oldCfg != nil {
+		// Compare resolved-vs-resolved configs so bundle merges and
+		// MCP listener auto-enable do not look like policy downgrades
+		// during hot reload.
+		if reasons := implausibleReloadTeardownReasons(oldCfg, newCfg); len(reasons) > 0 && !restoringPriorPolicy {
+			rejectErr := fmt.Errorf("rejected: implausibly empty config reload would weaken security posture: %s", strings.Join(reasons, ", "))
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v\n", rejectErr)
+			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+			return rejectErr
+		}
+		cleanDrops := cleanDropsWithoutBundleErrors(
+			cleanBundleCoverageDrops(oldCfg, newCfg, s.currentMCPToolExtraPoison(), reloadBundleResult.ToolPoison),
+			reloadBundleResult,
+		)
+		if len(cleanDrops) > 0 {
+			for _, drop := range cleanDrops {
+				outcome := ruleBundleOutcomeDegraded
+				severity := config.SeverityWarn
+				if strictRuleBundleDegradationDisallowed(oldCfg, newCfg) && !restoringPriorPolicy {
+					outcome = ruleBundleOutcomeRejected
+					severity = config.SeverityCritical
+				}
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: rule bundle %s cleanly removed %d live pattern(s) (%s)\n",
+					drop.Name, drop.Total(), drop.Reason())
+				s.logger.LogRuleBundleDegraded(audit.RuleBundleDegradedEvent{
+					Bundle:          drop.Name,
+					FailureClass:    "coverage_drop",
+					Reason:          drop.Reason(),
+					Phase:           ruleBundlePhaseReload,
+					Outcome:         outcome,
+					Severity:        severity,
+					AllowDegraded:   newCfg.Rules.AllowDegraded,
+					DroppedPatterns: drop.Total(),
+				})
+			}
+			if strictRuleBundleDegradationDisallowed(oldCfg, newCfg) && !restoringPriorPolicy {
+				rejectErr := fmt.Errorf("rejected: strict mode rule bundle coverage drop: %s", bundleCoverageDropSummary(cleanDrops))
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v\n", rejectErr)
+				s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+				return rejectErr
+			}
+			if newCfg.Rules.AllowDegraded {
+				_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: rules.allow_degraded=true; accepting degraded rule-bundle coverage after explicit operator opt-in")
+			}
+		}
+		warnings := config.ValidateReload(oldCfg, newCfg)
+		if newCfg.Rules.AllowDegraded && len(cleanDrops) > 0 {
+			warnings = filterAllowedRuleBundleCoverageWarnings(oldCfg, newCfg, warnings)
+		}
+		for _, w := range warnings {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: %s - %s\n", w.Field, w.Message)
+		}
+		// Block downgrades from strict mode and from explicit "required"
+		// security contracts. A required evidence/signature mode should not
+		// keep forwarding under a warning-only weakening reload.
+		if reason := reloadDowngradeRejectReason(oldCfg, newCfg, warnings); reason != "" && !restoringPriorPolicy {
+			// The returned error keeps this exact prefix: other code, tests, and
+			// docs match on "rejected: security downgrade from".
+			rejectErr := fmt.Errorf("rejected: security downgrade from %s", reason)
+			// "reason" names the CONTRACT that is in force (e.g. "required
+			// security mode (flight_recorder.require_receipts)"), which is not
+			// always the field the operator just edited. That field is only
+			// discoverable by re-deriving it from the reload warnings. Name it
+			// explicitly so the operator does not read a receipts-contract
+			// rejection as "something about receipts broke" when the actual
+			// edit was an entropy exclusion. The restart remedy holds because
+			// this downgrade comparison runs only on reload (oldCfg non-nil); a
+			// fresh start still validates the file but has no old config to
+			// compare it against, so this particular refusal cannot recur.
+			detail := rejectedDowngradeReloadDetail(oldCfg, newCfg, warnings)
+			auditErr := rejectErr
+			if detail != "" {
+				auditErr = fmt.Errorf("%w: %s", rejectErr, detail)
+			}
+			switch {
+			case len(trustExpansionReloadFields(warnings)) > 0 && len(requiredModeTeardowns(oldCfg, newCfg)) == 0:
+				// Preserve the existing operator-facing wording for this case:
+				// it already leads with the field and the exact reason it is
+				// rejectable, so it does not repeat the generic prefix. A torn-
+				// down contract lives only in rejectErr, so that case falls
+				// through and prints both causes.
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %s; previous configuration remains active; restart Pipelock to apply this change\n", detail)
+			case detail != "":
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v: %s; previous configuration remains active; restart Pipelock to apply this change\n", rejectErr, detail)
+			default:
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v; previous configuration remains active; restart Pipelock to apply this change\n", rejectErr)
+			}
+			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), auditErr)
+			return auditErr
+		}
+		// Bundle load failures are warning-only at startup because there is no
+		// previous live bundle coverage to preserve. At reload there is: a fresh
+		// config that fails bundle resolution must not activate if it would drop
+		// currently-live bundle rules. This gate is mode-independent so balanced
+		// and audit deployments fail closed for the real weakening without
+		// rejecting unrelated bundle errors that do not remove live coverage.
+		if reason := bundleResolutionRejectReason(oldCfg, newCfg, reloadBundleResult, s.currentMCPToolExtraPoison()); reason != "" {
+			rejectErr := fmt.Errorf("rejected: bundle resolution error would drop live detection rules: %s", reason)
+			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v\n", rejectErr)
+			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+			return rejectErr
+		}
+		if len(cleanDrops) > 0 {
+			applyDegradedRuleBundleState(newCfg, appendBundleDropNames(reloadBundleResult.DegradedBundleNames(), cleanDrops))
+		} else {
+			applyDegradedRuleBundleState(newCfg, reloadBundleResult.DegradedBundleNames())
+		}
+	}
+	if oldCfg == nil {
+		applyDegradedRuleBundleState(newCfg, reloadBundleResult.DegradedBundleNames())
+	}
+	newSc, err := s.constructScanner(newCfg)
+	if err != nil {
+		rejectErr := fmt.Errorf("rejected: scanner construction failed: %w", err)
+		_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v\n", rejectErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	wirePromptInjectionAudit(newSc, s.logger)
+	newSc.SetDLPWarnHook(func(ctx context.Context, patternName, severity string) {
+		emitDLPWarn(s.logger, s.metrics, s.liveReceiptEmitter(), ctx, patternName, severity)
+	})
+	// The controller must honor the candidate's kill-switch sources (its
+	// `enabled` flag and sentinel_file) before the proxy publishes the
+	// candidate, and keep honoring the current sources until it is live.
+	// PrepareReload watches both sets at once, so neither an enabling
+	// candidate nor a sentinel created at the new path during this window
+	// can reach traffic unguarded, and an active old source cannot lapse.
+	// Reload(newCfg) below narrows the watch to the candidate after
+	// publication; AbortReload drops the candidate if publication fails.
+	s.killswitch.PrepareReload(newCfg)
+	fireReloadBeforeProxySwapHook(s)
+	if !s.proxy.Reload(newCfg, newSc) {
+		s.killswitch.AbortReload()
+		return errors.New("reload failed: proxy kept previous config")
+	}
+	if agentEntitlementLost {
+		// Same-input reloads share the license generation. End it only once
+		// proven entitlement loss has committed, never for profile edits.
+		s.proxy.SetLicenseRevoked(newCfg, true)
+	}
+	if s.containmentManaged {
+		s.containmentMetricsDenied.Store(false)
+	}
+	s.reportLapsedContainmentGrants(newCfg, "reload")
+	// The candidate is live now, so this is true when it is said.
+	if loopbackServicesChanged {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: containment.loopback_services changed — this reload updates policy only; "+
+			"run `pipelock contain reload-nft-rules` as root to apply the change to the live nftables boundary")
+	}
+	if publishedServicesChanged {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: containment.published_services changed — this reload updates policy only; "+
+			"run `pipelock contain reload-nft-rules` as root to open or close the published endpoints")
+	}
+	fireReloadAfterProxySwapHook(s)
+	s.refreshRuntimeState(oldCfg, newCfg, reloadBundleResult, s.proxy.ScannerPtr().Load())
+	publishDegradedRuleBundleMetrics(s.metrics, newCfg)
+	if reloadErr := s.proxy.LoadCertCache(newCfg); reloadErr != nil {
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile),
+			fmt.Errorf("TLS cert cache reload failed: %w", reloadErr))
+	}
+	s.killswitch.Reload(newCfg)
+
+	if needsHITLApprover(newCfg) && !s.hasApprover {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reloaded to HITL ask mode but approver was not initialized at startup; detections will be blocked")
+	}
+	reloadHash := newCfg.Hash()
+	if s.reloadDurablePending {
+		s.logger.LogConfigReload("pending", "awaiting durable Conductor activation", reloadHash)
+		return nil
+	}
+	s.logger.LogConfigReload("success", fmt.Sprintf("mode=%s", newCfg.Mode), reloadHash)
+	logPromptInjectionPolicy(newCfg, s.logger)
+	s.recordReloadSuccess(reloadHash)
+	return nil
+}
+
+// newRetiredSinkFinalizer returns idempotent cleanup for one generation. It is
+// called both on the normal reload path and as a deferred panic/error fallback.
+func newRetiredSinkFinalizer(
+	emitter *emit.Emitter,
+	generation *emit.RetiredSinks,
+	preclosed map[int]bool,
+	onCloseError func(error),
+) func() {
+	sinks := generation.Sinks()
+	closed := make([]bool, len(sinks))
+	for index := range sinks {
+		closed[index] = preclosed[index]
+	}
+
+	return func() {
+		for index, sink := range sinks {
+			if closed[index] {
+				continue
+			}
+			closeErr := sink.Close()
+			closed[index] = true
+			if closeErr != nil && onCloseError != nil {
+				onCloseError(closeErr)
+			}
+		}
+		emitter.FinalizeRetiredSinks(generation)
+	}
+}
+
+func strictRuleBundleDegradationDisallowed(oldCfg, newCfg *config.Config) bool {
+	if newCfg == nil || newCfg.Rules.AllowDegraded {
+		return false
+	}
+	return newCfg.Mode == config.ModeStrict || (oldCfg != nil && oldCfg.Mode == config.ModeStrict)
+}
+
+func cleanDropsWithoutBundleErrors(drops []bundleCoverageDrop, result *rules.LoadResult) []bundleCoverageDrop {
+	if len(drops) == 0 || result == nil || len(result.Errors) == 0 {
+		return drops
+	}
+	errorBundles := make(map[string]struct{}, len(result.Errors))
+	for _, e := range result.Errors {
+		if e.Name != "" {
+			errorBundles[e.Name] = struct{}{}
+		}
+	}
+	clean := drops[:0]
+	for _, drop := range drops {
+		if _, errored := errorBundles[drop.Name]; errored {
+			continue
+		}
+		clean = append(clean, drop)
+	}
+	return clean
+}
+
+func boolPtrEqual(a, b *bool) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+func reloadRuntimeModeLabel(mode config.RuntimeMode) string {
+	switch mode {
+	case config.RuntimeForwardWithMCPListener:
+		return "listener"
+	case config.RuntimeMCPProxy:
+		return "proxy"
+	case config.RuntimeMCPScan:
+		return "scan"
+	default:
+		return "forward"
+	}
+}
+
+func implausibleReloadTeardownReasons(oldCfg, newCfg *config.Config) []string {
+	if oldCfg == nil {
+		return nil
+	}
+	if newCfg == nil {
+		return []string{"new config is nil"}
+	}
+
+	var reasons []string
+	appendCleared := func(field, oldValue, newValue string) {
+		if oldValue != "" && newValue == "" {
+			reasons = append(reasons, field+" cleared")
+		}
+	}
+	appendDisabled := func(field string, oldEnabled, newEnabled bool) {
+		if oldEnabled && !newEnabled {
+			reasons = append(reasons, field+" disabled")
+		}
+	}
+
+	appendCleared("mode", oldCfg.Mode, newCfg.Mode)
+	appendCleared("fetch_proxy.listen", oldCfg.FetchProxy.Listen, newCfg.FetchProxy.Listen)
+	appendCleared("license_file", oldCfg.LicenseFile, newCfg.LicenseFile)
+	if oldCfg.EnforceEnabled() && !newCfg.EnforceEnabled() {
+		reasons = append(reasons, "enforce disabled")
+	}
+	if len(oldCfg.Internal) > 0 && len(newCfg.Internal) == 0 {
+		reasons = append(reasons, "internal CIDR list emptied")
+	}
+
+	appendDisabled("dlp.scan_env", oldCfg.DLP.ScanEnv, newCfg.DLP.ScanEnv)
+	appendDisabled("forward_proxy.enabled", oldCfg.ForwardProxy.Enabled, newCfg.ForwardProxy.Enabled)
+	appendDisabled("websocket_proxy.enabled", oldCfg.WebSocketProxy.Enabled, newCfg.WebSocketProxy.Enabled)
+	appendDisabled("tls_interception.enabled", oldCfg.TLSInterception.Enabled, newCfg.TLSInterception.Enabled)
+	appendDisabled("mcp_input_scanning.enabled", oldCfg.MCPInputScanning.Enabled, newCfg.MCPInputScanning.Enabled)
+	appendDisabled("mcp_tool_scanning.enabled", oldCfg.MCPToolScanning.Enabled, newCfg.MCPToolScanning.Enabled)
+	appendDisabled("mcp_tool_policy.enabled", oldCfg.MCPToolPolicy.Enabled, newCfg.MCPToolPolicy.Enabled)
+	appendDisabled("session_profiling.enabled", oldCfg.SessionProfiling.Enabled, newCfg.SessionProfiling.Enabled)
+	appendDisabled("adaptive_enforcement.enabled", oldCfg.AdaptiveEnforcement.Enabled, newCfg.AdaptiveEnforcement.Enabled)
+	appendDisabled("behavioral_baseline.enabled", oldCfg.BehavioralBaseline.Enabled, newCfg.BehavioralBaseline.Enabled)
+	appendDisabled("mcp_session_binding.enabled", oldCfg.MCPSessionBinding.Enabled, newCfg.MCPSessionBinding.Enabled)
+	appendDisabled("a2a_scanning.enabled", oldCfg.A2AScanning.Enabled, newCfg.A2AScanning.Enabled)
+	appendDisabled("tool_chain_detection.enabled", oldCfg.ToolChainDetection.Enabled, newCfg.ToolChainDetection.Enabled)
+	appendDisabled("cross_request_detection.enabled", oldCfg.CrossRequestDetection.Enabled, newCfg.CrossRequestDetection.Enabled)
+	appendDisabled("address_protection.enabled", oldCfg.AddressProtection.Enabled, newCfg.AddressProtection.Enabled)
+	appendDisabled("taint.enabled", oldCfg.Taint.Enabled, newCfg.Taint.Enabled)
+	appendDisabled("response_scanning.enabled", oldCfg.ResponseScanning.Enabled, newCfg.ResponseScanning.Enabled)
+	appendDisabled("request_body_scanning.enabled", oldCfg.RequestBodyScanning.Enabled, newCfg.RequestBodyScanning.Enabled)
+	// Configurable/default DLP patterns vanishing is a teardown even though the
+	// compiled-in core DLP floor (scanner/core.go) still runs. ValidateReload
+	// only WARNS on this, which strict rejects but balanced does not.
+	if len(oldCfg.DLP.Patterns) > 0 && len(newCfg.DLP.Patterns) == 0 {
+		reasons = append(reasons, "dlp.patterns emptied")
+	}
+	if oldCfg.BehavioralBaseline.Enabled && newCfg.BehavioralBaseline.Enabled &&
+		config.ActionDowngraded(oldCfg.BehavioralBaseline.DeviationAction, newCfg.BehavioralBaseline.DeviationAction) {
+		reasons = append(reasons, "behavioral_baseline.deviation_action downgraded")
+	}
+
+	// A live profile_dir change is a posture teardown: Reconfigure swaps the
+	// dir in memory without loading profiles from it, so locked profiles are
+	// silently orphaned on the next restart (fail-open). Require a full restart
+	// to move the profile store instead of a hot reload.
+	if oldCfg.BehavioralBaseline.Enabled && newCfg.BehavioralBaseline.Enabled &&
+		oldCfg.BehavioralBaseline.ProfileDir != newCfg.BehavioralBaseline.ProfileDir {
+		reasons = append(reasons, "behavioral_baseline.profile_dir changed")
+	}
+
+	return reasons
+}
+
+// requiredModeTeardowns reports the "required" security contracts that this
+// reload turns OFF, comparing the old and candidate configs DIRECTLY.
+//
+// It exists because the rejection below is otherwise reachable only through
+// warning emission, in a different package, that nobody is forced to write. That
+// coupling is what let a reload silently clear an active
+// flight_recorder.require_receipts: reloadDowngradeRejectReason already NAMED
+// the field in the reason it reports, and the field was in the required list
+// below, but config.ValidateReload emitted no ReloadWarning for it, so
+// hasRejectableDowngradeWarning never saw one and the whole gate was
+// unreachable outside strict mode. Everything about it read as coverage in
+// review. It checked nothing.
+//
+// It is not only defence in depth. It was written as such, on the belief that
+// every contract already had a warning, and then re-deriving the list from the
+// schema turned up forward_proxy.sni_require_tls, which had none and was
+// therefore a live silent downgrade. The lesson is in the mechanism: this list
+// was first seeded by COPYING the required list below, so it inherited that
+// list's blind spot exactly. Add to it by re-deriving from the schema, never by
+// copying an existing list.
+//
+// The value of comparing directly is that it cannot be forgotten. A contract
+// added here fails closed on its own transition, with no second edit in a second
+// package to remember.
+//
+// Runs AFTER the restart-only preservation earlier in Reload, so newCfg already
+// holds the effective candidate values. A field preserved as restart-only (the
+// license require-intermediate set) therefore compares equal and never fires.
+func requiredModeTeardowns(oldCfg, newCfg *config.Config) []string {
+	if oldCfg == nil || newCfg == nil {
+		return nil
+	}
+	var torn []string
+	tornDown := func(field string, oldRequired, newRequired bool) {
+		if oldRequired && !newRequired {
+			torn = append(torn, field)
+		}
+	}
+	tornDown("flight_recorder.require_receipts",
+		oldCfg.FlightRecorder.RequireReceipts, newCfg.FlightRecorder.RequireReceipts)
+	tornDown("license_require_intermediate",
+		oldCfg.LicenseRequireIntermediateResolved, newCfg.LicenseRequireIntermediateResolved)
+	tornDown("a2a_scanning.require_signed_agent_cards",
+		oldCfg.A2AScanning.Enabled && oldCfg.A2AScanning.RequireSignedAgentCards,
+		newCfg.A2AScanning.Enabled && newCfg.A2AScanning.RequireSignedAgentCards)
+	tornDown("mcp_binary_integrity.require_signature",
+		oldCfg.MCPBinaryIntegrity.Enabled && oldCfg.MCPBinaryIntegrity.RequireSignature,
+		newCfg.MCPBinaryIntegrity.Enabled && newCfg.MCPBinaryIntegrity.RequireSignature)
+	// Listener state tokens are optional in balanced and audit modes for
+	// compatibility, but a strict-mode listener that was requiring one cannot
+	// silently stop doing so. Session binding is the parent that makes the
+	// setting effective, so turning that parent off is a teardown too.
+	tornDown("mcp_session_binding.listener_require_state_token",
+		oldCfg.Mode == config.ModeStrict && oldCfg.MCPSessionBinding.Enabled && oldCfg.MCPSessionBinding.RequiresListenerStateToken(),
+		newCfg.MCPSessionBinding.Enabled && newCfg.MCPSessionBinding.RequiresListenerStateToken())
+	tornDown("mediation_envelope.verify_inbound.enabled",
+		oldCfg.MediationEnvelope.VerifyInbound.Enabled, newCfg.MediationEnvelope.VerifyInbound.Enabled)
+	// sni_require_tls refuses to splice an opaque CONNECT tunnel when the
+	// client sends no TLS or a ClientHello with no SNI extension. Such a tunnel
+	// bypasses DLP entirely, so switching it off hands the agent a one-tunnel
+	// exfiltration channel. It was absent from the pre-existing required list
+	// this helper was seeded from, and a balanced reload silently applied the
+	// teardown. Parent-gated: forward.go only consults it inside the SNI
+	// verification branch, so verification being off means it was never in force.
+	tornDown("forward_proxy.sni_require_tls",
+		oldCfg.ForwardProxy.SNIVerificationEnabled() && oldCfg.ForwardProxy.SNIRequireTLSEnabled(),
+		newCfg.ForwardProxy.SNIVerificationEnabled() && newCfg.ForwardProxy.SNIRequireTLSEnabled())
+	return torn
+}
+
+func reloadDowngradeRejectReason(oldCfg, newCfg *config.Config, warnings []config.ReloadWarning) string {
+	if oldCfg == nil {
+		return ""
+	}
+	// Independent of warning emission: a required contract being torn down is
+	// itself the rejection, whether or not anyone wrote a warning for it.
+	if torn := requiredModeTeardowns(oldCfg, newCfg); len(torn) > 0 {
+		return "required security mode (" + strings.Join(torn, ", ") + ")"
+	}
+	if len(warnings) == 0 {
+		return ""
+	}
+	if oldCfg.Mode == config.ModeStrict {
+		return "strict mode"
+	}
+	if !hasRejectableDowngradeWarning(warnings) {
+		return ""
+	}
+
+	// Fallback path: some OTHER non-advisory downgrade is in play, and this
+	// reports which required contracts are in force to explain why it is
+	// refused. It deliberately lists what is ACTIVE, not what was torn down —
+	// requiredModeTeardowns above owns teardown detection and has already
+	// returned by the time any contract here is being dismantled. Do not treat
+	// this as the authoritative contract list; it is shorter, and seeding a new
+	// list from it is what hid forward_proxy.sni_require_tls.
+	var required []string
+	if oldCfg.FlightRecorder.RequireReceipts {
+		required = append(required, "flight_recorder.require_receipts")
+	}
+	if oldCfg.LicenseRequireIntermediateResolved {
+		required = append(required, "license_require_intermediate")
+	}
+	if oldCfg.A2AScanning.Enabled && oldCfg.A2AScanning.RequireSignedAgentCards {
+		required = append(required, "a2a_scanning.require_signed_agent_cards")
+	}
+	if oldCfg.MCPBinaryIntegrity.Enabled && oldCfg.MCPBinaryIntegrity.RequireSignature {
+		required = append(required, "mcp_binary_integrity.require_signature")
+	}
+	if oldCfg.MediationEnvelope.VerifyInbound.Enabled {
+		required = append(required, "mediation_envelope.verify_inbound.enabled")
+	}
+	if len(required) == 0 {
+		return ""
+	}
+	return "required security mode (" + strings.Join(required, ", ") + ")"
+}
+
+func bundleResolutionRejectReason(
+	oldCfg, newCfg *config.Config,
+	result *rules.LoadResult,
+	oldToolPoison []*tools.ExtraPoisonPattern,
+) string {
+	if oldCfg == nil || newCfg == nil || result == nil || len(result.Errors) == 0 {
+		return ""
+	}
+
+	// Enforce by comparing the live bundle-sourced rules against the resolved
+	// candidate directly, independent of whether ValidateReload emitted a
+	// warning for the same drop. Coupling enforcement to warning generation
+	// would be brittle: a suppressed, renamed, or missed warning must not be
+	// able to bypass this coverage-drop check.
+	var reasons []string
+	if dropped := removedBundleDLPPatterns(oldCfg.DLP.Patterns, newCfg.DLP.Patterns); len(dropped) > 0 {
+		reasons = append(reasons, "dlp.patterns: "+strings.Join(dropped, ", "))
+	}
+	if dropped := removedBundleResponsePatterns(oldCfg.ResponseScanning.Patterns, newCfg.ResponseScanning.Patterns); len(dropped) > 0 {
+		reasons = append(reasons, "response_scanning.patterns: "+strings.Join(dropped, ", "))
+	}
+	if dropped := removedBundleToolPoisonPatterns(oldToolPoison, rules.ConvertToolPoison(result.ToolPoison)); len(dropped) > 0 {
+		reasons = append(reasons, "mcp_tool_scanning.tool_poison: "+strings.Join(dropped, ", "))
+	}
+	if len(reasons) == 0 {
+		return ""
+	}
+
+	// The dropped patterns above name exactly what was lost per surface. The
+	// suffix lists the bundle load errors observed during this reload as
+	// context; it is not a causal attribution (an unrelated bundle can error in
+	// the same reload without dropping any live rule), so it is labelled as
+	// such to avoid pointing an operator at the wrong bundle.
+	names := make([]string, 0, len(result.Errors))
+	for _, e := range result.Errors {
+		names = append(names, e.Name)
+	}
+	return strings.Join(reasons, "; ") + " (bundle load errors this reload: " + strings.Join(names, ", ") + ")"
+}
+
+func removedBundleDLPPatterns(old, updated []config.DLPPattern) []string {
+	return bundlePatternDropNames(removedBundleNamedRegexPatternDrops(old, updated,
+		func(p config.DLPPattern) string { return p.Name },
+		func(p config.DLPPattern) string { return p.Regex },
+		func(p config.DLPPattern) string { return p.Bundle },
+		dlpPatternEnforcementIdentity))
+}
+
+func removedBundleResponsePatterns(old, updated []config.ResponseScanPattern) []string {
+	return bundlePatternDropNames(removedBundleNamedRegexPatternDrops(old, updated,
+		func(p config.ResponseScanPattern) string { return p.Name },
+		func(p config.ResponseScanPattern) string { return p.Regex },
+		func(p config.ResponseScanPattern) string { return p.Bundle },
+		func(config.ResponseScanPattern) string { return "" }))
+}
+
+type bundlePatternDropDetail struct {
+	Name   string
+	Bundle string
+	Reason string
+}
+
+func removedBundleDLPPatternDrops(old, updated []config.DLPPattern) []bundlePatternDropDetail {
+	return removedBundleNamedRegexPatternDrops(old, updated,
+		func(p config.DLPPattern) string { return p.Name },
+		func(p config.DLPPattern) string { return p.Regex },
+		func(p config.DLPPattern) string { return p.Bundle },
+		dlpPatternEnforcementIdentity)
+}
+
+func removedBundleResponsePatternDrops(old, updated []config.ResponseScanPattern) []bundlePatternDropDetail {
+	return removedBundleNamedRegexPatternDrops(old, updated,
+		func(p config.ResponseScanPattern) string { return p.Name },
+		func(p config.ResponseScanPattern) string { return p.Regex },
+		func(p config.ResponseScanPattern) string { return p.Bundle },
+		func(config.ResponseScanPattern) string { return "" })
+}
+
+func removedBundleNamedRegexPatternDrops[T any](
+	old, updated []T,
+	nameOf func(T) string,
+	regexOf func(T) string,
+	bundleOf func(T) string,
+	enforcementIdentityOf func(T) string,
+) []bundlePatternDropDetail {
+	updatedByName := make(map[string]bundlePatternIdentity, len(updated))
+	for _, p := range updated {
+		updatedByName[nameOf(p)] = bundlePatternIdentity{
+			Regex:               regexOf(p),
+			Bundle:              bundleOf(p),
+			EnforcementIdentity: enforcementIdentityOf(p),
+		}
+	}
+
+	var removed []bundlePatternDropDetail
+	for _, p := range old {
+		bundle := bundleOf(p)
+		if bundle == "" {
+			continue
+		}
+		name := nameOf(p)
+		newIdentity, ok := updatedByName[name]
+		switch {
+		case !ok:
+			removed = append(removed, bundlePatternDropDetail{Name: name, Bundle: bundle})
+		case newIdentity.Bundle != bundle:
+			removed = append(removed, bundlePatternDropDetail{Name: name, Bundle: bundle, Reason: "bundle changed"})
+		case newIdentity.Regex != regexOf(p):
+			removed = append(removed, bundlePatternDropDetail{Name: name, Bundle: bundle, Reason: "regex changed"})
+		case newIdentity.EnforcementIdentity != enforcementIdentityOf(p):
+			removed = append(removed, bundlePatternDropDetail{Name: name, Bundle: bundle, Reason: "enforcement fields changed"})
+		}
+	}
+	return removed
+}
+
+func removedBundleToolPoisonPatterns(old, updated []*tools.ExtraPoisonPattern) []string {
+	return bundlePatternDropNames(removedBundleToolPoisonPatternDrops(old, updated))
+}
+
+func removedBundleToolPoisonPatternDrops(old, updated []*tools.ExtraPoisonPattern) []bundlePatternDropDetail {
+	updatedByName := make(map[string]string, len(updated))
+	for _, p := range updated {
+		if p == nil {
+			continue
+		}
+		updatedByName[p.Name] = toolPoisonPatternIdentity(p)
+	}
+
+	var removed []bundlePatternDropDetail
+	for _, p := range old {
+		if p == nil || p.Bundle == "" {
+			continue
+		}
+		identity, ok := updatedByName[p.Name]
+		switch {
+		case !ok:
+			removed = append(removed, bundlePatternDropDetail{Name: p.Name, Bundle: p.Bundle})
+		case identity != toolPoisonPatternIdentity(p):
+			removed = append(removed, bundlePatternDropDetail{Name: p.Name, Bundle: p.Bundle, Reason: "regex, scan_field, or bundle changed"})
+		}
+	}
+	return removed
+}
+
+type bundlePatternIdentity struct {
+	Regex               string
+	Bundle              string
+	EnforcementIdentity string
+}
+
+func dlpPatternEnforcementIdentity(p config.DLPPattern) string {
+	return p.KeywordPolicyIdentity() + "\x00" + p.Severity + "\x00" + p.Validator + "\x00" + p.Action + "\x00" + strings.Join(p.ExemptDomains, "\x00")
+}
+
+func bundlePatternDropNames(drops []bundlePatternDropDetail) []string {
+	if len(drops) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(drops))
+	for _, drop := range drops {
+		if drop.Reason != "" {
+			names = append(names, drop.Name+" ("+drop.Reason+")")
+			continue
+		}
+		names = append(names, drop.Name)
+	}
+	return names
+}
+
+func toolPoisonPatternIdentity(p *tools.ExtraPoisonPattern) string {
+	if p == nil {
+		return ""
+	}
+	regex := ""
+	if p.Re != nil {
+		regex = p.Re.String()
+	}
+	return regex + "\x00" + p.ScanField + "\x00" + p.Bundle
+}
+
+func hasRejectableDowngradeWarning(warnings []config.ReloadWarning) bool {
+	for _, w := range warnings {
+		if reloadWarningIsAdvisory(w) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func reloadWarningIsAdvisory(w config.ReloadWarning) bool {
+	return w.Disposition == config.ReloadWarningDispositionAdvisory
+}
+
+// rejectedDowngradeReloadDetail names the specific edit that triggered a
+// downgrade rejection, for the stderr WARNING and the audit event. It is a
+// diagnostic only; reloadDowngradeRejectReason above already decided the
+// reload is rejected before this is ever called.
+//
+// A contract that requiredModeTeardowns reports as torn down is left out,
+// because reason already names it (e.g. "required security mode
+// (flight_recorder.require_receipts)" for a reload that cleared
+// require_receipts itself); any other weakening in the same reload is still
+// named. In the remaining cases the rejection came from a non-advisory
+// ReloadWarning whose field is NOT named in "reason" at all, because reason
+// there reports the ACTIVE contract the warning is rejectable under, not the
+// field the warning is about. Trust-widening warnings get their own phrasing
+// ("cannot widen trust at runtime") because the caller already prints them
+// without repeating the generic "security downgrade from" prefix.
+func rejectedDowngradeReloadDetail(oldCfg, newCfg *config.Config, warnings []config.ReloadWarning) string {
+	// A torn-down contract is already named in reason, so it is left out
+	// here; any OTHER weakening in the same reload still has to be named.
+	named := make(map[string]struct{})
+	for _, f := range requiredModeTeardowns(oldCfg, newCfg) {
+		named[f] = struct{}{}
+	}
+	trust := trustExpansionReloadFields(warnings)
+	isTrust := make(map[string]struct{}, len(trust))
+	var parts []string
+	if len(trust) > 0 {
+		for _, f := range trust {
+			isTrust[f] = struct{}{}
+		}
+		parts = append(parts, strings.Join(trust, ", ")+" cannot widen trust at runtime")
+	}
+	// A reload can widen trust and weaken another control at once; name both,
+	// or the second edit stays invisible.
+	var weakened []string
+	for _, f := range rejectableDowngradeReloadWarningFields(warnings) {
+		_, trusted := isTrust[f]
+		_, torn := named[f]
+		if !trusted && !torn {
+			weakened = append(weakened, f)
+		}
+	}
+	if len(weakened) > 0 {
+		parts = append(parts, strings.Join(weakened, ", ")+" weakens protection and cannot apply at runtime")
+	}
+	return strings.Join(parts, "; ")
+}
+
+// rejectableDowngradeReloadWarningFields names the reload warning fields that
+// make a reload rejectable under a required/strict contract, deduplicated and
+// in warning-emission order. Advisory warnings (restart-only, informational)
+// are excluded: hasRejectableDowngradeWarning already treats them as unable to
+// trigger rejection on their own, so naming one here would blame an edit that
+// was not the actual trigger.
+func rejectableDowngradeReloadWarningFields(warnings []config.ReloadWarning) []string {
+	seen := make(map[string]struct{}, len(warnings))
+	var fields []string
+	for _, w := range warnings {
+		if reloadWarningIsAdvisory(w) {
+			continue
+		}
+		if _, ok := seen[w.Field]; ok {
+			continue
+		}
+		seen[w.Field] = struct{}{}
+		fields = append(fields, w.Field)
+	}
+	return fields
+}
+
+// trustExpansionReloadFields identifies trust fields for a rejected reload's
+// diagnostic. It does not decide whether a reload is accepted.
+func trustExpansionReloadFields(warnings []config.ReloadWarning) []string {
+	fields := make([]string, 0, len(warnings))
+	for _, w := range warnings {
+		if w.Field == "trusted_domains" || w.Field == "ssrf.ip_allowlist" || w.Field == "destination_grants" ||
+			(strings.HasPrefix(w.Field, "agents.") && strings.HasSuffix(w.Field, ".trusted_domains")) {
+			fields = append(fields, w.Field)
+		}
+	}
+	return fields
+}
+
+func hasNamedAgentProfiles(agents map[string]config.AgentProfile) bool {
+	for name := range agents {
+		if name != "_default" {
+			return true
+		}
+	}
+	return false
+}
+
+// preserveLicenseInputsRestartOnly copies the old license inputs and agent
+// profiles onto newCfg so a reload cannot activate OR deactivate licensed
+// surfaces without a restart. Used for both a plain license-input change and an
+// unverifiable new input: in both cases the effective entitlement is the old,
+// already-verified one, and committing the new input fields would let a later
+// unrelated reload see no diff and silently apply the staged license.
+func preserveLicenseInputsRestartOnly(newCfg, oldCfg *config.Config) {
+	newCfg.Agents = oldCfg.Agents
+	// The license-gate record describes the agents map, so it follows the
+	// preserved map rather than the candidate's stripped one.
+	newCfg.LicenseDisabledAgents = oldCfg.LicenseDisabledAgents
+	newCfg.LicenseDisabledReason = oldCfg.LicenseDisabledReason
+	newCfg.LicenseKey = oldCfg.LicenseKey
+	newCfg.LicenseFile = oldCfg.LicenseFile
+	newCfg.LicenseCRLFile = oldCfg.LicenseCRLFile
+	newCfg.LicenseIntermediateFile = oldCfg.LicenseIntermediateFile
+	newCfg.LicenseIntermediateCert = append([]byte(nil), oldCfg.LicenseIntermediateCert...)
+	newCfg.LicenseIntermediateLoadError = oldCfg.LicenseIntermediateLoadError
+	newCfg.LicensePublicKey = oldCfg.LicensePublicKey
+	// Require-intermediate is restart-only too: preserve both the YAML pointer and
+	// the materialized value so a later unrelated reload sees no diff and cannot
+	// silently apply a staged require-mode change without a restart.
+	newCfg.LicenseRequireIntermediate = oldCfg.LicenseRequireIntermediate
+	newCfg.LicenseRequireIntermediateResolved = oldCfg.LicenseRequireIntermediateResolved
+	newCfg.LicenseRequireIntermediateEnvError = oldCfg.LicenseRequireIntermediateEnvError
+	// The CRL freshness window is part of the restart-only license input set.
+	newCfg.LicenseCRLMaxAge = oldCfg.LicenseCRLMaxAge
+	newCfg.LicenseCRLMaxAgeResolved = oldCfg.LicenseCRLMaxAgeResolved
+	newCfg.LicenseCRLMaxAgeError = oldCfg.LicenseCRLMaxAgeError
+}
+
+// cleanup closes all owned resources. Safe to call multiple times: each
+// field is niled after its close so repeat calls are no-ops. LIFO order
+// mirrors the original RunCmd deferred closures so shutdown sequencing is
+// preserved.
+func (s *Server) cleanup() {
+	if s.recorder != nil {
+		_ = s.recorder.Close()
+		s.recorder = nil
+	}
+	s.finishConductorAudit()
+	if s.captureWriter != nil {
+		_ = s.captureWriter.Close()
+		s.captureWriter = nil
+	}
+	if s.approver != nil {
+		s.approver.Close()
+		s.approver = nil
+	}
+	liveScanner := s.scanner
+	if s.proxy != nil {
+		if current := s.proxy.ScannerPtr().Load(); current != nil {
+			liveScanner = current
+		}
+	}
+	if liveScanner != nil {
+		liveScanner.Close()
+		s.scanner = nil
+	}
+	if s.emitter != nil {
+		_ = s.emitter.Close()
+		s.emitter = nil
+		s.emitSinks = nil
+	}
+	if s.logger != nil {
+		s.logger.Close()
+		s.logger = nil
+	}
+	if s.sentry != nil {
+		s.sentry.Close()
+		s.sentry = nil
+	}
+}

@@ -1,0 +1,141 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"slices"
+	"testing"
+)
+
+// matchesPath: host-style globs (no scheme, no path separator) anchor to the
+// URL host; path/scheme-qualified patterns keep full-URL matching.
+func TestMatchesPath_HostGlobAnchorsToHost(t *testing.T) {
+	cases := []struct {
+		target, pattern string
+		want            bool
+	}{
+		{"https://api.anthropic.com/v1/messages", "*.anthropic.com*", true},
+		{"https://API.AnThRoPiC.COM/v1/messages", "*.anthropic.com*", true},
+		{"https://attacker.test/?x=.anthropic.com", "*.anthropic.com*", false},
+		{"https://attacker.test/.anthropic.com/x", "*.anthropic.com*", false},
+		{"https://api.anthropic.com:80@evil.test/steal", "*.anthropic.com*", false},
+		{"https://api.anthropic.com%2f@evil.test/steal", "*.anthropic.com*", false},
+		{"https://api.anthropic.com.evil.test/v1/messages", "*.anthropic.com*", false},
+		{"https://xanthropic.com/v1/messages", "*.anthropic.com*", false},
+		{"https://chatgpt.com/backend-api/codex", "*chatgpt.com*", true},
+		// Trailing-dot FQDN must match the bare-domain glob, mirroring what
+		// scanner.matchesDomainList exempts on the URL-DLP side (cross-surface
+		// parity: never exempt a host for URL DLP but block it for body DLP).
+		{"https://api.anthropic.com./v1/messages", "*.anthropic.com*", true},
+		{"https://api.anthropic.com.:443/v1/messages", "*.anthropic.com*", true},
+		{"https://api.example.com.:8443/v1/messages", "*.example.com:8443*", true},
+		// Scheme-qualified full-URL glob still matches its own URL.
+		{"https://api.x.com/v1/chat", "https://api.x.com/*", true},
+		// Dotted version URL/path globs are not host globs.
+		{"https://example.com/downloads/pipelock-v1.2.3/manifest.json", "*v1.2.3*", true},
+		// Ambiguous double-sided dotted globs stay host-scoped because
+		// extension-looking labels can also be real TLDs.
+		{"https://api.example.zip/v1/messages", "*.example.zip*", true},
+		{"https://attacker.test/?x=.example.zip", "*.example.zip*", false},
+		// Bare relative path patterns are unaffected.
+		{"https://example.com/robots.txt", "robots.txt", true},
+		{"https://example.com/releases/pipelock.tar.gz", "*.tar.gz", true},
+		{"https://example.com/assets/pipelock.min.js", "*.min.js", true},
+	}
+	for _, c := range cases {
+		t.Run(c.pattern+"/"+c.target, func(t *testing.T) {
+			if got := matchesPath(c.target, c.pattern); got != c.want {
+				t.Errorf("matchesPath(%q, %q) = %v, want %v", c.target, c.pattern, got, c.want)
+			}
+		})
+	}
+}
+
+func TestBuiltInCredentialAudienceHosts_ReplaceDerivedProviderDefaults(t *testing.T) {
+	cfg := Defaults()
+	patternByName := make(map[string]DLPPattern, len(cfg.DLP.Patterns))
+	for _, p := range cfg.DLP.Patterns {
+		patternByName[p.Name] = p
+	}
+
+	// A pattern may legitimately carry more than one audience host when the
+	// vendor serves the credential on several domains, so this asserts the
+	// exact SET rather than a single value.
+	expected := map[string][]string{ // #nosec G101 -- compiled audience host assertions, not credential material
+		"Anthropic API Key":     {"api.anthropic.com", "platform.claude.com", "mcp-proxy.anthropic.com"},
+		"OpenAI API Key":        {"api.openai.com"},
+		"OpenAI Service Key":    {"api.openai.com"},
+		"Fireworks API Key":     {"api.fireworks.ai"},
+		"LLM Router API Key":    {"openrouter.ai"},
+		"Answer Engine API Key": {"api.perplexity.ai"},
+		"Web Research API Key":  {"api.tavily.com"},
+		"Google API Key":        {"generativelanguage.googleapis.com", "language.googleapis.com", "translation.googleapis.com", "maps.googleapis.com"},
+		"Google OAuth Token":    {"gmail.googleapis.com", "www.googleapis.com", "storage.googleapis.com"},
+		"Hugging Face Token":    {"huggingface.co", "router.huggingface.co"},
+		"Databricks Token":      nil,
+		"Replicate API Token":   {"api.replicate.com"},
+		"Together AI Key":       {"api.together.ai", "api.together.xyz"},
+		"Pinecone API Key":      {"api.pinecone.io"},
+		"Groq API Key":          {"api.groq.com"},
+		"xAI API Key":           {"api.x.ai"},
+		"Discord Bot Token":     {"discord.com", "gateway.discord.gg"},
+		// Slack bot/user tokens are presented to the Web API and hosted MCP server;
+		// app-level tokens are presented only to the Web API. Slack Token is also a
+		// core-floor pattern, so these prove a compiled audience attaches to a core
+		// pattern (its issuing authorities) while YAML still cannot reach the floor.
+		"Slack Token":             {"slack.com", "mcp.slack.com"},
+		"Slack App Token":         {"slack.com"},
+		"GitHub Token":            {"api.github.com", "uploads.github.com", "rubygems.pkg.github.com"},
+		"GitHub Fine-Grained PAT": {"api.github.com", "uploads.github.com", "rubygems.pkg.github.com"},
+		"GitLab PAT":              {"gitlab.com"},
+		"GitLab CI Job Token":     {"gitlab.com"},
+		// GitHub release downloads redirect to this storage host with a signed
+		// grant in the URL query; the exact host is the whole audience.
+		"JWT Token": {"release-assets.githubusercontent.com"},
+		// The release redirect's Azure SAS shares that exact host list and is
+		// granted only beside a validated JWT for that host. Attestation
+		// bundle SAS uses the same carrier with a scanner-side account list
+		// (attestationBundleSASAllowed); it is not a second pattern host, so
+		// this set does not grow.
+		"Azure SAS Token": {"release-assets.githubusercontent.com"},
+	}
+	for name, hosts := range expected {
+		t.Run(name, func(t *testing.T) {
+			p, ok := patternByName[name]
+			if !ok {
+				t.Fatalf("default DLP pattern missing for audience-bound rule %q", name)
+			}
+			if len(p.ExemptDomains) != 0 {
+				t.Fatalf("%q inherited URL-only exempt_domains = %#v", name, p.ExemptDomains)
+			}
+			// Compare as SETS. Order is not policy: the canonical hash sorts
+			// audience hosts, so two orderings are the same policy and an
+			// order-sensitive assertion would fail on a harmless reordering.
+			got := append([]string(nil), p.CredentialAudienceHosts...)
+			want := append([]string(nil), hosts...)
+			slices.Sort(got)
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("%q credential audience hosts = %#v, want %#v (as sets)", name, p.CredentialAudienceHosts, hosts)
+			}
+		})
+	}
+
+	// The table above is only half the contract. Without this reverse check an
+	// audience added to a built-in pattern, which allows that credential to
+	// leave for a new set of hosts, lands without anyone updating the table.
+	for _, p := range cfg.DLP.Patterns {
+		if len(p.CredentialAudienceHosts) == 0 {
+			continue
+		}
+		if _, ok := expected[p.Name]; !ok {
+			t.Errorf("%q carries compiled credential audience %#v but is not listed in this test", p.Name, p.CredentialAudienceHosts)
+		}
+	}
+	for _, suppression := range cfg.Suppress {
+		if suppression.Reason == "provider-bound credential" {
+			t.Fatalf("legacy derived suppression remained: %#v", suppression)
+		}
+	}
+}

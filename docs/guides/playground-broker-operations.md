@@ -1,0 +1,361 @@
+# Playground broker operations
+
+> **Demonstration tooling, not a shipped product feature.** The playground
+> binaries live under `cmd/` and are built from source; they are **not packaged in
+> Pipelock releases**, and the production firewall does not depend on them. This
+> guide documents evaluation/demonstration tooling.
+
+`pipelock-playground-broker` is the public front door for the live playground. It
+serves the static viewer, validates the visitor gate, leases one isolated
+per-visitor VM, and reverse-proxies `/api/live/*` to that VM. Treat it as an
+internet-facing cost and abuse boundary: every accepted session can boot compute
+and every VM can spend model tokens.
+
+## Public exposure checklist
+
+Before removing an external identity gate, the broker must have all of these
+controls enabled:
+
+| Control | Required setting |
+|---|---|
+| Human/bot gate | `--turnstile-secret-file` or `--turnstile-secret-env` |
+| Global broker spend cap | `--global-daily-budget` greater than `0` |
+| Per-VM model spend cap | `--vm-daily-turn-budget` greater than `0` |
+| Abuse buckets | `--per-ip-daily-budget` and IP rate; add per-code controls when invite codes are enabled |
+| Short sessions | `--session-ttl`, `--deadline-grace`, `--vm-session-ttl` |
+| Host protection | `--public-host`, `--allow-origin`, and origin-side Access JWT while private |
+| Provider backstop | Model-provider billing cap or prepaid balance outside Pipelock |
+
+The broker refuses to start with unlimited global/model budgets unless
+`--unsafe-unlimited-budgets` is set. That escape hatch is for local development,
+not public deployments. Think of this like a shutoff valve: rate limits slow the
+flow, but a positive daily budget is the valve that stops the bill.
+
+The broker also refuses to start without either Turnstile or Cloudflare Access
+unless `--unsafe-no-human-gate` is set. Use that only for local development or a
+separately protected private environment; anonymous public traffic needs a bot
+gate before session creation.
+
+## Example command
+
+```bash
+pipelock-playground-broker serve \
+  --listen 0.0.0.0:8100 \
+  --provider fly \
+  --fly-app playground-example \
+  --fly-token-env FLY_API_TOKEN \
+  --image registry.example.com/pipelock/playground-vm@sha256:REPLACE_WITH_PUBLISHED_VM_IMAGE_DIGEST \
+  --vm-image-digest sha256:REPLACE_WITH_PUBLISHED_VM_IMAGE_DIGEST \
+  --region iad \
+  --memory-mb 256 \
+  --cpus 1 \
+  --internal-port 8080 \
+  --concurrency 20 \
+  --global-daily-budget 60 \
+  --per-ip-daily-budget 20 \
+  --admin-listen 127.0.0.1:8101 \
+  --admin-token-env PLAYGROUND_ADMIN_TOKEN \
+  --turnstile-secret-env PLAYGROUND_TURNSTILE_SECRET \
+  --turnstile-sitekey 1x00000000000000000000AA \
+  --turnstile-origin https://challenges.cloudflare.com \
+  --turnstile-expected-hostname playground.example.com \
+  --turnstile-action playground-session \
+  --vm-model-base-url https://api.provider.example/v1 \
+  --vm-model demo-model \
+  --model-key-env PLAYGROUND_MODEL_KEY \
+  --orchestrator-key-env PLAYGROUND_ORCHESTRATOR_ROOT \
+  --vm-model-max-steps 20 \
+  --vm-daily-turn-budget 400 \
+  --vm-max-messages-per-session 20 \
+  --vm-session-ttl 30m \
+  --static-dir ./dist/playground \
+  --allow-origin https://playground.example.com \
+  --embed-origin https://site.example \
+  --public-host playground.example.com
+```
+
+Before deploying, replace both `REPLACE_WITH_PUBLISHED_VM_IMAGE_DIGEST` values
+with the same immutable digest of the VM image you published. The broker checks
+that the image reference and `--vm-image-digest` agree before it creates a
+delegation.
+
+Provide `PLAYGROUND_ORCHESTRATOR_ROOT` only through configuration scoped to the
+broker machine. Do not store it as a Fly app-level secret: app secrets are also
+inherited by visitor VMs, and the visitor entrypoint will refuse to boot when
+either durable-root variable is present.
+
+This example uses Turnstile as the public authorization step and therefore
+needs no invite codes. When no `--code` values are configured, the broker
+creates an unguessable process-local gate value that is never logged or sent to
+the browser. Per-code rate and budget controls are disabled in this mode;
+per-IP, global daily, concurrency, and provider billing controls remain active.
+If public invite codes are configured, the existing per-code controls still
+apply normally.
+
+Secrets are loaded from files or environment variables and are never printed by
+the broker. Do not pass model keys, provider tokens, Turnstile secrets, or invite
+codes through public logs or shell history in real deployments.
+
+Deploy automation can ask the exact configured command which environment names
+it depends on without reading their values:
+
+```bash
+# Append --print-required-env to the serve command the deployment already runs.
+pipelock-playground-broker serve --print-required-env
+```
+
+The command validates the non-secret flags and static UI, prints one variable
+name per line, and exits before it resolves a secret or contacts the machine
+provider. A deployment should refuse to start when any reported name is absent
+or empty.
+
+The public health response includes `signing_ready`. Production startup succeeds
+only after the broker mints a throwaway delegation and verifies it through the
+same published-root path used by visitor VMs, so `true` means that signing path
+passed. `published_signing_root` identifies the public key already compiled into
+the shipped verifiers. Neither field contains a private key or secret value.
+
+### Optional counts-only analytics
+
+`--analytics-project-key` enables `POST /api/live/analytics`, a same-origin
+relay for the playground's closed event schema. The browser cannot provide an
+identifier or arbitrary properties; the broker disables GeoIP and person
+profiles before forwarding accepted events. The relay has a bounded per-IP
+rate plus a process-wide 100,000-event daily ceiling, and the broker's
+pause/kill switch stops it with the paid session paths. The project key is a
+public ingestion key, not an account or personal API key.
+
+Accepted events receive HTTP 202 because delivery is asynchronous and
+best-effort. A bounded worker pool forwards them to
+`https://us.i.posthog.com`; Fly deployments reject other ingestion hosts.
+Upstream failures are rate-limited in the broker log and are not retried.
+
+Do not load an analytics SDK in the playground or add an analytics host to its
+CSP. Keep the browser transport same-origin and send JSON with
+`Content-Type: application/json`; the browser supplies
+`Sec-Fetch-Site: same-origin`. Cross-site, form-style, duplicate security
+headers, and JSON bodies with duplicate member names or case-folded schema
+aliases are rejected.
+
+## Human verification
+
+When `--turnstile-secret-file` or `--turnstile-secret-env` is set, session
+creation requires a JSON `turnstile_token` field. The broker sends that token,
+plus the resolved client IP, to Cloudflare Turnstile Siteverify before redeeming
+the invite code or leasing a VM. Missing, expired, duplicated, oversized,
+unparseable, or rejected tokens fail closed with HTTP 403.
+
+The static UI must obtain the token in the visitor's browser and include it with
+the `/api/live/session` request. The server-side verification is mandatory; a
+client-side widget without Siteverify does not protect the broker.
+
+## Client IPs behind Cloudflare
+
+The broker always accepts `CF-Connecting-IP` only when the direct TCP peer is in
+Cloudflare's published proxy ranges. Direct clients cannot mint a fresh abuse
+bucket by forging Cloudflare headers. `--trust-forwarded-for` remains available
+for other trusted reverse proxies, but only enable it when the broker is not
+reachable directly.
+
+IPv6 clients are bucketed by their `/64` network for rate limits and per-IP
+budgets, so an attacker cannot evade per-IP caps by rotating addresses inside a
+single allocation. IPv4 clients are bucketed by their exact address.
+
+The Cloudflare proxy ranges are compiled into the binary from
+<https://www.cloudflare.com/ips-v4/> and <https://www.cloudflare.com/ips-v6/>.
+If Cloudflare adds a range, clients arriving from it collapse to the shared edge
+IP as one abuse bucket (over-restrictive, never a bypass) until the list is
+refreshed in a new build.
+
+Validation command:
+
+```bash
+curl -i https://playground.example.com/api/live/session \
+  -H 'Content-Type: application/json' \
+  -H 'X-Forwarded-For: 198.51.100.200' \
+  --data '{"code":"press-review-code","turnstile_token":"invalid"}'
+```
+
+Expected result for the invalid token is HTTP 403. The request must not lease a
+VM and must not create a separate per-IP budget bucket from the forged
+`X-Forwarded-For` value.
+
+## Pause and resume
+
+The broker has an emergency kill switch. `SIGUSR1` pauses the broker and releases
+all active leases; `SIGUSR2` resumes new sessions. `SIGTERM` and `SIGINT` trigger
+graceful HTTP shutdown. For remote operation, run the authenticated admin API on
+a separate listener with `--admin-listen` plus `--admin-token-file` or
+`--admin-token-env`.
+
+Bind `--admin-listen` to loopback and use a long random token (e.g. `openssl rand -hex 32`). The broker refuses to start when `--admin-listen` names any other address, including an all-interfaces bind, unless you also pass `--unsafe-admin-listen-public`, which is only safe inside a container network namespace that already isolates the port. The token is
+compared in constant time, but the endpoint has no rate limiting or lockout by
+design. To operate it remotely, use an authenticated, encrypted tunnel to the
+loopback listener; do not send the bearer token over plaintext network HTTP.
+
+On a single host:
+
+```bash
+kill -USR1 "$(pidof pipelock-playground-broker)"
+```
+
+What this does: engages the broker pause switch and tears down current leased VMs.
+
+```bash
+kill -USR2 "$(pidof pipelock-playground-broker)"
+```
+
+What this does: clears the pause switch so new sessions can start again.
+
+Through the admin listener:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8101/admin/pause \
+  -H "Authorization: Bearer $PLAYGROUND_ADMIN_TOKEN"
+```
+
+What this does: authenticates with the admin bearer token, engages the pause
+switch, and releases active leases.
+
+```bash
+curl -sS -X POST http://127.0.0.1:8101/admin/resume \
+  -H "Authorization: Bearer $PLAYGROUND_ADMIN_TOKEN"
+```
+
+What this does: authenticates with the admin bearer token and clears the pause
+switch.
+
+Health check:
+
+```bash
+curl -s https://playground.example.com/api/live/health
+```
+
+Admin health check:
+
+```bash
+curl -s http://127.0.0.1:8101/admin/health \
+  -H "Authorization: Bearer $PLAYGROUND_ADMIN_TOKEN"
+```
+
+During pause, health reports `"killed":true` and session creation returns HTTP
+503 with a paused-demo message.
+
+## Monitoring
+
+Poll `/api/live/health` and alert on:
+
+| Signal | Why it matters |
+|---|---|
+| `ok:false` | Broker is paused, out of global budget, or gate is closed |
+| `budget_remaining` near `0` | The demo is about to stop accepting sessions |
+| `in_use` near `capacity` | Visitors are queued out by the concurrency cap |
+| `session_starts_last_minute` spike | Bot traffic, or an invite code shared more broadly than planned when codes are enabled |
+| Repeated HTTP 403 on session creation | Bot traffic, invalid Turnstile tokens, or bad invite flow |
+| Repeated HTTP 429 | Abuse pressure or caps set too low for the audience |
+| Repeated HTTP 503 on `/api/live/message` | Model provider is out of credits, has bad credentials, or is rate-limiting; check provider billing and the model key |
+
+Also configure the model provider's own billing alert or hard spend cap. The
+broker's in-process budgets reset on restart and are intentionally not a billing
+system.
+
+## Abuse response
+
+1. Pause immediately with `SIGUSR1`.
+2. Confirm health reports `"killed":true`.
+3. Check provider billing and active machine count.
+4. If invite codes are enabled, rotate them when a shared code leaks.
+5. Reduce `--concurrency`, daily budgets, session TTL, or per-IP caps before
+   resuming.
+6. Resume with `SIGUSR2` only after the cost ceiling and bot gate are confirmed.
+
+## Deploy and rollback
+
+Keep the public broker as a single warm instance unless shared state is added.
+The broker's token-to-lease table and daily budgets are in memory. Running two
+brokers without shared state can split sessions, double budgets, and route a
+visitor to a broker that does not recognize its token.
+
+Build and deploy sequence:
+
+1. Fetch the latest `main` in both the Pipelock and site repositories. Build
+   from clean checkouts of those fetched commits. The build script refuses
+   uncommitted tracked or untracked changes in Pipelock or under the site viewer
+   directory, and a tracked file whose bytes differ from HEAD when git status
+   hides that change. Ignored viewer files also count as source changes, except for the
+   WASM verifier, its shim, and the build record, which are replaced in staging;
+   `PLAYGROUND_ALLOW_DIRTY=1` is only for an explicitly marked diagnostic build.
+   The record describes those source trees and the files the image builds
+   consume. A clean record requires an empty `GOFLAGS`, including settings saved by
+   `go env -w`. Clear it with `unset GOFLAGS` and `go env -u GOFLAGS`. The record
+   does not describe the rest of the host Go toolchain, such as `GOEXPERIMENT`
+   or the module cache, so
+   build from a shell with no custom Go settings. The host verifier's input
+   inspection and WASM build ignore Go workspaces (`GOWORK=off`). Leave both
+   checkouts unchanged while the build runs: the record describes the inputs
+   checked at the start, and the script checks them again before pushing and
+   refuses if either revision or its recorded inputs changed. This includes
+   commits made during the build and newly generated ignored build inputs.
+   Set `PLAYGROUND_UI_DIR` to the site's `static/playground/demo` directory and
+   `PLAYGROUND_REGISTRY` to the image registry prefix. Run
+   `deploy/fly-playground/build-images.sh` with `PLAYGROUND_PUSH=1`. It prints
+   `IMAGE_REFS vm=... broker=...` as its last line. Save those commit-qualified
+   image references. `--only vm` and `--only broker` are available when only
+   one image needs rebuilding. The broker build stages the viewer, builds its
+   WASM verifier there, records the served files in `/build-info.json`, and runs
+   `serve --check-config` before pushing.
+2. Before changing production, record its current broker image reference, VM
+   image reference and digest, machine configuration, and complete broker
+   arguments, including budgets and security flags. Keep this rollback record
+   together so the previous broker and its VM can be restored as one unit.
+3. Deploy both candidate images and their matching arguments to a separate
+   staging app. Testing a candidate on the production app interrupts active
+   visitor sessions. Keep the public production broker at one warm instance.
+4. On staging, check `/api/live/health`, complete one valid session, confirm an
+   invalid Turnstile or session token fails closed, and pause with `SIGUSR1`.
+   Confirm session creation returns HTTP 503, then resume with `SIGUSR2`.
+   Run `deploy/fly-playground/check-live.sh https://playground.example
+   /path/to/site/static/playground/demo <expected-version>` against the staging
+   origin and require a pass.
+5. Drain active production sessions, then deploy the candidate broker image and
+   visitor VM image reference together. Set the broker's `--image` and
+   `--vm-image-digest` to the same published VM digest. Start the broker with
+   explicit budgets, `--turnstile-sitekey`, and Turnstile enabled. The viewer
+   is fixed to Cloudflare's
+   `https://challenges.cloudflare.com` origin.
+   If the first-party viewer JavaScript intentionally loads a third-party
+   script at runtime or sends browser telemetry to another origin, allow each
+   exact HTTPS origin with `--external-script-origin` or
+   `--external-connect-origin`. Treat a script origin as fully trusted: its
+   code can read the live page's session data and tokens. Keep these runtime
+   flags with the deployed broker configuration; they are not image-build
+   settings. A third-party `<script src>` baked directly into `index.html`
+   remains unsupported by the standard image preflight.
+6. Run `check-live.sh` against the production origin with the site viewer path
+   and expected version. Confirm health and a valid session before reopening
+   traffic.
+
+Rollback sequence:
+
+1. Pause the current broker with `SIGUSR1`.
+2. Redeploy the recorded broker image, visitor VM image and digest, machine
+   configuration, and matching broker arguments together. An old binary can
+   reject flags introduced by a newer config, and a new binary can require
+   settings absent from an older config.
+3. Confirm health and budget values. For images that include `/build-info.json`,
+   run `check-live.sh` against the restored version. For images built before
+   build records, confirm health and the recorded image digest instead. Run the
+   invalid-token and pause/resume checks again before sending traffic back.
+
+### Checking for drift
+
+`deploy/fly-playground/check-live.sh <public-origin> [site-viewer-dir|-]
+[expected-pipelock-version]` reads `/build-info.json` and `/api/live/health`,
+fetches every recorded viewer file, and checks its SHA-256 against the served
+record. With a site viewer directory, it also compares every viewer file with
+the local checkout and notes when the site has newer commits; a site commit
+that leaves the viewer unchanged is not drift. The WASM verifier and its
+JavaScript shim are built outputs and are skipped in that local comparison.
+Use `-` for the viewer directory when checking only an expected version; an empty or `/` argument is refused rather than treated as no viewer. Any missing file, mismatched hash, unhealthy
+broker, version mismatch, or build record marked dirty (`dirty`, `pipelock_dirty`, or `site_dirty`) makes the command fail. A restored image built before this record does not serve `/build-info.json`; that failure means the check does not apply to it, so confirm health and the recorded image digest instead of treating the rollback as bad. The script uses `curl` and
+`jq` and does not change the deployment or either checkout.

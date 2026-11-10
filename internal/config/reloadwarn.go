@@ -1,0 +1,2025 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"fmt"
+	"net"
+	"reflect"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ReloadWarning describes a potential security downgrade from a config reload.
+type ReloadWarning struct {
+	Field       string
+	Message     string
+	Disposition ReloadWarningDisposition
+}
+
+// ReloadWarningDisposition describes whether a reload warning can be accepted
+// by a required security contract. Its zero value is deliberately rejectable:
+// a new or unclassified warning must not weaken a required contract.
+type ReloadWarningDisposition string
+
+const (
+	// ReloadWarningDispositionAdvisory marks a warning that does not weaken a
+	// required security contract, including restart-only notices and changes
+	// that restore coverage.
+	ReloadWarningDispositionAdvisory ReloadWarningDisposition = "advisory"
+)
+
+func advisoryReloadWarning(field, message string) ReloadWarning {
+	return ReloadWarning{
+		Field:       field,
+		Message:     message,
+		Disposition: ReloadWarningDispositionAdvisory,
+	}
+}
+
+func defaultMCPResponseTrust(trust string, existed bool) string {
+	if !existed || trust == "" {
+		return ResponseTrustUntrusted
+	}
+	return trust
+}
+
+// ValidateReload compares old and new configs and returns warnings for
+// potential security downgrades. Warnings don't block the reload.
+func ValidateReload(old, updated *Config) []ReloadWarning {
+	var warnings []ReloadWarning
+	if (old.PromptInjectionMode() == ActionBlock && updated.PromptInjectionMode() != ActionBlock) || (old.PromptInjectionMode() == ActionWarn && updated.PromptInjectionMode() == ActionAllow) {
+		warnings = append(warnings, ReloadWarning{Field: "prompt_injection_detection", Message: updated.PromptInjectionNotice()})
+	}
+
+	// Mode downgrade: strict → balanced → audit
+	modeRank := map[string]int{ModeStrict: 3, ModeBalanced: 2, ModeAudit: 1}
+	if modeRank[updated.Mode] < modeRank[old.Mode] {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mode",
+			Message: fmt.Sprintf("mode downgraded from %s to %s", old.Mode, updated.Mode),
+		})
+	}
+
+	// Declared credential-audience hosts widen where a core credential may
+	// go. Adding one is a weakening with the zero (rejectable) disposition,
+	// so strict mode and require_receipts refuse it; removing one narrows.
+	if added := exactStringsAdded(old.DLP.GitHubEnterpriseHosts, updated.DLP.GitHubEnterpriseHosts); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "dlp.github_enterprise_hosts",
+			Message: "GitHub enterprise credential audience widened: " + strings.Join(added, ", ") + " — GitHub tokens are now allowed to these hosts on an encrypted Authorization header",
+		})
+	}
+	if added := exactStringsAdded(old.DLP.GitLabHosts, updated.DLP.GitLabHosts); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "dlp.gitlab_hosts",
+			Message: "GitLab credential audience widened: " + strings.Join(added, ", ") + " — GitLab PAT and CI job tokens are now allowed to these hosts on their documented headers",
+		})
+	}
+
+	// DLP patterns removed or weakened. Plain len() comparison misses
+	// same-length downgrades (e.g. swapping (?i)secret_key for (?i)key
+	// under the same pattern name). Pattern count stays constant but
+	// coverage drops silently, violating the "hot reload must preserve
+	// security state" invariant. Diff by (name, regex) identity so
+	// name-preserving regex swaps are surfaced too.
+	if removed := removedOrWeakenedDLPPatterns(old.DLP.Patterns, updated.DLP.Patterns); len(removed) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "dlp.patterns",
+			Message: "DLP patterns removed or regex/validator changed on reload: " + strings.Join(removed, ", "),
+		})
+	}
+	warnings = append(warnings, agentDLPReloadWarnings(old, updated)...)
+	if removed := removedOrWeakenedResponsePatterns(old.ResponseScanning.Patterns, updated.ResponseScanning.Patterns); len(removed) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "response_scanning.patterns",
+			Message: "response scanning patterns removed or regex-swapped on reload: " + strings.Join(removed, ", "),
+		})
+	}
+
+	// DLP include_defaults disabled
+	oldInclude := old.DLP.IncludeDefaults == nil || *old.DLP.IncludeDefaults
+	newInclude := updated.DLP.IncludeDefaults == nil || *updated.DLP.IncludeDefaults
+	if oldInclude && !newInclude {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "dlp.include_defaults",
+			Message: "DLP include_defaults disabled — new default patterns will not be merged on future upgrades",
+		})
+	}
+
+	// Internal CIDRs emptied
+	if len(old.Internal) > 0 && len(updated.Internal) == 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "internal",
+			Message: "internal CIDR list emptied — SSRF protection disabled",
+		})
+	}
+
+	// Enforce disabled
+	if old.EnforceEnabled() && !updated.EnforceEnabled() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "enforce",
+			Message: "enforcement disabled — switching to detect-only mode",
+		})
+	}
+
+	appendActionDowngradeWarnings(&warnings, old, updated)
+	appendSuppressWideningWarnings(&warnings, old.Suppress, updated.Suppress)
+
+	// Response scanning disabled
+	if old.ResponseScanning.Enabled && !updated.ResponseScanning.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "response_scanning.enabled",
+			Message: "response scanning disabled",
+		})
+	}
+	oldMCPTrust := make(map[string]string, len(old.ResponseScanning.MCPServers))
+	for _, entry := range old.ResponseScanning.MCPServers {
+		oldMCPTrust[entry.Server] = entry.Trust
+	}
+	for _, entry := range updated.ResponseScanning.MCPServers {
+		oldTrust, existed := oldMCPTrust[entry.Server]
+		if entry.Trust == ResponseTrustReasoning && (!existed || oldTrust != ResponseTrustReasoning) {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "response_scanning.mcp_servers",
+				Message: fmt.Sprintf("MCP server %q response trust changed from %s to %s", entry.Server, defaultMCPResponseTrust(oldTrust, existed), entry.Trust),
+			})
+		}
+	}
+
+	// Response scanning exempt_domains: warn when the exemption surface may have
+	// widened (new/changed entries) or was cleared entirely. Subset removal
+	// (tightening) does not warn - it makes scanning stricter.
+	if len(old.ResponseScanning.ExemptDomains) > 0 && len(updated.ResponseScanning.ExemptDomains) == 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "response_scanning.exempt_domains",
+			Message: "response scanning exempt_domains cleared (was non-empty)",
+		})
+	} else if len(updated.ResponseScanning.ExemptDomains) > 0 {
+		oldExempt := make(map[string]bool, len(old.ResponseScanning.ExemptDomains))
+		for _, d := range old.ResponseScanning.ExemptDomains {
+			oldExempt[d] = true
+		}
+		for _, d := range updated.ResponseScanning.ExemptDomains {
+			if !oldExempt[d] {
+				warnings = append(warnings, ReloadWarning{
+					Field:   "response_scanning.exempt_domains",
+					Message: fmt.Sprintf("response scanning exempt_domains changed: %q not in previous set", d),
+				})
+				break
+			}
+		}
+	}
+
+	// MCP input scanning disabled
+	if old.MCPInputScanning.Enabled && !updated.MCPInputScanning.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_input_scanning.enabled",
+			Message: "MCP input scanning disabled",
+		})
+	}
+
+	// MCP tool scanning disabled
+	if old.MCPToolScanning.Enabled && !updated.MCPToolScanning.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_tool_scanning.enabled",
+			Message: "MCP tool scanning disabled",
+		})
+	}
+
+	// MCP data-class labels disabled
+	if old.MCPDataClassLabels.Enabled && !updated.MCPDataClassLabels.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_data_class_labels.enabled",
+			Message: "MCP data-class receipt labels disabled",
+		})
+	}
+
+	// MCP tool policy disabled
+	if old.MCPToolPolicy.Enabled && !updated.MCPToolPolicy.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_tool_policy.enabled",
+			Message: "MCP tool call policy disabled",
+		})
+	}
+
+	// MCP tool policy rules reduced
+	if len(updated.MCPToolPolicy.Rules) < len(old.MCPToolPolicy.Rules) {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_tool_policy.rules",
+			Message: fmt.Sprintf("tool policy rules reduced from %d to %d", len(old.MCPToolPolicy.Rules), len(updated.MCPToolPolicy.Rules)),
+		})
+	}
+
+	// MCP binary integrity disabled or signature requirement weakened.
+	if old.MCPBinaryIntegrity.Enabled && !updated.MCPBinaryIntegrity.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_binary_integrity.enabled",
+			Message: "MCP binary integrity disabled",
+		})
+	}
+	if old.MCPBinaryIntegrity.Enabled && old.MCPBinaryIntegrity.RequireSignature &&
+		(!updated.MCPBinaryIntegrity.Enabled || !updated.MCPBinaryIntegrity.RequireSignature) {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_binary_integrity.require_signature",
+			Message: "MCP binary manifest signature requirement disabled",
+		})
+	}
+
+	// MCP tool provenance disabled.
+	if old.MCPToolProvenance.Enabled && !updated.MCPToolProvenance.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_tool_provenance.enabled",
+			Message: "MCP tool provenance verification disabled",
+		})
+	}
+
+	// Forward proxy disabled
+	if old.ForwardProxy.Enabled && !updated.ForwardProxy.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "forward_proxy.enabled",
+			Message: "forward proxy disabled",
+		})
+	}
+
+	// WebSocket proxy disabled
+	if old.WebSocketProxy.Enabled && !updated.WebSocketProxy.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "websocket_proxy.enabled",
+			Message: "WebSocket proxy disabled",
+		})
+	}
+
+	// Session profiling disabled
+	if old.SessionProfiling.Enabled && !updated.SessionProfiling.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "session_profiling.enabled",
+			Message: "session behavioral profiling disabled",
+		})
+	}
+
+	if added := forwarderDestinationsAdded(
+		old.Emit.Forwarder.DestinationAllowlist,
+		updated.Emit.Forwarder.DestinationAllowlist,
+	); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "emit.forwarder.destination_allowlist",
+			Message: fmt.Sprintf("SIEM forwarder destination allowlist expanded: %s — forwarding can now reach additional hosts", strings.Join(added, ", ")),
+		})
+	}
+
+	if !old.Emit.Forwarder.AllowInsecureHTTP && updated.Emit.Forwarder.AllowInsecureHTTP {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "emit.forwarder.allow_insecure_http",
+			Message: "SIEM forwarder cleartext http enabled — audit payloads may now be forwarded to a non-loopback host without TLS",
+		})
+	}
+
+	// Adaptive enforcement disabled
+	if old.AdaptiveEnforcement.Enabled && !updated.AdaptiveEnforcement.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "adaptive_enforcement.enabled",
+			Message: "adaptive enforcement disabled",
+		})
+	}
+	// Warn if escalation levels are weakened on reload.
+	if old.AdaptiveEnforcement.Enabled && updated.AdaptiveEnforcement.Enabled {
+		checkEscalationWeakening(&old.AdaptiveEnforcement.Levels, &updated.AdaptiveEnforcement.Levels, &warnings)
+	}
+
+	// Taint escalation disabled or weakened.
+	if old.Taint.Enabled && !updated.Taint.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "taint.enabled",
+			Message: "taint-aware policy escalation disabled",
+		})
+	}
+	taintPolicyRank := map[string]int{ModeStrict: 3, ModeBalanced: 2, ModePermissive: 1}
+	if old.Taint.Enabled && updated.Taint.Enabled && taintPolicyRank[updated.Taint.Policy] < taintPolicyRank[old.Taint.Policy] {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "taint.policy",
+			Message: fmt.Sprintf("taint policy downgraded from %s to %s", old.Taint.Policy, updated.Taint.Policy),
+		})
+	}
+	if old.Taint.Enabled && updated.Taint.Enabled {
+		if added := passthroughDomainsAdded(old.Taint.AllowlistedDomains, updated.Taint.AllowlistedDomains); len(added) > 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "taint.allowlisted_domains",
+				Message: fmt.Sprintf("taint allowlisted domains added: %s — these sources now downgrade from untrusted to allowlisted", strings.Join(added, ", ")),
+			})
+		}
+		if added := exactStringsAdded(old.Taint.TrustedMCPServers, updated.Taint.TrustedMCPServers); len(added) > 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "taint.trusted_mcp_servers",
+				Message: fmt.Sprintf("taint-trusted MCP servers added: %s — clean responses from these servers no longer contaminate the session", strings.Join(added, ", ")),
+			})
+		}
+		if removed := removedPatterns(old.Taint.ProtectedPaths, updated.Taint.ProtectedPaths); len(removed) > 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "taint.protected_paths",
+				Message: fmt.Sprintf("taint protected paths removed: %s — fewer actions are treated as protected under taint", strings.Join(removed, ", ")),
+			})
+		}
+		if removed := removedPatterns(old.Taint.ElevatedPaths, updated.Taint.ElevatedPaths); len(removed) > 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "taint.elevated_paths",
+				Message: fmt.Sprintf("taint elevated paths removed: %s — fewer actions are treated as elevated under taint", strings.Join(removed, ", ")),
+			})
+		}
+		if added := taintOverridesAdded(old.Taint.TrustOverrides, updated.Taint.TrustOverrides); len(added) > 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "taint.trust_overrides",
+				Message: fmt.Sprintf("taint trust overrides added: %s", strings.Join(added, ", ")),
+			})
+		}
+	}
+
+	// MCP session binding disabled
+	if old.MCPSessionBinding.Enabled && !updated.MCPSessionBinding.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_session_binding.enabled",
+			Message: "MCP session binding disabled",
+		})
+	}
+	if old.MCPSessionBinding.Enabled && updated.MCPSessionBinding.Enabled &&
+		old.MCPSessionBinding.RequiresListenerStateToken() && !updated.MCPSessionBinding.RequiresListenerStateToken() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mcp_session_binding.listener_require_state_token",
+			Message: "MCP listener state-token requirement disabled",
+		})
+	}
+
+	// A2A scanning disabled or downgraded
+	if old.A2AScanning.Enabled && !updated.A2AScanning.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "a2a_scanning.enabled",
+			Message: "A2A scanning disabled",
+		})
+	}
+	if old.A2AScanning.ScanAgentCards && !updated.A2AScanning.ScanAgentCards {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "a2a_scanning.scan_agent_cards",
+			Message: "A2A Agent Card scanning disabled",
+		})
+	}
+	if old.A2AScanning.DetectCardDrift && !updated.A2AScanning.DetectCardDrift {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "a2a_scanning.detect_card_drift",
+			Message: "A2A Agent Card drift detection disabled",
+		})
+	}
+	// Turning off fail-closed receipt enforcement is a security downgrade and
+	// belongs with the other "required" contracts. reloadDowngradeRejectReason
+	// already NAMES flight_recorder.require_receipts in the reason it reports,
+	// but nothing emitted a warning for it, so hasRejectableDowngradeWarning
+	// never saw one and the rejection could not fire outside strict mode: a
+	// plain reload silently cleared an active requirement. Emitting the warning
+	// is what arms the existing gate.
+	if old.FlightRecorder.RequireReceipts && !updated.FlightRecorder.RequireReceipts {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "flight_recorder.require_receipts",
+			Message: "fail-closed receipt enforcement disabled",
+		})
+	}
+	// Signature-verification downgrades only matter while A2A scanning is on; if
+	// it is being disabled the top-level "A2A scanning disabled" warning covers it.
+	if updated.A2AScanning.Enabled {
+		if old.A2AScanning.RequireSignedAgentCards && !updated.A2AScanning.RequireSignedAgentCards {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "a2a_scanning.require_signed_agent_cards",
+				Message: "A2A require-signed-agent-cards disabled",
+			})
+		}
+		// Removing a trusted key is revocation (stricter), not a downgrade, so a
+		// count decrease must NOT warn — that would block emergency key revocation
+		// under strict-mode reload. The genuine weakening is verification turning
+		// off: the trusted-key set going from non-empty to empty.
+		if len(old.A2AScanning.TrustedAgentCardKeys) > 0 && len(updated.A2AScanning.TrustedAgentCardKeys) == 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "a2a_scanning.trusted_agent_card_keys",
+				Message: "A2A trusted Agent Card keys removed (signature verification disabled)",
+			})
+		}
+	}
+	// session_smuggling_detection is reserved and not enforced, so turning it
+	// off lowers no protection and raises no warning.
+	if old.A2AScanning.ScanRawParts && !updated.A2AScanning.ScanRawParts {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "a2a_scanning.scan_raw_parts",
+			Message: "A2A raw part scanning disabled — text-like attachments will not be scanned",
+		})
+	}
+
+	// TLS interception disabled
+	if old.TLSInterception.Enabled && !updated.TLSInterception.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "tls_interception.enabled",
+			Message: "TLS interception disabled — CONNECT tunnel body/header scanning lost",
+		})
+	}
+
+	// TLS passthrough domains changed (scanning coverage may be reduced).
+	// Uses set-diff semantics: warns when new domains are added that weren't
+	// in the old list, even if the total count stays the same or shrinks.
+	if old.TLSInterception.Enabled && updated.TLSInterception.Enabled {
+		added := passthroughDomainsAdded(old.TLSInterception.PassthroughDomains, updated.TLSInterception.PassthroughDomains)
+		if len(added) > 0 {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "tls_interception.passthrough_domains",
+				Message: fmt.Sprintf("passthrough domains added: %s — these CONNECT tunnels now bypass body scanning", strings.Join(added, ", ")),
+			})
+		}
+	}
+
+	// Blocklist entries removed. The exclusion lists below reduce coverage by
+	// GROWING; the blocklist reduces it by SHRINKING, so the comparison runs the
+	// other way: any entry present before and absent now is a destination that
+	// was denied and is reachable after this reload.
+	if removed := passthroughDomainsAdded(
+		updated.FetchProxy.Monitoring.Blocklist,
+		old.FetchProxy.Monitoring.Blocklist,
+	); len(removed) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.blocklist",
+			Message: fmt.Sprintf("blocklist entries removed: %s — these destinations are no longer denied", strings.Join(removed, ", ")),
+		})
+	}
+
+	// Subdomain entropy exclusions expanded (reduces detection coverage)
+	if added := passthroughDomainsAdded(
+		old.FetchProxy.Monitoring.SubdomainEntropyExclusions,
+		updated.FetchProxy.Monitoring.SubdomainEntropyExclusions,
+	); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.subdomain_entropy_exclusions",
+			Message: fmt.Sprintf("subdomain entropy exclusions added: %s — entropy detection coverage reduced", strings.Join(added, ", ")),
+		})
+	}
+
+	// Query entropy exclusions expanded (reduces detection coverage on the
+	// query-string entropy gate; body DLP and other gates remain enforced).
+	if added := passthroughDomainsAdded(
+		old.FetchProxy.Monitoring.QueryEntropyExclusions,
+		updated.FetchProxy.Monitoring.QueryEntropyExclusions,
+	); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.query_entropy_exclusions",
+			Message: fmt.Sprintf("query entropy exclusions added: %s — entropy detection coverage reduced on query parameters", strings.Join(added, ", ")),
+		})
+	}
+	if added := pathEntropyExclusionsAdded(
+		old.FetchProxy.Monitoring.PathEntropyExclusions,
+		updated.FetchProxy.Monitoring.PathEntropyExclusions,
+	); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.path_entropy_exclusions",
+			Message: fmt.Sprintf("path entropy exclusions added: %s — path-entropy coverage reduced on these exact routes", strings.Join(added, ", ")),
+		})
+	}
+	if removed := pathEntropyExclusionsRemoved(
+		old.FetchProxy.Monitoring.PathEntropyExclusions,
+		updated.FetchProxy.Monitoring.PathEntropyExclusions,
+	); len(removed) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:       "fetch_proxy.monitoring.path_entropy_exclusions",
+			Message:     fmt.Sprintf("path entropy exclusions removed: %s — path-entropy coverage restored on these routes", strings.Join(removed, ", ")),
+			Disposition: ReloadWarningDispositionAdvisory,
+		})
+	}
+	if added := queryEntropyParamExclusionsAdded(
+		old.FetchProxy.Monitoring.QueryEntropyParamExclusions,
+		updated.FetchProxy.Monitoring.QueryEntropyParamExclusions,
+	); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.query_entropy_param_exclusions",
+			Message: fmt.Sprintf("query entropy parameter exclusions added: %s — only query-value entropy coverage is reduced for these exact endpoint parameters", strings.Join(added, ", ")),
+		})
+	}
+	if removed := queryEntropyParamExclusionsRemoved(
+		old.FetchProxy.Monitoring.QueryEntropyParamExclusions,
+		updated.FetchProxy.Monitoring.QueryEntropyParamExclusions,
+	); len(removed) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:       "fetch_proxy.monitoring.query_entropy_param_exclusions",
+			Message:     fmt.Sprintf("query entropy parameter exclusions removed: %s — matching requests will again be subject to query-value entropy blocks", strings.Join(removed, ", ")),
+			Disposition: ReloadWarningDispositionAdvisory,
+		})
+	}
+
+	appendOAuthAuthorizationReloadWarnings(&warnings, old, updated)
+	appendIssuedRedirectDelegationReloadWarnings(&warnings, old, updated)
+
+	if old.FetchProxy.Monitoring.ScanNestedURLsEnabled() && !updated.FetchProxy.Monitoring.ScanNestedURLsEnabled() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.scan_nested_urls",
+			Message: "nested URL destination scanning disabled — query-parameter destinations will not be evaluated",
+		})
+	}
+
+	// Exact grants widen destination admission and private-address access.
+	if destinationGrantsAdded(old.DestinationGrants, updated.DestinationGrants) {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "destination_grants",
+			Message: "exact destination grants added: strict admission and ordinary private-IP checks are bypassed for these destinations",
+		})
+	}
+	// Trusted domains expanded (SSRF protection scope reduced)
+	if added := passthroughDomainsAdded(old.TrustedDomains, updated.TrustedDomains); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "trusted_domains",
+			Message: fmt.Sprintf("trusted domains added: %s — SSRF internal-IP check bypassed for these hosts", strings.Join(added, ", ")),
+		})
+	}
+	// SSRF IP allowlist expanded (SSRF protection scope reduced).
+	// CIDR-semantic comparison: a new entry expands coverage only if it is
+	// not already contained within a previously-configured CIDR.
+	if expanded := ssrfIPAllowlistExpanded(old.SSRF.IPAllowlist, updated.SSRF.IPAllowlist); len(expanded) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "ssrf.ip_allowlist",
+			Message: fmt.Sprintf("SSRF IP allowlist expanded: %s — SSRF check bypassed for these IP ranges", strings.Join(expanded, ", ")),
+		})
+	}
+
+	// Per-agent trusted_domains expanded - mirrors the global trusted_domains
+	// warning above. A profile added entirely with trusted_domains is treated
+	// as an expansion (whole list is "new"). Profiles removed entirely are
+	// not flagged here; that's a profile rollback, not a trust expansion.
+	agentNames := make([]string, 0, len(updated.Agents))
+	for name := range updated.Agents {
+		agentNames = append(agentNames, name)
+	}
+	sort.Strings(agentNames)
+	for _, name := range agentNames {
+		oldProfile := old.Agents[name]
+		newProfile := updated.Agents[name]
+		added := passthroughDomainsAdded(oldProfile.TrustedDomains, newProfile.TrustedDomains)
+		if len(added) == 0 {
+			continue
+		}
+		warnings = append(warnings, ReloadWarning{
+			Field:   fmt.Sprintf("agents.%s.trusted_domains", name),
+			Message: fmt.Sprintf("agent %q trusted domains added: %s — SSRF internal-IP check bypassed for these hosts when this agent profile is active", name, strings.Join(added, ", ")),
+		})
+	}
+
+	// Request body scanning disabled
+	if old.RequestBodyScanning.Enabled && !updated.RequestBodyScanning.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "request_body_scanning.enabled",
+			Message: "request body scanning disabled",
+		})
+	}
+	if contentEntropyReloadConsumed(old) && contentEntropyReloadConsumed(updated) {
+		if old.RequestBodyScanning.ContentEntropyEnabled && !updated.RequestBodyScanning.ContentEntropyEnabled {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "request_body_scanning.content_entropy_enabled",
+				Message: "request body content entropy detection disabled",
+			})
+		}
+		if old.RequestBodyScanning.ContentEntropyEnabled && updated.RequestBodyScanning.ContentEntropyEnabled &&
+			updated.RequestBodyScanning.ContentEntropyThreshold > old.RequestBodyScanning.ContentEntropyThreshold {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "request_body_scanning.content_entropy_threshold",
+				Message: fmt.Sprintf("request body content entropy threshold raised from %.2f to %.2f", old.RequestBodyScanning.ContentEntropyThreshold, updated.RequestBodyScanning.ContentEntropyThreshold),
+			})
+		}
+	}
+	if added := entropyHostExclusionsAdded(old.RequestBodyScanning.ContentEntropyExclusions, updated.RequestBodyScanning.ContentEntropyExclusions); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "request_body_scanning.content_entropy_exclusions",
+			Message: fmt.Sprintf("request body content entropy exclusions added: %s — per-message body/frame entropy bypassed for these hosts", strings.Join(added, ", ")),
+		})
+	}
+	if added := entropyWarnRoutesAdded(old.RequestBodyScanning.ContentEntropyWarnRoutes, updated.RequestBodyScanning.ContentEntropyWarnRoutes); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "request_body_scanning.content_entropy_warn_routes",
+			Message: fmt.Sprintf("request body entropy warning routes added or materially changed: %s — matching entropy findings now warn instead of block", strings.Join(added, ", ")),
+		})
+	}
+	if added := sigV4CredentialRoutesAdded(old.RequestBodyScanning.SigV4CredentialRoutes, updated.RequestBodyScanning.SigV4CredentialRoutes); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "request_body_scanning.sigv4_credential_routes",
+			Message: fmt.Sprintf("request body SigV4 credential routes added or materially changed: %s — matching bodies may carry a structurally valid presigned URL", strings.Join(added, ", ")),
+		})
+	}
+	if added := entropyHostExclusionsAdded(old.WebSocketProxy.ContentEntropyExclusions, updated.WebSocketProxy.ContentEntropyExclusions); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "websocket_proxy.content_entropy_exclusions",
+			Message: fmt.Sprintf("WebSocket content entropy exclusions added: %s — per-message WebSocket entropy bypassed for these hosts", strings.Join(added, ", ")),
+		})
+	}
+
+	// Tool chain detection disabled
+	if old.ToolChainDetection.Enabled && !updated.ToolChainDetection.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "tool_chain_detection.enabled",
+			Message: "tool chain detection disabled",
+		})
+	}
+
+	// Cross-request detection disabled
+	if old.CrossRequestDetection.Enabled && !updated.CrossRequestDetection.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "cross_request_detection.enabled",
+			Message: "cross-request exfiltration detection disabled",
+		})
+	}
+	// Per-detector warnings only matter when the parent stays enabled.
+	// If the parent is being disabled, the parent warning above covers it.
+	if old.CrossRequestDetection.Enabled &&
+		updated.CrossRequestDetection.Enabled &&
+		old.CrossRequestDetection.EntropyBudget.Enabled &&
+		!updated.CrossRequestDetection.EntropyBudget.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "cross_request_detection.entropy_budget.enabled",
+			Message: "cross-request entropy budget detection disabled",
+		})
+	}
+	if old.CrossRequestDetection.Enabled &&
+		updated.CrossRequestDetection.Enabled &&
+		old.CrossRequestDetection.FragmentReassembly.Enabled &&
+		!updated.CrossRequestDetection.FragmentReassembly.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "cross_request_detection.fragment_reassembly.enabled",
+			Message: "cross-request fragment reassembly disabled",
+		})
+	}
+
+	// Address protection disabled
+	if old.AddressProtection.Enabled && !updated.AddressProtection.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "address_protection.enabled",
+			Message: "address protection disabled",
+		})
+	}
+
+	// Seed phrase detection disabled
+	if (old.SeedPhraseDetection.Enabled == nil || *old.SeedPhraseDetection.Enabled) &&
+		updated.SeedPhraseDetection.Enabled != nil && !*updated.SeedPhraseDetection.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "seed_phrase_detection.enabled",
+			Message: "seed phrase detection disabled",
+		})
+	}
+	// Seed phrase checksum verification disabled
+	if (old.SeedPhraseDetection.VerifyChecksum == nil || *old.SeedPhraseDetection.VerifyChecksum) &&
+		updated.SeedPhraseDetection.VerifyChecksum != nil && !*updated.SeedPhraseDetection.VerifyChecksum {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "seed_phrase_detection.verify_checksum",
+			Message: "seed phrase checksum verification disabled — increased false positive risk",
+		})
+	}
+	// Seed phrase min_words decreased
+	if old.SeedPhraseDetection.MinWords > 0 &&
+		updated.SeedPhraseDetection.MinWords > 0 &&
+		updated.SeedPhraseDetection.MinWords < old.SeedPhraseDetection.MinWords {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "seed_phrase_detection.min_words",
+			Message: fmt.Sprintf("seed phrase min_words decreased from %d to %d", old.SeedPhraseDetection.MinWords, updated.SeedPhraseDetection.MinWords),
+		})
+	}
+
+	// Emit sinks removed
+	if old.Emit.Webhook.URL != "" && updated.Emit.Webhook.URL == "" {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "emit.webhook.url",
+			Message: "webhook emission disabled",
+		})
+	}
+	if old.Emit.Syslog.Address != "" && updated.Emit.Syslog.Address == "" {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "emit.syslog.address",
+			Message: "syslog emission disabled",
+		})
+	}
+	if old.Emit.OTLP.Endpoint != "" && updated.Emit.OTLP.Endpoint == "" {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "emit.otlp.endpoint",
+			Message: "OTLP log emission disabled",
+		})
+	}
+	if old.Emit.Forwarder.URL != "" && updated.Emit.Forwarder.URL == "" {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "emit.forwarder.url",
+			Message: "durable SIEM forwarding disabled",
+		})
+	}
+
+	// Kill switch API listen address changed (requires restart)
+	if old.KillSwitch.APIListen != updated.KillSwitch.APIListen {
+		warnings = append(warnings, advisoryReloadWarning(
+			"kill_switch.api_listen",
+			"api_listen cannot change at runtime (requires restart) — ignoring",
+		))
+	}
+
+	// Metrics listen address changed (requires restart)
+	if old.MetricsListen != updated.MetricsListen {
+		warnings = append(warnings, advisoryReloadWarning(
+			"metrics_listen",
+			"metrics_listen cannot change at runtime (requires restart) — ignoring",
+		))
+	}
+
+	// Health watchdog settings are startup-only: the goroutine interval and
+	// enabled/disabled wiring are established when the proxy is constructed.
+	if old.HealthWatchdog.Enabled != updated.HealthWatchdog.Enabled ||
+		old.HealthWatchdog.IntervalSeconds != updated.HealthWatchdog.IntervalSeconds {
+		warnings = append(warnings, advisoryReloadWarning(
+			"health_watchdog",
+			"health_watchdog config changes require restart — ignored on reload",
+		))
+	}
+	if !boolPtrEqual(old.DashboardSnapshot.Enabled, updated.DashboardSnapshot.Enabled) ||
+		old.DashboardSnapshot.Path != updated.DashboardSnapshot.Path ||
+		old.DashboardSnapshot.Interval != updated.DashboardSnapshot.Interval {
+		warnings = append(warnings, advisoryReloadWarning(
+			"dashboard_snapshot",
+			"dashboard_snapshot config changes require restart — ignored on reload",
+		))
+	}
+
+	// Secrets file changed or removed (security-relevant)
+	if old.DLP.SecretsFile != updated.DLP.SecretsFile {
+		if updated.DLP.SecretsFile == "" {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "dlp.secrets_file",
+				Message: "secrets_file removed — known secret scanning disabled",
+			})
+		} else if old.DLP.SecretsFile != "" {
+			warnings = append(warnings, ReloadWarning{
+				Field: "dlp.secrets_file",
+				Message: fmt.Sprintf("secrets_file changed from %q to %q — secrets will be reloaded",
+					old.DLP.SecretsFile, updated.DLP.SecretsFile),
+			})
+		}
+	}
+
+	// Sentry DSN changed (requires restart - scrubber is built once at init)
+	if old.Sentry.DSN != updated.Sentry.DSN {
+		warnings = append(warnings, advisoryReloadWarning("sentry.dsn", "Sentry DSN changes require restart"))
+	}
+
+	// Sentry scrubber uses DLP patterns, env secrets, and file secrets from
+	// init time. Warn on ANY change that would affect scrubbing coverage.
+	if dlpPatternsChanged(old.DLP.Patterns, updated.DLP.Patterns) {
+		warnings = append(warnings, advisoryReloadWarning("sentry", "DLP patterns changed; Sentry scrubber uses init-time patterns until restart"))
+	}
+	if old.DLP.ScanEnv != updated.DLP.ScanEnv {
+		warnings = append(warnings, advisoryReloadWarning("sentry", "dlp.scan_env changed; Sentry scrubber uses init-time env secrets until restart"))
+	}
+	if old.DLP.SecretsFile != updated.DLP.SecretsFile {
+		warnings = append(warnings, advisoryReloadWarning("sentry", "dlp.secrets_file changed; Sentry scrubber uses init-time file secrets until restart"))
+	}
+
+	// File sentry config is startup-only (watches are armed once at init).
+	// ALL fields are reload-immutable, not just enabled/best_effort.
+	if fileSentryChanged(old, updated) {
+		warnings = append(warnings, advisoryReloadWarning("file_sentry", "file_sentry config changes require restart — ignored on reload"))
+	}
+
+	// The learn-lock block constructs one coupled runtime: its trust root,
+	// roster, active-store watcher, environment binding, signature threshold,
+	// and enforcement mode must all agree. Server reload preserves this block
+	// from the running configuration, so a changed setting is ignored. The
+	// proxy still rebuilds the contract loader from the preserved settings on
+	// reload and moves the active-manifest watcher onto it; a promoted
+	// manifest itself applies live through that watcher and needs no reload.
+	if old.LearnLock != updated.LearnLock {
+		warnings = append(warnings, advisoryReloadWarning("learn_lock", "learn_lock config changes require restart — ignored on reload"))
+	}
+
+	// Sandbox config is startup-only. Warn if any sandbox fields changed
+	// so operators know the reload had no effect on the running sandbox.
+	if sandboxChanged(old, updated) {
+		warnings = append(warnings, advisoryReloadWarning("sandbox", "sandbox config changes require restart — ignored on reload"))
+	}
+
+	// reverse_proxy.profile is startup-only: the listener binds once and the
+	// submit-profile SSRF-safe dialer is installed on the transport at init.
+	// A reload that flips the profile would leave the dial path stale (or
+	// leave safe dialing on after switching away), and reapplying it would
+	// race in-flight requests since it replaces the transport. Warn so the
+	// operator restarts rather than trusting a no-op reload. The listen/
+	// upstream addresses are already restart-only for the same reason.
+	if old.ReverseProxy.Profile != updated.ReverseProxy.Profile {
+		warnings = append(warnings, advisoryReloadWarning("reverse_proxy", "reverse_proxy.profile change requires restart — dial path and listener are fixed at startup, reload ignored"))
+	}
+
+	// Media policy downgrades. Each toggle that weakens protection gets a
+	// dedicated warning so operators see the field-level cause of the
+	// downgrade rather than a generic "media_policy changed" message.
+	if old.MediaPolicy.IsEnabled() && !updated.MediaPolicy.IsEnabled() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.enabled",
+			Message: "media policy disabled — image metadata stripping, audio/video blocks, and exposure events no longer apply",
+		})
+	}
+	if old.MediaPolicy.ShouldStripImages() && !updated.MediaPolicy.ShouldStripImages() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.strip_images",
+			Message: "media_policy.strip_images disabled — image responses now forwarded without stripping",
+		})
+	}
+	if old.MediaPolicy.ShouldStripAudio() && !updated.MediaPolicy.ShouldStripAudio() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.strip_audio",
+			Message: "media_policy.strip_audio disabled — audio responses now forwarded",
+		})
+	}
+	if old.MediaPolicy.ShouldStripVideo() && !updated.MediaPolicy.ShouldStripVideo() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.strip_video",
+			Message: "media_policy.strip_video disabled — video responses now forwarded",
+		})
+	}
+	if old.MediaPolicy.ShouldStripImageMetadata() && !updated.MediaPolicy.ShouldStripImageMetadata() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.strip_image_metadata",
+			Message: "media_policy.strip_image_metadata disabled — image metadata no longer removed",
+		})
+	}
+	if old.MediaPolicy.ShouldLogExposure() && !updated.MediaPolicy.ShouldLogExposure() {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.log_media_exposure",
+			Message: "media_policy.log_media_exposure disabled — media responses no longer emit exposure events",
+		})
+	}
+	oldMax := old.MediaPolicy.EffectiveMaxImageBytes()
+	newMax := updated.MediaPolicy.EffectiveMaxImageBytes()
+	if newMax > oldMax {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "media_policy.max_image_bytes",
+			Message: fmt.Sprintf("media_policy.max_image_bytes raised from %d to %d — larger images now accepted", oldMax, newMax),
+		})
+	}
+	// Allowed image types widened: warn when any effective entry is newly
+	// admitted. Compare on the EFFECTIVE list so reloading from an
+	// explicit narrow list like ["image/png"] back to "" (which falls
+	// through to DefaultAllowedImageTypes, i.e., {png, jpeg}) still
+	// counts as a widening. The previous guard was a raw-list length
+	// check that missed the "clear to defaults" transition.
+	oldEffective := old.MediaPolicy.EffectiveAllowedImageTypes()
+	newEffective := updated.MediaPolicy.EffectiveAllowedImageTypes()
+	oldAllowed := make(map[string]bool, len(oldEffective))
+	for _, t := range oldEffective {
+		oldAllowed[t] = true
+	}
+	for _, t := range newEffective {
+		if !oldAllowed[t] {
+			warnings = append(warnings, ReloadWarning{
+				Field:   "media_policy.allowed_image_types",
+				Message: fmt.Sprintf("media_policy.allowed_image_types widened: %q newly admitted", t),
+			})
+			break
+		}
+	}
+
+	// Mediation envelope signing downgraded or disabled.
+	//
+	// Downgrading from sign:true to sign:false means every mediated
+	// request loses its RFC 9421 signature. Downstream verifiers that
+	// were relying on the signature as part of an admission decision
+	// will start accepting unsigned envelopes - a silent weakening of
+	// the trust chain. Warn the operator on every such transition so a
+	// revocation shows up in logs.
+	if old.MediationEnvelope.Sign && !updated.MediationEnvelope.Sign {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mediation_envelope.sign",
+			Message: "mediation envelope signing disabled — outbound requests will no longer carry an RFC 9421 signature",
+		})
+	}
+	// Disabling the envelope entirely is a bigger step: no mediation
+	// header at all. Same reasoning; warn separately so operators can
+	// distinguish "lost the signature" from "lost the whole envelope".
+	if old.MediationEnvelope.Enabled && !updated.MediationEnvelope.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mediation_envelope.enabled",
+			Message: "mediation envelope disabled — outbound requests will no longer carry the Pipelock-Mediation header",
+		})
+	}
+	// Inbound verification is a fail-closed trust boundary for federated
+	// mediation. Disabling it means incoming mediation headers are no longer
+	// authenticated before being stripped/replaced.
+	if old.MediationEnvelope.VerifyInbound.Enabled && !updated.MediationEnvelope.VerifyInbound.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "mediation_envelope.verify_inbound.enabled",
+			Message: "inbound mediation envelope verification disabled — incoming mediation headers will no longer require a trusted RFC 9421 signature",
+		})
+	}
+	// Key rotation is not a downgrade, but an operator rotating the
+	// key id without first publishing the new public key will silently
+	// start emitting signatures no verifier can check. Warn on change.
+	if old.MediationEnvelope.Sign && updated.MediationEnvelope.Sign &&
+		old.MediationEnvelope.KeyID != updated.MediationEnvelope.KeyID {
+		warnings = append(warnings, advisoryReloadWarning(
+			"mediation_envelope.key_id",
+			fmt.Sprintf("mediation envelope signing key_id changed from %q to %q — verifiers must have the new public key published",
+				old.MediationEnvelope.KeyID, updated.MediationEnvelope.KeyID),
+		))
+	}
+	if old.MediationEnvelope.Sign && updated.MediationEnvelope.Sign {
+		updatedComponents := make(map[string]struct{}, len(updated.MediationEnvelope.SignedComponents))
+		for _, comp := range updated.MediationEnvelope.SignedComponents {
+			updatedComponents[strings.ToLower(strings.TrimSpace(comp))] = struct{}{}
+		}
+		removedComponents := make([]string, 0, len(old.MediationEnvelope.SignedComponents))
+		for _, comp := range old.MediationEnvelope.SignedComponents {
+			normalized := strings.ToLower(strings.TrimSpace(comp))
+			if normalized == "" {
+				continue
+			}
+			if _, ok := updatedComponents[normalized]; !ok && !slices.Contains(removedComponents, normalized) {
+				removedComponents = append(removedComponents, normalized)
+			}
+		}
+		if len(removedComponents) > 0 {
+			slices.Sort(removedComponents)
+			warnings = append(warnings, ReloadWarning{
+				Field: "mediation_envelope.signed_components",
+				Message: fmt.Sprintf("mediation envelope signed_components narrowed — removed %s from RFC 9421 coverage",
+					strings.Join(removedComponents, ", ")),
+			})
+		}
+		if updated.MediationEnvelope.MaxBodyBytes < old.MediationEnvelope.MaxBodyBytes {
+			warnings = append(warnings, ReloadWarning{
+				Field: "mediation_envelope.max_body_bytes",
+				Message: fmt.Sprintf("mediation envelope max_body_bytes reduced from %d to %d — fewer request bodies will carry content-digest coverage",
+					old.MediationEnvelope.MaxBodyBytes, updated.MediationEnvelope.MaxBodyBytes),
+			})
+		}
+	}
+
+	// Redaction disabled or default profile changed under our feet - both
+	// are policy downgrades an operator should see in the reload log.
+	if old.Redaction.Enabled && !updated.Redaction.Enabled {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "redaction.enabled",
+			Message: "redaction disabled — request bodies will no longer be rewritten before forwarding",
+		})
+	}
+	if old.Redaction.Enabled && updated.Redaction.Enabled &&
+		old.Redaction.DefaultProfile != updated.Redaction.DefaultProfile {
+		warnings = append(warnings, ReloadWarning{
+			Field: "redaction.default_profile",
+			Message: fmt.Sprintf("redaction default_profile changed from %q to %q — matcher rules updated",
+				old.Redaction.DefaultProfile, updated.Redaction.DefaultProfile),
+		})
+	}
+
+	appendMCPIdentityReloadWarnings(&warnings, old.MCPIdentities, updated.MCPIdentities)
+
+	return warnings
+}
+
+func contentEntropyReloadConsumed(c *Config) bool {
+	if c == nil {
+		return false
+	}
+	if c.RequestBodyScanning.Enabled || c.A2AScanning.Enabled {
+		return true
+	}
+	wsTextScanEnabled := c.WebSocketProxy.ScanTextFrames == nil || *c.WebSocketProxy.ScanTextFrames
+	return c.WebSocketProxy.Enabled && wsTextScanEnabled
+}
+
+// pathEntropyExclusionTuple identifies a path exemption by the fields that
+// change DETECTION. Governance metadata is excluded deliberately, so editing a
+// reason on reload does not read as a policy downgrade, which matches how the
+// canonical policy hash treats the same fields.
+func pathEntropyExclusionTuple(entry PathEntropyExclusion) string {
+	return pathEntropyExclusionIdentity(entry) + scannerExceptionExpiryIdentity(entry.Expires)
+}
+
+func pathEntropyExclusionIdentity(entry PathEntropyExclusion) string {
+	return entry.Scheme + "://" + entry.Host + entry.PathPrefix
+}
+
+func scannerExceptionExpiryWidened(previous, updated string) bool {
+	return previous != "" && (updated == "" || updated > previous)
+}
+
+func pathEntropyExclusionsAdded(old, updated []PathEntropyExclusion) []string {
+	oldSet := make(map[string]string, len(old))
+	for _, entry := range canonicalPathEntropyExclusions(old) {
+		oldSet[pathEntropyExclusionIdentity(entry)] = entry.Expires
+	}
+	var added []string
+	for _, entry := range canonicalPathEntropyExclusions(updated) {
+		tuple := pathEntropyExclusionTuple(entry)
+		if previous, ok := oldSet[pathEntropyExclusionIdentity(entry)]; !ok || scannerExceptionExpiryWidened(previous, entry.Expires) {
+			added = append(added, tuple)
+		}
+	}
+	sort.Strings(added)
+	return added
+}
+
+func pathEntropyExclusionsRemoved(old, updated []PathEntropyExclusion) []string {
+	newSet := make(map[string]struct{}, len(updated))
+	for _, entry := range canonicalPathEntropyExclusions(updated) {
+		newSet[pathEntropyExclusionIdentity(entry)] = struct{}{}
+	}
+	var removed []string
+	for _, entry := range canonicalPathEntropyExclusions(old) {
+		tuple := pathEntropyExclusionTuple(entry)
+		if _, ok := newSet[pathEntropyExclusionIdentity(entry)]; !ok {
+			removed = append(removed, tuple)
+		}
+	}
+	sort.Strings(removed)
+	return removed
+}
+
+func queryEntropyParamExclusionsAdded(old, updated []QueryEntropyParamExclusion) []string {
+	oldSet := make(map[string]string, len(old))
+	for _, entry := range canonicalQueryEntropyParamExclusions(old) {
+		oldSet[queryEntropyParamIdentity(entry)] = entry.Expires
+	}
+	var added []string
+	for _, entry := range canonicalQueryEntropyParamExclusions(updated) {
+		tuple := queryEntropyParamTuple(entry)
+		if previous, ok := oldSet[queryEntropyParamIdentity(entry)]; !ok || scannerExceptionExpiryWidened(previous, entry.Expires) {
+			added = append(added, tuple)
+		}
+	}
+	sort.Strings(added)
+	return added
+}
+
+func queryEntropyParamExclusionsRemoved(old, updated []QueryEntropyParamExclusion) []string {
+	updatedSet := make(map[string]struct{}, len(updated))
+	for _, entry := range canonicalQueryEntropyParamExclusions(updated) {
+		updatedSet[queryEntropyParamIdentity(entry)] = struct{}{}
+	}
+	var removed []string
+	for _, entry := range canonicalQueryEntropyParamExclusions(old) {
+		tuple := queryEntropyParamTuple(entry)
+		if _, ok := updatedSet[queryEntropyParamIdentity(entry)]; !ok {
+			removed = append(removed, tuple)
+		}
+	}
+	sort.Strings(removed)
+	return removed
+}
+
+func queryEntropyParamTuple(entry QueryEntropyParamExclusion) string {
+	return queryEntropyParamIdentity(entry) + scannerExceptionExpiryIdentity(entry.Expires)
+}
+
+func queryEntropyParamIdentity(entry QueryEntropyParamExclusion) string {
+	scheme := entry.Scheme
+	if scheme == "" {
+		scheme = QueryEntropyParamDefaultScheme
+	}
+	return fmt.Sprintf("%s://%s%s?%s", scheme, entry.Host, entry.Path, entry.Param)
+}
+
+func appendActionDowngradeWarnings(warnings *[]ReloadWarning, old, updated *Config) {
+	appendRequestPolicyBlockReloadWarnings(warnings, old.RequestPolicy, updated.RequestPolicy)
+	appendExactRequestReloadWarnings(warnings, old.RequestPolicy, updated.RequestPolicy)
+	appendActionDowngradeWarning(warnings, "request_policy.on_parse_error", old.RequestPolicy.OnParseError, updated.RequestPolicy.OnParseError)
+	appendActionDowngradeWarning(warnings, "request_policy.on_opaque_operation", old.RequestPolicy.OnOpaqueOperation, updated.RequestPolicy.OnOpaqueOperation)
+	if old.ResponseScanning.Enabled && updated.ResponseScanning.Enabled {
+		appendActionDowngradeWarning(warnings, "response_scanning.action", old.ResponseScanning.Action, updated.ResponseScanning.Action)
+	}
+	if old.ResponseScanning.SSEStreaming.Enabled && updated.ResponseScanning.SSEStreaming.Enabled {
+		appendActionDowngradeWarning(warnings, "response_scanning.sse_streaming.action", old.ResponseScanning.SSEStreaming.Action, updated.ResponseScanning.SSEStreaming.Action)
+	}
+	if old.RequestBodyScanning.Enabled && updated.RequestBodyScanning.Enabled {
+		appendActionDowngradeWarning(warnings, "request_body_scanning.action", old.RequestBodyScanning.Action, updated.RequestBodyScanning.Action)
+	}
+	if contentEntropyReloadConsumed(old) && contentEntropyReloadConsumed(updated) &&
+		old.RequestBodyScanning.ContentEntropyEnabled && updated.RequestBodyScanning.ContentEntropyEnabled {
+		appendActionDowngradeWarning(warnings, "request_body_scanning.content_entropy_action", old.RequestBodyScanning.ContentEntropyAction, updated.RequestBodyScanning.ContentEntropyAction)
+	}
+	if old.MCPInputScanning.Enabled && updated.MCPInputScanning.Enabled {
+		appendActionDowngradeWarning(warnings, "mcp_input_scanning.action", old.MCPInputScanning.Action, updated.MCPInputScanning.Action)
+	}
+	appendActionDowngradeWarning(warnings, "mcp_input_scanning.on_parse_error", old.MCPInputScanning.OnParseError, updated.MCPInputScanning.OnParseError)
+	if old.MCPToolScanning.Enabled && updated.MCPToolScanning.Enabled {
+		appendActionDowngradeWarning(warnings, "mcp_tool_scanning.action", old.MCPToolScanning.Action, updated.MCPToolScanning.Action)
+		if old.MCPToolScanning.NewToolAdmission == NewToolWithhold && updated.MCPToolScanning.NewToolAdmission == NewToolAdmit {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   "mcp_tool_scanning.new_tool_admission",
+				Message: "admission downgraded from withhold to admit",
+			})
+		}
+		appendMCPAckReloadWarnings(warnings, old.MCPToolScanning.AcknowledgedFindings, updated.MCPToolScanning.AcknowledgedFindings)
+	}
+	if old.MCPToolPolicy.Enabled && updated.MCPToolPolicy.Enabled {
+		appendActionDowngradeWarning(warnings, "mcp_tool_policy.action", old.MCPToolPolicy.Action, updated.MCPToolPolicy.Action)
+		appendActionDowngradeWarning(warnings, "mcp_tool_policy.on_incomplete_check", incompleteCheckAction(old.MCPToolPolicy), incompleteCheckAction(updated.MCPToolPolicy))
+		appendToolPolicyRuleActionDowngrades(warnings, old.MCPToolPolicy, updated.MCPToolPolicy)
+	}
+	if old.MCPBinaryIntegrity.Enabled && updated.MCPBinaryIntegrity.Enabled {
+		appendActionDowngradeWarning(warnings, "mcp_binary_integrity.action", old.MCPBinaryIntegrity.Action, updated.MCPBinaryIntegrity.Action)
+	}
+	if old.MCPToolProvenance.Enabled && updated.MCPToolProvenance.Enabled {
+		appendActionDowngradeWarning(warnings, "mcp_tool_provenance.action", old.MCPToolProvenance.Action, updated.MCPToolProvenance.Action)
+	}
+	if old.AddressProtection.Enabled && updated.AddressProtection.Enabled {
+		appendActionDowngradeWarning(warnings, "address_protection.action", old.AddressProtection.Action, updated.AddressProtection.Action)
+		appendActionDowngradeWarning(warnings, "address_protection.unknown_action", old.AddressProtection.UnknownAction, updated.AddressProtection.UnknownAction)
+	}
+	if old.A2AScanning.Enabled && updated.A2AScanning.Enabled {
+		appendActionDowngradeWarning(warnings, "a2a_scanning.action", old.A2AScanning.Action, updated.A2AScanning.Action)
+	}
+	if old.CrossRequestDetection.Enabled && updated.CrossRequestDetection.Enabled {
+		appendActionDowngradeWarning(warnings, "cross_request_detection.action", old.CrossRequestDetection.Action, updated.CrossRequestDetection.Action)
+		if old.CrossRequestDetection.EntropyBudget.Enabled && updated.CrossRequestDetection.EntropyBudget.Enabled {
+			appendActionDowngradeWarning(warnings, "cross_request_detection.entropy_budget.action", old.CrossRequestDetection.EntropyBudget.Action, updated.CrossRequestDetection.EntropyBudget.Action)
+		}
+	}
+	if old.MCPSessionBinding.Enabled && updated.MCPSessionBinding.Enabled {
+		appendActionDowngradeWarning(warnings, "mcp_session_binding.unknown_tool_action", old.MCPSessionBinding.UnknownToolAction, updated.MCPSessionBinding.UnknownToolAction)
+		appendActionDowngradeWarning(warnings, "mcp_session_binding.no_baseline_action", old.MCPSessionBinding.NoBaselineAction, updated.MCPSessionBinding.NoBaselineAction)
+	}
+	if old.ToolChainDetection.Enabled && updated.ToolChainDetection.Enabled {
+		appendActionDowngradeWarning(warnings, "tool_chain_detection.action", old.ToolChainDetection.Action, updated.ToolChainDetection.Action)
+		appendToolChainActionDowngrades(warnings, old.ToolChainDetection, updated.ToolChainDetection)
+	}
+}
+
+// appendRequestPolicyBlockReloadWarnings retains the existing named enforcement
+// identity across reloads. Predicate containment is not inferred here.
+func appendRequestPolicyBlockReloadWarnings(warnings *[]ReloadWarning, old, updated RequestPolicy) {
+	if !old.Enabled {
+		return
+	}
+	enforcing := make(map[string]bool, len(updated.Rules))
+	if updated.Enabled {
+		for _, rule := range updated.Rules {
+			enforcing[rule.Name] = rule.Action == ActionBlock && !rule.Shadow
+		}
+	}
+	for _, rule := range old.Rules {
+		if rule.Action == ActionBlock && !rule.Shadow && !enforcing[rule.Name] {
+			*warnings = append(*warnings, ReloadWarning{Field: "request_policy.rules", Message: "request-policy block rule removed, disabled, or renamed"})
+			return
+		}
+	}
+}
+
+func appendExactRequestReloadWarnings(warnings *[]ReloadWarning, old, updated RequestPolicy) {
+	if !old.Enabled || !updated.Enabled {
+		return
+	}
+	previous := make(map[string]time.Time)
+	key := func(rule string, r RequestPolicyExactRequest) string {
+		canonical, ok := CanonicalExactRequestURL(r.URL)
+		if !ok {
+			canonical = r.URL
+		}
+		return rule + "\x00" + r.Method + "\x00" + canonical + "\x00" + r.BodySHA256
+	}
+	for _, rule := range old.Rules {
+		if rule.Except == nil {
+			continue
+		}
+		for _, request := range rule.Except.Requests {
+			expires, err := time.Parse(time.RFC3339, request.ExpiresAt)
+			if err == nil {
+				requestKey := key(rule.Name, request)
+				if prior, ok := previous[requestKey]; !ok || expires.After(prior) {
+					previous[requestKey] = expires
+				}
+			}
+		}
+	}
+	for _, rule := range updated.Rules {
+		if rule.Except == nil {
+			continue
+		}
+		for _, request := range rule.Except.Requests {
+			expires, err := time.Parse(time.RFC3339, request.ExpiresAt)
+			if err != nil || !time.Now().Before(expires) {
+				continue
+			}
+			if prior, ok := previous[key(rule.Name, request)]; !ok || expires.After(prior) {
+				*warnings = append(*warnings, ReloadWarning{Field: "request_policy.rules", Message: "exact-request exception added or extended"})
+				return
+			}
+		}
+	}
+}
+
+// incompleteCheckAction resolves an omitted on_incomplete_check to warn.
+func incompleteCheckAction(p MCPToolPolicy) string {
+	if p.OnIncompleteCheck == "" {
+		return ActionWarn
+	}
+	return p.OnIncompleteCheck
+}
+
+func appendActionDowngradeWarning(warnings *[]ReloadWarning, field, oldAction, newAction string) {
+	if !actionDowngraded(oldAction, newAction) {
+		return
+	}
+	*warnings = append(*warnings, ReloadWarning{
+		Field:   field,
+		Message: fmt.Sprintf("action downgraded from %s to %s", oldAction, newAction),
+	})
+}
+
+func appendToolPolicyRuleActionDowngrades(warnings *[]ReloadWarning, oldPolicy, updatedPolicy MCPToolPolicy) {
+	oldByName := make(map[string]ToolPolicyRule, len(oldPolicy.Rules))
+	for _, rule := range oldPolicy.Rules {
+		if strings.TrimSpace(rule.Name) == "" {
+			continue
+		}
+		oldByName[rule.Name] = rule
+	}
+	for _, updatedRule := range updatedPolicy.Rules {
+		oldRule, ok := oldByName[updatedRule.Name]
+		if !ok {
+			continue
+		}
+		oldAction := oldRule.Action
+		if oldAction == "" {
+			oldAction = oldPolicy.Action
+		}
+		newAction := updatedRule.Action
+		if newAction == "" {
+			newAction = updatedPolicy.Action
+		}
+		appendActionDowngradeWarning(warnings, "mcp_tool_policy.rules."+updatedRule.Name+".action", oldAction, newAction)
+	}
+}
+
+func appendToolChainActionDowngrades(warnings *[]ReloadWarning, oldChain, updatedChain ToolChainDetection) {
+	for name, oldAction := range oldChain.PatternOverrides {
+		if strings.TrimSpace(oldAction) == "" {
+			oldAction = oldChain.Action
+		}
+		newAction, ok := updatedChain.PatternOverrides[name]
+		if !ok || strings.TrimSpace(newAction) == "" {
+			newAction = updatedChain.Action
+		}
+		appendActionDowngradeWarning(warnings, "tool_chain_detection.pattern_overrides."+name, oldAction, newAction)
+	}
+	oldByName := make(map[string]ChainPattern, len(oldChain.CustomPatterns))
+	for _, pattern := range oldChain.CustomPatterns {
+		if strings.TrimSpace(pattern.Name) == "" {
+			continue
+		}
+		oldByName[pattern.Name] = pattern
+	}
+	for _, updatedPattern := range updatedChain.CustomPatterns {
+		oldPattern, ok := oldByName[updatedPattern.Name]
+		if !ok {
+			continue
+		}
+		oldAction := oldPattern.Action
+		if oldAction == "" {
+			oldAction = oldChain.Action
+		}
+		newAction := updatedPattern.Action
+		if newAction == "" {
+			newAction = updatedChain.Action
+		}
+		appendActionDowngradeWarning(warnings, "tool_chain_detection.custom_patterns."+updatedPattern.Name+".action", oldAction, newAction)
+	}
+}
+
+func actionDowngraded(oldAction, newAction string) bool {
+	oldStrength, oldOK := reloadActionStrength(oldAction)
+	newStrength, newOK := reloadActionStrength(newAction)
+	return oldOK && newOK && newStrength < oldStrength
+}
+
+// ActionDowngraded reports whether newAction is a weaker terminal enforcement
+// outcome than oldAction (e.g. block->warn, ask->warn) using the same ranking
+// as reload-downgrade detection. Exported for reload teardown guards in other
+// packages that must reject any enforcement downgrade, not just block->non-block.
+func ActionDowngraded(oldAction, newAction string) bool {
+	return actionDowngraded(oldAction, newAction)
+}
+
+// reloadActionStrength ranks terminal enforcement outcomes for reload-downgrade
+// detection. Block is strongest because it denies the risky operation outright.
+// Defer and ask both stop automatic forwarding, but defer is stronger because it
+// requires a resolver policy path while ask is direct HITL. Redirect contains the
+// action by replacing the destination/tool, strip mutates and forwards sanitized
+// content, warn observes only, and allow/forward are weakest because they proceed.
+func reloadActionStrength(action string) (int, bool) {
+	switch strings.TrimSpace(action) {
+	case "":
+		return 0, false
+	case ActionAllow, ActionForward:
+		return 1, true
+	case ActionWarn:
+		return 2, true
+	case ActionStrip:
+		return 3, true
+	case ActionRedirect:
+		return 4, true
+	case ActionAsk:
+		return 5, true
+	case ActionDefer:
+		return 6, true
+	case ActionBlock:
+		return 7, true
+	default:
+		return 0, false
+	}
+}
+
+func appendSuppressWideningWarnings(warnings *[]ReloadWarning, oldSuppress, updatedSuppress []SuppressEntry) {
+	for _, updated := range updatedSuppress {
+		if suppressEntryCoveredByAny(oldSuppress, updated) {
+			continue
+		}
+		*warnings = append(*warnings, ReloadWarning{
+			Field:   "suppress",
+			Message: fmt.Sprintf("suppress entry widened or added for rule %q path %q", updated.Rule, updated.Path),
+		})
+		return
+	}
+}
+
+func suppressEntryCoveredByAny(oldSuppress []SuppressEntry, updated SuppressEntry) bool {
+	for _, old := range oldSuppress {
+		if strings.TrimSpace(old.Rule) != strings.TrimSpace(updated.Rule) {
+			continue
+		}
+		if suppressPathCovers(old.Path, updated.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func suppressPathCovers(oldPath, updatedPath string) bool {
+	oldPath = strings.TrimSpace(oldPath)
+	updatedPath = strings.TrimSpace(updatedPath)
+	if oldPath == "" || updatedPath == "" {
+		return oldPath == updatedPath
+	}
+	if oldPath == "*" || oldPath == updatedPath {
+		return true
+	}
+	// Only single-wildcard shapes are decidable: an exact match (handled above),
+	// a single prefix glob ("foo*"), or a single suffix glob ("*.host.com").
+	// A non-matching literal, or more than one wildcard (mid-string/contains
+	// globs like "*host*"), cannot be proven to cover the updated entry, so it is
+	// treated as NOT covering — a widening then surfaces a warning instead of
+	// slipping through (fail-closed for the guard). The previous prefix-only
+	// model gave a leading "*" an empty prefix that strings.HasPrefix matched
+	// against everything, silently covering any path (the bypass this closes).
+	oldPre, oldSuf, ok := singleGlobParts(oldPath)
+	if !ok {
+		return false
+	}
+	if !strings.ContainsRune(updatedPath, '*') {
+		// Literal updated path: covered iff it satisfies old's fixed prefix+suffix.
+		return len(updatedPath) >= len(oldPre)+len(oldSuf) &&
+			strings.HasPrefix(updatedPath, oldPre) &&
+			strings.HasSuffix(updatedPath, oldSuf)
+	}
+	uPre, uSuf, uok := singleGlobParts(updatedPath)
+	if !uok {
+		return false
+	}
+	// updated = uPre*uSuf is a subset of old = oldPre*oldSuf iff old's fixed parts
+	// sit at the matching ends of updated's fixed parts.
+	return strings.HasPrefix(uPre, oldPre) && strings.HasSuffix(uSuf, oldSuf)
+}
+
+// singleGlobParts splits a pattern containing exactly one "*" into its fixed
+// prefix and suffix. It returns ok=false for patterns with zero or multiple
+// wildcards, which the suppress-coverage check cannot decide.
+func singleGlobParts(pattern string) (prefix, suffix string, ok bool) {
+	idx := strings.IndexByte(pattern, '*')
+	if idx < 0 || idx != strings.LastIndexByte(pattern, '*') {
+		return "", "", false
+	}
+	return pattern[:idx], pattern[idx+1:], true
+}
+
+// sandboxChanged returns true if any sandbox-related config field differs.
+// fileSentryChanged returns true if any file_sentry config field differs.
+// File sentry is startup-only: watches are armed once at init and cannot
+// be reconfigured on reload.
+func fileSentryChanged(old, updated *Config) bool {
+	if old.FileSentry.Enabled != updated.FileSentry.Enabled {
+		return true
+	}
+	if old.FileSentry.BestEffort != updated.FileSentry.BestEffort {
+		return true
+	}
+	if old.FileSentry.Action != updated.FileSentry.Action {
+		return true
+	}
+	if !slices.Equal(old.FileSentry.WatchPaths, updated.FileSentry.WatchPaths) {
+		return true
+	}
+	if !boolPtrEqual(old.FileSentry.ScanContent, updated.FileSentry.ScanContent) {
+		return true
+	}
+	if !slices.Equal(old.FileSentry.IgnorePatterns, updated.FileSentry.IgnorePatterns) {
+		return true
+	}
+	return false
+}
+
+func sandboxChanged(old, updated *Config) bool {
+	if old.Sandbox.Enabled != updated.Sandbox.Enabled {
+		return true
+	}
+	if old.Sandbox.Strict != updated.Sandbox.Strict {
+		return true
+	}
+	if old.Sandbox.BestEffort != updated.Sandbox.BestEffort {
+		return true
+	}
+	if old.Sandbox.BestEffortReason != updated.Sandbox.BestEffortReason {
+		return true
+	}
+	if old.Sandbox.BestEffortExpiry != updated.Sandbox.BestEffortExpiry {
+		return true
+	}
+	if old.Sandbox.Workspace != updated.Sandbox.Workspace {
+		return true
+	}
+	if sandboxFSChanged(old.Sandbox.FS, updated.Sandbox.FS) {
+		return true
+	}
+	// Check per-agent sandbox overrides (bidirectional: added, removed, changed).
+	for name, oldProfile := range old.Agents {
+		newProfile, ok := updated.Agents[name]
+		if !ok {
+			// Agent removed - if it had sandbox overrides, that's a change.
+			if oldProfile.Sandbox != nil {
+				return true
+			}
+			continue
+		}
+		if agentSandboxChanged(oldProfile.Sandbox, newProfile.Sandbox) {
+			return true
+		}
+	}
+	// Check for newly added agents with sandbox overrides.
+	for name, newProfile := range updated.Agents {
+		if _, existed := old.Agents[name]; !existed && newProfile.Sandbox != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// sandboxFSChanged compares two SandboxFilesystem structs by content.
+func sandboxFSChanged(oldFS, newFS *SandboxFilesystem) bool {
+	if (oldFS == nil) != (newFS == nil) {
+		return true
+	}
+	if oldFS == nil {
+		return false
+	}
+	if !stringSlicesEqual(oldFS.AllowRead, newFS.AllowRead) {
+		return true
+	}
+	return !stringSlicesEqual(oldFS.AllowWrite, newFS.AllowWrite)
+}
+
+// agentSandboxChanged compares two AgentSandboxOverride pointers.
+func agentSandboxChanged(old, updated *AgentSandboxOverride) bool {
+	if (old == nil) != (updated == nil) {
+		return true
+	}
+	if old == nil {
+		return false
+	}
+	if !boolPtrEqual(old.Enabled, updated.Enabled) || !boolPtrEqual(old.Strict, updated.Strict) || !boolPtrEqual(old.BestEffort, updated.BestEffort) {
+		return true
+	}
+	if old.BestEffortReason != updated.BestEffortReason || old.BestEffortExpiry != updated.BestEffortExpiry {
+		return true
+	}
+	if old.Workspace != updated.Workspace {
+		return true
+	}
+	return sandboxFSChanged(old.FS, updated.FS)
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func boolPtrEqual(a, b *bool) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	if a == nil {
+		return true
+	}
+	return *a == *b
+}
+
+// dlpPatternsChanged returns true if the DLP pattern set differs in ways that
+// affect the Sentry scrubber (count, name, or regex content). exempt_domains
+// changes are intentionally excluded - the scrubber compiles regexes only and
+// does not use destination-domain exemptions.
+func dlpPatternsChanged(old, updated []DLPPattern) bool {
+	if len(old) != len(updated) {
+		return true
+	}
+	for i := range old {
+		if old[i].Regex != updated[i].Regex {
+			return true
+		}
+		if old[i].Name != updated[i].Name {
+			return true
+		}
+	}
+	return false
+}
+
+// passthroughDomainsAdded returns domains present in updated but not in old.
+func passthroughDomainsAdded(old, updated []string) []string {
+	oldSet := make(map[string]struct{}, len(old))
+	for _, d := range old {
+		oldSet[strings.ToLower(d)] = struct{}{}
+	}
+	var added []string
+	for _, d := range updated {
+		if _, exists := oldSet[strings.ToLower(d)]; !exists {
+			added = append(added, d)
+		}
+	}
+	return added
+}
+
+// entropyHostExclusionsAdded is passthroughDomainsAdded for entries that may
+// carry an expiry. An entry is new when its host, expiry or metadata is not in
+// the old list, so swapping an expiring entry for a permanent one, or
+// extending an expiry, is reported. Adding an expiry to a permanent entry is not.
+// A plain entry reports as its bare host, as before.
+func entropyHostExclusionsAdded(old, updated []EntropyHostExclusion) []string {
+	identity := func(e EntropyHostExclusion) string {
+		return strings.ToLower(e.Host) + "\x00" + e.Expires + "\x00" + e.Owner + "\x00" + e.Reason
+	}
+	oldSet := make(map[string]struct{}, len(old))
+	oldPermanent := make(map[string]struct{}, len(old))
+	for _, e := range old {
+		oldSet[identity(e)] = struct{}{}
+		if !e.temporary() {
+			oldPermanent[strings.ToLower(e.Host)] = struct{}{}
+		}
+	}
+	var added []string
+	for _, e := range updated {
+		if _, exists := oldSet[identity(e)]; exists {
+			continue
+		}
+		// Giving an existing permanent exclusion an expiry narrows it.
+		if _, wasPermanent := oldPermanent[strings.ToLower(e.Host)]; wasPermanent && e.temporary() {
+			continue
+		}
+		if e.Expires != "" {
+			added = append(added, fmt.Sprintf("%s (expires %s)", e.Host, e.Expires))
+		} else {
+			added = append(added, e.Host)
+		}
+	}
+	return added
+}
+
+func entropyWarnRoutesAdded(old, updated []RequestBodyEntropyWarnRoute) []string {
+	oldSet := make(map[string]struct{}, len(old))
+	for _, entry := range old {
+		oldSet[entropyWarnRouteIdentity(entry)] = struct{}{}
+	}
+	var added []string
+	for _, entry := range updated {
+		identity := entropyWarnRouteIdentity(entry)
+		if _, ok := oldSet[identity]; !ok {
+			added = append(added, identity)
+		}
+	}
+	sort.Strings(added)
+	return added
+}
+
+func entropyWarnRouteIdentity(entry RequestBodyEntropyWarnRoute) string {
+	return fmt.Sprintf("host=%q path=%q path_prefix=%q methods=%q content_types=%q owner=%q reason=%q expires=%q",
+		strings.TrimSuffix(strings.ToLower(entry.Host), "."), entry.Path, entry.PathPrefix, entry.Methods, entry.ContentTypes, entry.Owner, entry.Reason, entry.Expires)
+}
+
+func sigV4CredentialRoutesAdded(old, updated []RequestBodySigV4CredentialRoute) []string {
+	oldSet := make(map[string]struct{}, len(old))
+	for _, entry := range old {
+		oldSet[sigV4CredentialRouteIdentity(entry)] = struct{}{}
+	}
+	var added []string
+	for _, entry := range updated {
+		identity := sigV4CredentialRouteIdentity(entry)
+		if _, ok := oldSet[identity]; !ok {
+			added = append(added, identity)
+		}
+	}
+	sort.Strings(added)
+	return added
+}
+
+func sigV4CredentialRouteIdentity(entry RequestBodySigV4CredentialRoute) string {
+	return fmt.Sprintf("host=%q path=%q methods=%q content_types=%q owner=%q reason=%q expires=%q",
+		strings.TrimSuffix(strings.ToLower(entry.Host), "."), entry.Path, entry.Methods, entry.ContentTypes, entry.Owner, entry.Reason, entry.Expires)
+}
+
+// forwarderDestinationsAdded compares exact DNS hosts using the same
+// normalization as forwarder validation.
+func forwarderDestinationsAdded(old, updated []string) []string {
+	oldSet := make(map[string]struct{}, len(old))
+	for _, host := range old {
+		oldSet[canonicalForwarderHost(host)] = struct{}{}
+	}
+	var added []string
+	for _, host := range updated {
+		normalized := canonicalForwarderHost(host)
+		if _, exists := oldSet[normalized]; !exists {
+			added = append(added, host)
+		}
+	}
+	return added
+}
+
+// exactStringsAdded returns values present in updated but not in old, preserving
+// case-sensitive identity for non-domain config surfaces such as MCP server names.
+func exactStringsAdded(old, updated []string) []string {
+	oldSet := make(map[string]struct{}, len(old))
+	for _, v := range old {
+		oldSet[v] = struct{}{}
+	}
+	var added []string
+	for _, v := range updated {
+		if _, exists := oldSet[v]; !exists {
+			added = append(added, v)
+		}
+	}
+	return added
+}
+
+func taintOverridesAdded(old, updated []TaintTrustOverride) []string {
+	oldExpiry := make(map[string]time.Time, len(old))
+	for _, override := range old {
+		key := taintOverrideReloadKey(override)
+		if expiry, exists := oldExpiry[key]; !exists || override.ExpiresAt.After(expiry) {
+			oldExpiry[key] = override.ExpiresAt
+		}
+	}
+	var added []string
+	for _, override := range updated {
+		key := taintOverrideReloadKey(override)
+		oldExpiresAt, exists := oldExpiry[key]
+		switch {
+		case !exists:
+			added = append(added, key)
+		case override.ExpiresAt.After(oldExpiresAt):
+			added = append(added, fmt.Sprintf("%s expires_at=%s", key, override.ExpiresAt.UTC().Format(time.RFC3339)))
+		}
+	}
+	return added
+}
+
+func removedPatterns(old, updated []string) []string {
+	updatedSet := make(map[string]struct{}, len(updated))
+	for _, pattern := range updated {
+		updatedSet[pattern] = struct{}{}
+	}
+	var removed []string
+	for _, pattern := range old {
+		if _, exists := updatedSet[pattern]; !exists {
+			removed = append(removed, pattern)
+		}
+	}
+	return removed
+}
+
+func taintOverrideReloadKey(override TaintTrustOverride) string {
+	scope := strings.ToLower(strings.TrimSpace(override.Scope))
+	source := strings.ToLower(strings.TrimSpace(override.SourceMatch))
+	action := strings.ToLower(strings.TrimSpace(override.ActionMatch))
+
+	switch scope {
+	case "source":
+		return fmt.Sprintf("scope=%s source=%s", scope, source)
+	case "action":
+		return fmt.Sprintf("scope=%s action=%s", scope, action)
+	default:
+		return fmt.Sprintf("scope=%s source=%s action=%s", scope, source, action)
+	}
+}
+
+// ssrfIPAllowlistExpanded returns CIDR strings from updated that expand coverage
+// beyond what old already covered. A CIDR is considered expanding if its network
+// address is not contained by any CIDR in the old list. Malformed entries that
+// passed validation are included verbatim (fail-open for warnings, not security).
+func ssrfIPAllowlistExpanded(old, updated []string) []string {
+	oldNets := make([]*net.IPNet, 0, len(old))
+	for _, cidr := range old {
+		if _, ipNet, err := net.ParseCIDR(cidr); err == nil {
+			oldNets = append(oldNets, ipNet)
+		}
+	}
+
+	var expanded []string
+	for _, cidr := range updated {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			expanded = append(expanded, cidr) // malformed - warn anyway
+			continue
+		}
+		covered := false
+		for _, oldNet := range oldNets {
+			if oldNet.Contains(ipNet.IP) {
+				oOnes, oSize := oldNet.Mask.Size()
+				nOnes, nSize := ipNet.Mask.Size()
+				// Same address family and old mask is equal or broader.
+				if oSize == nSize && oOnes <= nOnes {
+					covered = true
+					break
+				}
+			}
+		}
+		if !covered {
+			expanded = append(expanded, cidr)
+		}
+	}
+	return expanded
+}
+
+// checkEscalationWeakening compares effective (post-default) escalation levels
+// and appends warnings for any enforcement that was reduced on reload.
+func checkEscalationWeakening(old, updated *EscalationLevels, warnings *[]ReloadWarning) {
+	type levelPair struct {
+		name    string
+		oldActs *EscalationActions
+		newActs *EscalationActions
+	}
+	pairs := []levelPair{
+		{"elevated", &old.Elevated, &updated.Elevated},
+		{"high", &old.High, &updated.High},
+		{"critical", &old.Critical, &updated.Critical},
+	}
+	for _, lp := range pairs {
+		if upgradeActionStrength(lp.newActs.UpgradeWarn) < upgradeActionStrength(lp.oldActs.UpgradeWarn) {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   fmt.Sprintf("adaptive_enforcement.levels.%s.upgrade_warn", lp.name),
+				Message: fmt.Sprintf("%s.upgrade_warn weakened", lp.name),
+			})
+		}
+		if upgradeActionStrength(lp.newActs.UpgradeAsk) < upgradeActionStrength(lp.oldActs.UpgradeAsk) {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   fmt.Sprintf("adaptive_enforcement.levels.%s.upgrade_ask", lp.name),
+				Message: fmt.Sprintf("%s.upgrade_ask weakened", lp.name),
+			})
+		}
+		// block_all: true -> false is weakening.
+		oldBlock := lp.oldActs.BlockAll != nil && *lp.oldActs.BlockAll
+		newBlock := lp.newActs.BlockAll != nil && *lp.newActs.BlockAll
+		if oldBlock && !newBlock {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   fmt.Sprintf("adaptive_enforcement.levels.%s.block_all", lp.name),
+				Message: fmt.Sprintf("%s.block_all weakened", lp.name),
+			})
+		}
+	}
+}
+
+// removedOrWeakenedDLPPatterns returns human-readable labels for any DLP
+// pattern that disappeared entirely or whose regex changed while keeping
+// the same name. Same-name regex swaps are the load-bearing case: an
+// attacker or misconfigured reload can keep pattern count identical while
+// silently downgrading coverage (e.g. (?i)secret_key -> (?i)key under the
+// same "AWS Secret" name). Legitimate strengthening under the same name
+// also triggers a warning; operators can resolve by reviewing the diff,
+// which is the point. Renames appear as both a removal (old name) and an
+// implicit add (new name), which the reload surface does not warn about.
+// removedOrWeakenedPatterns is the shared name+regex reload-downgrade diff for
+// any named-regex pattern set (DLP, response scanning). One helper so the two
+// security surfaces cannot drift: a pattern present in old but absent in
+// updated is "removed", and a matching name with a changed regex is "regex
+// changed". Both are downgrades a strict reload rejects.
+func removedOrWeakenedPatterns[T any](old, updated []T, nameOf, regexOf func(T) string) []string {
+	updatedByName := make(map[string]string, len(updated))
+	for _, p := range updated {
+		updatedByName[nameOf(p)] = regexOf(p)
+	}
+	var changed []string
+	for _, p := range old {
+		newRegex, ok := updatedByName[nameOf(p)]
+		switch {
+		case !ok:
+			changed = append(changed, nameOf(p))
+		case newRegex != regexOf(p):
+			changed = append(changed, nameOf(p)+" (regex changed)")
+		}
+	}
+	return changed
+}
+
+func removedOrWeakenedDLPPatterns(old, updated []DLPPattern) []string {
+	changed := removedOrWeakenedPatterns(old, updated,
+		func(p DLPPattern) string { return p.Name },
+		func(p DLPPattern) string { return p.Regex })
+	updatedByName := make(map[string]DLPPattern, len(updated))
+	for _, p := range updated {
+		updatedByName[p.Name] = p
+	}
+	for _, p := range old {
+		next, ok := updatedByName[p.Name]
+		if ok && next.Regex == p.Regex && KeywordCoverageReduced(p, next) {
+			changed = append(changed, p.Name+" (keywords narrowed)")
+		}
+		// Adding or swapping a validator can filter previously detected
+		// candidates without changing the regex. Removing one restores
+		// shape-only detection, so it cannot reduce that pattern's coverage.
+		// Regex changes already have a warning from the shared diff above.
+		if ok && next.Regex == p.Regex && next.Validator != "" && next.Validator != p.Validator {
+			changed = append(changed, p.Name+" (validator changed)")
+		}
+	}
+	return changed
+}
+
+func removedOrWeakenedResponsePatterns(old, updated []ResponseScanPattern) []string {
+	return removedOrWeakenedPatterns(old, updated,
+		func(p ResponseScanPattern) string { return p.Name },
+		func(p ResponseScanPattern) string { return p.Regex })
+}
+
+// appendMCPIdentityReloadWarnings reports mcp_identities changes. A new or
+// edited registration changes which launches are named, pinned and bound, so it
+// warns like any other relaxation. A removed one only stops refusing launches
+// that claim its name, so it is advisory and says what then happens.
+func appendMCPIdentityReloadWarnings(warnings *[]ReloadWarning, old, updated []MCPIdentity) {
+	const field = "mcp_identities"
+	updatedNames := make(map[string]bool, len(updated))
+	for _, e := range updated {
+		updatedNames[e.Name] = true
+		prior, _, existed := FindMCPIdentity(old, e.Name)
+		if !existed {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   field,
+				Message: fmt.Sprintf("mcp identity %q added: launches matching its matcher are now named and pinned by it", e.Name),
+			})
+			continue
+		}
+		for _, change := range mcpIdentityChanges(prior, e) {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   field,
+				Message: fmt.Sprintf("mcp identity %q %s", e.Name, change),
+			})
+		}
+	}
+	for _, e := range old {
+		if !updatedNames[e.Name] {
+			*warnings = append(*warnings, advisoryReloadWarning(field,
+				fmt.Sprintf("mcp identity %q removed: launches claiming the name are no longer refused as impersonation, and acknowledgments with server_binding_mode verified-local-session for it are refused at load", e.Name)))
+		}
+	}
+}
+
+// mcpIdentityChanges names each class of change between two registrations of
+// the same identity. It compares canonical forms, so reordering mapped files
+// or environment keys is not a change.
+func mcpIdentityChanges(prior, next MCPIdentity) []string {
+	a, b := canonicalMCPIdentities([]MCPIdentity{prior})[0], canonicalMCPIdentities([]MCPIdentity{next})[0]
+	if reflect.DeepEqual(a, b) {
+		return nil
+	}
+	av, bv := a.VerifiedLocalService, b.VerifiedLocalService
+	if av == nil || bv == nil {
+		return []string{"matcher changed: the registration kind differs"}
+	}
+	var out []string
+	if av.Scheme != bv.Scheme || av.Host != bv.Host || av.Path != bv.Path {
+		out = append(out, "matcher changed: the upstream scheme, host or path it matches differs")
+	}
+	if av.ExecutableSHA256 != bv.ExecutableSHA256 {
+		out = append(out, "pin changed: executable_sha256 differs")
+	}
+	if !reflect.DeepEqual(av.MappedFiles, bv.MappedFiles) {
+		out = append(out, "pin changed: mapped_files differ")
+	}
+	if !reflect.DeepEqual(av.ControlEnvironment, bv.ControlEnvironment) {
+		out = append(out, "pin changed: control_environment differs")
+	}
+	if !reflect.DeepEqual(av.PrincipalUID, bv.PrincipalUID) {
+		out = append(out, "pin changed: principal_uid differs")
+	}
+	if !reflect.DeepEqual(av.SessionHeader, bv.SessionHeader) {
+		switch {
+		case av.SessionHeader == nil:
+			out = append(out, "session header scope added: one header is no longer bound by acknowledgments")
+		case bv.SessionHeader == nil:
+			out = append(out, "session header scope removed: every header is bound by acknowledgments again")
+		default:
+			out = append(out, "session header scope changed: a different header is excluded from acknowledgment binding")
+		}
+	}
+	return out
+}
+
+func mcpAckReloadKey(e MCPAcknowledgedFinding) string {
+	return fmt.Sprintf("server %q tool %q", e.Server, e.Tool)
+}
+
+// appendMCPAckReloadWarnings reports acknowledgment changes. A new or edited
+// entry lifts a finding, so it warns like any other relaxation. A removed
+// entry only makes the tool's finding follow mcp_tool_scanning.action again,
+// which may be warn rather than block, so it is advisory and says exactly that.
+func appendMCPAckReloadWarnings(warnings *[]ReloadWarning, old, updated []MCPAcknowledgedFinding) {
+	oldByKey := make(map[string]MCPAcknowledgedFinding, len(old))
+	for _, e := range old {
+		oldByKey[mcpAckReloadKey(e)] = e
+	}
+	updatedKeys := make(map[string]bool, len(updated))
+	for _, e := range updated {
+		key := mcpAckReloadKey(e)
+		updatedKeys[key] = true
+		prior, existed := oldByKey[key]
+		switch {
+		case !existed:
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   "mcp_tool_scanning.acknowledged_findings",
+				Message: "acknowledgment added for " + key + ": its Credential Request Directive finding is lifted while every occurrence still matches",
+			})
+		case !reflect.DeepEqual(prior, e):
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   "mcp_tool_scanning.acknowledged_findings",
+				Message: "acknowledgment changed for " + key + ": the new entry applies only if it matches the tool exactly; otherwise the tools/list is refused",
+			})
+		}
+	}
+	for _, e := range old {
+		if key := mcpAckReloadKey(e); !updatedKeys[key] {
+			*warnings = append(*warnings, advisoryReloadWarning("mcp_tool_scanning.acknowledged_findings",
+				"acknowledgment removed for "+key+": its Credential Request Directive finding follows mcp_tool_scanning.action again"))
+		}
+	}
+}
+
+// Expiry changes the duration of effective enforcement. Metadata does not.
+func scannerExceptionExpiryIdentity(expires string) string {
+	if expires == "" {
+		return ""
+	}
+	return " expires=" + expires
+}
+
+// agentDLPReloadWarnings compares the same resolved policies that the agent
+// registry installs. Removed profiles resolve through the configured fallback.
+func agentDLPReloadWarnings(old, updated *Config) []ReloadWarning {
+	if MergeAgentProfileFunc == nil {
+		return nil
+	}
+	names := make(map[string]bool, len(old.Agents)+len(updated.Agents))
+	for name := range old.Agents {
+		names[name] = true
+	}
+	for name := range updated.Agents {
+		names[name] = true
+	}
+	ordered := make([]string, 0, len(names))
+	for name := range names {
+		ordered = append(ordered, name)
+	}
+	sort.Strings(ordered)
+	resolve := func(cfg *Config, name string) (*Config, error) {
+		profile, ok := cfg.Agents[name]
+		if !ok {
+			profile, ok = cfg.Agents["_default"]
+		}
+		if !ok {
+			return cfg, nil
+		}
+		return MergeAgentProfileFunc(cfg, &profile)
+	}
+	var warnings []ReloadWarning
+	for _, name := range ordered {
+		field := fmt.Sprintf("agents.%s.dlp.patterns", name)
+		before, oldErr := resolve(old, name)
+		after, newErr := resolve(updated, name)
+		if oldErr != nil || newErr != nil {
+			warnings = append(warnings, ReloadWarning{Field: field, Message: fmt.Sprintf("agent %q DLP coverage could not be resolved for reload comparison", name)})
+			continue
+		}
+		if changed := removedOrWeakenedDLPPatterns(before.DLP.Patterns, after.DLP.Patterns); len(changed) > 0 {
+			warnings = append(warnings, ReloadWarning{Field: field, Message: fmt.Sprintf("agent %q DLP patterns removed or coverage reduced on reload: %s", name, strings.Join(changed, ", "))})
+		}
+	}
+	return warnings
+}

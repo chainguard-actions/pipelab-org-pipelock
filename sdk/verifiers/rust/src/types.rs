@@ -1,0 +1,255 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+use serde::Serialize;
+use serde_json::Value;
+
+pub type Receipt = Value;
+pub type AuditPacket = Value;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Totals {
+    pub allow: u64,
+    pub block: u64,
+    pub warn: u64,
+    pub ask: u64,
+    pub strip: u64,
+    pub forward: u64,
+    pub redirect: u64,
+    pub other: u64,
+}
+
+impl Totals {
+    pub fn zero() -> Self {
+        Self {
+            allow: 0,
+            block: 0,
+            warn: 0,
+            ask: 0,
+            strip: 0,
+            forward: 0,
+            redirect: 0,
+            other: 0,
+        }
+    }
+
+    pub fn keys() -> [&'static str; 8] {
+        [
+            "allow", "block", "warn", "ask", "strip", "forward", "redirect", "other",
+        ]
+    }
+
+    pub fn get(&self, key: &str) -> u64 {
+        match key {
+            "allow" => self.allow,
+            "block" => self.block,
+            "warn" => self.warn,
+            "ask" => self.ask,
+            "strip" => self.strip,
+            "forward" => self.forward,
+            "redirect" => self.redirect,
+            "other" => self.other,
+            _ => 0,
+        }
+    }
+
+    pub fn add_verdict(&mut self, verdict: &str) {
+        match verdict.trim().to_ascii_lowercase().as_str() {
+            "allow" => self.allow += 1,
+            "block" => self.block += 1,
+            "warn" => self.warn += 1,
+            "ask" => self.ask += 1,
+            "strip" => self.strip += 1,
+            "forward" => self.forward += 1,
+            "redirect" => self.redirect += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    pub fn sum(&self) -> u64 {
+        self.allow
+            + self.block
+            + self.warn
+            + self.ask
+            + self.strip
+            + self.forward
+            + self.redirect
+            + self.other
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainResult {
+    pub valid: bool,
+    pub integrity_verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    pub receipt_count: usize,
+    pub final_seq: u64,
+    pub root_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_at_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditPacketReport {
+    pub integrity: String,
+    pub end_proof: EndProof,
+    pub scope: String,
+    pub status: String,
+    pub path: String,
+    pub verdict: String,
+    pub trusted: bool,
+    pub valid: bool,
+    pub summary: ReportSummary,
+    pub posture: ReportPosture,
+    pub run: ReportRun,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errors: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
+    pub schema_check: String,
+    pub chain_check: String,
+    pub cross_check: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_reason: Option<String>,
+    pub lifecycle_assessment: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_assessment_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportSummary {
+    pub receipt_count: u64,
+    pub totals: Totals,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportPosture {
+    pub enforcement_mode: String,
+    pub unsupported_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportRun {
+    pub provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha: Option<String>,
+    pub agent_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReceiptReport {
+    pub path: String,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpinned: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_span_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct EndProof {
+    pub proven: bool,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChainCommandReport {
+    pub integrity: String,
+    pub end_proof: EndProof,
+    pub scope: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub companion_end_proven: Option<bool>,
+    pub path: String,
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpinned: Option<bool>,
+    pub receipt_count: usize,
+    pub final_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub broken_at_seq: Option<u64>,
+    /// Receipts of each kind the session or file holds. Both chains present
+    /// must verify for the report to be valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_receipts: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence_receipts: Option<usize>,
+}
+
+/// Directory-mode report when the evidence directory holds per-run receipt
+/// chains: one chain report per run, then the base's restart continuity.
+/// Unlinked runs are always listed, because a passing result is not proof
+/// that no run's evidence is missing.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetReport {
+    pub integrity: String,
+    pub end_proof: EndProof,
+    pub scope: String,
+    pub status: String,
+    pub path: String,
+    pub base: String,
+    pub valid: bool,
+    pub chains: Vec<ChainSetEntry>,
+    pub continuity: ChainSetContinuity,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetEntry {
+    pub session: String,
+    #[serde(flatten)]
+    pub report: ChainCommandReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetContinuity {
+    pub healthy: bool,
+    /// Every chain of the base, which a named run's report lists alongside
+    /// the one chain it verifies.
+    pub chain_count: usize,
+    pub linked: Vec<ChainSetLink>,
+    pub discontinuities: Vec<ChainSetDiscontinuity>,
+    pub unlinked: Vec<String>,
+    pub findings: Vec<crate::chain_set::BaseFinding>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetLink {
+    pub session: String,
+    pub predecessor_session: String,
+    pub predecessor_tail_seq: u64,
+    pub trust: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainSetDiscontinuity {
+    pub session: String,
+    pub predecessor_session: String,
+    pub shard: String,
+    pub damage_offset: u64,
+}

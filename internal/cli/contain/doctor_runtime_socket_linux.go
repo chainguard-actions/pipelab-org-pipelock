@@ -1,0 +1,113 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build linux
+
+package contain
+
+import (
+	"bytes"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+func probeDoctorRuntimeSockets(ctx context.Context, env *doctorEnv) doctorResult {
+	if env.readFile == nil || env.runCmd == nil {
+		return unknown("runtime socket isolation could not be read", "restore access and rerun `"+doctorCommandForPort(env.port)+"`")
+	}
+	wrapperDir := env.wrapperDir
+	if wrapperDir == "" {
+		wrapperDir = defaultWrapperDir
+	}
+	wrapperPath := filepath.Join(wrapperDir, "plk-contained-launch")
+	body, err := env.readFile(wrapperPath)
+	if os.IsNotExist(err) {
+		return fail(classInfra, "managed contained-launch wrapper is missing", installRemedyForPort(env.port))
+	}
+	if err != nil {
+		return unknown("managed contained-launch wrapper could not be read", "restore access to the managed wrapper and "+installRemedyForPort(env.port))
+	}
+	if !doctorContainedLaunchWrapperMatches(body, wrapperDir, env) {
+		return fail(classInfra, "managed contained-launch wrapper differs from the installed template; runtime socket isolation cannot be established", installRemedyForPort(env.port))
+	}
+	probe := filesystemProbeEnvForDoctor(env)
+	services, problem, unusable := declaredContainmentLoopbackServicesForVerify(probe, probe.port)
+	if unusable {
+		return fail(classInfra, "managed runtime socket units cannot be determined: "+problem, installRemedyForPort(env.port))
+	}
+	if problem != "" && !strings.HasPrefix(problem, "no managed config was found at ") {
+		return unknown("managed runtime socket units cannot be determined: "+problem, "restore access and rerun `"+doctorCommandForPort(env.port)+"`")
+	}
+	units := []string{containedNamespaceForwarderUnit}
+	proxyParent := filepath.Dir(containedDoorwaySocketPath)
+	// Each namespace forwarder binds its doorway directory and the systemd
+	// notification socket its Type=notify readiness needs; nothing else.
+	notifyBind := canonicalBind(systemdNotifySocketPath, systemdNotifySocketPath, "rbind")
+	expectedBinds := map[string][]string{
+		containedNamespaceForwarderUnit: {canonicalBind(proxyParent, proxyParent, "rbind"), notifyBind},
+	}
+	for _, service := range services {
+		unit := loopbackForwarderUnitBase(service.Host, service.Port) + "-netns.service"
+		units = append(units, unit)
+		parent := filepath.Dir(declaredLoopbackDoorwayPath(service.Host, service.Port))
+		expectedBinds[unit] = []string{canonicalBind(parent, parent, "rbind"), notifyBind}
+	}
+	if env.configPath != "" {
+		cfg, loadErr := config.LoadForInspection(env.configPath)
+		if loadErr != nil && !os.IsNotExist(loadErr) {
+			return unknown("managed display runtime mounts cannot be determined from the configuration", "repair the managed configuration and "+installRemedyForPort(env.port))
+		}
+		if loadErr == nil && cfg.Containment.Display.IsEnabled(true) {
+			displayUnit := env.displayUnitPath
+			if displayUnit == "" {
+				displayUnit = defaultDisplayUnitPath
+			}
+			units = append(units, filepath.Base(displayUnit))
+		}
+	}
+	for _, unit := range units {
+		out, code, showErr := env.runCmd(ctx, "systemctl", "show", unit, "--property=TemporaryFileSystem", "--value")
+		if showErr != nil || code != 0 {
+			return unknown("runtime mounts for "+unit+" could not be read", "restore access to systemctl and rerun `"+doctorCommandForPort(env.port)+"`")
+		}
+		if err := sameLifecyclePathList(strings.TrimSpace(out), runtimeSocketTemporaryFileSystems()); err != nil {
+			return fail(classInfra, "managed unit "+unit+" lacks runtime socket isolation", installRemedyForPort(env.port))
+		}
+		if expected, forwarder := expectedBinds[unit]; forwarder {
+			out, code, showErr := env.runCmd(ctx, "systemctl", "show", unit, "--property=BindReadOnlyPaths", "--value")
+			if showErr != nil || code != 0 {
+				return unknown("runtime doorway bind for "+unit+" could not be read", "restore access to systemctl and rerun `"+doctorCommandForPort(env.port)+"`")
+			}
+			binds, parseErr := parseSystemdBindShow(strings.TrimSpace(out))
+			if parseErr != nil || !sameBindList(binds, expected) {
+				return fail(classInfra, "managed unit "+unit+" lacks its runtime doorway bind", installRemedyForPort(env.port))
+			}
+		}
+	}
+	return pass("managed contained-launch wrapper and configured namespace/display units specify runtime socket masks; live mounts are checked against the host mount table at launch")
+}
+
+func doctorContainedLaunchWrapperMatches(body []byte, wrapperDir string, env *doctorEnv) bool {
+	expected := &installEnv{
+		wrapperDir:               wrapperDir,
+		networkNamespaceUnitPath: containedNetworkNamespaceUnit,
+		pipelockTarget:           env.pipelockTarget,
+		agentUserName:            env.agentUserName,
+		agentHome:                env.agentHome,
+		bashPath:                 env.bashPath,
+	}
+	// Installation supports both systemd versions with and without this
+	// optional flag. Require the entire generated script, including the exec
+	// invocation, so unused arrays or altered control flow cannot pass.
+	for _, version := range []int{0, systemdExpandEnvironmentMinVersion} {
+		expected.systemdVersion = version
+		if bytes.Equal(body, []byte(renderContainedLaunchWrapper(expected))) {
+			return true
+		}
+	}
+	return false
+}

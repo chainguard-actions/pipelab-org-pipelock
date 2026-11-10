@@ -1,0 +1,452 @@
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"regexp"
+	"strings"
+	"unicode"
+
+	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+)
+
+// DLPValidators maps validator names from config.DLPPattern.Validator to
+// post-match validation functions. Each function receives the regex-matched
+// text and checks its structure and checksum. Passing does not establish that
+// an identifier is assigned, active, or owned by the person presenting it.
+// Exported for use by gitprotect (scan-diff) to maintain parity with runtime DLP.
+var DLPValidators = map[string]func(string) bool{
+	config.ValidatorLuhn:  validateLuhn,
+	config.ValidatorMod97: validateMod97,
+	config.ValidatorABA:   validateABA,
+	config.ValidatorWIF:   validateWIF,
+	config.ValidatorDEA:   validateDEA,
+	config.ValidatorNPI:   validateNPI,
+}
+
+// awsCredentialPrefixRe finds an access-key-shaped run with one of the two
+// prefixes AWS issues for access keys: AKIA (long-term) and ASIA (temporary
+// STS). The other prefixes in the detector regex name IAM resources (users,
+// roles, policies, instance profiles), not credentials.
+var awsCredentialPrefixRe = regexp.MustCompile(`(?i)(AKIA|ASIA)[A-Z0-9]{16}`)
+
+// validateAWSAccessIDCandidate rejects one false-positive class of the
+// case-folded AWS Access ID detector: ordinary prose that the
+// whitespace-collapsed view joins into a lowercase run behind an IAM resource
+// prefix. In "the technician vacuumed out the water" the collapsed view joins
+// "technician" and "vacuumed" into one run containing "anva" followed by more
+// letters, which the case-insensitive pattern reads as an ANVA identifier.
+//
+// The rejection is narrow on purpose. A candidate still validates when it
+//   - contains a genuine uppercase/digit identifier (strict, case-sensitive),
+//   - is entirely uppercase and digits (unchanged behavior for any prefix), or
+//   - contains an AKIA or ASIA run anywhere, in any case.
+//
+// The last rule keeps the evasion the case-folding exists for closed: a real
+// access key always starts AKIA or ASIA, so lowercasing it, splitting it with
+// spaces, or leading it with decoy prose leaves a run this check still finds.
+// The validator runs inside the pattern's all-matches loop, so rejecting a
+// prose candidate never hides a later genuine key in the same text.
+// builtinDLPValidatorForRegex returns the precision validator a built-in
+// detector regex always carries, keyed by the regex rather than the pattern
+// name so the immutable core copy, the configurable copy, and any renamed
+// operator copy of the same regex behave identically.
+func builtinDLPValidatorForRegex(regex string) func(string) bool {
+	if regex == config.AWSAccessIDRegex {
+		return validateAWSAccessIDCandidate
+	}
+	return nil
+}
+
+// builtinDLPJoinedValidatorForRegex returns the extra check a built-in
+// detector applies only to matches found in the whitespace-joined view.
+func builtinDLPJoinedValidatorForRegex(regex string) func(string, int, int, string, []int) bool {
+	if regex == config.AWSAccessIDRegex {
+		return validateAWSAccessIDJoined
+	}
+	return nil
+}
+
+// awsIDPrefixes are the prefixes of config.AWSAccessIDRegex. AWS's IAM
+// identifier reference lists AKIA as access key, ASIA as temporary STS access
+// key, and AGPA/AIDA/AIPA/ANPA/ANVA/AROA as group, user, instance profile,
+// managed policy, policy version and role IDs. A3T is a legacy shape.
+var awsIDPrefixes = [...]string{"AKIA", "A3T", "AGPA", "AIDA", "AROA", "AIPA", "ANPA", "ANVA", "ASIA"}
+
+// awsIDTailMin is the minimum tail length the detector regex requires.
+const awsIDTailMin = 16
+
+// validateAWSAccessIDJoined narrows AWS Access ID matches found ONLY in the
+// whitespace-joined view, where adjacent words fuse and the case-insensitive
+// regex reads English as a key ("cANVAs operations to prevent..."). Raw
+// (unjoined) matching is untouched. The candidate [start,end) is accepted when
+// some prefix inside it has a window of prefix plus the regex's minimum tail
+// that
+//   - is all alphanumeric with consistent letter case (a key split by spaces
+//     keeps its case, mixed-case words do not),
+//   - is uppercase, or is lowercase behind AKIA/ASIA (the existing rule that
+//     lowercase IAM resource prefixes are prose), and
+//   - for IAM resource IDs, does not start in the middle of a same-case word
+//     in source. Credential prefixes AKIA/ASIA remain detectable mid-word. A prefix
+//     preceded by punctuation, whitespace, a digit, or a letter of the other
+//     case still counts, so "key=AKIA IOSF..." and "xAKIA IOSF..." stay caught.
+//
+// Scanning every prefix position in the candidate means a decoy run cannot hide
+// a genuine key later in the same joined run.
+func validateAWSAccessIDJoined(joined string, start, end int, source string, offsets []int) bool {
+	if start < 0 || end > len(joined) || start >= end || end > len(offsets) {
+		return true // Invalid context stays fail-closed for detection.
+	}
+	for i := start; i < end; i++ {
+		c := joined[i] | 0x20
+		if c != 'a' {
+			continue
+		}
+		for _, prefix := range awsIDPrefixes {
+			n := len(prefix) + awsIDTailMin
+			if i+n > end || !strings.EqualFold(joined[i:i+len(prefix)], prefix) {
+				continue
+			}
+			// An uppercase AKIA or ASIA prefix is itself a credential signal that
+			// prose does not produce, so its window may run into joined words:
+			// that is how a key split across stream events reads once the
+			// events' text is joined. The single-case rule exists for resource
+			// prefixes and for lowercase or mixed-case prose such as "Asia".
+			if awsJoinedWindowAllowed(joined[i:i+n], prefix, awsUppercaseCredentialPrefix(joined[i:i+len(prefix)])) &&
+				(prefix == "AKIA" || prefix == "ASIA" || awsJoinedStartAllowed(source, offsets[i], joined[i])) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func awsUppercaseCredentialPrefix(prefix string) bool {
+	return prefix == "AKIA" || prefix == "ASIA"
+}
+
+// awsJoinedWindowAllowed requires an alphanumeric window. mixedCaseOK relaxes
+// only the single-case rule, never the character class.
+func awsJoinedWindowAllowed(window, prefix string, mixedCaseOK bool) bool {
+	var upper, lower bool
+	for j := 0; j < len(window); j++ {
+		switch b := window[j]; {
+		case b >= 'A' && b <= 'Z':
+			upper = true
+		case b >= 'a' && b <= 'z':
+			lower = true
+		case b >= '0' && b <= '9':
+		default:
+			return false
+		}
+	}
+	if upper && lower && !mixedCaseOK {
+		return false
+	}
+	if lower && prefix != "AKIA" && prefix != "ASIA" {
+		return false
+	}
+	return true
+}
+
+func awsJoinedStartAllowed(source string, at int, first byte) bool {
+	if at <= 0 || at > len(source) {
+		return true
+	}
+	prev := source[at-1]
+	isUpper := first >= 'A' && first <= 'Z'
+	switch {
+	case prev >= 'A' && prev <= 'Z':
+		return !isUpper
+	case prev >= 'a' && prev <= 'z':
+		return isUpper
+	}
+	return true
+}
+
+func validateAWSAccessIDCandidate(candidate string) bool {
+	if strictAWSAccessIDRe.MatchString(candidate) || !containsASCIILower(candidate) {
+		return true
+	}
+	return awsCredentialPrefixRe.MatchString(candidate)
+}
+
+// RetriesCardPrefixes reports whether p is the built-in card rule with its
+// luhn validator. Preset YAML copies the built-in rule without its Compiled
+// marker, so rule name and regex both identify it. A separately named operator
+// rule using the same regex keeps whole-match semantics.
+func RetriesCardPrefixes(p config.DLPPattern) bool {
+	return p.Name == "Credit Card Number" && p.Validator == config.ValidatorLuhn && jsonnumber.IsShippedCardPattern(p.Regex)
+}
+
+// AcceptsMatch applies the scanner's accepted-span policy to one regex hit for
+// consumers that keep their own pattern loop, such as scan-diff and the
+// project scan, so they agree with runtime scanning on card endpoints.
+func AcceptsMatch(match string, validate func(string) bool, cardPrefixRetry bool) bool {
+	if !cardPrefixRetry {
+		return validate(match)
+	}
+	_, ok := jsonnumber.AcceptedCardEnd(match, func(end int) bool { return validate(match[:end]) })
+	return ok
+}
+
+// validateLuhn preserves the scanner validator contract while the shared
+// number helper keeps redaction and detection on the same issuer/checksum rule.
+func validateLuhn(s string) bool { return jsonnumber.ValidCardNumber(s) }
+
+func validCardIssuer(digits []byte, n int) bool { return jsonnumber.ValidCardIssuer(digits, n) }
+
+// validateMod97 implements ISO 7064 mod-97 validation for IBAN numbers.
+// Uses iterative modular arithmetic - no math/big needed. Rearranges the
+// IBAN (move first 4 chars to end), converts letters to numbers (A=10..Z=35),
+// and checks that the result mod 97 equals 1. Eliminates ~99% of false positives.
+func validateMod97(s string) bool {
+	// Strip spaces and dashes, uppercase - IBANs are often formatted with
+	// spaces every 4 characters (e.g. "GB29 NWBK 6016 1331 9268 19").
+	cleaned := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '-' {
+			return -1
+		}
+		return unicode.ToUpper(r)
+	}, s)
+
+	n := len(cleaned)
+	if n < 15 || n > 34 {
+		return false
+	}
+
+	// Must start with 2 letters (country code) + 2 digits (check digits).
+	if !isASCIILetter(cleaned[0]) || !isASCIILetter(cleaned[1]) ||
+		!isASCIIDigit(cleaned[2]) || !isASCIIDigit(cleaned[3]) {
+		return false
+	}
+
+	// Validate country code and country-specific length against the IBAN
+	// registry (SWIFT/ISO 13616). Rejects fabricated country prefixes and
+	// IBANs with wrong length for their country (e.g. 15-char German IBAN).
+	cc := cleaned[:2]
+	expectedLen, ok := ibanCountryLengths[cc]
+	if !ok {
+		return false
+	}
+	if n != expectedLen {
+		return false
+	}
+
+	// Rearrange: move first 4 characters to end.
+	rearranged := cleaned[4:] + cleaned[:4]
+
+	// Iterative mod-97: process character by character to avoid big integers.
+	// Letters expand to 2 digits (A=10..Z=35), so multiply remainder by 100.
+	// Digits expand to 1 digit, so multiply remainder by 10.
+	remainder := 0
+	for i := 0; i < len(rearranged); i++ {
+		c := rearranged[i]
+		if isASCIIDigit(c) {
+			remainder = (remainder*10 + int(c-'0')) % 97
+		} else if isASCIILetter(c) {
+			remainder = (remainder*100 + int(c-'A') + 10) % 97
+		} else {
+			return false // unexpected character in BBAN
+		}
+	}
+
+	return remainder == 1
+}
+
+// validateABA implements the ABA routing number checksum (3-7-1 weighted sum).
+// ABA routing numbers are exactly 9 digits with the weighted checksum:
+// 3*d1 + 7*d2 + 1*d3 + 3*d4 + 7*d5 + 1*d6 + 3*d7 + 7*d8 + 1*d9 ≡ 0 (mod 10).
+// Also validates that the first two digits fall within valid Federal Reserve
+// district ranges (00-12, 21-32, 61-72, 80), reducing false positives from
+// ~10% to ~4.4% of random 9-digit numbers.
+func validateABA(s string) bool {
+	// Extract digits only.
+	var digits [9]byte
+	n := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] >= '0' && s[i] <= '9' {
+			if n >= 9 {
+				return false
+			}
+			digits[n] = s[i] - '0'
+			n++
+		}
+	}
+
+	if n != 9 {
+		return false
+	}
+
+	// Validate Federal Reserve district prefix (first 2 digits).
+	// Valid ranges: 00-12, 21-32, 61-72, 80.
+	prefix := int(digits[0])*10 + int(digits[1])
+	validPrefix := (prefix <= 12) ||
+		(prefix >= 21 && prefix <= 32) ||
+		(prefix >= 61 && prefix <= 72) ||
+		prefix == 80
+	if !validPrefix {
+		return false
+	}
+
+	weights := [9]int{3, 7, 1, 3, 7, 1, 3, 7, 1}
+	sum := 0
+	for i := 0; i < 9; i++ {
+		sum += int(digits[i]) * weights[i]
+	}
+
+	return sum%10 == 0
+}
+
+// validateWIF validates Bitcoin WIF (Wallet Import Format) private keys
+// using Base58Check decoding with SHA-256d checksum verification.
+// WIF keys have version byte 0x80 (mainnet) with 32-byte (uncompressed)
+// or 33-byte (compressed, ends with 0x01 flag) payloads. Eliminates
+// false positives from conversation text that happens to match the
+// base58 character class - invalid checksums have a 1-in-2^32 chance
+// of passing.
+func validateWIF(s string) bool {
+	if ok, canonical := validateCanonicalWIF(s); canonical {
+		return ok
+	}
+	payload, version, err := addressprotect.Base58CheckDecode(s)
+	if err != nil {
+		return false
+	}
+
+	// WIF mainnet version byte.
+	if version != 0x80 {
+		return false
+	}
+
+	// Uncompressed: 32-byte private key.
+	// Compressed: 32-byte key + 0x01 compression flag = 33 bytes.
+	return len(payload) == 32 || (len(payload) == 33 && payload[32] == 0x01)
+}
+
+// Mainnet WIF widths: https://en.bitcoin.it/wiki/Wallet_import_format
+const (
+	wifUncompressedLen = 51
+	wifCompressedLen   = 52
+	base58Alphabet     = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+)
+
+var base58Digit = func() (digits [256]int8) {
+	for i := range digits {
+		digits[i] = -1
+	}
+	for i := 0; i < len(base58Alphabet); i++ {
+		digits[base58Alphabet[i]] = int8(i)
+	}
+	return digits
+}()
+
+func isBase58Byte(c byte) bool { return base58Digit[c] >= 0 }
+
+// validateCanonicalWIF decodes the canonical candidate shape without
+// allocating, so overlapping WIF enumeration stays cheap on long base58 runs.
+// canonical is false for any other input, which takes the general decoder.
+// The decision matches Base58CheckDecode: version 0x80, a 32-byte payload or
+// a 33-byte payload ending in 0x01, then the SHA-256d checksum.
+func validateCanonicalWIF(s string) (ok, canonical bool) {
+	switch {
+	case len(s) == wifUncompressedLen && s[0] == '5':
+	case len(s) == wifCompressedLen && (s[0] == 'K' || s[0] == 'L'):
+	default:
+		return false, false
+	}
+	// 58^52 < 2^320, so ten 32-bit limbs hold any 52-digit value.
+	var limbs [10]uint32
+	for i := 0; i < len(s); i++ {
+		digit := base58Digit[s[i]]
+		if digit < 0 {
+			return false, true
+		}
+		carry := uint64(digit)
+		for j := len(limbs) - 1; j >= 0; j-- {
+			x := uint64(limbs[j])*58 + carry
+			limbs[j] = uint32(x) // #nosec G115 -- keeps the low 32 bits; the high bits carry
+			carry = x >> 32
+		}
+	}
+	var buf [40]byte
+	for j, limb := range limbs {
+		binary.BigEndian.PutUint32(buf[4*j:], limb)
+	}
+	first := 0
+	for first < len(buf) && buf[first] == 0 {
+		first++
+	}
+	decoded := buf[first:]
+	switch {
+	case len(decoded) == 37 && decoded[0] == 0x80:
+	case len(decoded) == 38 && decoded[0] == 0x80 && decoded[33] == 0x01:
+	default:
+		return false, true
+	}
+	body, checksum := decoded[:len(decoded)-4], decoded[len(decoded)-4:]
+	h1 := sha256.Sum256(body)
+	h2 := sha256.Sum256(h1[:])
+	return h2[0] == checksum[0] && h2[1] == checksum[1] && h2[2] == checksum[2] && h2[3] == checksum[3], true
+}
+
+func isASCIILetter(c byte) bool { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') }
+func isASCIIDigit(c byte) bool  { return c >= '0' && c <= '9' }
+
+// ibanCountryLengths maps ISO 13616 IBAN country codes to their required
+// total IBAN length. Rejects fabricated country prefixes and wrong-length
+// IBANs (e.g. a 15-char string with DE prefix when German IBANs must be 22).
+// Source: SWIFT IBAN Registry (Release 101, Dec 2025).
+// https://www.swift.com/resource/iban-registry-pdf
+var ibanCountryLengths = map[string]int{
+	"AD": 24, "AE": 23, "AL": 28, "AT": 20, "AZ": 28,
+	"BA": 20, "BE": 16, "BG": 22, "BH": 22, "BI": 27,
+	"BR": 29, "BY": 28, "CH": 21, "CR": 22, "CY": 28,
+	"CZ": 24, "DE": 22, "DJ": 27, "DK": 18, "DO": 28,
+	"EE": 20, "EG": 29, "ES": 24, "FI": 18, "FK": 18,
+	"FO": 18, "FR": 27, "GB": 22, "GE": 22, "GI": 23,
+	"GL": 18, "GR": 27, "GT": 28, "HN": 28, "HR": 21, "HU": 28,
+	"IE": 22, "IL": 23, "IQ": 23, "IS": 26, "IT": 27,
+	"JO": 30, "KW": 30, "KZ": 20, "LB": 28, "LC": 32,
+	"LI": 21, "LT": 20, "LU": 20, "LV": 21, "LY": 25,
+	"MC": 27, "MD": 24, "ME": 22, "MK": 19, "MN": 20,
+	"MR": 27, "MT": 31, "MU": 30, "NI": 28, "NL": 18,
+	"NO": 15, "OM": 23, "PK": 24, "PL": 28, "PS": 29,
+	"PT": 25, "QA": 29, "RO": 24, "RS": 22, "RU": 33,
+	"SA": 24, "SC": 31, "SD": 18, "SE": 24, "SI": 19,
+	"SK": 24, "SM": 27, "SN": 28, "SO": 23, "ST": 25,
+	"SV": 28, "TL": 23, "TN": 24, "TR": 26, "UA": 29,
+	"VA": 22, "VG": 24, "XK": 20, "YE": 30,
+}
+
+// RetriesWIFOverlaps binds overlapping search to the fixed-width mainnet WIF
+// grammar. Arbitrary operator regexes retain their whole-match semantics.
+func RetriesWIFOverlaps(p config.DLPPattern) bool {
+	return p.Validator == config.ValidatorWIF && p.Regex == config.BitcoinWIFRegex
+}
+
+// ValidatedPatternMatches shares checksum candidate enumeration with local
+// diff and project scanners. Failed WIF hits cannot consume a valid neighbor.
+func ValidatedPatternMatches(text string, re *regexp.Regexp, validate func(string) bool, cardPrefixRetry, wifOverlapRetry bool) bool {
+	return ContextualPatternMatches(text, re, validate, cardPrefixRetry, wifOverlapRetry, nil)
+}
+
+// ContextualPatternMatches shares candidate continuation and keyword windows
+// with offline consumers that supply their own logical text units.
+func ContextualPatternMatches(text string, re *regexp.Regexp, validate func(string) bool, cardPrefixRetry, wifOverlapRetry bool, keywords *config.DLPKeywordMatcher) bool {
+	if re == nil {
+		return false
+	}
+	p := compiledPattern{re: re, validate: validate, cardPrefixRetry: cardPrefixRetry, wifOverlapRetry: wifOverlapRetry, keywords: keywords}
+	if keywords != nil {
+		_, _, matched := p.matchSpanWithDecodes(normalize.ForDLP(text), text, nil)
+		return matched
+	}
+	return p.matches(text)
+}

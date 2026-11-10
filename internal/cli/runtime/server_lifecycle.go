@@ -1,0 +1,1574 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"context"
+	"crypto/hmac"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/net/netutil"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/httpstream"
+	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/identity"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/scanapi"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+var newFileSentryWatcher = filesentry.NewWatcher
+
+// fileSentryRuntimeFailure preserves the first asynchronous watcher failure
+// until its owner has completed graceful shutdown. A file sentry backend error
+// is a fail-closed runtime failure; cancellation is only the mechanism used to
+// drain listeners and child processes safely.
+type fileSentryRuntimeFailure struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (f *fileSentryRuntimeFailure) set(err error) {
+	if err == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err == nil {
+		f.err = err
+	}
+}
+
+func (f *fileSentryRuntimeFailure) get() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
+}
+
+func validateServerFileSentry(cfg *config.Config) error {
+	if cfg != nil && cfg.FileSentry.Enabled && cfg.FileSentry.Action == config.ActionBlock {
+		return errors.New("file_sentry.action: block requires subprocess MCP mode (pipelock mcp proxy -- COMMAND); pipelock run has no child process to cancel")
+	}
+	return nil
+}
+
+func (s *Server) startFileSentry(ctx context.Context, cfg *config.Config, cancel context.CancelFunc) (func() error, error) {
+	if err := validateServerFileSentry(cfg); err != nil {
+		return nil, err
+	}
+	if cfg == nil || !cfg.FileSentry.Enabled {
+		return func() error { return nil }, nil
+	}
+
+	onErr := func(err error) {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: [file_sentry] %v\n", err)
+	}
+	watcher, err := newFileSentryWatcher(&cfg.FileSentry, liveFileSentryScanner{
+		load: func() *scanner.Scanner {
+			if s.proxy == nil {
+				return nil
+			}
+			return s.proxy.ScannerPtr().Load()
+		},
+	}, nil, onErr)
+	if err != nil {
+		return nil, fmt.Errorf("file sentry init failed (feature is enabled): %w", err)
+	}
+
+	if err := watcher.Arm(); err != nil {
+		// Capture the watch failure count before closing the watcher.
+		degraded := watcher.DegradedPathCount()
+		_ = watcher.Close()
+		if cfg.FileSentry.BestEffort && !fileSentryArmErrorMustFailClosed(err) {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: file sentry failed to arm watches (best_effort: continuing without file monitoring): %v\n", err)
+			return func() error { return nil }, nil
+		}
+		return nil, fileSentryArmFailure(err, degraded)
+	}
+
+	var findingHook filesentry.FindingHook
+	if s.metrics != nil {
+		findingHook = s.metrics.RecordFileSentryFinding
+	}
+	waitConsumer := filesentry.ConsumeFindings(filesentry.ConsumerOpts{
+		Watcher:   watcher,
+		Action:    cfg.FileSentry.Action,
+		Log:       s.opts.Stderr,
+		OnFinding: findingHook,
+		Cancel:    cancel,
+	})
+
+	var failure fileSentryRuntimeFailure
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		if err := watcher.Start(ctx); err != nil {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: file sentry fatal: %v — cancelling runtime\n", err)
+			failure.set(err)
+			cancel()
+		}
+	}()
+
+	// Report skipped subtrees explicitly. A recursive root can have multiple
+	// inaccessible descendants, so subtracting DegradedPaths from configured
+	// roots would invent an inaccurate count.
+	reportFileSentryCoverage(s.opts.Stderr, len(cfg.FileSentry.WatchPaths), cfg.FileSentry.Action, watcher.DegradedPathCount())
+
+	var stopOnce sync.Once
+	var stopErr error
+	return func() error {
+		stopOnce.Do(func() {
+			_ = watcher.Close()
+			<-watcherDone
+			waitConsumer()
+			if err := failure.get(); err != nil {
+				stopErr = fmt.Errorf("file sentry runtime failed: %w", err)
+			}
+		})
+		return stopErr
+	}, nil
+}
+
+func reportFileSentryCoverage(w io.Writer, configuredPaths int, action string, degradedPaths int) {
+	if degradedPaths > 0 {
+		_, _ = fmt.Fprintf(w, "pipelock: file sentry watching %d configured path(s) (action=%s; %d skipped/unarmed subtree(s))\n",
+			configuredPaths, action, degradedPaths)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "pipelock: file sentry watching %d configured path(s) (action=%s)\n", configuredPaths, action)
+}
+
+func fileSentryArmErrorMustFailClosed(err error) bool {
+	return errors.Is(err, filesentry.ErrNoWatchPaths) || errors.Is(err, filesentry.ErrRequiredWatchPath)
+}
+
+// fileSentryArmFailure keeps the summary and remedy ahead of joined details,
+// preserving the original error chain. The count includes omitted diagnostics.
+func fileSentryArmFailure(err error, degradedSubtrees int) error {
+	return fmt.Errorf("%s\n%s\ndetails:\n%w",
+		fileSentryArmFailureSummary(err, degradedSubtrees),
+		fileSentryArmRemedy(err),
+		err)
+}
+
+func fileSentryArmFailureSummary(err error, degradedSubtrees int) string {
+	const head = "file sentry failed to arm watches (feature is enabled)"
+	if degradedSubtrees > 0 {
+		return fmt.Sprintf("%s: %d skipped/unarmed watch subtree(s)", head, degradedSubtrees)
+	}
+	if errors.Is(err, filesentry.ErrNoWatchPaths) {
+		return head + ": no watch paths could be armed"
+	}
+	return head
+}
+
+// fileSentryArmRemedy offers best_effort only when it can resolve the failure.
+func fileSentryArmRemedy(err error) string {
+	if errors.Is(err, filesentry.ErrNoWatchPaths) {
+		return "remedies: ensure at least one file_sentry.watch_paths entry names an existing directory the user pipelock runs as can read and execute, and that file_sentry.ignore_patterns does not exclude it. file_sentry.best_effort does NOT apply to this failure: at least one path must be watchable"
+	}
+	if fileSentryArmErrorMustFailClosed(err) {
+		return "remedies: create missing required directories or correct their file_sentry.watch_paths entries; grant the user pipelock runs as read and execute access to each listed directory; or adjust file_sentry.ignore_patterns to exclude inaccessible paths while retaining at least one watchable directory. file_sentry.best_effort does NOT apply to this failure: required watch coverage must be available"
+	}
+	return "remedies: grant the user pipelock runs as read and execute access to each listed directory; add a file_sentry.ignore_patterns entry matching an inaccessible path; or set file_sentry.best_effort: true to trade coverage for availability"
+}
+
+// startupSummaryLine renders the one-line startup diagnostic. fetchAddr is the
+// resolved fetch listener address (the OS-chosen port when the configured
+// address is ephemeral), so the summary matches the per-endpoint lines instead
+// of echoing a stale ":0".
+func (s *Server) startupSummaryLine(cfg *config.Config, fetchAddr string) string {
+	return fmt.Sprintf(
+		"  Check:  mode=%s listeners=%s allowlist=%d dlp_patterns=%d checks=%d entropy=%s; run `pipelock explain` to see why a request was blocked",
+		cfg.Mode,
+		strings.Join(s.startupListeners(cfg, fetchAddr), ","),
+		len(cfg.APIAllowlist),
+		len(cfg.DLP.Patterns),
+		startupEnabledCheckCount(cfg),
+		startupEntropyState(cfg),
+	)
+}
+
+func (s *Server) startupListeners(cfg *config.Config, fetchAddr string) []string {
+	listeners := []string{"fetch=" + fetchAddr}
+	if cfg.MetricsListen != "" && cfg.MetricsListen != cfg.FetchProxy.Listen {
+		listeners = append(listeners, "stats="+cfg.MetricsListen)
+	}
+	if cfg.ForwardProxy.Enabled {
+		listeners = append(listeners, "forward=enabled")
+	}
+	if cfg.WebSocketProxy.Enabled {
+		listeners = append(listeners, "ws="+fetchAddr)
+	}
+	if cfg.ScanAPI.Listen != "" {
+		listeners = append(listeners, "scan_api="+cfg.ScanAPI.Listen)
+	}
+	if killSwitchAPITokenConfigured(cfg) {
+		if s.apiOnSeparatePort {
+			listeners = append(listeners, "kill_api="+cfg.KillSwitch.APIListen)
+		} else {
+			listeners = append(listeners, "kill_api="+fetchAddr)
+		}
+	}
+	if s.hasMCPListen {
+		listeners = append(listeners, "mcp="+s.opts.MCPListen)
+	}
+	if cfg.ReverseProxy.Enabled {
+		listeners = append(listeners, "reverse="+cfg.ReverseProxy.Listen)
+	}
+	if ports := s.proxy.Ports(); len(ports) > 0 {
+		listeners = append(listeners, fmt.Sprintf("agents=%d", len(ports)))
+	}
+	return listeners
+}
+
+func startupEnabledCheckCount(cfg *config.Config) int {
+	count := 7 // parser, scheme, CRLF, path traversal, core SSRF, core DLP, context
+	if cfg.FetchProxy.Monitoring.MaxURLLength > 0 {
+		count++
+	}
+	if cfg.Mode == config.ModeStrict && len(cfg.APIAllowlist) > 0 {
+		count++
+	}
+	if len(cfg.FetchProxy.Monitoring.Blocklist) > 0 {
+		count++
+	}
+	if len(cfg.DLP.Patterns) > 0 {
+		count++
+	}
+	if cfg.FetchProxy.Monitoring.EntropyThreshold > 0 {
+		count++
+	}
+	if cfg.FetchProxy.Monitoring.SubdomainEntropyThreshold > 0 {
+		count++
+	}
+	if cfg.Internal != nil {
+		count++
+	}
+	if cfg.FetchProxy.Monitoring.MaxReqPerMinute > 0 {
+		count++
+	}
+	if cfg.FetchProxy.Monitoring.MaxDataPerMinute > 0 {
+		count++
+	}
+	if cfg.SeedPhraseDetection.Enabled == nil || *cfg.SeedPhraseDetection.Enabled {
+		count++
+	}
+	if cfg.RequestBodyScanning.Enabled {
+		count++
+	}
+	if cfg.ResponseScanning.Enabled {
+		count++
+	}
+	if cfg.ResponseScanning.SSEStreaming.Enabled {
+		count++
+	}
+	if cfg.MCPInputScanning.Enabled {
+		count++
+	}
+	if cfg.MCPToolScanning.Enabled {
+		count++
+	}
+	if cfg.MCPToolPolicy.Enabled {
+		count++
+	}
+	if cfg.MCPSessionBinding.Enabled {
+		count++
+	}
+	if cfg.ToolChainDetection.Enabled {
+		count++
+	}
+	if cfg.CrossRequestDetection.Enabled {
+		count++
+	}
+	if cfg.AddressProtection.Enabled {
+		count++
+	}
+	if cfg.BrowserShield.Enabled {
+		count++
+	}
+	if cfg.A2AScanning.Enabled {
+		count++
+	}
+	if cfg.FileSentry.Enabled {
+		count++
+	}
+	return count
+}
+
+func startupEntropyState(cfg *config.Config) string {
+	if cfg.FetchProxy.Monitoring.EntropyThreshold <= 0 && cfg.FetchProxy.Monitoring.SubdomainEntropyThreshold <= 0 {
+		return "off"
+	}
+	return "on"
+}
+
+func killSwitchAPITokenConfigured(cfg *config.Config) bool {
+	return cfg.EffectiveKillSwitchAPITokenConfigured()
+}
+
+// Start binds all configured listeners, launches the reload/signal/
+// capture-timer goroutines, prints the startup banner, and runs the fetch
+// proxy. Start blocks until ctx is cancelled or the proxy returns an
+// error, then drains listener error channels, closes owned resources, and
+// returns.
+func (s *Server) Start(ctx context.Context) (startErr error) {
+	ctx, cancel := context.WithCancel(ctx)
+	s.cancelMu.Lock()
+	s.internalCancel = cancel
+	s.cancelMu.Unlock()
+	defer cancel()
+
+	// Cleanup order mirrors the original RunCmd deferred closures so
+	// shutdown sequencing (reloader → recorder → capture writer →
+	// approver → scanner → emitter → logger → sentry) is preserved.
+	defer s.cleanup()
+
+	var reloadWG sync.WaitGroup
+	defer reloadWG.Wait()
+
+	// lifecycleWG joins every long-lived listener/watcher goroutine spawned
+	// below (kill-switch API, metrics, scan API, MCP, reverse proxy, agent
+	// listeners, license watchers). This deferred join is registered after
+	// s.cleanup(), so in LIFO order it runs BEFORE cleanup() closes and nils
+	// shared Server fields (s.logger, s.scanner, s.emitter, ...). Without it,
+	// an early-error return (e.g. a fetch_proxy bind failure) races cleanup()
+	// against an in-flight listener goroutine still reading those fields.
+	// Order matters: cancel() first so ctx-driven goroutines and the HTTP
+	// shutdown goroutines wake, then ShutdownAgentServers() to unblock agent
+	// listener Serve loops on early-error paths where proxy.Start never ran its
+	// own shutdown, then Wait() for every goroutine to finish (HTTP shutdown
+	// goroutines complete only after in-flight handlers drain).
+	var lifecycleWG sync.WaitGroup
+	proxyDrainIncomplete := false
+	var mcpErr, reverseProxyErr, scanAPIErr chan error
+	listenerShutdownTimeout := s.opts.listenerShutdownTimeout
+	if listenerShutdownTimeout <= 0 {
+		listenerShutdownTimeout = serverShutdownTimeout
+	}
+	defer func() {
+		cancel()
+		if err := s.proxy.ShutdownAgentServers(); err != nil {
+			proxyDrainIncomplete = true
+			startErr = errors.Join(startErr, err)
+		}
+		lifecycleWG.Wait()
+		for _, listener := range []struct {
+			name   string
+			result chan error
+		}{
+			{"MCP listener", mcpErr}, {"reverse proxy listener", reverseProxyErr}, {"scan API listener", scanAPIErr},
+		} {
+			if listener.result != nil {
+				if err := <-listener.result; err != nil {
+					proxyDrainIncomplete = proxyDrainIncomplete || errors.Is(err, proxy.ErrShutdownIncomplete)
+					startErr = errors.Join(startErr, fmt.Errorf("%s: %w", listener.name, err))
+				}
+			}
+		}
+		if s.agentDrainIncomplete.Load() {
+			proxyDrainIncomplete = true
+			startErr = errors.Join(startErr, fmt.Errorf("agent listeners unbound before shutdown: %w", proxy.ErrShutdownIncomplete))
+		}
+		// Join auxiliary listener lifecycles before writing completeness anchors.
+		// Main and agent drain failures, including earlier license-driven agent
+		// unbinds, and auxiliary listener drain failures leave the run unsealed.
+		// Hijacked handlers join the same gate after their sockets close. Seal before the
+		// deferred cleanup closes the recorder; this is a no-op when receipts are
+		// off or none were emitted.
+		if !proxyDrainIncomplete {
+			s.sealTranscriptRoot()
+		}
+	}()
+
+	// Capture duration timer: cancel context after the specified capture
+	// duration so the proxy shuts down automatically.
+	if s.opts.CaptureOutput != "" && s.opts.CaptureDuration > 0 {
+		go func() {
+			select {
+			case <-time.After(s.opts.CaptureDuration):
+				_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: capture duration reached (%s), shutting down\n", s.opts.CaptureDuration)
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	cleanupSignal := RegisterKillSwitchSignal(s.killswitch, s.opts.Stderr)
+	defer cleanupSignal()
+
+	if s.opts.ConfigFile != "" {
+		reloader := config.NewReloader(s.opts.ConfigFile)
+		defer reloader.Close()
+
+		reloadWG.Add(1)
+		go func() {
+			defer reloadWG.Done()
+			if err := reloader.Start(ctx); err != nil {
+				s.setReloadWatcherState("failed")
+				s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), err)
+			} else {
+				s.setReloadWatcherState("stopped")
+			}
+		}()
+
+		// Block until the config file watch is established before continuing to
+		// bind and serve. Without this, the proxy can report healthy while the
+		// watch is not yet active, and a config edit made in that window is
+		// silently missed until the next write. Ready() also closes if the
+		// reloader exits without establishing the watch, so this never deadlocks
+		// on a watcher-setup failure (the error is logged above).
+		select {
+		case <-reloader.Ready():
+			if reloader.WatchEstablished() {
+				s.setReloadWatcherState("watching")
+			}
+		case <-ctx.Done():
+		}
+
+		// Closed when Start returns, so a startup that fails before publishing
+		// readiness still releases the reload consumer. Without it the consumer
+		// could wait on a gate that will never close while Start waits on the
+		// consumer, and neither the context nor the reloader has to be closed
+		// for that to happen.
+		startupSettled := make(chan struct{})
+		defer close(startupSettled)
+
+		reloadWG.Add(1)
+		go func() {
+			defer reloadWG.Done()
+			s.consumeReloads(ctx, reloader.Reloads(), startupSettled)
+		}()
+	}
+
+	if !IsContainerized() {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: running outside a container - consider using Docker/Podman for network isolation")
+	}
+
+	cfg := s.currentConfig()
+	var requiredHeartbeatErrMu sync.Mutex
+	var requiredHeartbeatErr error
+	setRequiredHeartbeatErr := func(err error) {
+		if err == nil {
+			return
+		}
+		if s.receiptShardSet != nil {
+			s.receiptShardSet.MarkUnhealthy(err)
+		}
+		requiredHeartbeatErrMu.Lock()
+		if requiredHeartbeatErr == nil {
+			requiredHeartbeatErr = err
+		}
+		requiredHeartbeatErrMu.Unlock()
+		cancel()
+	}
+	getRequiredHeartbeatErr := func() error {
+		requiredHeartbeatErrMu.Lock()
+		defer requiredHeartbeatErrMu.Unlock()
+		if requiredHeartbeatErr == nil {
+			return nil
+		}
+		return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt heartbeat emission failed: %w", requiredHeartbeatErr)
+	}
+	if s.receiptShardSet != nil {
+		for _, shard := range s.receiptShardSet.Emitters() {
+			e := shard
+			startReceiptHeartbeat(ctx, &lifecycleWG, cfg.FlightRecorder.HeartbeatIntervalDuration(), func() *receipt.Emitter { return e }, s.opts.Stderr, cfg.FlightRecorder.RequireReceipts, setRequiredHeartbeatErr)
+		}
+	} else if receiptEmitterReady(s.liveReceiptEmitter()) {
+		startReceiptHeartbeat(ctx, &lifecycleWG, cfg.FlightRecorder.HeartbeatIntervalDuration(), s.liveReceiptEmitter, s.opts.Stderr, cfg.FlightRecorder.RequireReceipts, setRequiredHeartbeatErr)
+	}
+	if s.recorder != nil {
+		startFlightRecorderRetention(ctx, &lifecycleWG, s.recorder, s.opts.Stderr, defaultFlightRecorderRetentionInterval, s.opts.expiry())
+	}
+	s.startEvidenceMonitors(ctx, &lifecycleWG, cfg)
+	s.startDashboardRuntimeSnapshot(ctx, &lifecycleWG, cfg)
+	stopFileSentry, fsErr := s.startFileSentry(ctx, cfg, cancel)
+	if fsErr != nil {
+		return fsErr
+	}
+	defer func() {
+		startErr = preferFileSentryRuntimeError(startErr, stopFileSentry())
+	}()
+
+	// Pre-bind the fetch listener so the startup summary reports the real
+	// OS-chosen address when the configured port is ephemeral (":0"), instead
+	// of echoing the literal ":0". Pre-binding also fails fast here on
+	// a bind conflict rather than at Serve. The listener is handed to the proxy
+	// below via StartWithListener. http.Server.Serve closes it when serving ends;
+	// this deferred close is an idempotent backstop guaranteeing the listener is
+	// released on EVERY early-return path before serving (a double close on an
+	// already-closed listener returns net.ErrClosed, ignored here). It is
+	// unconditional so the "closed unless owned" invariant can never be defeated
+	// by a future early return added inside proxy.start before it reaches Serve.
+	fetchLn, fetchLnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.FetchProxy.Listen)
+	if fetchLnErr != nil {
+		err := wrapBindError("fetch_proxy.listen", cfg.FetchProxy.Listen, fetchLnErr)
+		if s.sentry != nil {
+			s.sentry.CaptureError(err)
+		}
+		return err
+	}
+	defer func() { _ = fetchLn.Close() }()
+	boundFetchAddr := fetchLn.Addr().String()
+	readyNotified := false
+	defer func() {
+		if readyNotified {
+			sdNotifyOrLog(s.opts.Stderr, "STOPPING=1")
+		}
+	}()
+
+	_, _ = fmt.Fprintf(s.opts.Stderr, "Pipelock %s starting\n", cliutil.DisplayVersion())
+	_, _ = fmt.Fprintln(s.opts.Stderr, s.startupSummaryLine(cfg, boundFetchAddr))
+	_, _ = fmt.Fprintf(s.opts.Stderr, "  Mode:   %s\n", cfg.Mode)
+	_, _ = fmt.Fprintf(s.opts.Stderr, "  Listen: %s\n", boundFetchAddr)
+	_, _ = fmt.Fprintf(s.opts.Stderr, "  Fetch:  http://%s/fetch?url=<url>\n", boundFetchAddr)
+	_, _ = fmt.Fprintf(s.opts.Stderr, "  Health: http://%s/health\n", boundFetchAddr)
+	if s.metricsDisabled {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "  Metrics: not exposed (containment managed-config drift); check metrics_listen")
+	} else if cfg.MetricsListen != "" {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Stats:  http://%s/stats (separate port)\n", cfg.MetricsListen)
+	} else {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "  Metrics: not exposed; set metrics_listen for a dedicated listener")
+	}
+	if cfg.ForwardProxy.Enabled {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Proxy:  HTTP/HTTPS forward proxy enabled (CONNECT + absolute-URI)\n")
+	}
+	if cfg.WebSocketProxy.Enabled {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  WS:     http://%s/ws?url=<ws-url> (WebSocket proxy enabled)\n", boundFetchAddr)
+	}
+	if cfg.Emit.Webhook.URL != "" {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Emit:   webhook -> %s (min_severity: %s)\n", RedactEndpoint(cfg.Emit.Webhook.URL), cfg.Emit.Webhook.MinSeverity)
+	}
+	if cfg.Emit.Syslog.Address != "" {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Emit:   syslog -> %s (min_severity: %s)\n", RedactEndpoint(cfg.Emit.Syslog.Address), cfg.Emit.Syslog.MinSeverity)
+	}
+	if killSwitchAPITokenConfigured(cfg) {
+		if s.apiOnSeparatePort {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "  API:    http://%s/api/v1/killswitch (kill switch remote control, separate port)\n", cfg.KillSwitch.APIListen)
+		} else {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "  API:    http://%s/api/v1/killswitch (kill switch remote control)\n", boundFetchAddr)
+		}
+	}
+	if s.opts.ConfigFile != "" {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Config: %s (hot-reload enabled%s; rejected security downgrades require restart)\n", s.opts.ConfigFile, ReloadSignalHint())
+	}
+	if s.hasMCPListen {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  MCP:    http://%s -> %s\n", s.opts.MCPListen, RedactEndpoint(s.opts.MCPUpstream))
+	}
+	if cfg.ReverseProxy.Enabled {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  RevPx:  http://%s -> %s (reverse proxy with body scanning)\n",
+			cfg.ReverseProxy.Listen, RedactEndpoint(cfg.ReverseProxy.Upstream))
+	}
+	if s.conductorAudit != nil {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Conductor: audit transport enabled -> %s\n", RedactEndpoint(cfg.Conductor.ConductorURL))
+	}
+	if s.conductorRemoteKill != nil {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Conductor: remote kill polling enabled -> %s\n", RedactEndpoint(cfg.Conductor.ConductorURL))
+	}
+	if s.conductorBundle != nil {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Conductor: policy bundle polling enabled -> %s\n", RedactEndpoint(cfg.Conductor.ConductorURL))
+	}
+	if s.conductorRollback != nil {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Conductor: rollback polling enabled -> %s\n", RedactEndpoint(cfg.Conductor.ConductorURL))
+	}
+	if s.conductorStale != nil {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Conductor: stale-bundle fail-closed enforcement enabled (after_grace=%s)\n", cfg.Conductor.StalePolicy.AfterGrace)
+	}
+	if s.opts.CaptureOutput != "" {
+		if s.opts.CaptureDuration > 0 {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "  Capture: %s (duration: %s)\n", s.opts.CaptureOutput, s.opts.CaptureDuration)
+		} else {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "  Capture: %s (until interrupted)\n", s.opts.CaptureOutput)
+		}
+	}
+	for addr, name := range s.proxy.Ports() {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Agent:  %s -> http://%s\n", name, addr)
+	}
+
+	if len(s.opts.AgentArgs) > 0 {
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Agent:  %v\n", s.opts.AgentArgs)
+		_, _ = fmt.Fprintln(s.opts.Stderr, "\nNote: agent process launching is not yet implemented (Phase 2).")
+		_, _ = fmt.Fprintln(s.opts.Stderr, "The fetch proxy is running — configure your agent to use:")
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  PIPELOCK_FETCH_URL=http://%s/fetch\n\n", boundFetchAddr)
+	}
+
+	var conductorWG sync.WaitGroup
+	// conductorCtx is a child of the process context so teardownConductor can
+	// stop the follower-side Conductor pollers on a runtime fleet-license
+	// revocation/expiry/downgrade WITHOUT tearing down the proxy/detection
+	// path. Process shutdown still cancels them via the parent ctx. When a
+	// poller's Run returns context.Canceled (the teardown signal) the error
+	// branches below intentionally skip the process-wide cancel().
+	conductorCtx := ctx
+	conductorRunners := s.conductorAudit != nil || s.conductorRemoteKill != nil || s.conductorBundle != nil || s.conductorRollback != nil || s.conductorStale != nil
+	if conductorRunners {
+		var conductorCancel context.CancelFunc
+		conductorCtx, conductorCancel = context.WithCancel(ctx)
+		s.setConductorCancel(conductorCancel)
+		if s.conductorRemoteKill != nil {
+			conductorWG.Add(1)
+		}
+		if s.conductorAudit != nil {
+			conductorWG.Add(1)
+		}
+		if s.conductorBundle != nil {
+			conductorWG.Add(1)
+		}
+		if s.conductorRollback != nil {
+			conductorWG.Add(1)
+		}
+		if s.conductorStale != nil {
+			conductorWG.Add(1)
+		}
+		s.setConductorWait(conductorWG.Wait)
+	}
+	if conductorRunners {
+		if s.conductorRemoteKill != nil {
+			go func() {
+				defer conductorWG.Done()
+				defer func() {
+					if r := recover(); r != nil {
+						_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor remote kill poller panic: %v\n", r)
+						cancel()
+					}
+				}()
+				if err := s.conductorRemoteKill.Run(conductorCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					s.logger.LogError(audit.NewResourceLogContext("conductor_remote_kill_poller", cfg.Conductor.ConductorURL), err)
+					_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor remote kill poller stopped: %v\n", err)
+					cancel()
+				}
+			}()
+		}
+	}
+	if s.conductorAudit != nil {
+		go func() {
+			defer conductorWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor audit transport panic: %v\n", r)
+				}
+			}()
+			if err := s.conductorAudit.Run(conductorCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.logger.LogError(audit.NewResourceLogContext("conductor_audit_transport", cfg.Conductor.ConductorURL), err)
+				_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor audit transport stopped: %v\n", err)
+			}
+		}()
+	}
+	if s.conductorBundle != nil {
+		go func() {
+			defer conductorWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor policy bundle poller panic: %v\n", r)
+					cancel()
+				}
+			}()
+			if err := s.conductorBundle.Run(conductorCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.logger.LogError(audit.NewResourceLogContext("conductor_policy_bundle_poller", cfg.Conductor.ConductorURL), err)
+				_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor policy bundle poller stopped: %v\n", err)
+				cancel()
+			}
+		}()
+	}
+	if s.conductorRollback != nil {
+		go func() {
+			defer conductorWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor rollback poller panic: %v\n", r)
+					cancel()
+				}
+			}()
+			if err := s.conductorRollback.Run(conductorCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.logger.LogError(audit.NewResourceLogContext("conductor_rollback_poller", cfg.Conductor.ConductorURL), err)
+				_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor rollback poller stopped: %v\n", err)
+				cancel()
+			}
+		}()
+	}
+	if s.conductorStale != nil {
+		go func() {
+			defer conductorWG.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor stale-bundle enforcer panic: %v\n", r)
+					cancel()
+				}
+			}()
+			if err := s.conductorStale.Run(conductorCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				s.logger.LogError(audit.NewResourceLogContext("conductor_stale_enforcer", cfg.Conductor.ConductorURL), err)
+				_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: conductor stale-bundle enforcer stopped: %v\n", err)
+				cancel()
+			}
+		}()
+	}
+	if conductorRunners {
+		defer func() {
+			cancel()
+			conductorWG.Wait()
+		}()
+	}
+
+	// Start kill switch API on a separate port if configured. Follows
+	// the same pattern as the MCP listener: bind synchronously so port
+	// conflicts are caught early, serve in a goroutine, and drain the
+	// error channel after the main proxy exits.
+	var ksAPIErr chan error
+	if s.apiOnSeparatePort {
+		apiMux := http.NewServeMux()
+		apiMux.HandleFunc("/api/v1/killswitch", s.ksAPI.HandleToggle)
+		apiMux.HandleFunc("/api/v1/killswitch/status", s.ksAPI.HandleStatus)
+
+		// Session admin API on the dedicated port. Mount the proxy's
+		// existing handler rather than building a second one so
+		// Reload's SetAPIToken rotation covers the dedicated-port
+		// mount too. p.SessionAPI() returns nil when no api_token is
+		// configured - in that case we skip registration and the
+		// admin routes simply don't exist on the listener.
+		if sessionAPI := s.proxy.SessionAPI(); sessionAPI != nil {
+			apiMux.HandleFunc("/api/v1/config/status", sessionAPI.HandleConfigStatus)
+			apiMux.HandleFunc("/api/v1/config/reload", sessionAPI.HandleConfigReload)
+			apiMux.HandleFunc("/api/v1/adaptive/status", sessionAPI.HandleAdaptiveStatus)
+			apiMux.HandleFunc("/api/v1/adaptive/flush", sessionAPI.HandleAdaptiveFlush)
+			apiMux.HandleFunc("/api/v1/adaptive/whoami", sessionAPI.HandleAdaptiveWhoami)
+			apiMux.HandleFunc("/api/v1/baseline", sessionAPI.HandleBaselineList)
+			apiMux.HandleFunc("/api/v1/baseline/", sessionAPI.HandleBaselineProfile)
+			apiMux.HandleFunc("/api/v1/sessions", sessionAPI.HandleList)
+			apiMux.HandleFunc("/api/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
+				path := r.URL.EscapedPath()
+				switch {
+				case killswitch.IsSessionActionPath(path, "airlock"):
+					sessionAPI.HandleAirlock(w, r)
+				case killswitch.IsSessionActionPath(path, "task"):
+					sessionAPI.HandleTask(w, r)
+				case killswitch.IsSessionActionPath(path, "trust"):
+					sessionAPI.HandleTrust(w, r)
+				case killswitch.IsSessionActionPath(path, "reset"):
+					sessionAPI.HandleReset(w, r)
+				case killswitch.IsSessionActionPath(path, "explain"):
+					sessionAPI.HandleExplain(w, r)
+				case killswitch.IsSessionActionPath(path, "terminate"):
+					sessionAPI.HandleTerminate(w, r)
+				case killswitch.IsSessionKeyPath(path):
+					sessionAPI.HandleInspect(w, r)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+		}
+
+		apiLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.KillSwitch.APIListen)
+		if lnErr != nil {
+			err := wrapBindError("kill_switch.api_listen", cfg.KillSwitch.APIListen, lnErr)
+			if s.sentry != nil {
+				s.sentry.CaptureError(err)
+			}
+			return err
+		}
+
+		apiSrv := newHTTPServer(apiMux)
+		lifecycleWG.Add(1)
+		go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
+			defer lifecycleWG.Done()
+			<-ctx.Done()
+			shutdownCtx, shutCancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+			defer shutCancel()
+			_ = apiSrv.Shutdown(shutdownCtx) //nolint:errcheck // best-effort shutdown
+		}()
+
+		ksAPIErr = make(chan error, 1)
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			err := apiSrv.Serve(apiLn)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			ksAPIErr <- err
+		}()
+	}
+
+	var metricsErr chan error
+	if cfg.MetricsListen != "" && !s.metricsDisabled {
+		metricsMux := http.NewServeMux()
+		if s.containmentManaged {
+			metricsMux.Handle("/metrics", containmentMetricsHandler(s.proxy.CurrentConfig, s.containmentMetricsDenied.Load, s.reportContainmentMetricsRequestDenied, s.metrics.PrometheusHandler()))
+			metricsMux.Handle("/stats", containmentLoopbackHandler(s.reportContainmentMetricsRequestDenied, s.metrics.StatsHandler()))
+		} else {
+			metricsMux.Handle("/metrics", s.metrics.PrometheusHandler())
+			metricsMux.HandleFunc("/stats", s.metrics.StatsHandler())
+		}
+
+		metricsLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.MetricsListen)
+		if lnErr != nil {
+			err := wrapBindError("metrics_listen", cfg.MetricsListen, lnErr)
+			if s.sentry != nil {
+				s.sentry.CaptureError(err)
+			}
+			return err
+		}
+		s.proxy.UpdateMetricsDialTargetFromBoundAddr(metricsLn.Addr().String())
+		metricsSrv := newHTTPServer(metricsMux)
+		lifecycleWG.Add(1)
+		go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
+			defer lifecycleWG.Done()
+			<-ctx.Done()
+			shutdownCtx, shutCancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+			defer shutCancel()
+			_ = metricsSrv.Shutdown(shutdownCtx)
+		}()
+		metricsErr = make(chan error, 1)
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			srvErr := metricsSrv.Serve(metricsLn)
+			if errors.Is(srvErr, http.ErrServerClosed) {
+				srvErr = nil
+			}
+			metricsErr <- srvErr
+		}()
+		_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: metrics listening on %s\n", cfg.MetricsListen)
+	}
+
+	// Scan API server on a dedicated port: same bind-synchronously +
+	// serve-in-goroutine pattern as the kill switch API.
+	if cfg.ScanAPI.Listen != "" {
+		scanAPIMux := http.NewServeMux()
+		scanHandler := scanapi.NewHandler(cfg, s.proxy.ScannerPtr().Load(), s.currentToolPolicyCfg(), s.metrics, cliutil.Version)
+		scanHandler.SetKillSwitchFn(s.killswitch.IsActive)
+		scanHandler.SetRuntimeGetters(
+			func() *config.Config { return s.proxy.CurrentConfig() },
+			func() *scanner.Scanner { return s.proxy.ScannerPtr().Load() },
+			s.currentToolPolicyCfg,
+		)
+		scanAPIMux.Handle("/api/v1/scan", scanHandler)
+
+		scanAPILn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ScanAPI.Listen)
+		if lnErr != nil {
+			err := wrapBindError("scan_api.listen", cfg.ScanAPI.Listen, lnErr)
+			if s.sentry != nil {
+				s.sentry.CaptureError(err)
+			}
+			return err
+		}
+		if cfg.ScanAPI.ConnectionLimit > 0 {
+			scanAPILn = netutil.LimitListener(scanAPILn, cfg.ScanAPI.ConnectionLimit)
+		}
+
+		readTimeout := 2 * time.Second
+		writeTimeout := 2 * time.Second
+		if d, parseErr := time.ParseDuration(cfg.ScanAPI.Timeouts.Read); parseErr == nil {
+			readTimeout = d
+		}
+		if d, parseErr := time.ParseDuration(cfg.ScanAPI.Timeouts.Write); parseErr == nil {
+			writeTimeout = d
+		}
+
+		scanAPIGate := &httpstream.Gate{}
+		scanAPISrv := newHTTPServer(scanAPIGate.Wrap(scanAPIMux))
+		scanAPISrv.ReadTimeout = readTimeout
+		scanAPISrv.ReadHeaderTimeout = readTimeout
+		scanAPISrv.WriteTimeout = writeTimeout
+		scanAPIErr = make(chan error, 1)
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			srvErr := httpstream.ServeUntilShutdown(ctx, func() error { return scanAPISrv.Serve(scanAPILn) }, func() error { //nolint:gosec // G118: fresh context preserves shutdown grace after cancellation
+				shutdownCtx, shutCancel := context.WithTimeout(context.Background(), listenerShutdownTimeout)
+				defer shutCancel()
+				return httpstream.DrainServer(shutdownCtx, httpstream.GatedServer{Server: scanAPISrv, Gate: scanAPIGate})
+			})
+			if errors.Is(srvErr, http.ErrServerClosed) && !errors.Is(srvErr, proxy.ErrShutdownIncomplete) {
+				srvErr = nil
+			}
+			scanAPIErr <- srvErr
+		}()
+		_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: scan API listening on %s\n", scanAPILn.Addr().String())
+	}
+
+	if s.hasMCPListen {
+		// MCP scanning sections auto-enable inside ResolveRuntime above
+		// when the operator did not configure them; the effective cfg
+		// already reflects those defaults.
+		//
+		// Resolve the listener identity before binding. The resolution is
+		// pinned for the listener's life; each request re-resolves against
+		// the live config and the listener stops serving if it differs.
+		mcpTransport := listenerTransport(s.opts.MCPUpstream)
+		if err := requireNoSessionHeader(cfg, mcpTransport); err != nil {
+			return err
+		}
+		mcpResolution, resolveErr := resolveLaunchIdentity(cfg, s.opts.MCPServerName, mcpTransport, s.opts.Stderr)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		mcpBinding := mcpRunListenerBinding(s.opts.MCPUpstream)
+		if mcpResolution.BindingMode == config.MCPAckBindingModeVerifiedLocalSession {
+			sessionBinding, bindErr := identity.SessionBinding(mcpResolution, mcpTransport)
+			if bindErr != nil {
+				return bindErr
+			}
+			mcpBinding = sessionBinding
+		}
+		mcpIdentity := newRunListenerIdentity(s.opts.MCPServerName, mcpResolution, mcpBinding, mcpTransport)
+		mcpToolBaseline := tools.NewToolBaseline()
+		mcpScannerFn := func() *scanner.Scanner { return s.proxy.ScannerPtr().Load() }
+		mcpInputCfgFn := func() *mcp.InputScanConfig { return buildMCPInputCfg(s.proxy.CurrentConfig()) }
+		var mcpToolCfgMu sync.Mutex
+		var cachedMCPToolSource *config.Config
+		var cachedMCPToolCfg *tools.ToolScanConfig
+		mcpToolCfgFn := func() *tools.ToolScanConfig {
+			mcpToolCfgMu.Lock()
+			defer mcpToolCfgMu.Unlock()
+			current, extraPoison := s.currentMCPToolSnapshot()
+			if current != cachedMCPToolSource {
+				cachedMCPToolCfg = buildMCPToolCfg(current, extraPoison, mcpToolBaseline)
+				cachedMCPToolSource = current
+				if cachedMCPToolCfg != nil {
+					s.liveAckSet.Store(&liveCredentialAckSet{cfg: current, set: cachedMCPToolCfg.CredentialAcks})
+				}
+			}
+			if cachedMCPToolCfg != nil && s.ackKeyRevokedFor.Load() == current {
+				cachedMCPToolCfg.CredentialAcks.Revoke()
+			}
+			return cachedMCPToolCfg
+		}
+		mcpRedirectRTFn := func() *mcp.RedirectRuntime {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return buildRedirectRT(c)
+		}
+		mcpProvenanceCfgFn := func() *config.MCPToolProvenance {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return &c.MCPToolProvenance
+		}
+		mcpRedactionCfgFn := func() mcp.MCPRedactionConfig {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return mcp.MCPRedactionConfig{}
+			}
+			matcher, limits, required := s.proxy.CurrentRedactionConfigFor(c)
+			return mcp.MCPRedactionConfig{
+				Matcher:  matcher,
+				Limits:   limits,
+				Profile:  c.Redaction.DefaultProfile,
+				Required: required,
+			}
+		}
+		mcpTaintCfgFn := func() *config.TaintConfig {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return &c.Taint
+		}
+		mcpA2ACfgFn := func() *config.A2AScanning {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return &c.A2AScanning
+		}
+		mcpMediaPolicyFn := func() *config.MediaPolicy {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return &c.MediaPolicy
+		}
+
+		var mcpApprover *hitl.Approver
+		if needsHITLApprover(cfg) {
+			mcpApprover = newRuntimeApprover(cfg)
+			// Closed inside the MCP listener goroutine below, after
+			// RunHTTPListenerProxy returns, so the approver outlives every
+			// request the listener hands it. A function-scoped defer would
+			// close it while the listener goroutine is still serving.
+		}
+
+		// Bind MCP listener synchronously so port conflicts are caught
+		// before the fetch proxy starts. Without this, a bind failure
+		// would be silently swallowed until shutdown.
+		mcpLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", s.opts.MCPListen)
+		if lnErr != nil {
+			err := wrapBindErrorNoDoctorHint("mcp_listen", s.opts.MCPListen, lnErr)
+			if s.sentry != nil {
+				s.sentry.CaptureError(err)
+			}
+			return err
+		}
+
+		// Share the proxy's session manager with the MCP listener so
+		// both use the same store and the sessions gauge is not
+		// double-counted. p.SessionStore() reads from the atomic
+		// pointer, so it returns the live store even after hot-reloads.
+		mcpStore := s.proxy.SessionStore() // nil when session profiling is disabled
+		mcpDoWWiring := s.currentMCPDoWRuntime().Wiring()
+
+		// Pass a function that reads the adaptive config from the live
+		// proxy config on each request. This ensures the long-lived
+		// MCP listener picks up hot-reload changes instead of being
+		// frozen to the startup snapshot.
+		mcpAdaptiveFn := mcp.AdaptiveConfigFunc(func() *config.AdaptiveEnforcement {
+			c := s.proxy.CurrentConfig()
+			if c != nil && c.AdaptiveEnforcement.Enabled {
+				return &c.AdaptiveEnforcement
+			}
+			return nil
+		})
+		mcpAirlockFn := func() *config.Airlock {
+			return mcpAirlockConfigFor(s.proxy.CurrentConfig())
+		}
+		mcpConfigHashFn := func() string {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return ""
+			}
+			return c.CanonicalPolicyHash()
+		}
+		mcpRequestBodyFn := func() *config.RequestBodyScanning {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return &c.RequestBodyScanning
+		}
+		mcpRequireReceiptsFn := func() bool {
+			c := s.proxy.CurrentConfig()
+			return c != nil && c.FlightRecorder.RequireReceipts
+		}
+		mcpResponseSuppressFn := func() []config.SuppressEntry {
+			c := s.proxy.CurrentConfig()
+			if c == nil {
+				return nil
+			}
+			return c.Suppress
+		}
+		mcpResponseTrustFn := func() string {
+			trust := config.ResponseTrustUntrusted
+			c := s.proxy.CurrentConfig()
+			if c != nil {
+				if configuredTrust, ok := c.MCPResponseTrustForServer(mcpIdentity.armingName(c)); ok {
+					trust = configuredTrust
+				}
+			}
+			return trust
+		}
+		mcpResponseActionFn := func() string {
+			c := s.proxy.CurrentConfig()
+			return c.MCPResponseActionForServer(mcpIdentity.armingName(c))
+		}
+		mcpTaintTrustedFn := func() bool {
+			c := s.proxy.CurrentConfig()
+			return c != nil && c.TaintTrustsMCPServer(mcpIdentity.armingName(c))
+		}
+
+		mcpErr = make(chan error, 1)
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			if mcpApprover != nil {
+				defer mcpApprover.Close()
+			}
+			var mcpCaptureObs capture.CaptureObserver
+			if s.captureWriter != nil {
+				mcpCaptureObs = s.captureWriter
+			}
+			listenerOpts := mcp.MCPProxyOpts{
+				ListenerBearerToken:          s.mcpListenerBearerToken,
+				ListenerAllowedOrigins:       s.opts.MCPAllowedOrigins,
+				ListenerAllowUnauthenticated: s.opts.MCPAllowUnauthenticated,
+				ListenerStateTokenRequiredFn: func() *bool {
+					c := s.proxy.CurrentConfig()
+					if c == nil {
+						return nil
+					}
+					return c.MCPSessionBinding.ListenerRequireStateToken
+				},
+				ScannerFn:                mcpScannerFn,
+				ReloadMu:                 s.proxy.ReloadLock(),
+				Approver:                 mcpApprover,
+				InputCfgFn:               mcpInputCfgFn,
+				RequestBodyFn:            mcpRequestBodyFn,
+				ToolCfgFn:                mcpToolCfgFn,
+				PolicyCfgFn:              s.currentToolPolicyCfg,
+				KillSwitch:               s.killswitch,
+				ChainMatcherFn:           s.currentMCPChainMatcher,
+				AuditLogger:              s.logger,
+				CorrelationHeader:        cfg.Emit.CorrelationHeader,
+				CEEFn:                    s.currentMCPCEE,
+				Store:                    mcpStore,
+				BaselineFn:               s.proxy.SessionBaselineChecker,
+				AdaptiveCfgFn:            mcpAdaptiveFn,
+				AirlockCfgFn:             mcpAirlockFn,
+				Metrics:                  s.metrics,
+				RedirectRTFn:             mcpRedirectRTFn,
+				CaptureObs:               mcpCaptureObs,
+				ConfigHashFn:             mcpConfigHashFn,
+				Profile:                  edition.ProfileDefault,
+				AddressProtectionAgent:   edition.ProfileDefault,
+				ProvenanceCfgFn:          mcpProvenanceCfgFn,
+				ReceiptEmitterFn:         s.liveReceiptEmitter,
+				RequireReceiptsFn:        mcpRequireReceiptsFn,
+				V2ReceiptEmitterFn:       s.liveV2ReceiptEmitter,
+				PolicyHashFn:             mcpConfigHashFn,
+				EnvelopeEmitterFn:        s.liveEnvelopeEmitter,
+				RedactionCfgFn:           mcpRedactionCfgFn,
+				TaintCfgFn:               mcpTaintCfgFn,
+				TaintTrustedSourceFn:     mcpTaintTrustedFn,
+				A2ACfgFn:                 mcpA2ACfgFn,
+				CardBaseline:             mcp.NewCardBaseline(1000),
+				A2ACardURL:               s.opts.MCPUpstream,
+				MediaPolicyFn:            mcpMediaPolicyFn,
+				ServerName:               mcpResolution.Name,
+				PolicyServerName:         mcpResolution.ArmingName,
+				ServerBinding:            mcpBinding,
+				ServerBindingMode:        mcpResolution.BindingMode,
+				ServerRevision:           mcpResolution.Revision,
+				ServerIdentityFn:         mcpIdentity.identityFn(s.proxy.CurrentConfig),
+				ServerIdentityHeadersFn:  listenerIdentityHeadersFn(mcpResolution, mcpTransport, mcpIdentity.identityFn(s.proxy.CurrentConfig)),
+				SuppressFn:               mcpResponseSuppressFn,
+				ResponseTrustClassFn:     mcpResponseTrustFn,
+				ResponseActionOverrideFn: mcpResponseActionFn,
+				ToolFreezer:              s.proxy.FrozenTools(),
+				FrozenToolStableKey:      s.opts.MCPUpstream,
+				ContractLoaderPtr:        s.proxy.ContractLoaderPtr(),
+				ContractAgent:            edition.ProfileDefault,
+				DialContext:              verifiedDialContext(mcp.NewMetadataSafeDialContext(mcpScannerFn), mcpResolution, s.opts.Stderr),
+			}
+			applyMCPDoWOpts(&listenerOpts, mcpDoWWiring, true)
+			if s.opts.MCPAuthTokenFile != "" {
+				listenerOpts.ListenerBearerTokenFn = func() (string, error) {
+					return readMCPListenerTokenFile(s.opts.MCPAuthTokenFile)
+				}
+			}
+			listenerOpts.ListenerShutdownTimeout = listenerShutdownTimeout
+			mcpErr <- mcp.RunHTTPListenerProxy(ctx, mcpLn, s.opts.MCPUpstream, s.opts.Stderr, listenerOpts)
+		}()
+	}
+
+	if cfg.ReverseProxy.Enabled {
+		rpUpstream, rpErr := url.Parse(cfg.ReverseProxy.Upstream)
+		if rpErr != nil {
+			return fmt.Errorf("reverse proxy upstream: %w", rpErr)
+		}
+
+		var rpCaptureObs capture.CaptureObserver
+		if s.captureWriter != nil {
+			rpCaptureObs = s.captureWriter
+		}
+		rpHandler := proxy.NewReverseProxy(
+			rpUpstream, s.proxy.ConfigPtr(), s.proxy.ScannerPtr(),
+			s.logger, s.metrics, s.killswitch, rpCaptureObs, s.proxy.ShieldEngine(),
+		)
+		rpHandler.SetOwnerProxy(s.proxy)
+		rpHandler.SetEnvelopeEmitter(s.proxy.EnvelopeEmitterPtr())
+		rpHandler.SetEnvelopeVerifier(s.proxy.EnvelopeVerifierPtr())
+		rpHandler.SetReceiptEmitter(s.proxy.ReceiptEmitterPtr())
+		rpHandler.SetV2ReceiptEmitter(s.proxy.V2EmitterPtr())
+		rpHandler.SetContractLoader(s.proxy.ContractLoaderPtr())
+		s.proxy.BindReverseProxyIdentity(rpHandler)
+		rpHandler.SetReloadLock(s.proxy.ReloadLock())
+		rpHandler.SetRequestPolicyFn(s.proxy.ApplyRequestPolicy)
+		rpHandler.SetRequestPolicyPrepareFn(s.proxy.PrepareRequestPolicyBody)
+		rpHandler.SetRedactionRuntimePtr(s.proxy.RedactionRuntimePtr())
+		// Generic reverse-proxy mode keeps operator-selected private/loopback
+		// upstreams reachable, but still applies the metadata hard floor at
+		// dial time. Submit profile is stricter and uses the full SSRF-safe
+		// dialer, matching the fetch/forward transports.
+		if cfg.ReverseProxy.Profile == config.ReverseProxyProfileSubmit {
+			rpHandler.SetSafeDialer(s.proxy.SafeDialer())
+		} else {
+			rpHandler.SetSafeDialer(s.proxy.MetadataSafeDialer())
+		}
+
+		rpLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.ReverseProxy.Listen)
+		if lnErr != nil {
+			err := wrapBindError("reverse_proxy.listen", cfg.ReverseProxy.Listen, lnErr)
+			if s.sentry != nil {
+				s.sentry.CaptureError(err)
+			}
+			return err
+		}
+
+		rpGate := &httpstream.Gate{}
+		rpSrv := newReverseProxyServer(rpGate.Wrap(rpHandler))
+		rpLn = newLimitListener(rpLn, reverseProxyMaxConns)
+
+		reverseProxyErr = make(chan error, 1)
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			srvErr := httpstream.ServeUntilShutdown(ctx, func() error { return rpSrv.Serve(rpLn) }, func() error { //nolint:gosec // G118: fresh context preserves the shutdown grace period after cancellation
+				shutdownCtx, shutCancel := context.WithTimeout(context.Background(), listenerShutdownTimeout)
+				defer shutCancel()
+				return httpstream.DrainServer(shutdownCtx, httpstream.GatedServer{Server: rpSrv, Gate: rpGate})
+			})
+			if errors.Is(srvErr, http.ErrServerClosed) && !errors.Is(srvErr, proxy.ErrShutdownIncomplete) {
+				srvErr = nil
+			}
+			reverseProxyErr <- srvErr
+		}()
+		_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: reverse proxy listening on %s -> %s\n",
+			rpLn.Addr().String(), RedactEndpoint(cfg.ReverseProxy.Upstream))
+	}
+
+	// Per-agent listener servers. Each listener injects the agent profile
+	// via context so identity is port-based, not header-based
+	// (spoof-proof). Ports() returns addr->profile mapping from the
+	// edition (empty in OSS mode).
+	agentPorts := s.proxy.Ports()
+	agentListenerCount := len(agentPorts)
+	var agentListenerErrs chan error
+	if agentListenerCount > 0 {
+		handler := s.proxy.Handler()
+		agentListenerErrs = make(chan error, agentListenerCount)
+
+		// Agent listeners use the same WriteTimeout logic as the main
+		// server: disabled when forward proxy or WebSocket proxy is
+		// enabled (CONNECT tunnels and /ws sessions are long-lived).
+		agentWriteTimeout := time.Duration(cfg.FetchProxy.TimeoutSeconds+10) * time.Second
+		if cfg.ForwardProxy.Enabled || cfg.WebSocketProxy.Enabled {
+			agentWriteTimeout = 0
+		}
+
+		for addr, name := range agentPorts {
+			ln, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+			if lnErr != nil {
+				err := wrapBindErrorNoDoctorHint(fmt.Sprintf("agents[%s].listen", name), addr, lnErr)
+				if s.sentry != nil {
+					s.sentry.CaptureError(err)
+				}
+				return err
+			}
+			srv := newHTTPServer(AgentHandler(name, handler))
+			srv.WriteTimeout = agentWriteTimeout
+			// Register with proxy so its shutdown goroutine gracefully
+			// stops agent servers alongside the main server.
+			s.proxy.RegisterAgentServer(srv)
+			lifecycleWG.Add(1)
+			go func(srv *http.Server, listener net.Listener) {
+				defer lifecycleWG.Done()
+				srvErr := srv.Serve(listener)
+				if errors.Is(srvErr, http.ErrServerClosed) {
+					srvErr = nil
+				}
+				agentListenerErrs <- srvErr
+			}(srv, ln)
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: agent %q listening on %s\n", name, addr)
+		}
+	}
+
+	// License expiry applies to all paid resolutions, including CIDR profiles
+	// on the main listener without dedicated listeners or Conductor.
+	if cfg.LicenseExpiresAt > 0 {
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			clock := edition.CurrentLicenseClock()
+			remaining := time.Unix(cfg.LicenseExpiresAt, 0).Sub(clock.Now())
+			if remaining <= 0 {
+				s.expireLicensedRuntime()
+				return
+			}
+			fired := make(chan struct{})
+			timer := clock.AfterFunc(remaining, func() { close(fired) })
+			defer timer.Stop()
+			select {
+			case <-fired:
+				s.expireLicensedRuntime()
+			case <-ctx.Done():
+			}
+		}()
+	}
+	if cfg.LicenseExpiresAt > 0 {
+		lifecycleWG.Add(1)
+		go func() {
+			defer lifecycleWG.Done()
+			s.startLicenseExpiryWatcher(ctx)
+		}()
+	}
+	// Keep the watcher alive without dedicated listeners, including when a
+	// license is installed or replaced by a later reload.
+	lifecycleWG.Add(1)
+	go func() {
+		defer lifecycleWG.Done()
+		s.startLicenseCRLWatcher(ctx)
+	}()
+
+	// Start the fetch proxy on the pre-bound listener (blocks until context
+	// cancelled or error). The listener was already bound above, so an error
+	// here is a serve/runtime failure, not a bind failure — do not relabel it as
+	// a bind error.
+	// All configured listeners are bound and auxiliary serving goroutines are
+	// running; the main proxy begins serving immediately below. Type=notify-reload
+	// uses this point for startup readiness.
+	sdNotifyOrLog(s.opts.Stderr, "READY=1")
+	readyNotified = true
+	s.markStartupNotified()
+	s.reloadMu.Lock()
+	s.notifyReloadStatusLocked()
+	s.reloadMu.Unlock()
+	if err := s.proxy.StartWithListener(ctx, fetchLn); err != nil {
+		// Shutdown may exhaust its grace period with handlers still active.
+		// Leave that run unsealed, even if a later shutdown retry drains it.
+		proxyDrainIncomplete = errors.Is(err, proxy.ErrShutdownIncomplete)
+		if groupErr := s.requiredReceiptGroupError(); groupErr != nil {
+			return groupErr
+		}
+		if s.receiptRotationRequested.Load() {
+			return errReceiptGroupKeyRotation
+		}
+		if heartbeatErr := getRequiredHeartbeatErr(); heartbeatErr != nil {
+			return heartbeatErr
+		}
+		if s.sentry != nil {
+			s.sentry.CaptureError(err)
+		}
+		return fmt.Errorf("proxy error: %w", err)
+	}
+
+	for range agentListenerCount {
+		if aErr := <-agentListenerErrs; aErr != nil {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: agent listener error: %v\n", aErr)
+		}
+	}
+
+	if metricsErr != nil {
+		if mErr := <-metricsErr; mErr != nil {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: metrics listener error: %v\n", mErr)
+		}
+	}
+
+	if ksAPIErr != nil {
+		if aErr := <-ksAPIErr; aErr != nil {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: kill switch API listener error: %v\n", aErr)
+		}
+	}
+
+	if err := stopFileSentry(); err != nil {
+		return err
+	}
+
+	if groupErr := s.requiredReceiptGroupError(); groupErr != nil {
+		return groupErr
+	}
+	if heartbeatErr := getRequiredHeartbeatErr(); heartbeatErr != nil {
+		return heartbeatErr
+	}
+	if s.receiptRotationRequested.Load() {
+		return errReceiptGroupKeyRotation
+	}
+
+	s.logger.LogShutdown("signal received")
+	_, _ = fmt.Fprintln(s.opts.Stderr, "\nPipelock stopped.")
+	return nil
+}
+
+// startupNotified returns a channel closed once startup readiness has been
+// reported to systemd. It is lazily created so a Server built by a test that
+// never starts still has a usable gate.
+func (s *Server) startupNotified() <-chan struct{} {
+	s.sdStartupReadyOnce.Do(func() { s.sdStartupReady = make(chan struct{}) })
+	return s.sdStartupReady
+}
+
+// markStartupNotified publishes startup readiness exactly once.
+func (s *Server) markStartupNotified() {
+	ready := s.startupNotified()
+	select {
+	case <-ready:
+	default:
+		close(s.sdStartupReady)
+	}
+}
+
+// startupNotifiedAlready reports whether readiness has been published, without
+// waiting for it.
+func (s *Server) startupNotifiedAlready() bool {
+	select {
+	case <-s.startupNotified():
+		return true
+	default:
+		return false
+	}
+}
+
+// handleConfigReload completes one file-watcher reload. Only SIGHUP-triggered
+// events participate in systemd's notify-reload protocol; filesystem updates
+// remain asynchronous and must not create unsolicited reload state.
+func (s *Server) handleConfigReload(event config.ReloadEvent) {
+	// Only a SIGHUP that arrives after startup readiness participates in the
+	// notify-reload protocol. Before that, READY=1 would report startup, not a
+	// reload verdict, and systemd would start dependent units against a proxy
+	// whose listeners are not up yet.
+	notifySystemd := event.Trigger == config.ReloadTriggerSignal && s.startupNotifiedAlready()
+	if notifySystemd {
+		sdNotifyReloading(s.opts.Stderr)
+	}
+	trigger := "fsnotify"
+	if event.Trigger == config.ReloadTriggerSignal {
+		trigger = "signal"
+	}
+	s.reloadMu.Lock()
+	s.reloadEventLocked(event, trigger)
+	if notifySystemd {
+		// READY ends the notify-reload handshake; it cannot communicate a
+		// rejected transaction. STATUS carries the daemon's actual outcome.
+		sdNotifyConfigComplete(s.opts.Stderr, s.reloadSystemdStatusLocked())
+	} else {
+		s.notifyReloadStatusLocked()
+	}
+	s.reloadMu.Unlock()
+
+	// Signal reload-cycle completion for tests (no-op in production). Fires per
+	// delivered config so reload tests can block on the event instead of polling
+	// stderr on a deadline.
+	fireReloadCompletedHook()
+}
+
+// revokeUnavailableAckKey runs after a reload fails. A failed reload keeps
+// the running configuration, including its pinned acknowledgment key, so a
+// key file that was deleted, truncated, loosened or rotated would otherwise
+// go on validating acknowledgments. The key source is resolved again; unless
+// it still yields the pinned bytes, the key is revoked for this running
+// configuration: the listener's live acknowledgment set is revoked at once,
+// reaching any in-flight response that holds a copy, and an atomic mark makes
+// later configuration reads revoke too. Revocation publishes nothing and
+// cannot fail. Every acknowledgment then
+// refuses until a reload succeeds with a usable key. Nothing else in the
+// running configuration changes.
+func (s *Server) revokeUnavailableAckKey() {
+	cur := s.proxy.CurrentConfig()
+	if cur == nil || len(cur.MCPToolScanning.AcknowledgmentKeyBytes) == 0 {
+		return
+	}
+	key, err := config.ResolveMCPAckKey(cur.MCPToolScanning.AcknowledgmentKey)
+	if err == nil && hmac.Equal(key, cur.MCPToolScanning.AcknowledgmentKeyBytes) {
+		return
+	}
+	s.ackKeyRevokedFor.Store(cur)
+	// Revoke the live set now, not at the next configuration read: a response
+	// already in flight holds a configuration copy that shares this set.
+	if live := s.liveAckSet.Load(); live != nil && live.cfg == cur {
+		live.set.Revoke()
+	}
+	_, _ = fmt.Fprintln(s.opts.Stderr, "pipelock: mcp_tool_scanning.acknowledgment_key is unavailable or changed and the reload failed; every acknowledgment refuses until a reload succeeds")
+}
+
+func preferFileSentryRuntimeError(startErr, fileSentryErr error) error {
+	if fileSentryErr != nil && (startErr == nil || errors.Is(startErr, context.Canceled)) {
+		return fileSentryErr
+	}
+	return startErr
+}
+
+// mcpAirlockConfigFor returns the live airlock configuration the MCP listener
+// should enforce against, or nil when airlock is absent or disabled. Returning
+// nil is what lets the MCP gate distinguish "airlock is off, allow" from
+// "airlock is on but this session's tier is unknown", which must fail closed.
+func mcpAirlockConfigFor(c *config.Config) *config.Airlock {
+	if c == nil || !c.Airlock.Enabled {
+		return nil
+	}
+	return &c.Airlock
+}
+
+// consumeReloads applies reload events until the channel closes, holding a
+// signal-triggered event until startup readiness has been reported. Handling
+// one before that point would either skip the envelope systemd is waiting on
+// or send a READY that completes the start job early, depending on which side
+// of the READY datagram the state was published.
+//
+// Cancellation and a startup that settles without publishing readiness both
+// end the loop rather than releasing the queued event: a configuration queued
+// before a failed or aborted start must not be applied after it.
+func (s *Server) consumeReloads(ctx context.Context, events <-chan config.ReloadEvent, startupSettled <-chan struct{}) {
+	for event := range events {
+		if event.Trigger == config.ReloadTriggerSignal {
+			select {
+			case <-s.startupNotified():
+			case <-ctx.Done():
+				return
+			case <-startupSettled:
+				return
+			}
+		}
+		s.handleConfigReload(event)
+	}
+}
+
+// evidenceMonitors builds the evidence self-audit and the auto-anchor loop.
+// With a receipt group every chain is audited against its own session; the
+// group's membership is fixed at opening, so the shard list never changes.
+// A group gets no anchor loop: config validation refuses auto-anchoring with
+// more than one receipt chain. The single-chain anchor loop is cheap and
+// inactive without a configured anchor point, and is built whenever the
+// recorder and emitter exist so that adding an anchor point on hot reload
+// takes effect without rebuilding recorder state.
+func (s *Server) evidenceMonitors(cfg *config.Config) (*evidenceHealthMonitor, *autoAnchorMonitor) {
+	if s.recorder == nil || s.metrics == nil {
+		return nil, nil
+	}
+	var health *evidenceHealthMonitor
+	if cfg.FlightRecorder.EvidenceHealthEnabled() {
+		health = newEvidenceHealthMonitor(s.recorder, s.metrics, s.liveReceiptEmitter, s.currentConfig, s.opts.Stderr)
+		if s.receiptShardSet != nil {
+			health.withShards(s.receiptShardSet.Emitters)
+		}
+	}
+	var anchor *autoAnchorMonitor
+	if s.receiptShardSet == nil && receiptEmitterReady(s.liveReceiptEmitter()) {
+		anchor = newAutoAnchorMonitor(s.recorder, s.metrics, s.liveReceiptEmitter, s.currentConfig, s.opts.Stderr)
+	}
+	return health, anchor
+}
+
+// startEvidenceMonitors starts the loops evidenceMonitors builds.
+func (s *Server) startEvidenceMonitors(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config) {
+	health, anchor := s.evidenceMonitors(cfg)
+	if health != nil {
+		health.start(ctx, wg)
+	}
+	if anchor != nil {
+		anchor.start(ctx, wg)
+	}
+}
+
+// shutdownAgentServers unbinds agent listeners outside the shutdown path:
+// license expiry, CRL fail-closed and license-revoking reloads. A drain that
+// does not finish is remembered so Start leaves the run unsealed, the same as
+// an agent drain failure during shutdown itself.
+func (s *Server) shutdownAgentServers() {
+	if err := s.proxy.ShutdownAgentServers(); err != nil {
+		s.agentDrainIncomplete.Store(true)
+		if s.opts.Stderr != nil {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: agent listener drain incomplete; receipts for this run will not be sealed as complete: %v\n", err)
+		}
+	}
+}

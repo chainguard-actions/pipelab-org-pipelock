@@ -1,0 +1,790 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package extract
+
+import (
+	"encoding/json"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestAllStringsFromJSON_NestedObjects(t *testing.T) {
+	raw := json.RawMessage(`{"a": {"b": "value1", "c": "value2"}, "d": "value3"}`)
+	result := AllStringsFromJSON(raw)
+	if len(result) == 0 {
+		t.Fatal("expected non-empty result")
+	}
+	got := make(map[string]struct{}, len(result))
+	for _, s := range result {
+		got[s] = struct{}{}
+	}
+	for _, want := range []string{"a", "b", "value1", "c", "value2", "d", "value3"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing exact token %q in result: %v", want, result)
+		}
+	}
+}
+
+func TestAllStringsFromJSON_Arrays(t *testing.T) {
+	raw := json.RawMessage(`["hello", "world", 42, true]`)
+	result := AllStringsFromJSON(raw)
+	got := make(map[string]struct{}, len(result))
+	for _, s := range result {
+		got[s] = struct{}{}
+	}
+	for _, want := range []string{"hello", "world", "42", "true"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing exact token %q in result: %v", want, result)
+		}
+	}
+}
+
+func TestAllStringsFromJSONOrdered_PreservesSourceOrder(t *testing.T) {
+	raw := json.RawMessage(`{"z":"ignore previous","a":"instructions","nested":{"b":"ignora","a":"las instrucciones anteriores"}}`)
+	result := AllStringsFromJSONOrdered(raw)
+	want := []string{"z", "ignore previous", "a", "instructions", "nested", "b", "ignora", "a", "las instrucciones anteriores"}
+	if len(result) != len(want) {
+		t.Fatalf("len(result) = %d, want %d: %#v", len(result), len(want), result)
+	}
+	for i := range want {
+		if result[i] != want[i] {
+			t.Fatalf("result[%d] = %q, want %q; all=%#v", i, result[i], want[i], result)
+		}
+	}
+}
+
+func TestAllStringsFromJSON_DepthLimit(t *testing.T) {
+	// Build deeply nested JSON: {"a":{"a":{"a":...}}} at 70 levels
+	var b strings.Builder
+	const depth = 70
+	for i := 0; i < depth; i++ {
+		b.WriteString(`{"a":`)
+	}
+	b.WriteString(`"deep"`)
+	for i := 0; i < depth; i++ {
+		b.WriteString(`}`)
+	}
+	raw := json.RawMessage(b.String())
+	result := AllStringsFromJSON(raw)
+	// Should not panic or stack overflow. Some strings extracted, but "deep"
+	// is beyond maxExtractDepth (64) so it should be truncated.
+	if len(result) == 0 {
+		t.Fatal("expected some strings extracted from outer levels")
+	}
+	// Verify we got keys from the outer levels.
+	got := make(map[string]struct{}, len(result))
+	for _, s := range result {
+		got[s] = struct{}{}
+	}
+	if _, ok := got["a"]; !ok {
+		t.Error("expected at least the key 'a' from outer levels")
+	}
+	// "deep" is nested at depth 70, beyond maxExtractDepth (64).
+	if _, present := got["deep"]; present {
+		t.Error("did not expect \"deep\" beyond maxExtractDepth")
+	}
+}
+
+func TestAllStringsFromJSON_EmptyInput(t *testing.T) {
+	result := AllStringsFromJSON(nil)
+	if len(result) != 0 {
+		t.Errorf("expected empty result for nil input, got %d", len(result))
+	}
+
+	result = AllStringsFromJSON(json.RawMessage(""))
+	if len(result) != 0 {
+		t.Errorf("expected empty result for empty input, got %d", len(result))
+	}
+}
+
+func TestJSONLeafPayloads(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 2, MaxStreams: 2, MaxPathBytes: 32}
+	tests := []struct {
+		name     string
+		raw      string
+		limits   JSONLeafLimits
+		complete bool
+		want     map[string]string
+	}{
+		{
+			name:     "partition values by escaped path",
+			raw:      `{"messages":[{"content":"first","count":2}],"enabled":true}`,
+			limits:   JSONLeafLimits{MaxDepth: 3, MaxStreams: 3, MaxPathBytes: 64},
+			complete: true,
+			want:     map[string]string{"$/messages/0/content": "first", "$/messages/0/count": "2", "$/enabled": "true"},
+		},
+		{
+			// Keys carrying RFC 6901 special characters ('~' and '/') must be
+			// escaped in the path segment ('~0' and '~1') so a key containing a
+			// slash cannot forge a deeper path and collide two distinct streams.
+			name:     "escape tilde and slash in object keys",
+			raw:      `{"a/b":{"c~d":"v1"},"a":{"b":"v2"}}`,
+			limits:   JSONLeafLimits{MaxDepth: 3, MaxStreams: 3, MaxPathBytes: 64},
+			complete: true,
+			want:     map[string]string{"$/a~1b/c~0d": "v1", "$/a/b": "v2"},
+		},
+		{name: "malformed input fails closed", raw: `{"unterminated"`, limits: limits},
+		{name: "depth limit fails closed", raw: `[[["deep"]]]`, limits: limits},
+		{name: "stream limit fails closed", raw: `{"one":"1","two":"2","three":"3"}`, limits: limits},
+		{name: "path limit fails closed", raw: `{"this-path-is-too-long":"value"}`, limits: JSONLeafLimits{MaxDepth: 2, MaxStreams: 2, MaxPathBytes: 16}},
+		{name: "invalid limits fail closed", raw: `"value"`, limits: JSONLeafLimits{}},
+		{name: "trailing content fails closed", raw: `{"value":"ok"} trailing`, limits: limits},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, complete := JSONLeafPayloads(json.RawMessage(tt.raw), tt.limits)
+			if complete != tt.complete {
+				t.Fatalf("complete = %t, want %t; payloads=%#v", complete, tt.complete, got)
+			}
+			if !complete {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("payload count = %d, want %d: %#v", len(got), len(tt.want), got)
+			}
+			for path, want := range tt.want {
+				if value := string(got[path]); value != want {
+					t.Errorf("payload %q = %q, want %q", path, value, want)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONLeafPayloadsPartial(t *testing.T) {
+	t.Run("retains newest representable leaves", func(t *testing.T) {
+		got, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"one":"1","two":2,"three":true,"four":null}`), JSONLeafLimits{
+			MaxDepth: 4, MaxStreams: 2, MaxPathBytes: 64,
+		})
+		if !valid {
+			t.Fatal("partial extraction rejected valid JSON")
+		}
+		if len(got) != 2 || string(got["$/two"]) != "2" || string(got["$/three"]) != "true" {
+			t.Fatalf("partial payloads = %#v, want newest scalar leaves", got)
+		}
+	})
+
+	t.Run("long paths receive stable opaque keys", func(t *testing.T) {
+		limits := JSONLeafLimits{MaxDepth: 4, MaxStreams: 2, MaxPathBytes: 8}
+		first, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"this-key-is-long":"first"}`), limits)
+		if !valid || len(first) != 1 {
+			t.Fatalf("first payloads = %#v, valid=%t", first, valid)
+		}
+		second, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"this-key-is-long":"second"}`), limits)
+		if !valid || len(second) != 1 {
+			t.Fatalf("second payloads = %#v, valid=%t", second, valid)
+		}
+		for path := range first {
+			if string(second[path]) != "second" {
+				t.Fatalf("opaque path %q was not stable: %#v", path, second)
+			}
+		}
+	})
+
+	t.Run("depth limit omits only deep leaves", func(t *testing.T) {
+		got, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"shallow":"kept","deep":{"nested":{"value":"omitted"}}}`), JSONLeafLimits{
+			MaxDepth: 1, MaxStreams: 2, MaxPathBytes: 64,
+		})
+		if !valid || string(got["$/shallow"]) != "kept" {
+			t.Fatalf("depth-limited payloads = %#v, valid=%t", got, valid)
+		}
+		if _, ok := got["$/deep/nested/value"]; ok {
+			t.Fatalf("depth-limited payloads retained deep leaf: %#v", got)
+		}
+	})
+
+	t.Run("arrays nulls and escaped keys remain representable", func(t *testing.T) {
+		got, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"a/b~c":[null,2,true,"text"]}`), JSONLeafLimits{
+			MaxDepth: 4, MaxStreams: 8, MaxPathBytes: 64,
+		})
+		if !valid || string(got["$/a~1b~0c/1"]) != "2" || string(got["$/a~1b~0c/2"]) != "true" || string(got["$/a~1b~0c/3"]) != "text" {
+			t.Fatalf("array payloads = %#v, valid=%t", got, valid)
+		}
+	})
+
+	t.Run("depth skip consumes nested arrays", func(t *testing.T) {
+		got, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"keep":"yes","drop":[{"nested":"no"}]}`), JSONLeafLimits{
+			MaxDepth: 1, MaxStreams: 4, MaxPathBytes: 64,
+		})
+		if !valid || string(got["$/keep"]) != "yes" || len(got) != 1 {
+			t.Fatalf("array depth-skip payloads = %#v, valid=%t", got, valid)
+		}
+	})
+
+	for _, limits := range []JSONLeafLimits{{}, {MaxDepth: -1, MaxStreams: 1, MaxPathBytes: 1}} {
+		if got, valid := JSONLeafPayloadsPartial(json.RawMessage(`"value"`), limits); valid || got != nil {
+			t.Fatalf("invalid limits payload = %#v, valid=%t", got, valid)
+		}
+	}
+	if got, valid := JSONLeafPayloadsPartial(json.RawMessage(`{"value":"ok"} trailing`), JSONLeafLimits{MaxDepth: 2, MaxStreams: 2, MaxPathBytes: 16}); valid || got != nil {
+		t.Fatalf("trailing payload = %#v, valid=%t", got, valid)
+	}
+
+	for _, raw := range []json.RawMessage{nil, json.RawMessage(`{"unterminated"`)} {
+		if got, valid := JSONLeafPayloadsPartial(raw, JSONLeafLimits{MaxDepth: 2, MaxStreams: 2, MaxPathBytes: 16}); valid || got != nil {
+			t.Fatalf("invalid partial payload = %#v, valid=%t", got, valid)
+		}
+	}
+}
+
+var testJSONLeafBucketKey = []byte("pipelock-test-json-leaf-bucket-key")
+
+func TestJSONLeafBucketPayloadsKeepsEveryLeafWithinFixedBuckets(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 2, MaxPathBytes: 32}
+
+	t.Run("arrays and scalar kinds remain represented", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`[null,2,true,"text"]`), limits, 8, testJSONLeafBucketKey)
+		if !valid {
+			t.Fatal("valid scalar array was rejected")
+		}
+		var all strings.Builder
+		for _, value := range buckets {
+			all.Write(value)
+		}
+		for _, want := range []string{"2", "true", "text"} {
+			if !strings.Contains(all.String(), want) {
+				t.Fatalf("bucket output omitted %q: %#v", want, buckets)
+			}
+		}
+	})
+
+	t.Run("invalid limits and empty key decline to partition", func(t *testing.T) {
+		for _, tt := range []struct {
+			raw     json.RawMessage
+			limits  JSONLeafLimits
+			buckets int
+			key     []byte
+		}{
+			{raw: json.RawMessage(`{"unterminated"`), limits: limits, buckets: 8, key: testJSONLeafBucketKey},
+			{raw: json.RawMessage(`{"value":"ok"}`), limits: JSONLeafLimits{}, buckets: 8, key: testJSONLeafBucketKey},
+			{raw: json.RawMessage(`{"value":"ok"}`), limits: limits, buckets: 0, key: testJSONLeafBucketKey},
+			{raw: json.RawMessage(`{"value":"ok"}`), limits: limits, buckets: maxJSONLeafBuckets + 1, key: testJSONLeafBucketKey},
+			{raw: json.RawMessage(`{"value":"ok"}`), limits: limits, buckets: 8, key: nil},
+			{raw: nil, limits: limits, buckets: 8, key: testJSONLeafBucketKey},
+		} {
+			if buckets, valid := JSONLeafBucketPayloads(tt.raw, tt.limits, tt.buckets, tt.key); valid || buckets != nil {
+				t.Fatalf("invalid bucket extraction = %#v, valid=%t", buckets, valid)
+			}
+		}
+	})
+
+	if got := jsonLeafBucketIndex(nil, 0, 0, maxJSONLeafBuckets+1, testJSONLeafBucketKey); got != 0 {
+		t.Fatalf("out-of-range bucket count index = %d, want 0", got)
+	}
+	if got := jsonLeafBucketIndex([]byte("$/a"), 0, 2, 8, nil); got != 0 {
+		t.Fatalf("empty-key bucket index = %d, want 0", got)
+	}
+
+	t.Run("deep leaf uses a stable bucket", func(t *testing.T) {
+		first, valid := JSONLeafBucketPayloads(nestedJSON(66), limits, 8, testJSONLeafBucketKey)
+		if !valid || len(first) != 1 {
+			t.Fatalf("first buckets = %#v, valid=%t", first, valid)
+		}
+		second, valid := JSONLeafBucketPayloads(nestedJSON(66), limits, 8, testJSONLeafBucketKey)
+		if !valid || len(second) != 1 {
+			t.Fatalf("second buckets = %#v, valid=%t", second, valid)
+		}
+		for bucket, value := range first {
+			if string(value) != "deep" || string(second[bucket]) != "deep" {
+				t.Fatalf("deep value was not retained in stable bucket %q: first=%q second=%q", bucket, value, second[bucket])
+			}
+		}
+	})
+
+	t.Run("more paths than buckets retain first and last leaves", func(t *testing.T) {
+		var raw strings.Builder
+		raw.WriteByte('{')
+		for index := range 20 {
+			if index > 0 {
+				raw.WriteByte(',')
+			}
+			raw.WriteString(`"field_`)
+			raw.WriteString(strconv.Itoa(index))
+			raw.WriteString(`":"value_`)
+			raw.WriteString(strconv.Itoa(index))
+			raw.WriteByte('"')
+		}
+		raw.WriteByte('}')
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(raw.String()), limits, 4, testJSONLeafBucketKey)
+		if !valid || len(buckets) > 4 {
+			t.Fatalf("buckets = %#v, valid=%t", buckets, valid)
+		}
+		var all strings.Builder
+		for _, value := range buckets {
+			all.Write(value)
+		}
+		for _, want := range []string{"value_0", "value_19"} {
+			if !strings.Contains(all.String(), want) {
+				t.Fatalf("bucket output omitted %q: %#v", want, buckets)
+			}
+		}
+	})
+}
+
+func TestJSONLeafBucketPayloadsKeepsLeavesParsedBeforeError(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 4, MaxPathBytes: 64}
+	secret := "AKI" + "AIOSFODNN7EXAMPLE"
+
+	t.Run("trailing byte keeps the parsed leaf", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"a":"`+secret+`"} x`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("trailing non-JSON must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, secret) {
+			t.Fatalf("parsed leaf was omitted after trailing byte: %#v", buckets)
+		}
+	})
+
+	t.Run("second top-level value keeps the first object's leaves", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"a":"`+secret+`"}{}`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("second top-level value must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, secret) {
+			t.Fatalf("parsed leaf was omitted after second value: %#v", buckets)
+		}
+	})
+
+	t.Run("truncated after a complete sibling keeps that sibling", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"keep":"yes","drop":"`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("truncated object must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, "yes") {
+			t.Fatalf("complete sibling was omitted: %#v", buckets)
+		}
+	})
+
+	t.Run("truncated before any scalar yields no buckets", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"a":"`+secret), limits, 8, testJSONLeafBucketKey)
+		if valid || buckets != nil {
+			t.Fatalf("unterminated first leaf = %#v, valid=%t", buckets, valid)
+		}
+	})
+}
+
+// The bucket walker must bound its own recursion the way its JSONLeafPayloads
+// and JSONLeafPayloadsPartial siblings do. Without a depth head check it
+// recursed once per nesting level and a deeply nested body overflowed the
+// goroutine stack. The deepest case here is above the measured overflow point:
+// a naive recursive walk of it fails with the runtime's fatal, unrecoverable
+// "goroutine stack exceeds 1000000000-byte limit" (measured on go1.25: 8M deep
+// overflows, 4M does not), which aborts the whole test binary. So this case is
+// the load-bearing guard for the recursion bound: the iterative bucketing path
+// completes it in ~200ms where the recursive path would crash. The recover()
+// below only catches an ordinary panic; a true stack overflow is fatal and is
+// not caught, which is exactly why the depth must exceed the overflow point
+// rather than merely be "large". The over-depth leaf must also still be
+// bucketed, so a fix that dropped it fails the containsSecret assertion.
+// goDecoderNestingLimit is encoding/json's maxNestingDepth, which Go 1.27's
+// json.Decoder.Token enforces and earlier releases did not.
+const goDecoderNestingLimit = 10000
+
+func TestJSONLeafBucketPayloadsBoundsRecursionDepth(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 8, MaxPathBytes: 512}
+	secret := "AKI" + "AIOSFODNN7EXAMPLE"
+
+	for _, depth := range []int{8, 64, 1000, 12000, 10_000_000} {
+		t.Run(strconv.Itoa(depth), func(t *testing.T) {
+			body := strings.Repeat(`[`, depth) + `"` + secret + `"` + strings.Repeat("]", depth)
+			var (
+				buckets map[string][]byte
+				valid   bool
+			)
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("depth %d panicked (unbounded recursion): %v", depth, r)
+					}
+				}()
+				buckets, valid = JSONLeafBucketPayloads(json.RawMessage(body), limits, 4096, testJSONLeafBucketKey)
+			}()
+			<-done
+			// Go 1.27's json.Decoder refuses to tokenize past
+			// goDecoderNestingLimit, so the walk may report incomplete beyond
+			// it; the leaf must still be bucketed either way.
+			if !valid && depth <= goDecoderNestingLimit {
+				t.Fatalf("depth %d: well-formed body reported incomplete", depth)
+			}
+			if !jsonLeafBucketsContain(buckets, secret) {
+				t.Fatalf("depth %d: over-depth leaf was dropped, not bucketed: %#v", depth, buckets)
+			}
+		})
+	}
+}
+
+// Over-depth object members are consumed but their keys are not bucketed as
+// values, matching the value-only contract of the in-depth recursive path.
+func TestJSONLeafBucketPayloadsOverDepthSkipsObjectKeys(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 1, MaxPathBytes: 512}
+	secret := "AKI" + "AIOSFODNN7EXAMPLE"
+	// The secret sits well past MaxDepth=1, reached through nested objects whose
+	// keys ("wrapper", "inner", "leaf") must not appear in any bucket.
+	body := `{"wrapper":{"inner":{"leaf":"` + secret + `"}}}`
+	buckets, valid := JSONLeafBucketPayloads(json.RawMessage(body), limits, 4096, testJSONLeafBucketKey)
+	if !valid {
+		t.Fatalf("well-formed body reported incomplete: %#v", buckets)
+	}
+	if !jsonLeafBucketsContain(buckets, secret) {
+		t.Fatalf("over-depth leaf value was dropped: %#v", buckets)
+	}
+	for _, key := range []string{"wrapper", "inner", "leaf"} {
+		if jsonLeafBucketsContain(buckets, key) {
+			t.Fatalf("over-depth object key %q leaked into a value bucket: %#v", key, buckets)
+		}
+	}
+}
+
+func TestJSONLeafBucketPayloadsWalkerErrorReturns(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 4, MaxPathBytes: 64}
+
+	t.Run("unexpected closing delimiter", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`}`), limits, 8, testJSONLeafBucketKey)
+		if valid || buckets != nil {
+			t.Fatalf("unexpected delim = %#v, valid=%t", buckets, valid)
+		}
+	})
+
+	t.Run("unexpected array closer", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`]`), limits, 8, testJSONLeafBucketKey)
+		if valid || buckets != nil {
+			t.Fatalf("unexpected array delim = %#v, valid=%t", buckets, valid)
+		}
+	})
+
+	t.Run("non-string object key", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{1:true}`), limits, 8, testJSONLeafBucketKey)
+		if valid || buckets != nil {
+			t.Fatalf("numeric key = %#v, valid=%t", buckets, valid)
+		}
+	})
+
+	t.Run("truncated object key", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"`), limits, 8, testJSONLeafBucketKey)
+		if valid || buckets != nil {
+			t.Fatalf("truncated key = %#v, valid=%t", buckets, valid)
+		}
+	})
+
+	t.Run("truncated after object key", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"a":`), limits, 8, testJSONLeafBucketKey)
+		if valid || buckets != nil {
+			t.Fatalf("truncated after key = %#v, valid=%t", buckets, valid)
+		}
+	})
+
+	t.Run("truncated array after a scalar keeps that scalar", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`[1,`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("truncated array must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, "1") {
+			t.Fatalf("array scalar was omitted: %#v", buckets)
+		}
+	})
+
+	t.Run("mismatched object closer", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"a":1]`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("mismatched closer must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, "1") {
+			t.Fatalf("leaf before mismatched closer was omitted: %#v", buckets)
+		}
+	})
+
+	t.Run("mismatched array closer", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`[true}`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("mismatched array closer must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, "true") {
+			t.Fatalf("array leaf before mismatched closer was omitted: %#v", buckets)
+		}
+	})
+
+	t.Run("truncated nested object after sibling", func(t *testing.T) {
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"keep":false,"child":{`), limits, 8, testJSONLeafBucketKey)
+		if valid {
+			t.Fatal("truncated nested object must not report a complete document")
+		}
+		if !jsonLeafBucketsContain(buckets, "false") {
+			t.Fatalf("sibling before truncated nested object was omitted: %#v", buckets)
+		}
+	})
+}
+
+func TestJSONLeafBucketIndexIsKeyedPerSecret(t *testing.T) {
+	path := []byte("$/messages/0/content")
+	first := jsonLeafBucketIndex(path, 1, 8, 4096, testJSONLeafBucketKey)
+	second := jsonLeafBucketIndex(path, 1, 8, 4096, testJSONLeafBucketKey)
+	if first != second {
+		t.Fatalf("same key mapped %q to %d then %d", path, first, second)
+	}
+	otherKey := append([]byte(nil), testJSONLeafBucketKey...)
+	otherKey[len(otherKey)-1] ^= 0x01
+	other := jsonLeafBucketIndex(path, 1, 8, 4096, otherKey)
+	if first == other {
+		t.Fatalf("distinct keys mapped %q to the same bucket %d", path, first)
+	}
+
+	target := jsonLeafBucketIndex(path, 1, 8, 4096, testJSONLeafBucketKey)
+	wrongKey := []byte("attacker-guessed-json-leaf-bucket")
+	hits := 0
+	for index := 1; index <= 20000; index++ {
+		candidate := []byte("$/n" + strconv.Itoa(index))
+		if jsonLeafBucketIndex(candidate, 1, 8, 4096, wrongKey) == target {
+			hits++
+		}
+	}
+	if hits > 20 {
+		t.Fatalf("grinding with the wrong key hit the secret bucket %d/20000 times; keyed mapping leaked", hits)
+	}
+	found := 0
+	for index := 1; index <= 20000; index++ {
+		candidate := []byte("$/n" + strconv.Itoa(index))
+		if jsonLeafBucketIndex(candidate, 1, 8, 4096, testJSONLeafBucketKey) == target {
+			found = index
+			break
+		}
+	}
+	if found == 0 {
+		t.Fatal("keyed oracle did not find a colliding path in 20000 candidates")
+	}
+}
+
+func jsonLeafBucketsContain(buckets map[string][]byte, want string) bool {
+	for _, value := range buckets {
+		if strings.Contains(string(value), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAllStringsFromJSON_InvalidJSON(t *testing.T) {
+	result := AllStringsFromJSON(json.RawMessage(`{invalid json`))
+	if len(result) != 0 {
+		t.Errorf("expected empty result for invalid JSON, got %d", len(result))
+	}
+}
+
+func TestAllStringsFromJSON_NumericAndBool(t *testing.T) {
+	raw := json.RawMessage(`{"count": 123, "active": false, "rate": 3.14}`)
+	result := AllStringsFromJSON(raw)
+	got := make(map[string]struct{}, len(result))
+	for _, s := range result {
+		got[s] = struct{}{}
+	}
+	if _, ok := got["123"]; !ok {
+		t.Error("missing numeric value 123")
+	}
+	if _, ok := got["false"]; !ok {
+		t.Error("missing boolean value false")
+	}
+	if _, ok := got["3.14"]; !ok {
+		t.Error("missing float value 3.14")
+	}
+}
+
+func TestAllStringsFromJSONResult_ReportsTruncation(t *testing.T) {
+	raw := nestedJSON(maxExtractDepth + 6)
+	got := AllStringsFromJSONResult(raw)
+	if !got.Truncated {
+		t.Fatal("expected Truncated when nesting exceeds maxExtractDepth")
+	}
+	if len(got.Strings) == 0 {
+		t.Fatal("expected outer keys before the depth cap")
+	}
+	for _, s := range got.Strings {
+		if s == "deep" {
+			t.Fatal(`extracted "deep" past maxExtractDepth`)
+		}
+	}
+
+	shallow := AllStringsFromJSONResult(json.RawMessage(`{"a":"ok"}`))
+	if shallow.Truncated {
+		t.Fatal("did not expect Truncated on shallow JSON")
+	}
+}
+
+func TestAllStringsFromJSONOrderedResult_NumbersAndBools(t *testing.T) {
+	got := AllStringsFromJSONOrderedResult(json.RawMessage(`[true,false,42,3.5]`))
+	want := []string{"true", "false", "42", "3.5"}
+	if len(got.Strings) != len(want) {
+		t.Fatalf("strings = %#v, want %#v", got.Strings, want)
+	}
+	for i := range want {
+		if got.Strings[i] != want[i] {
+			t.Fatalf("strings[%d] = %q, want %q", i, got.Strings[i], want[i])
+		}
+	}
+	if got.Truncated {
+		t.Fatal("did not expect Truncated on a flat array")
+	}
+}
+
+func TestAllStringsFromJSONOrderedResult_DepthCapOmitsInnerTokens(t *testing.T) {
+	raw := nestedJSON(maxExtractDepth + 2)
+	got := AllStringsFromJSONOrderedResult(raw)
+	if !got.Truncated {
+		t.Fatal("expected Truncated when ordered extraction exceeds maxExtractDepth")
+	}
+	for _, s := range got.Strings {
+		if s == "deep" {
+			t.Fatal(`ordered extraction kept "deep" past maxExtractDepth`)
+		}
+	}
+	if len(got.Strings) == 0 {
+		t.Fatal("expected keys from levels inside the depth cap")
+	}
+}
+
+func nestedJSON(depth int) json.RawMessage {
+	var b strings.Builder
+	for i := 0; i < depth; i++ {
+		b.WriteString(`{"a":`)
+	}
+	b.WriteString(`"deep"`)
+	for i := 0; i < depth; i++ {
+		b.WriteString(`}`)
+	}
+	return json.RawMessage(b.String())
+}
+
+// Over-depth content is walked with an explicit stack, so every scalar shape
+// and both container shapes below MaxDepth must be bucketed without recursion,
+// and a body cut off inside the over-depth region must report incomplete while
+// keeping the leaves that completed before the cut.
+func TestJSONLeafBucketPayloadsOverDepthShapes(t *testing.T) {
+	limits := JSONLeafLimits{MaxDepth: 1, MaxPathBytes: 512}
+	secret := "AKI" + "AIOSFODNN7EXAMPLE"
+
+	t.Run("mixed scalars and containers", func(t *testing.T) {
+		body := `{"w":{"s":"` + secret + `","n":1234567890,"b":true,"z":null,"arr":[["deep"],{"k":"v"}]}}`
+		buckets, valid := JSONLeafBucketPayloads(json.RawMessage(body), limits, 4096, testJSONLeafBucketKey)
+		if !valid {
+			t.Fatalf("well-formed body reported incomplete: %#v", buckets)
+		}
+		for _, want := range []string{secret, "1234567890", "true", "deep", "v"} {
+			if !jsonLeafBucketsContain(buckets, want) {
+				t.Fatalf("over-depth leaf %q was dropped: %#v", want, buckets)
+			}
+		}
+		for _, key := range []string{"w", "s", "n", "b", "z", "arr", "k"} {
+			if jsonLeafBucketsContain(buckets, key) {
+				t.Fatalf("over-depth object key %q leaked into a value bucket: %#v", key, buckets)
+			}
+		}
+	})
+
+	cut := []struct {
+		name string
+		body string
+	}{
+		{"inside a value", `{"w":{"s":"` + secret + `","t":"trunc`},
+		{"after a key", `{"w":{"s":"` + secret + `","t":`},
+		{"inside a nested array", `{"w":[["` + secret + `"],["cut`},
+	}
+	for _, tc := range cut {
+		t.Run("truncated "+tc.name, func(t *testing.T) {
+			buckets, valid := JSONLeafBucketPayloads(json.RawMessage(tc.body), limits, 4096, testJSONLeafBucketKey)
+			if valid {
+				t.Fatalf("truncated body reported complete: %#v", buckets)
+			}
+			if !jsonLeafBucketsContain(buckets, secret) {
+				t.Fatalf("leaf that completed before the cut was dropped: %#v", buckets)
+			}
+		})
+	}
+}
+
+func TestFoldRemainingJSONScalars(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]struct {
+		raw  string
+		want []string
+	}{
+		"array values":        {raw: `[["a",1,true,false,null]]`, want: []string{"a", "1", "true", "false"}},
+		"object keys skipped": {raw: `{"k":"v","n":{"k2":"v2"}}`, want: []string{"v", "v2"}},
+		"escapes decoded":     {raw: `["\u0041KIA","x\"y"]`, want: []string{"AKIA", `x"y`}},
+		"unmatched closers":   {raw: `]]}, "tail"]`, want: []string{"tail"}},
+		"mid-member start":    {raw: `: [["deep"]], "sib": "val"}`, want: []string{"deep", "sib", "val"}},
+		"unterminated string": {raw: `["ok", "cut`, want: []string{"ok"}},
+		"invalid escape":      {raw: `["ok", "\q"]`, want: []string{"ok"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var got []string
+			foldRemainingJSONScalars([]byte(tc.raw), func(v string) { got = append(got, v) })
+			if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+				t.Fatalf("foldRemainingJSONScalars(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestJSONLeafBucketPayloadsKeepsLeavesPastDecoderLimit covers a document
+// whose deep member exceeds Go 1.27's decoder nesting limit next to a shallow
+// member: both leaves must still reach a bucket on every Go release.
+func TestJSONLeafBucketPayloadsKeepsLeavesPastDecoderLimit(t *testing.T) {
+	t.Parallel()
+
+	secret := "AKI" + "AIOSFODNN7EXAMPLE"
+	deep := goDecoderNestingLimit + 5
+	body := `{"a":"shallow-leaf","b":` + strings.Repeat("[", deep) + `"` + secret + `"` + strings.Repeat("]", deep) + `,"c":"after-leaf"}`
+	buckets, _ := JSONLeafBucketPayloads(json.RawMessage(body), JSONLeafLimits{MaxDepth: 8, MaxPathBytes: 512}, 4096, testJSONLeafBucketKey)
+	for _, want := range []string{"shallow-leaf", secret, "after-leaf"} {
+		if !jsonLeafBucketsContain(buckets, want) {
+			t.Fatalf("leaf %q dropped: %#v", want, buckets)
+		}
+	}
+}
+
+// TestJSONLeafBucketPayloadsFoldDoesNotRepeatLeaves pins that when the
+// decoder gives up part way through an over-depth value, the fallback scan
+// resumes after the last token it returned: a leaf already bucketed must not
+// be emitted again, or a piece of a split secret appears twice and breaks the
+// cross-request join.
+func TestJSONLeafBucketPayloadsFoldDoesNotRepeatLeaves(t *testing.T) {
+	t.Parallel()
+
+	deep := goDecoderNestingLimit + 5
+	body := `{"w":["FIRST",` + strings.Repeat("[", deep) + `"SECOND"` + strings.Repeat("]", deep) + `]}`
+	// MaxDepth 0 makes the whole "w" array one over-depth fold, so FIRST is
+	// tokenized by the decoder before it gives up inside the deep element.
+	buckets, _ := JSONLeafBucketPayloads(json.RawMessage(body), JSONLeafLimits{MaxDepth: 0, MaxPathBytes: 512}, 4096, testJSONLeafBucketKey)
+	var all strings.Builder
+	for _, v := range buckets {
+		all.Write(v)
+	}
+	if got := strings.Count(all.String(), "FIRST"); got != 1 {
+		t.Fatalf("FIRST bucketed %d times, want 1: %#v", got, buckets)
+	}
+	if !strings.Contains(all.String(), "SECOND") {
+		t.Fatalf("SECOND dropped: %#v", buckets)
+	}
+
+	// A syntax error after FIRST runs the fallback fold on every Go release,
+	// not only where the decoder has a nesting limit.
+	buckets, valid := JSONLeafBucketPayloads(json.RawMessage(`{"w":["FIRST",1 2 "RECOVERED"]}`), JSONLeafLimits{MaxDepth: 0, MaxPathBytes: 512}, 4096, testJSONLeafBucketKey)
+	if valid {
+		t.Fatalf("malformed body reported complete: %#v", buckets)
+	}
+	if !jsonLeafBucketsContain(buckets, "RECOVERED") {
+		t.Fatalf("malformed body dropped the leaf after the syntax error: %#v", buckets)
+	}
+	all.Reset()
+	for _, v := range buckets {
+		all.Write(v)
+	}
+	if got := strings.Count(all.String(), "FIRST"); got != 1 {
+		t.Fatalf("malformed body: FIRST bucketed %d times, want 1: %#v", got, buckets)
+	}
+}

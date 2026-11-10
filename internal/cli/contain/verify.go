@@ -1,0 +1,4013 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"bytes"
+	"context"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"net/netip"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
+)
+
+// Probe environment defaults. These match the layout produced by
+// `pipelock contain install`. Operators who installed the model
+// elsewhere can override via flags.
+const (
+	defaultProxyPort    = 8888
+	defaultProxyUser    = "pipelock-proxy"
+	defaultAgentUser    = config.DefaultContainmentAgentUser
+	defaultWrapperDir   = "/usr/local/bin"
+	defaultLaunchScript = "/usr/local/bin/plk-launch"
+	defaultCABundlePath = "/etc/pipelock/combined-ca.pem"
+	defaultServiceName  = "pipelock.service"
+	defaultNFTTable     = "pipelock_containment"
+	defaultNFTChain     = "output_filter"
+
+	probeDialTimeout        = 2 * time.Second
+	readinessTimeout        = 5 * time.Second
+	installReadinessTimeout = 30 * time.Second
+	readinessInterval       = 100 * time.Millisecond
+
+	// curl flags shared between the egress canary and the operator
+	// reachability probe. Connect timeout is intentionally lower than
+	// max time so a slow handshake still returns within probe budget.
+	curlConnectTimeout = "3"
+	curlMaxTime        = "5"
+	defaultCurlPath    = "/usr/bin/curl"
+	curlPath           = defaultCurlPath
+	canaryURL          = "https://example.com/"
+
+	// Probe 8 uses a DNS-free, non-routable TEST-NET-1 address on a normally
+	// unused port. This forces the probe packet through the managed catch-all
+	// agent DROP rule and removes DNS/TLS as alternate causes of failure. The
+	// curl's own time_connect measurement provides probe-specific evidence of
+	// whether this canary established TCP; the UID-wide DROP counter only
+	// corroborates a dial that did not complete.
+	directEgressCanaryURL       = "http://192.0.2.1:9/"
+	directCurlConnectTimeout    = "1"
+	directCurlMaxTime           = "2"
+	directCurlTimeConnectPrefix = "PLK_TIME_CONNECT="
+	directCurlWriteOut          = "\n" + directCurlTimeConnectPrefix + "%{time_connect}\n%{http_code}"
+
+	// Probe status values. Strings (not an enum type) so JSON
+	// serialization is identity and tests can compare cheaply.
+	statusPass    = "pass"
+	statusFail    = "fail"
+	statusSkip    = "skip"
+	statusUnknown = "unknown"
+	// statusFilesystemOff is not confinement and not a skipped probe. contain
+	// run allows it. verify and doctor count it apart from pass, fail, skip,
+	// and unknown so an upgrade that leaves the key absent stays exit 0.
+	statusFilesystemOff = "off"
+	// statusFilesystemNotApplicable is the service-posture result. Pipelock
+	// does not render that unit, so it neither tests nor signs a filesystem
+	// claim. The status is not a pass and is not confinement. verify and
+	// doctor never produce it; an unexpected appearance is coerced to fail.
+	statusFilesystemNotApplicable = "not-applicable"
+	filesystemNotApplicableDetail = "not applicable: operator-managed unit"
+
+	// Internal: cap on stdout/stderr we keep from a subprocess so a
+	// runaway command can't blow the runner's heap.
+	maxCmdOutputBytes = 64 << 10
+)
+
+// expectedNoProxy is the exact NO_PROXY value the plk-launch wrapper must
+// set per the 2026-05-04 decision in the runbook's open questions
+// (cluster traffic flows through Pipelock, so NO_PROXY is limited to
+// loopback). Any deviation is a policy regression.
+const expectedNoProxy = "NO_PROXY=" + contractNoProxy
+
+// defaultToolWrappers is the fallback wrapper list used when the inventory
+// file has not been written yet.
+var defaultToolWrappers = []string{"plk-claude", "plk-codex", "plk-gemini", "plk-playwright"}
+
+// runCommand is the function shape used by probes that shell out.
+// Factored as a type so tests can inject canned outputs without
+// spawning a real process.
+//
+// Contract:
+//   - On a process that ran (even with a non-zero exit), returns
+//     stdout+stderr, the exit code, and a nil error.
+//   - On context cancellation or executable-not-found, returns
+//     whatever output was captured, an exit code of -1, and the wrap
+//     error from exec.
+type runCommand func(ctx context.Context, name string, args ...string) (output string, exitCode int, err error)
+
+// dialFunc is the dialer signature probe 6 uses. Same shape as
+// net.Dialer.DialContext + a timeout.
+type dialFunc func(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error)
+
+type waitFunc func(ctx context.Context, duration time.Duration) error
+
+// lookupUserFunc is the os/user.Lookup signature, factored so tests can
+// substitute a deterministic lookup.
+type lookupUserFunc func(name string) (*user.User, error)
+
+type groupIDsFunc func(*user.User) ([]string, error)
+
+// dropCounterFunc reads the total packet count for the managed nftables DROP
+// rules that apply to the contained agent user.
+type dropCounterFunc func(ctx context.Context, env *probeEnv) (uint64, error)
+
+// probeEnv carries the inputs every probe needs. Everything is
+// addressable from outside the package so tests can populate it
+// directly without going through the cobra layer.
+type probeEnv struct {
+	rfbSocketPath                 string
+	displayTmpfilesPath           string
+	port                          int
+	operatorUser                  string
+	proxyUserName                 string
+	agentUserName                 string
+	wrapperDir                    string
+	toolWrappers                  []string
+	caBundlePath                  string
+	caExportPath                  string
+	configDir                     string
+	launchPath                    string
+	nftTable                      string
+	nftChain                      string
+	nftRulesPath                  string
+	nftMainPath                   string
+	nftPersistUnitPath            string
+	nftExpiryServicePath          string
+	nftExpiryTimerPath            string
+	nftPath                       string
+	serviceName                   string
+	readinessTimeout              time.Duration
+	curlPath                      string
+	pinPath                       string
+	wrapperInvPath                string
+	toolsListPath                 string
+	configPath                    string
+	workspaceInvPath              string
+	loopbackForwarderInvPath      string
+	workspacePaths                []string
+	workspaceGrants               []workspaceGrant
+	networkNamespaceUnitPath      string
+	proxyForwarderSocketPath      string
+	proxyForwarderServicePath     string
+	namespaceForwarderServicePath string
+	displayUnitPath               string
+	xvfbPath                      string
+	xvncPath                      string
+	display                       string
+	agentHome                     string
+	platformFamily                string
+	lookPath                      func(string) (string, error)
+	browserCATrust                func(context.Context, *probeEnv) (string, string)
+	// workspaceInvErr records a recorded-inventory read that failed for any
+	// reason other than absence. The workspace probe fails on it so a permission
+	// or parse error cannot make verify pass with the grant set silently empty.
+	workspaceInvErr    error
+	pipelockTarget     string
+	verifyRunningImage bool
+	// postureProofPath is the resolved path the current `contain run` writes its
+	// signed posture capsule to. It is exported into the contained launch env as
+	// PIPELOCK_POSTURE_PROOF so an in-child emitter binds the exact capsule this
+	// run produced, even when --posture-output points off the default path.
+	postureProofPath string
+	lifecycle        *containRunLifecycle
+	// postureLauncher names the launch path bound into signed posture evidence.
+	// Empty preserves the ordinary plk-launch value used by contain run.
+	postureLauncher string
+	procRoot        string
+	// prelaunch marks a preflight that runs before the contained agent starts,
+	// so listeners the agent itself will create are pending rather than absent.
+	prelaunch bool
+
+	now func() time.Time
+
+	runCmd            runCommand
+	dropCounter       dropCounterFunc
+	dialCtx           dialFunc
+	wait              waitFunc
+	lookupUser        lookupUserFunc
+	groupIDs          groupIDsFunc
+	stat              func(path string) (os.FileInfo, error)
+	lstat             func(path string) (os.FileInfo, error)
+	readFile          func(path string) ([]byte, error)
+	readDir           func(path string) ([]os.DirEntry, error)
+	readLink          func(path string) (string, error)
+	selfPath          func() (string, error)
+	hashFile          func(path string) (string, error)
+	privateTmpProbe   func(context.Context, *probeEnv) (string, string)
+	filesystemProbe   func(context.Context, *probeEnv) (string, string)
+	runtimeMountProbe func(context.Context, *probeEnv, filesystemProfile) (string, string)
+	filesystem        filesystemProfile
+	// filesystemCanaryOmitProperties is a test seam. The confined canary unit
+	// is started without the filesystem profile, so a real probe must fail.
+	// Production leaves it false.
+	filesystemCanaryOmitProperties bool
+	networkNamespaceProbe          func(context.Context, *probeEnv) (string, string)
+	agentProcessNetnsProbe         func(context.Context, *probeEnv, string) (string, string)
+	currentCA                      func(context.Context, *probeEnv) ([]byte, error)
+	displaySocket                  func(int) string
+}
+
+// defaultProbeEnv returns the production environment. The operator user
+// is derived from $SUDO_USER (set by sudo to the invoking user) when
+// present; otherwise probe 9 runs curl as the current process user
+// directly. See probe 9 implementation for the runtime branch.
+func defaultProbeEnv() *probeEnv {
+	platform := detectContainPlatform(os.ReadFile, os.Stat, exec.LookPath)
+	return &probeEnv{
+		port:                          defaultProxyPort,
+		operatorUser:                  os.Getenv("SUDO_USER"),
+		proxyUserName:                 defaultProxyUser,
+		agentUserName:                 defaultAgentUser,
+		wrapperDir:                    defaultWrapperDir,
+		toolWrappers:                  append([]string(nil), defaultToolWrappers...),
+		caBundlePath:                  defaultCABundlePath,
+		caExportPath:                  defaultCAExportPath,
+		configDir:                     defaultConfigDir,
+		launchPath:                    defaultLaunchScript,
+		nftTable:                      defaultNFTTable,
+		nftChain:                      defaultNFTChain,
+		nftRulesPath:                  defaultNFTRulesPath,
+		nftPersistUnitPath:            defaultNFTPersistUnitPath,
+		nftExpiryServicePath:          defaultNFTExpiryServicePath,
+		nftExpiryTimerPath:            defaultNFTExpiryTimerPath,
+		nftPath:                       platform.nftPath,
+		serviceName:                   defaultServiceName,
+		curlPath:                      platform.curlPath,
+		pinPath:                       defaultIntegrityPin,
+		wrapperInvPath:                defaultWrapperInvPath,
+		toolsListPath:                 defaultToolsListPath,
+		workspaceInvPath:              defaultWorkspaceInvPath,
+		loopbackForwarderInvPath:      defaultLoopbackForwarderInvPath,
+		configPath:                    filepath.Join(defaultConfigDir, "pipelock.yaml"),
+		pipelockTarget:                defaultPipelockTarget,
+		verifyRunningImage:            true,
+		procRoot:                      "/proc",
+		now:                           time.Now,
+		runCmd:                        realRunCommand,
+		dropCounter:                   readContainmentDropCounter,
+		dialCtx:                       realDial,
+		wait:                          waitForReadiness,
+		lookupUser:                    user.Lookup,
+		groupIDs:                      realGroupIDs,
+		stat:                          os.Stat,
+		lstat:                         os.Lstat,
+		readFile:                      os.ReadFile,
+		readDir:                       os.ReadDir,
+		readLink:                      os.Readlink,
+		selfPath:                      os.Executable,
+		hashFile:                      sha256HexOfFile,
+		networkNamespaceUnitPath:      defaultNetworkNamespaceUnitPath,
+		proxyForwarderSocketPath:      defaultProxyForwarderSocketPath,
+		proxyForwarderServicePath:     defaultProxyForwarderServicePath,
+		namespaceForwarderServicePath: defaultNamespaceForwarderServicePath,
+		displayUnitPath:               defaultDisplayUnitPath,
+		xvfbPath:                      defaultXvfbPath,
+		xvncPath:                      xvncPathForVerify(os.Stat),
+		agentHome:                     "/home/" + defaultAgentUser,
+		display:                       os.Getenv("DISPLAY"),
+		platformFamily:                platform.family,
+		lookPath:                      exec.LookPath,
+	}
+}
+
+func realGroupIDs(u *user.User) ([]string, error) {
+	return u.GroupIds()
+}
+
+// realRunCommand executes name+args under ctx, captures merged stdout
+// and stderr (bounded), and returns the process exit code. An
+// ExitError is treated as a successful invocation with a non-zero
+// exit code - only failure to start the binary returns a non-nil
+// error.
+func realRunCommand(ctx context.Context, name string, args ...string) (string, int, error) {
+	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec // G204: name comes from probe definitions (compile-time string literals or package consts), never user input.
+	buf := newCappedBuffer(maxCmdOutputBytes)
+	cmd.Stdout = buf
+	cmd.Stderr = buf
+	runErr := cmd.Run()
+
+	out := buf.String()
+
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return out, exitErr.ExitCode(), nil
+	}
+	if runErr != nil {
+		return out, -1, runErr
+	}
+	return out, 0, nil
+}
+
+// cappedBuffer captures the first N bytes written and silently
+// drops the rest. Every Write reports the full input length back to
+// the caller so a chatty subprocess is not backpressured; the
+// runner just stops accumulating once the cap is hit. This bounds
+// memory at probe-runner level even if the target command produces
+// gigabytes of output.
+type cappedBuffer struct {
+	buf bytes.Buffer
+	rem int
+}
+
+func newCappedBuffer(capBytes int) *cappedBuffer {
+	return &cappedBuffer{rem: capBytes}
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.rem > 0 {
+		n := len(p)
+		if n > c.rem {
+			n = c.rem
+		}
+		_, _ = c.buf.Write(p[:n])
+		c.rem -= n
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+
+// errorTrackingWriter preserves the first output error even when a text
+// renderer intentionally ignores individual fmt write results. Command drivers
+// check Err after each logical record so a broken output stream can never be
+// reported as a successful verification.
+type errorTrackingWriter struct {
+	w   io.Writer
+	err error
+}
+
+// Write forwards p while recording the first error or short write.
+func (w *errorTrackingWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.w.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.err = err
+	}
+	return n, err
+}
+
+// Err returns the first write failure observed by Write.
+func (w *errorTrackingWriter) Err() error {
+	return w.err
+}
+
+// realDial dials network+address with a fixed timeout, honoring ctx
+// cancellation. Tests inject a deterministic dialer.
+func realDial(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error) {
+	d := net.Dialer{Timeout: timeout}
+	return d.DialContext(ctx, network, address)
+}
+
+func waitForReadiness(ctx context.Context, duration time.Duration) error {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// probe is one verification step. Probes are walked in slice order;
+// reordering is a contract change (operators may key off probe numbers
+// in dashboards).
+type probe struct {
+	n    int
+	name string
+	desc string
+	fn   func(ctx context.Context, env *probeEnv) (status, detail string)
+}
+
+func allProbes() []probe {
+	return []probe{
+		{1, "system_users_exist", "system users exist", probeSystemUsers},
+		{2, "pipelock_systemd_unit", "pipelock systemd unit running as pipelock-proxy", probeSystemdUnit},
+		{3, "nftables_containment_ruleset", "nftables containment ruleset present", probeNFTContainment},
+		{4, "wrapper_scripts_installed", "wrapper scripts installed", probeWrapperScripts},
+		{5, "ca_bundle_present", "pipelock CA bundle readable", probeCABundle},
+		{6, "pipelock_listening_loopback", "pipelock listening on loopback", probeLoopbackListen},
+		{7, "no_proxy_env_correct", "NO_PROXY in plk-launch matches policy", probeNoProxyEnv},
+		{8, "cc_agent_egress_denied", "pipelock-agent cannot reach the internet directly", probeCCAgentEgressDenied},
+		{9, "operator_egress_reachable", "operator user can still reach the internet", probeOperatorEgress},
+		{10, "binary_integrity_pin", "deployed and running pipelock binary match TOFU pin", probeBinaryIntegrity},
+		{11, "cc_launch_allow_list_enforced", "plk-launch rejects tools missing from the allow-list", probeCCLaunchAllowList},
+		{12, "listed_tool_targets_resolvable", "tools.list entries resolve for pipelock-agent", probeListedToolTargets},
+		{13, "managed_config_metrics", "managed config keeps metrics on loopback or a current, source-scoped exception", probeManagedConfigMetrics},
+		{14, "launch_env_allow_list", "plk-launch clears the operator environment (env -i) before exec", probeLaunchEnvAllowList},
+		{16, "private_tmp_isolation", "transient contained-agent service cannot see the operator temporary-directory canary", probePrivateTmp},
+		{19, "pipelock_ca_export_current", "exported Pipelock CA matches the CA in the contain-managed keystore", probeCurrentCAExport},
+		{probeBrowserCATrustNum, probeBrowserCATrust, "contained agent NSS database trusts the Pipelock CA", probeBrowserCATrustState},
+		{21, "agent_network_namespace", "contained-agent namespace is private and reaches only its proxy socket", probeAgentNetworkNamespace},
+		{27, "filesystem_confinement", "contained-agent filesystem profile hides the host and binds only the agent home and unexpired workspace grants", probeFilesystemConfinement},
+	}
+}
+
+func probesForEnv(env *probeEnv) []probe {
+	probes := allProbes()
+	cfg, displayConfigErr := config.LoadForInspection(env.configPath)
+	displayUnitErr := os.ErrNotExist
+	displayXvfbPresent := true
+	if env.stat != nil {
+		_, displayUnitErr = env.stat(env.displayUnitPath)
+		_, xvfbErr := env.stat(env.xvfbPath)
+		displayXvfbPresent = xvfbErr == nil
+	}
+	// Published as 22, not 17 or 18: `contain run` already publishes those
+	// for its own run-only checks, and a consumer keyed on a probe number
+	// cannot tell two different checks apart when they share one.
+	if (displayConfigErr == nil && cfg.Containment.Display.IsEnabled(displayXvfbPresent)) ||
+		(displayConfigErr != nil && !errors.Is(displayConfigErr, os.ErrNotExist)) ||
+		displayUnitErr == nil || !errors.Is(displayUnitErr, os.ErrNotExist) {
+		probes = append(probes, probe{22, "agent_display", "configured fallback display is agent-owned and locally isolated", probeAgentDisplay})
+		if displayConfigErr == nil && cfg.Containment.Display.EffectiveBackend() == "xvnc" {
+			probes = append(probes, probe{23, "agent_display_rfb", "agent RFB Unix socket is private and TCP RFB is disabled", probeAgentDisplayRFB})
+			probes = append(probes, probe{24, "viewer_service", "contained display viewer socket is restricted to its operator", probeViewerService})
+			probes = append(probes, probe{25, "viewer_rfb_access", "RFB socket mode and group match viewer setting", probeViewerRFBAccess})
+		}
+	}
+	if env.agentHome != "" {
+		probes = append(probes, probe{26, "legacy_viewer_acl", "obsolete agent-home viewer access is absent", probeLegacyViewerACL})
+	}
+	if !env.verifyRunningImage {
+		for i := range probes {
+			if probes[i].name == "binary_integrity_pin" {
+				probes[i].desc = "deployed pipelock binary matches TOFU pin; running-service image is not verified"
+				break
+			}
+		}
+	}
+	// Preserve workspace_access as published probe 15. Insert it before the
+	// private-temp probe so configured output remains numerically ordered
+	// without renumbering published results, including the browser-CA probe
+	// that follows private-temp.
+	if len(env.workspacePaths) > 0 || len(env.workspaceGrants) > 0 || env.workspaceInvErr != nil {
+		out := make([]probe, 0, len(probes)+1)
+		inserted := false
+		for _, p := range probes {
+			if p.name == "private_tmp_isolation" && !inserted {
+				out = append(out, probe{15, "workspace_access", "pipelock-agent can read configured workspace paths and no grant has expired", probeWorkspaceAccess})
+				inserted = true
+			}
+			out = append(out, p)
+		}
+		if !inserted {
+			out = append(out, probe{15, "workspace_access", "pipelock-agent can read configured workspace paths and no grant has expired", probeWorkspaceAccess})
+		}
+		return out
+	}
+	return probes
+}
+
+func probeWorkspaceAccess(ctx context.Context, env *probeEnv) (string, string) {
+	// An unreadable inventory is a failure, not an empty grant set: verify must
+	// not pass while the recorded grants are unknown (fail closed).
+	if env.workspaceInvErr != nil {
+		return statusFail, fmt.Sprintf("workspace inventory %s could not be read: %v; repair it before trusting recorded grants", env.workspaceInvPath, env.workspaceInvErr)
+	}
+	// Expiry gate first: a recorded grant past its window means the ACL is still
+	// live after the operator's intended lifetime, which is a posture failure
+	// even if the path is still readable. Fail CLOSED, including on a malformed
+	// expiry value.
+	now := time.Now()
+	if env.now != nil {
+		now = env.now()
+	}
+	expired, err := expiredWorkspaceGrants(env.workspaceGrants, now)
+	if err != nil {
+		return statusFail, err.Error()
+	}
+	if len(expired) > 0 {
+		return statusFail, fmt.Sprintf("%d workspace grant(s) expired: %s; re-grant with `pipelock contain grant-workspace` or remove with `pipelock contain revoke-workspace`",
+			len(expired), strings.Join(expired, "; "))
+	}
+
+	// Check readability of every path the agent is supposed to reach: ad-hoc
+	// --workspace paths AND every recorded grant, deduplicated, so a recorded
+	// grant is never silently skipped when no --workspace flag is given.
+	paths := workspaceProbePaths(env)
+	guardedRoots := credentialGuardConfigRoots(env)
+	var bad []string
+	for _, path := range paths {
+		clean, err := filepath.Abs(filepath.Clean(path))
+		if err != nil {
+			bad = append(bad, fmt.Sprintf("%s resolve: %v", path, err))
+			continue
+		}
+		info, err := env.stat(clean)
+		if err != nil {
+			bad = append(bad, fmt.Sprintf("%s stat: %v", clean, err))
+			continue
+		}
+		args := []string{"-n", "-u", env.agentUserName, "--", "test", "-r", clean}
+		if info.IsDir() {
+			args = []string{"-n", "-u", env.agentUserName, "--", "test", "-r", clean, "-a", "-x", clean}
+			// The credential guard deliberately cuts its config roots back to
+			// traverse-only so the agent can reach granted subpaths but never
+			// list the directory holding credential files. Requiring read there
+			// would fail every install and name a remedy the guard reverts.
+			if guardedRoots[clean] {
+				args = []string{"-n", "-u", env.agentUserName, "--", "test", "-x", clean}
+			}
+		}
+		out, code, err := env.runCmd(ctx, "sudo", args...)
+		if err != nil {
+			bad = append(bad, fmt.Sprintf("%s check failed: %v", clean, err))
+			continue
+		}
+		if isSudoUserMissing(out) {
+			return statusSkip, "pipelock-agent user missing (install never ran)"
+		}
+		if isSudoRefusal(out) {
+			return statusSkip, "sudo -n refused (no NOPASSWD rule for operator -> pipelock-agent)"
+		}
+		if code != 0 {
+			reason := oneLine(out)
+			if reason == "" {
+				reason = diagnoseWorkspaceACLCause(ctx, env, clean)
+			}
+			if reason == "" {
+				reason = fmt.Sprintf("exit %d", code)
+			}
+			bad = append(bad, fmt.Sprintf("%s not readable/traversable by %s: %s; repair with `pipelock contain grant-workspace %s`",
+				clean, env.agentUserName, reason, clean))
+		}
+	}
+	if len(bad) > 0 {
+		return statusFail, strings.Join(bad, "; ")
+	}
+	return statusPass, fmt.Sprintf("%d workspace path(s) readable by %s; %d recorded grant(s) within expiry",
+		len(paths), env.agentUserName, len(env.workspaceGrants))
+}
+
+// diagnoseWorkspaceACLCause explains WHY a workspace-access check failed with
+// no output of its own (POSIX `test` prints nothing on a permission denial).
+// It reads the real ACL via `getfacl` and distinguishes the two drift shapes
+// seen live: a directory mask reset by a later chmod that silently caps an
+// otherwise-correct grant ("#effective:" suffix on the entry), versus a grant
+// recorded without read access at all. Both remedies are the same shipped
+// command, so an empty return here still leaves the caller's fallback message
+// naming it.
+func diagnoseWorkspaceACLCause(ctx context.Context, env *probeEnv, path string) string {
+	out, err := readAccessACL(ctx, env.runCmd, path)
+	if err != nil {
+		return ""
+	}
+	prefix := "user:" + env.agentUserName + ":"
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(line, prefix)
+		perms, effective, hasEffective := strings.Cut(rest, "\t")
+		perms = strings.TrimSpace(perms)
+		if hasEffective && strings.Contains(effective, "#effective:") {
+			return fmt.Sprintf("ACL grants %s %q but the directory's ACL mask limits it to a lower effective permission (a later chmod resets the mask); re-apply the grant to recompute the mask", env.agentUserName, perms)
+		}
+		if !strings.Contains(perms, "r") {
+			return fmt.Sprintf("ACL grants %s only %q, no read permission", env.agentUserName, perms)
+		}
+		return fmt.Sprintf("ACL grants %s %q but access still failed", env.agentUserName, perms)
+	}
+	return fmt.Sprintf("no ACL entry for %s on this path", env.agentUserName)
+}
+
+func readAccessACL(ctx context.Context, run runCommand, path string) (string, error) {
+	if run == nil {
+		return "", fmt.Errorf("ACL reader unavailable")
+	}
+	out, code, err := run(ctx, "getfacl", "-p", path)
+	if err != nil {
+		return "", err
+	}
+	if code != 0 {
+		return "", fmt.Errorf("getfacl exit %d: %s", code, strings.TrimSpace(out))
+	}
+	return out, nil
+}
+
+// workspaceProbePaths returns the deduplicated union of ad-hoc --workspace
+// paths and recorded grant paths, in first-seen order.
+func workspaceProbePaths(env *probeEnv) []string {
+	seen := make(map[string]bool, len(env.workspacePaths)+len(env.workspaceGrants))
+	var paths []string
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		paths = append(paths, p)
+	}
+	for _, p := range env.workspacePaths {
+		add(p)
+	}
+	for _, g := range env.workspaceGrants {
+		add(g.Path)
+	}
+	return paths
+}
+
+// probeListedToolTargets verifies each configured wrapper target exists and is
+// executable from the contained agent's user context.
+func probeListedToolTargets(ctx context.Context, env *probeEnv) (string, string) {
+	data, err := env.readFile(env.toolsListPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return statusSkip, fmt.Sprintf("tools.list missing at %s (install never ran)", env.toolsListPath)
+		}
+		return statusFail, fmt.Sprintf("read %s: %v", env.toolsListPath, err)
+	}
+	entries, err := parseToolsList(data)
+	if err != nil {
+		return statusFail, fmt.Sprintf("parse %s: %v", env.toolsListPath, err)
+	}
+	if len(entries) == 0 {
+		return statusFail, fmt.Sprintf("%s has no tool entries", env.toolsListPath)
+	}
+
+	agentPath := agentExecPath(env.agentUserName)
+	var bad []string
+	for _, entry := range entries {
+		target := entry.target
+		if target == "" {
+			var ok bool
+			target, ok = resolveToolInPath(env, entry.name, agentPath)
+			if !ok {
+				bad = append(bad, fmt.Sprintf("%s not found in pipelock-agent PATH", entry.name))
+				continue
+			}
+		}
+		if !filepath.IsAbs(target) {
+			bad = append(bad, fmt.Sprintf("%s target %q is not absolute", entry.name, target))
+			continue
+		}
+		info, err := env.stat(target)
+		if err != nil {
+			bad = append(bad, fmt.Sprintf("%s target %s: %v", entry.name, target, err))
+			continue
+		}
+		if info.IsDir() {
+			bad = append(bad, fmt.Sprintf("%s target %s is a directory", entry.name, target))
+			continue
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			bad = append(bad, fmt.Sprintf("%s target %s is not executable", entry.name, target))
+			continue
+		}
+
+		out, code, runErr := env.runCmd(ctx, "sudo", "-n", "-u", env.agentUserName, "--", "test", "-x", target)
+		if runErr != nil {
+			return statusSkip, fmt.Sprintf("could not verify %s as %s: %v", target, env.agentUserName, runErr)
+		}
+		if isSudoUserMissing(out) {
+			return statusSkip, fmt.Sprintf("%s user missing (install never ran)", env.agentUserName)
+		}
+		if isSudoRefusal(out) {
+			return statusSkip, fmt.Sprintf("sudo -n refused agent-context executable check for %s", target)
+		}
+		if code != 0 {
+			bad = append(bad, fmt.Sprintf("%s target %s is not executable/traversable by %s: %s",
+				entry.name, target, env.agentUserName, oneLine(out)))
+		}
+	}
+	if len(bad) > 0 {
+		return statusFail, strings.Join(bad, "; ")
+	}
+	return statusPass, fmt.Sprintf("%d allow-listed tool target(s) resolvable via %s", len(entries), agentPath)
+}
+
+func agentExecPath(agentUserName string) string {
+	return "/home/" + agentUserName + "/.local/bin:/usr/local/bin:/usr/bin:/bin"
+}
+
+func resolveToolInPath(env *probeEnv, name, pathList string) (string, bool) {
+	for _, dir := range filepath.SplitList(pathList) {
+		if dir == "" {
+			continue
+		}
+		candidate := filepath.Join(dir, name)
+		info, err := env.stat(candidate)
+		if err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+// probeCCLaunchAllowList runs `plk-launch <something-not-installed>` as
+// pipelock-agent and asserts the script exits 5 - "tool not in allow-list".
+// This exercises the full read path: sudoers grants no-password to
+// plk-launch, /etc/pipelock is directory-traversable for pipelock-agent,
+// /etc/pipelock/contain is traversable, /etc/pipelock/contain/tools.list
+// is readable, and the bash script's allow-list lookup is intact.
+//
+// We use a sentinel tool name (random + obviously not a real tool) so
+// that even on a system where the operator's `pipelock contain add-tool`
+// invocations accidentally collide with real binaries, this probe still
+// exercises the denial branch.
+//
+// Exit code mapping (matches install.go renderLaunchWrapper):
+//   - 0  unexpected - the sentinel was somehow accepted and executed
+//   - 1  sudo refused (NOPASSWD rule missing) → skip
+//   - 3  tool-name regex rejected - sentinel chosen wrong
+//   - 4  tools.list unreadable - fail, this breaks the launcher boundary
+//   - 5  tool not in allow-list - PASS
+//   - 6  in allow-list but PATH lookup failed - unexpected
+func probeCCLaunchAllowList(ctx context.Context, env *probeEnv) (string, string) {
+	// Sentinel must satisfy containToolNameRegex (max 31 chars) so plk-launch
+	// reaches the allow-list rejection path (exit 5) instead of the up-front
+	// name regex (exit 3). "not-a-real-tool" suffix preserves operator intent.
+	const sentinelTool = "pipelock-probe-sentinel-tool"
+
+	out, code, err := env.runCmd(ctx, "sudo", "-n", "-u", env.agentUserName, "--",
+		env.launchPath, sentinelTool)
+	if err != nil {
+		return statusSkip, fmt.Sprintf("plk-launch invocation failed: %v", err)
+	}
+	if isSudoUserMissing(out) {
+		return statusSkip, "pipelock-agent user missing (install never ran)"
+	}
+	if isSudoRefusal(out) {
+		return statusSkip, "sudo -n refused (no NOPASSWD rule for operator -> pipelock-agent)"
+	}
+	if isSudoTargetCommandMissing(out) {
+		return statusSkip, fmt.Sprintf("plk-launch missing at %s (install never ran)", env.launchPath)
+	}
+
+	switch code {
+	case 5:
+		return statusPass, "allow-list correctly rejected sentinel tool"
+	case 4:
+		return statusFail, fmt.Sprintf("tools.list unreadable by pipelock-agent (exit 4): %s", oneLine(out))
+	case 0:
+		return statusFail, fmt.Sprintf("sentinel tool %q was unexpectedly allowed; allow-list bypass", sentinelTool)
+	default:
+		// Anything else is unexpected. Report the exit code + first
+		// stderr line so the operator can map it back to the wrapper's
+		// exit-code table.
+		return statusFail, fmt.Sprintf("plk-launch exit %d (expected 5): %s", code, oneLine(out))
+	}
+}
+
+// probeLaunchEnvAllowList confirms the installed plk-launch clears the operator
+// environment before exec'ing the tool. plk-launch runs after sudo, which leaves
+// operator variables standing (DISPLAY, XAUTHORITY, XDG_RUNTIME_DIR, SUDO_*);
+// plain `env` would pass them all through to the contained agent, and a sudoers
+// change could widen that further. The launcher is rendered with `env -i` so it
+// rebuilds ONLY the identity block, the proxy/CA contract, the posture-proof
+// binding, and PATH. This probe fails CLOSED: a plk-launch that reverted to
+// plain `env`, or that no longer forwards the posture proof, is a boundary
+// regression the operator must see, not a silent leak.
+//
+// It is a read-only check of the rendered launcher artifact rather than a live
+// env dump: with `env -i` the child's environment is fully determined by the
+// script text, and there is no default-registered tool that prints its
+// environment to exec through the allow-list, so reading the artifact is both
+// sufficient and the only path that does not depend on install-specific tools.
+func probeLaunchEnvAllowList(_ context.Context, env *probeEnv) (string, string) {
+	// Read the on-disk launcher artifact the same way probeNoProxyEnv does, so
+	// both probes inspect the exact script the operator will exec.
+	data, err := os.ReadFile(filepath.Clean(env.launchPath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return statusSkip, fmt.Sprintf("plk-launch missing at %s (install never ran)", env.launchPath)
+		}
+		return statusSkip, fmt.Sprintf("read %s: %v (rerun as root)", env.launchPath, err)
+	}
+	script := string(data)
+	// Parse the executed `exec env -i` block rather than substring-matching the
+	// file: a comment or a decoy line must not satisfy the probe, and the block
+	// must rebuild EXACTLY the runtime contract, nothing missing and nothing
+	// extra. Both directions fail: a missing variable breaks the proxy/CA
+	// contract, an extra one is an operator-environment passthrough.
+	if plainExecEnvLine(script) {
+		return statusFail, "plk-launch execs the tool with plain `env`; operator environment (DISPLAY, XAUTHORITY, SUDO_*, ...) leaks into the contained agent - reinstall with `" + installCommandForPort(env.port) + "`"
+	}
+	blocks, malformed := parseLaunchExecEnvBlocks(script)
+	if malformed {
+		return statusFail, fmt.Sprintf("plk-launch at %s has an `exec env -i` block that does not match the installed launcher grammar (a token before \"$TARGET\" is not a NAME=VALUE assignment, or a line is missing its trailing continuation), so the launcher may not start the agent under the runtime contract - reinstall with `%s`", env.launchPath, installCommandForPort(env.port))
+	}
+	switch len(blocks) {
+	case 0:
+		return statusFail, fmt.Sprintf("plk-launch at %s does not clear the environment (no `exec env -i` block) before exec", env.launchPath)
+	case 1:
+	default:
+		// A correctly rendered wrapper execs exactly once. More than one block
+		// means the block this probe reads is not necessarily the one the shell
+		// reaches, so a canonical decoy could stand in front of a leaky block
+		// that actually runs. Refuse to guess which is effective.
+		return statusFail, fmt.Sprintf("plk-launch at %s contains %d `exec env -i` blocks; exactly one is expected, so the effective launch environment is ambiguous - reinstall with `%s`",
+			env.launchPath, len(blocks), installCommandForPort(env.port))
+	}
+	assigns := blocks[0]
+	names := make([]string, 0, len(assigns))
+	for _, a := range assigns {
+		names = append(names, a.name)
+	}
+	if dup := firstDuplicateName(names); dup != "" {
+		// env applies the LAST assignment of a repeated name, so a duplicate
+		// makes the effective value differ from the one a reader sees first.
+		return statusFail, fmt.Sprintf("plk-launch env -i block assigns %s more than once; the effective value is not the one it appears to set - reinstall with `%s`", dup, installCommandForPort(env.port))
+	}
+	expected := expectedLaunchEnvNames()
+	missing, extra := diffNameSets(expected, names)
+	if len(missing) > 0 || len(extra) > 0 {
+		return statusFail, fmt.Sprintf("plk-launch env -i block does not match the runtime contract (missing: %s; unexpected: %s); reinstall with `%s`",
+			listOrNone(missing), listOrNone(extra), installCommandForPort(env.port))
+	}
+	// Names alone are not the contract. A wrapper that assigns every expected
+	// name and points HTTPS_PROXY somewhere else, or SSL_CERT_FILE at an
+	// attacker-writable bundle, passes a name-only check while defeating exactly
+	// what containment buys. Values are checked for the variables whose correct
+	// value this probe can derive with certainty from the verified install
+	// (proxy endpoint, no-proxy list, CA bundle, agent identity); the rest
+	// (NODE_OPTIONS shim path, NODE_EXTRA_CA_CERTS, PATH, posture proof) depend
+	// on install-time paths this probe does not rediscover, so demanding a value
+	// for them would refuse legitimate non-default installs.
+	if name, want, got, ok := firstLaunchEnvValueMismatch(assigns, env); !ok {
+		return statusFail, fmt.Sprintf("plk-launch env -i block sets %s=%s, expected %s; the contained agent would not be bound to this install's %s - reinstall with `%s`",
+			name, got, want, launchEnvValueSubject(name), installCommandForPort(env.port))
+	}
+	return statusPass, fmt.Sprintf("plk-launch clears the environment (env -i) and rebuilds exactly the %d-variable runtime contract, with the proxy, no-proxy, CA and identity values bound to this install", len(expected))
+}
+
+// probeCurrentCAExport compares the exported single CA with the CA selected by
+// the running proxy. Subject names are insufficient because a rotated CA can
+// retain the same subject while having different signing material.
+func probeCurrentCAExport(ctx context.Context, env *probeEnv) (string, string) {
+	exported, err := os.ReadFile(filepath.Clean(env.caExportPath))
+	if err != nil {
+		return statusFail, fmt.Sprintf("read exported Pipelock CA %s: %v; run `%s` or `pipelock contain ca-refresh`", env.caExportPath, err, installCommandForPort(env.port))
+	}
+	if err := validateSingleCAPEM(exported); err != nil {
+		return statusFail, fmt.Sprintf("exported Pipelock CA %s is invalid: %v; run `pipelock contain ca-refresh`", env.caExportPath, err)
+	}
+	currentReader := env.currentCA
+	if currentReader == nil {
+		currentReader = currentCAForVerify
+	}
+	current, err := currentReader(ctx, env)
+	if err != nil {
+		return statusFail, fmt.Sprintf("read the selected Pipelock CA: %v; run `pipelock contain ca-refresh` after the proxy is healthy", err)
+	}
+	if err := validateSingleCAPEM(current); err != nil {
+		return statusFail, fmt.Sprintf("proxy returned an invalid current TLS CA: %v", err)
+	}
+	// Compare DECODED certificate material. Byte-comparing the PEM would reject
+	// the same certificate re-encoded with different but equally valid line
+	// wrapping or headers, which is a false alarm on a security probe and the
+	// fastest way to get an operator to stop trusting it.
+	exportedDER, err := firstCertificateDER(exported)
+	if err != nil {
+		return statusFail, fmt.Sprintf("decode exported Pipelock CA %s: %v; run `pipelock contain ca-refresh`", env.caExportPath, err)
+	}
+	currentDER, err := firstCertificateDER(current)
+	if err != nil {
+		return statusFail, fmt.Sprintf("decode the selected Pipelock CA: %v", err)
+	}
+	if !bytes.Equal(exportedDER, currentDER) {
+		return statusFail, fmt.Sprintf("exported Pipelock CA %s does not match the selected Pipelock CA; run `pipelock contain ca-refresh`", env.caExportPath)
+	}
+	return statusPass, "exported Pipelock CA matches the selected Pipelock CA (compared by material, not subject name; not a live handshake)"
+}
+
+func currentCAForVerify(ctx context.Context, env *probeEnv) ([]byte, error) {
+	args := []string{"-n", "-u", env.proxyUserName, "--", env.pipelockTarget, "tls", "show-ca"}
+	certPath := filepath.Join(env.configDir, "tls", "ca.pem")
+	if _, err := env.stat(certPath); err == nil {
+		args = append(args, "--cert", certPath)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect configured TLS CA %s: %w", certPath, err)
+	}
+	out, code, err := env.runCmd(ctx, "sudo", args...)
+	if err != nil {
+		return nil, fmt.Errorf("exec pipelock tls show-ca: %w", err)
+	}
+	if code != 0 {
+		return nil, fmt.Errorf("pipelock tls show-ca exited %d", code)
+	}
+	return []byte(out), nil
+}
+
+// launchEnvAssign is one NAME=VALUE assignment read from a launcher's exec
+// block, with surrounding shell quoting stripped from the value.
+type launchEnvAssign struct {
+	name  string
+	value string
+}
+
+// plainExecEnvLine reports whether the script execs the tool through `env`
+// WITHOUT -i anywhere, which passes the whole operator environment through.
+// Checked independently of the -i parse so a leaky exec line is caught even
+// when a canonical block also exists.
+func plainExecEnvLine(script string) bool {
+	for _, raw := range strings.Split(script, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "exec env ") {
+			continue
+		}
+		if !strings.HasPrefix(line, "exec env -i") {
+			return true
+		}
+	}
+	return false
+}
+
+// firstDuplicateName returns the first name assigned more than once, or "".
+func firstDuplicateName(names []string) string {
+	seen := make(map[string]bool, len(names))
+	for _, n := range names {
+		if seen[n] {
+			return n
+		}
+		seen[n] = true
+	}
+	return ""
+}
+
+// launchEnvValueSubject names, in operator words, what a mismatched variable
+// would have bound the agent to, so the failure line says what broke.
+func launchEnvValueSubject(name string) string {
+	switch name {
+	case "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy":
+		return "proxy endpoint"
+	case "NO_PROXY", "no_proxy":
+		return "proxy bypass list"
+	case "USER", "LOGNAME", "SHELL":
+		return "agent identity"
+	default:
+		return "CA bundle"
+	}
+}
+
+// firstLaunchEnvValueMismatch checks the assignments whose correct value is
+// derivable from the verified install state. ok is false on the first mismatch.
+func firstLaunchEnvValueMismatch(assigns []launchEnvAssign, env *probeEnv) (name, want, got string, ok bool) {
+	proxy := proxyURLFor(env.port)
+	expect := map[string]string{
+		"HTTP_PROXY":  proxy,
+		"http_proxy":  proxy,
+		"HTTPS_PROXY": proxy,
+		"https_proxy": proxy,
+		"ALL_PROXY":   proxy,
+		"all_proxy":   proxy,
+		"NO_PROXY":    contractNoProxy,
+		"no_proxy":    contractNoProxy,
+	}
+	if env.caBundlePath != "" {
+		// NODE_EXTRA_CA_CERTS joined this list when the contract stopped pointing
+		// Node at the single-CA export. Leaving it out let this probe pass a
+		// launcher that still pointed Node at the stale export, which is the
+		// leftover wrapper the export refresh exists to stop trusting.
+		for _, n := range []string{"SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "CARGO_HTTP_CAINFO", "PIP_CERT", "NODE_EXTRA_CA_CERTS"} {
+			expect[n] = env.caBundlePath
+		}
+	}
+	// SHELL is a fixed literal in the contract, so it is always checkable.
+	expect["SHELL"] = "/bin/bash"
+	if env.agentUserName != "" {
+		expect["USER"] = env.agentUserName
+		expect["LOGNAME"] = env.agentUserName
+	}
+	for _, a := range assigns {
+		if w, checked := expect[a.name]; checked && a.value != w {
+			return a.name, w, a.value, false
+		}
+	}
+	return "", "", "", true
+}
+
+var launchEnvNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// parseLaunchExecEnvBlocks finds EVERY `exec env -i` command in a launcher
+// script (comment lines are skipped) and returns each one's assignments,
+// reading line continuations up to the "$TARGET" token. All blocks are returned
+// rather than the first, because a script with more than one has no
+// determinable effective environment and the caller refuses it.
+func parseLaunchExecEnvBlocks(script string) (blocks [][]launchEnvAssign, malformed bool) {
+	lines := strings.Split(script, "\n")
+	for i := 0; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, "exec env -i") {
+			continue
+		}
+		var assigns []launchEnvAssign
+		rest := strings.TrimPrefix(line, "exec env -i")
+		reachedTarget := false
+		unsupported := ""
+		for {
+			trimmed := strings.TrimSpace(rest)
+			// The shell ends the command at the first physical line that is NOT
+			// continued. A block whose continuation is missing therefore never
+			// reaches "$TARGET" and never starts the tool, so reading on past
+			// that line would let the probe collect a complete-looking variable
+			// set from lines the shell would never pass to env.
+			continued := strings.HasSuffix(trimmed, "\\")
+			trimmed = strings.TrimSuffix(trimmed, "\\")
+			for _, tok := range splitLaunchEnvTokens(trimmed) {
+				if tok == `"$TARGET"` || tok == "$TARGET" {
+					reachedTarget = true
+					break
+				}
+				// Parse ONLY the grammar the renderer emits: every token before
+				// the target is a NAME=VALUE assignment. Anything else means the
+				// installed script is not the script `contain install` writes,
+				// and the shell may not read it the way this probe does. An
+				// inline `#` is the sharp case: `PATH="$PATH" # \` looks
+				// continued to a line-based reader, while the shell treats the
+				// rest as a comment and runs `env -i` with no target, so the
+				// probe would certify a runtime contract for a launcher that
+				// never starts the agent. Control operators (;, &, |, redirects,
+				// command substitution) are rejected for the same reason.
+				eq := strings.IndexByte(tok, '=')
+				if eq <= 0 || !launchEnvNamePattern.MatchString(tok[:eq]) {
+					unsupported = tok
+					break
+				}
+				assigns = append(assigns, launchEnvAssign{name: tok[:eq], value: unquoteShellValue(tok[eq+1:])})
+			}
+			if unsupported != "" {
+				break
+			}
+			i++
+			if reachedTarget || !continued || i >= len(lines) {
+				break
+			}
+			rest = lines[i]
+		}
+		if unsupported != "" || !reachedTarget {
+			// Either a token outside the renderer's grammar, or the block ran
+			// off a broken continuation or the end of the file. Both mean this
+			// launcher does not reliably exec the tool under the contract, so
+			// fail rather than report a variable set the shell may never apply.
+			malformed = true
+			continue
+		}
+		blocks = append(blocks, assigns)
+	}
+	return blocks, malformed
+}
+
+// splitLaunchEnvTokens splits a rendered launcher line into shell words,
+// honoring double and single quotes. strings.Fields cannot be used here: the
+// renderer quotes any value that is not shell-safe, so a value containing a
+// space (NODE_OPTIONS="--require /path/shim.js") would split into two words and
+// the second would look like a token outside the grammar.
+func splitLaunchEnvTokens(line string) []string {
+	var (
+		tokens []string
+		cur    strings.Builder
+		quote  byte
+		inTok  bool
+	)
+	flush := func() {
+		if inTok {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+			inTok = false
+		}
+	}
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+			cur.WriteByte(c)
+		case c == '"' || c == '\'':
+			quote = c
+			inTok = true
+			cur.WriteByte(c)
+		case c == ' ' || c == '\t':
+			flush()
+		default:
+			inTok = true
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	return tokens
+}
+
+// unquoteShellValue strips one layer of matching single or double quotes from a
+// rendered assignment value so it can be compared with the literal it must
+// carry. envAssign quotes only when the value is not shell-safe, so an unquoted
+// value is returned unchanged.
+func unquoteShellValue(v string) string {
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') || (v[0] == '\'' && v[len(v)-1] == '\'') {
+			return v[1 : len(v)-1]
+		}
+	}
+	return v
+}
+
+// expectedLaunchEnvNames is the exact variable-name set a correctly rendered
+// plk-launch assigns under env -i: the identity block, the proxy/CA runtime
+// contract, the posture-proof binding, and PATH. Names do not depend on
+// install-time values, so a zero installEnv yields the canonical set.
+func expectedLaunchEnvNames() []string {
+	var names []string
+	for _, v := range containedLaunchIdentityVars("", "") {
+		names = append(names, v.name)
+	}
+	for _, v := range runtimeContractVars(&installEnv{}) {
+		names = append(names, v.name)
+	}
+	return append(names, posturebinding.RuntimeProofEnv, "DISPLAY", "PATH")
+}
+
+// diffNameSets returns the names in want but not got (missing) and in got but
+// not want (extra), each sorted.
+func diffNameSets(want, got []string) (missing, extra []string) {
+	wantSet := make(map[string]bool, len(want))
+	for _, n := range want {
+		wantSet[n] = true
+	}
+	gotSet := make(map[string]bool, len(got))
+	for _, n := range got {
+		gotSet[n] = true
+	}
+	for n := range wantSet {
+		if !gotSet[n] {
+			missing = append(missing, n)
+		}
+	}
+	for n := range gotSet {
+		if !wantSet[n] {
+			extra = append(extra, n)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	return missing, extra
+}
+
+func listOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ",")
+}
+
+// probeBinaryIntegrity reads the integrity pin written at install time and
+// normally confirms all three identities agree: the deployed install path, the
+// effective systemd ExecStart path, and the executable mapped by the service's
+// current MainPID. In enforcement-only mode it checks the deployed path and pin
+// only, and reports that running-service image verification was not performed.
+// Running-image checks skip when the needed host state is unavailable to the
+// caller (for example, /proc access requires root).
+//
+// This is still trust-on-first-use drift detection. It does not survive an
+// attacker able to rewrite the binary, pin, unit, and running process as root.
+func probeBinaryIntegrity(ctx context.Context, env *probeEnv) (string, string) {
+	data, err := env.readFile(env.pinPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return statusSkip, fmt.Sprintf("no pin at %s (install never ran or skipped)", env.pinPath)
+		}
+		return statusSkip, fmt.Sprintf("read %s: %v (rerun as root)", env.pinPath, err)
+	}
+	pinned := strings.TrimSpace(string(data))
+	if pinned == "" {
+		return statusFail, fmt.Sprintf("%s is empty (corrupted pin)", env.pinPath)
+	}
+	// Install writes a lowercase hex digest and hashFile returns lowercase, so an
+	// uppercase pin can never match. Rejecting it as malformed here tells the
+	// operator the pin itself is wrong; letting it through reports a hash
+	// mismatch, which reads as a swapped binary and sends them hunting a
+	// compromise that did not happen.
+	if _, err := hex.DecodeString(pinned); err != nil || len(pinned) != sha256HexLen ||
+		pinned != strings.ToLower(pinned) {
+		return statusFail, fmt.Sprintf("%s contains malformed SHA-256 pin (length %d)", env.pinPath, len(pinned))
+	}
+
+	target := filepath.Clean(env.pipelockTarget)
+	got, err := env.hashFile(target)
+	if err != nil {
+		return statusFail, fmt.Sprintf("hash deployed binary %s: %v", target, err)
+	}
+	if got != pinned {
+		// Truncate for readability; full hashes are 64 chars.
+		return statusFail, fmt.Sprintf("binary hash mismatch: pin=%s got=%s (deployed binary swapped after install)",
+			shortHash(pinned), shortHash(got))
+	}
+	if !env.verifyRunningImage {
+		return statusPass, fmt.Sprintf("deployed %s (running service image not verified)", binaryIntegrityDetail(env, target, pinned))
+	}
+
+	// The installed pathname alone is not the running service identity. An
+	// atomic upgrade can replace and re-pin the file while the old executable
+	// remains mapped by the current service process until restart.
+	execStart, code, err := env.runCmd(ctx, "systemctl", "show", env.serviceName, "--property=ExecStart", "--value")
+	if err != nil {
+		return statusSkip, fmt.Sprintf("systemctl unavailable for running binary verification: %v", err)
+	}
+	if code != 0 {
+		return statusFail, fmt.Sprintf("systemctl exit=%d while reading ExecStart: %s", code, oneLine(execStart))
+	}
+
+	execPath, err := systemdExecStartPath(execStart)
+	if err != nil {
+		return statusFail, fmt.Sprintf("parse effective ExecStart: %v", err)
+	}
+	if filepath.Clean(execPath) != target {
+		return statusFail, fmt.Sprintf("effective ExecStart path %s does not match deployed binary %s", oneLine(execPath), oneLine(target))
+	}
+
+	mainPID, code, err := env.runCmd(ctx, "systemctl", "show", env.serviceName, "--property=MainPID", "--value")
+	if err != nil {
+		return statusSkip, fmt.Sprintf("systemctl unavailable for running binary verification: %v", err)
+	}
+	if code != 0 {
+		return statusFail, fmt.Sprintf("systemctl exit=%d while reading MainPID: %s", code, oneLine(mainPID))
+	}
+
+	pid, err := systemdMainPID(strings.TrimSpace(mainPID))
+	if err != nil {
+		return statusFail, fmt.Sprintf("parse service MainPID: %v", err)
+	}
+	procExe := serviceProcessExePath(pid)
+	runningPath, err := env.readLink(procExe)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return statusSkip, fmt.Sprintf("read running service image %s: %v (rerun as root)", procExe, err)
+		}
+		return statusFail, fmt.Sprintf("read running service image %s: %v", procExe, err)
+	}
+
+	targetInfo, err := env.stat(target)
+	if err != nil {
+		return statusFail, fmt.Sprintf("stat deployed binary %s: %v", target, err)
+	}
+	runningInfo, err := env.stat(procExe)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return statusSkip, fmt.Sprintf("stat running service image %s: %v (rerun as root)", procExe, err)
+		}
+		return statusFail, fmt.Sprintf("stat running service image %s: %v", procExe, err)
+	}
+	if !os.SameFile(targetInfo, runningInfo) {
+		return statusFail, fmt.Sprintf("running service image %s differs from deployed binary %s", oneLine(runningPath), oneLine(target))
+	}
+
+	runningHash, err := env.hashFile(procExe)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return statusSkip, fmt.Sprintf("hash running service image %s: %v (rerun as root)", procExe, err)
+		}
+		return statusFail, fmt.Sprintf("hash running service image %s: %v", procExe, err)
+	}
+	if runningHash != pinned {
+		return statusFail, fmt.Sprintf("running service image hash mismatch: pin=%s got=%s", shortHash(pinned), shortHash(runningHash))
+	}
+
+	return statusPass, fmt.Sprintf("deployed and running service %s", binaryIntegrityDetail(env, target, pinned))
+}
+
+func binaryIntegrityDetail(env *probeEnv, target, pinned string) string {
+	detail := fmt.Sprintf("binary hash %s matches pin", shortHash(pinned))
+	if self, err := env.selfPath(); err == nil && filepath.Clean(self) != target {
+		self = filepath.Clean(self)
+		targetInfo, targetErr := env.stat(target)
+		selfInfo, selfErr := env.stat(self)
+		switch {
+		case targetErr != nil || selfErr != nil:
+			// Identity is unknown, not different. Saying the binaries differ here
+			// would assert something unverified, which is the failure this probe
+			// exists to stop making.
+			detail += fmt.Sprintf(" (note: could not compare invoking binary %s with deployed binary %s)", self, target)
+		case !os.SameFile(targetInfo, selfInfo):
+			detail += fmt.Sprintf(" (note: invoking binary %s differs from deployed binary %s)", self, target)
+		}
+	}
+	return detail
+}
+
+// systemdExecStartPath extracts the one executable path from systemctl show's
+// stable ExecStart representation. Pipelock's managed service is Type=simple
+// with exactly one command; accepting multiple commands here would leave its
+// running program ambiguous.
+func systemdExecStartPath(raw string) (string, error) {
+	var paths []string
+	for _, segment := range strings.Split(raw, ";") {
+		segment = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(segment), "{"))
+		if !strings.HasPrefix(segment, "path=") {
+			continue
+		}
+		path := strings.TrimPrefix(segment, "path=")
+		if path == "" || !filepath.IsAbs(path) {
+			return "", fmt.Errorf("invalid executable path %q", path)
+		}
+		paths = append(paths, path)
+	}
+	if len(paths) == 0 {
+		return "", fmt.Errorf("no executable path in %q", raw)
+	}
+	if len(paths) != 1 {
+		return "", fmt.Errorf("expected one executable path, found %d", len(paths))
+	}
+	return paths[0], nil
+}
+
+func systemdMainPID(raw string) (int, error) {
+	if raw == "" {
+		return 0, errors.New("missing MainPID")
+	}
+	pid, err := strconv.Atoi(raw)
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("invalid MainPID %q", raw)
+	}
+	return pid, nil
+}
+
+func serviceProcessExePath(pid int) string {
+	return filepath.Join("/proc", strconv.Itoa(pid), "exe")
+}
+
+const sha256HexLen = 64
+
+func shortHash(s string) string {
+	if len(s) <= 12 {
+		return s
+	}
+	return s[:12] + "…"
+}
+
+// probeRecord is one JSON record per probe in --json output.
+type probeRecord struct {
+	Probe  int    `json:"probe"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// aggregateRecord is the trailing JSON record summarizing the run.
+type aggregateRecord struct {
+	Aggregate aggregateBody `json:"aggregate"`
+}
+
+type aggregateBody struct {
+	Pass     int `json:"pass"`
+	Fail     int `json:"fail"`
+	Skip     int `json:"skip"`
+	Unknown  int `json:"unknown,omitempty"`
+	Off      int `json:"off,omitempty"`
+	Total    int `json:"total"`
+	ExitCode int `json:"exit_code"`
+}
+
+// verifyOpts collects all flag-derived state for runVerify.
+type verifyOpts struct {
+	jsonOutput      bool
+	enforcementOnly bool
+	port            int
+	workspacePaths  []string
+}
+
+// Match doctor's injectable environment so command tests need no host probes.
+var verifyEnvFactory = defaultProbeEnv
+
+func verifyCmd() *cobra.Command {
+	var opts verifyOpts
+
+	cmd := &cobra.Command{
+		Use:   "verify",
+		Short: "Run containment probes against the containment model",
+		Long: `Run nineteen fixed probes to verify the workstation containment model
+is installed correctly and the boundary is intact. A conditional workspace
+probe runs as an additional result when workspace paths or grants are present.
+
+Probes inspect system users, the pipelock systemd unit, nftables rules,
+wrapper scripts, the CA bundle, the pipelock loopback bind, the NO_PROXY
+policy, run two egress canaries (pipelock-agent must NOT reach the internet
+directly; the operator user must still reach the internet), verify the
+deployed and running service binaries match the TOFU integrity pin written at
+install time, exercise plk-launch end-to-end with a sentinel tool to confirm
+the allow-list enforcement path actually fires, and check that the managed
+config keeps metrics on loopback or uses a current, source-scoped exception. It
+also creates and removes an operator /tmp canary, then starts the same transient
+service shape used by contain run to prove the contained agent cannot see it.
+Pass --workspace to also
+verify that pipelock-agent can read/traverse real project directories.
+Pass --enforcement-only when another process owns the proxy lifecycle;
+that mode verifies the kernel/user/wrapper controls and the pinned file at the
+deployed path, while skipping proxy liveness and running-service-image checks.
+
+verify removes its temporary /tmp and /var/tmp canaries before returning.
+Probes that require root visibility (nft list ruleset and the private-temp
+canary) record skip when run unprivileged.
+
+Exit codes:
+  0  All probes passed.
+  1  At least one probe failed (containment is broken or partially installed).
+  2  Verification incomplete (one or more probes skipped or inconclusive,
+     curl/sudo missing, context cancelled).`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := validatePort(opts.port); err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+			}
+			env := verifyEnvFactory()
+			env.port = opts.port
+			env.workspacePaths = append([]string(nil), opts.workspacePaths...)
+			// Load recorded grants so the workspace probe checks readability and
+			// expiry of every grant, not just the ad-hoc --workspace paths. A
+			// missing inventory is empty (no grants); any other read or parse error
+			// is recorded so the probe FAILS instead of treating grants as absent.
+			if inv, err := loadWorkspaceInventoryFrom(env.readFile, env.workspaceInvPath); err != nil {
+				env.workspaceInvErr = err
+			} else {
+				// Scope to this agent user: another contained user's grant is not
+				// part of this verification's boundary and must not fail it.
+				env.workspaceGrants = grantsForAgent(inv.Workspaces, env.agentUserName)
+			}
+			return runVerify(cmd, env, opts)
+		},
+	}
+
+	cmd.Flags().BoolVar(&opts.jsonOutput, "json", false, "emit newline-delimited JSON instead of text")
+	cmd.Flags().BoolVar(&opts.enforcementOnly, "enforcement-only", false, "skip service, loopback, and running-service-image checks")
+	cmd.Flags().IntVar(&opts.port, "port", defaultProxyPort, "pipelock listen port to probe on loopback")
+	cmd.Flags().StringArrayVar(&opts.workspacePaths, "workspace", nil, "workspace path that pipelock-agent must be able to read/traverse (repeatable)")
+
+	return cmd
+}
+
+func validatePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid --port %d (must be 1-65535)", port)
+	}
+	return nil
+}
+
+// runVerify walks every probe in order, prints per-probe output in
+// either text or JSON mode, and returns an ExitError carrying the
+// aggregate exit code.
+func runVerify(cmd *cobra.Command, env *probeEnv, opts verifyOpts) error {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// Mode policy is per invocation. Callers can share a probe environment in
+	// tests and embedders, so never toggle a field on their environment while a
+	// verification is running.
+	runEnv := *env
+	if opts.enforcementOnly {
+		runEnv.verifyRunningImage = false
+	}
+
+	w := cmd.OutOrStdout()
+	var textWriter *errorTrackingWriter
+	if !opts.jsonOutput {
+		textWriter = &errorTrackingWriter{w: w}
+		w = textWriter
+	}
+	enc := json.NewEncoder(w)
+
+	if !opts.jsonOutput {
+		header := "pipelock contain verify"
+		if opts.enforcementOnly {
+			header += " --enforcement-only"
+		}
+		_, _ = fmt.Fprintln(w, header)
+		if err := textWriter.Err(); err != nil {
+			return fmt.Errorf("writing verify header: %w", err)
+		}
+	}
+
+	probes := probesForEnv(&runEnv)
+	if opts.enforcementOnly {
+		probes = enforcementProbes(probes)
+	}
+	var passN, failN, skipN, unknownN, offN int
+
+	for _, p := range probes {
+		status, detail := p.fn(ctx, &runEnv)
+		switch status {
+		case statusPass:
+			passN++
+		case statusFail:
+			failN++
+		case statusSkip:
+			skipN++
+		case statusUnknown:
+			unknownN++
+		case statusFilesystemOff:
+			offN++
+		default:
+			// A probe returned something unexpected. Coerce to fail
+			// and carry the value forward so we don't silently drop it.
+			failN++
+			detail = fmt.Sprintf("invalid status %q (detail: %s)", status, detail)
+			status = statusFail
+		}
+
+		if opts.jsonOutput {
+			if err := enc.Encode(probeRecord{
+				Probe:  p.n,
+				Name:   p.name,
+				Status: status,
+				Detail: detail,
+			}); err != nil {
+				return fmt.Errorf("encoding probe %d JSON: %w", p.n, err)
+			}
+			continue
+		}
+
+		writeTextLine(w, p, status, detail)
+		if err := textWriter.Err(); err != nil {
+			return fmt.Errorf("writing probe %d text: %w", p.n, err)
+		}
+	}
+
+	exitCode := cliutil.ExitOK
+	switch {
+	case failN > 0:
+		exitCode = cliutil.ExitGeneral
+	case skipN > 0 || unknownN > 0:
+		exitCode = cliutil.ExitConfig
+	}
+
+	if opts.jsonOutput {
+		if err := enc.Encode(aggregateRecord{Aggregate: aggregateBody{
+			Pass:     passN,
+			Fail:     failN,
+			Skip:     skipN,
+			Unknown:  unknownN,
+			Off:      offN,
+			Total:    len(probes),
+			ExitCode: exitCode,
+		}}); err != nil {
+			return fmt.Errorf("encoding aggregate JSON: %w", err)
+		}
+	} else {
+		_, _ = fmt.Fprint(w, formatContainAggregate(passN, failN, skipN, unknownN, offN, exitCode))
+		if err := textWriter.Err(); err != nil {
+			return fmt.Errorf("writing verify aggregate: %w", err)
+		}
+	}
+
+	if exitCode == cliutil.ExitOK {
+		return nil
+	}
+	if failN > 0 {
+		return cliutil.ExitCodeError(exitCode, fmt.Errorf("%d probe(s) failed", failN))
+	}
+	if unknownN > 0 {
+		return cliutil.ExitCodeError(exitCode, fmt.Errorf("%d probe(s) inconclusive; verification incomplete", unknownN))
+	}
+	return cliutil.ExitCodeError(exitCode, fmt.Errorf("%d probe(s) skipped; verification incomplete", skipN))
+}
+
+func enforcementProbes(probes []probe) []probe {
+	skip := map[string]struct{}{
+		"pipelock_systemd_unit":       {},
+		"pipelock_listening_loopback": {},
+	}
+	filtered := make([]probe, 0, len(probes))
+	for _, p := range probes {
+		if _, ok := skip[p.name]; ok {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	return filtered
+}
+
+// writeTextLine renders one probe outcome in text mode.
+func formatContainAggregate(passN, failN, skipN, unknownN, offN, exitCode int) string {
+	line := fmt.Sprintf("Result: %d PASS / %d FAIL / %d SKIP", passN, failN, skipN)
+	if unknownN > 0 {
+		line += fmt.Sprintf(" / %d UNKNOWN", unknownN)
+	}
+	if offN > 0 {
+		line += fmt.Sprintf(" / %d OFF", offN)
+	}
+	return fmt.Sprintf("%s — exit %d\n", line, exitCode)
+}
+
+func writeTextLine(w io.Writer, p probe, status, detail string) {
+	tag := "[PASS]"
+	switch status {
+	case statusFail:
+		tag = "[FAIL]"
+	case statusSkip:
+		tag = "[SKIP]"
+	case statusUnknown:
+		tag = "[UNKNOWN]"
+	case statusFilesystemOff:
+		tag = "[OFF]"
+	case statusFilesystemNotApplicable:
+		tag = "[N/A]"
+	}
+
+	line := fmt.Sprintf("  %s probe %d: %s", tag, p.n, p.desc)
+	if status != statusPass && detail != "" {
+		line += " (" + detail + ")"
+	} else if status == statusPass && detail != "" {
+		line += " — " + detail
+	}
+	_, _ = fmt.Fprintln(w, line)
+}
+
+// ---------------------------------------------------------------------------
+// Probe 1: system_users_exist
+// ---------------------------------------------------------------------------
+
+func probeSystemUsers(_ context.Context, env *probeEnv) (string, string) {
+	proxy, perr := env.lookupUser(env.proxyUserName)
+	agent, aerr := env.lookupUser(env.agentUserName)
+
+	switch {
+	case perr != nil && aerr != nil:
+		return statusFail, fmt.Sprintf("neither %s nor %s exist", env.proxyUserName, env.agentUserName)
+	case perr != nil:
+		return statusFail, fmt.Sprintf("%s missing: %v", env.proxyUserName, perr)
+	case aerr != nil:
+		return statusFail, fmt.Sprintf("%s missing: %v", env.agentUserName, aerr)
+	}
+
+	return statusPass, fmt.Sprintf("%s uid=%s, %s uid=%s",
+		env.proxyUserName, proxy.Uid, env.agentUserName, agent.Uid)
+}
+
+// ---------------------------------------------------------------------------
+// Probe 2: pipelock_systemd_unit
+// ---------------------------------------------------------------------------
+
+func probeSystemdUnit(ctx context.Context, env *probeEnv) (string, string) {
+	out, code, err := env.runCmd(ctx, "systemctl", "show", env.serviceName,
+		"--property=ActiveState,SubState,User,Type",
+	)
+	if err != nil {
+		return statusSkip, fmt.Sprintf("systemctl unavailable: %v", err)
+	}
+	if code != 0 {
+		return statusFail, fmt.Sprintf("systemctl exit=%d: %s", code, oneLine(out))
+	}
+
+	fields := parseSystemdShow(out)
+	active := fields["ActiveState"]
+	sub := fields["SubState"]
+	svcUser := fields["User"]
+
+	if svcUser != env.proxyUserName {
+		return statusFail, fmt.Sprintf("ActiveState=%s SubState=%s User=%q (want User=%s)",
+			active, sub, svcUser, env.proxyUserName)
+	}
+	if active != "active" || sub != "running" {
+		return statusFail, fmt.Sprintf("ActiveState=%s SubState=%s User=%s (want active/running)",
+			active, sub, svcUser)
+	}
+	return statusPass, fmt.Sprintf("ActiveState=%s SubState=%s User=%s", active, sub, svcUser)
+}
+
+// parseSystemdShow parses `systemctl show --property=...` key=value
+// output into a map. Empty lines and lines without an '=' are ignored.
+func parseSystemdShow(out string) map[string]string {
+	fields := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		fields[k] = v
+	}
+	return fields
+}
+
+// ---------------------------------------------------------------------------
+// Probe 13: managed_config_metrics
+// ---------------------------------------------------------------------------
+
+// probeManagedConfigMetrics verifies the containment-specific metrics surface
+// from the managed config without starting or reloading Pipelock. An operator
+// may run verify without root, while the managed config is readable only by
+// root and pipelock-proxy, so an unreadable or absent file is incomplete
+// evidence and must not become a pass.
+func probeManagedConfigMetrics(_ context.Context, env *probeEnv) (string, string) {
+	configPath := filepath.Clean(env.configPath)
+	data, err := env.readFile(configPath)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return statusSkip, fmt.Sprintf("managed config %s is missing", configPath)
+		case errors.Is(err, os.ErrPermission):
+			return statusSkip, fmt.Sprintf("managed config %s is not readable; rerun as root", configPath)
+		default:
+			return statusUnknown, fmt.Sprintf("read managed config %s: %v", configPath, err)
+		}
+	}
+	if _, err := containServiceReadOnlyPaths(data, env.port); err != nil {
+		return statusFail, fmt.Sprintf("managed config %s violates containment metrics policy: %v", configPath, err)
+	}
+	return statusPass, fmt.Sprintf("managed config %s keeps metrics off the agent-accessible proxy port", configPath)
+}
+
+// ---------------------------------------------------------------------------
+// Probe 3: nftables_containment_ruleset
+// ---------------------------------------------------------------------------
+
+// probeNFTContainment verifies the installed nftables boundary structure,
+// ordering, UID ownership, and persistence wiring.
+func probeNFTContainment(ctx context.Context, env *probeEnv) (string, string) {
+	status, detail, _ := probeNFTContainmentClassified(ctx, env)
+	return status, detail
+}
+
+// probeNFTContainmentClassified is probeNFTContainment plus whether a FAIL
+// came from being unable to read the state (a command, parse or lookup error)
+// rather than from a confirmed structural problem. contain verify treats both
+// as FAIL; doctor needs the distinction to report an unreadable chain as
+// inconclusive and a confirmed missing rule as FAIL.
+func probeNFTContainmentClassified(ctx context.Context, env *probeEnv) (resultStatus, resultDetail string, unreadable bool) {
+	// Structural checks and remedy prediction share one file observation.
+	snapshot := *env
+	snapshot.readFile, _ = snapshotReconcileReads(env.readFile)
+	env = &snapshot
+	out, code, err := env.runCmd(ctx, probeNFTExecutable(env), "-n", "-a", "list", "chain", "inet", env.nftTable, env.nftChain)
+	if err != nil {
+		return statusSkip, fmt.Sprintf("nft unavailable: %v", err), false
+	}
+	if code != 0 {
+		low := strings.ToLower(out)
+		if strings.Contains(low, "operation not permitted") || strings.Contains(low, "permission denied") {
+			return statusSkip, "nft list chain requires root; rerun as root", false
+		}
+		if nftOutputConfirmsAbsent(out) {
+			detail := fmt.Sprintf("chain %s missing or not loaded from table inet %s", env.nftChain, env.nftTable)
+			if env.nftRulesPath != "" {
+				current, identityErr := containmentUIDsFromProbeEnv(env)
+				if identityErr == nil {
+					_, remedy, predictionErr := predictNFTReconciliation(env, "", current)
+					if predictionErr != nil {
+						detail += "; " + predictionErr.Error()
+					}
+					detail += "; " + remedy
+				}
+			}
+			return statusFail, detail, false
+		}
+		return statusFail, fmt.Sprintf("nft exit=%d: %s", code, oneLine(out)), true
+	}
+
+	lines, err := attributedNFTChainLines(out, env.nftChain)
+	if err != nil {
+		return statusFail, err.Error(), true
+	}
+
+	current, err := containmentUIDsFromProbeEnv(env)
+	if err != nil {
+		return statusFail, err.Error(), true
+	}
+	defer func() {
+		// A configured persistence path is the ownership authority. Older
+		// embedders without it retain structural verification only.
+		if env.nftRulesPath == "" || !nftChainLinesHaveManagedOutputBaseChain(lines) {
+			return
+		}
+		plan, remedy, predictionErr := predictNFTReconciliation(env, out, current)
+		if len(plan.conflicts) > 0 {
+			prefix := ""
+			if resultStatus != statusPass && resultDetail != "" {
+				prefix = resultDetail + "; "
+			}
+			resultStatus, unreadable = statusFail, false
+			resultDetail = prefix + predictionErr.Error() + "; rerun `" + verifyCommandForPort(env.port) + "` after resolving the conflict"
+			return
+		}
+		if predictionErr == nil && (plan.kernelChanged || plan.fileChanged) {
+			if resultStatus == statusPass {
+				resultStatus, resultDetail = statusFail, "managed nft rules differ from the reconciliation plan"
+			}
+			resultDetail += "; " + remedy
+		} else if predictionErr != nil && resultStatus == statusPass {
+			resultStatus, resultDetail = statusFail, predictionErr.Error()+"; "+remedy
+		}
+	}()
+	// The base-chain contract comes first. Without the output hook no rule in
+	// this chain is ever reached, so neither the catch-all drop nor a rule
+	// sitting before it means anything, and calling that a containment hole
+	// would report a definite verdict about a chain that enforces nothing.
+	// The doctor maps this wording to UNKNOWN, which is the honest state.
+	if !nftChainLinesHaveManagedOutputBaseChain(lines) {
+		return statusFail, fmt.Sprintf("chain %s is not the managed output base chain (want type filter hook output priority filter/0 policy accept)", env.nftChain), false
+	}
+	if !chainLinesHaveAgentCatchAllDrop(lines, current.agentUID) {
+		return statusFail, fmt.Sprintf(containmentHoleDetailPrefix+" chain present but current agent uid %d catch-all skuid-drop rule missing", current.agentUID), false
+	}
+	// nft(8): an accept is terminal for this chain. Any agent UID accept
+	// outside the canonical proxy/reply exceptions admits traffic before the
+	// drop, including conditional accepts. Definite holes precede stale marks
+	// and policy/read failures; jump/return semantics remain inconclusive.
+	if rule, ok := agentUIDBareAcceptBeforeDrop(lines, current.agentUID); ok {
+		return statusFail, fmt.Sprintf(containmentBypassDetailFormat, rule), false
+	}
+	if rule, ok := agentUIDConditionalAcceptBeforeDrop(lines, current, env.port); ok {
+		detail := containmentHoleDetailPrefix + " conditional agent UID accept bypasses managed catch-all DROP: " + rule
+		if _, problem, _ := declaredContainmentLoopbackServicesForVerify(env, env.port); problem != "" {
+			detail += "; " + problem
+		}
+		return statusFail, detail, false
+	}
+	if handles := legacyOwnedLoopbackMarkRuleHandles(out, current.agentUID); len(handles) > 0 {
+		return statusFail, fmt.Sprintf("chain contains %d stale owned-loopback cgroup mark rule(s) using %s; %s", len(handles), legacyOwnedLoopbackMark, installRemedyForPort(env.port)), false
+	}
+	listenerData, listenerReadErr := env.readFile(env.configPath)
+	if listenerReadErr != nil && !errors.Is(listenerReadErr, os.ErrNotExist) {
+		return statusFail, fmt.Sprintf("read managed listener config: %v", listenerReadErr), false
+	}
+	agentListener, listenerErr := agentListenerFromConfigBytes(listenerData)
+	if listenerErr != nil {
+		return statusFail, fmt.Sprintf("parse managed listener config: %v", listenerErr), false
+	}
+	if agentListener != "" && !chainLinesHaveAgentListenerGuard(lines, agentListener, current.proxyUID) {
+		return statusFail, "chain present but containment.agent_listener owner guard is missing or malformed", false
+	}
+	if agentListener == "" && chainLinesHaveAgentListenerGuardLine(lines) {
+		return statusFail, "chain contains a containment.agent_listener owner guard but no listener is configured", false
+	}
+	if current.operatorKnown && !chainLinesHaveSkuidAcceptForUID(lines, current.operatorUID) {
+		return statusFail, fmt.Sprintf("chain present but operator uid %d accept rule missing", current.operatorUID), false
+	}
+	if !chainLinesHaveSkuidAcceptForUID(lines, current.proxyUID) {
+		return statusFail, fmt.Sprintf("chain present but proxy uid %d accept rule missing", current.proxyUID), false
+	}
+	if !chainLinesHaveAgentProxyLoopbackAllowBeforeDrop(lines, current.agentUID, env.port) {
+		return statusFail, fmt.Sprintf("chain present but current agent uid %d proxy loopback allow for 127.0.0.1:%d is missing or appears after the agent catch-all drop", current.agentUID, env.port), false
+	}
+	// A managed config this probe cannot read or honor fails the probe
+	// outright. Reporting it only alongside an unsafe verdict left the
+	// canonical case silent: once reload has already reconciled to zero
+	// services the chain looks exactly like a host that declared nothing,
+	// so an unreadable, malformed, or expired declaration returned PASS
+	// while verify had no idea what it was meant to be proving. A
+	// containment probe that cannot read the policy has not verified the
+	// policy, whatever the chain happens to look like.
+	_, loopbackProblem, loopbackUnusable := declaredContainmentLoopbackServicesForVerify(env, env.port)
+	if loopbackUnusable {
+		return statusFail, "containment.loopback_services cannot be honored: " + loopbackProblem, false
+	}
+	if !chainLinesHaveAgentDNSDropBeforeCatchAll(lines, current.agentUID, "udp") {
+		return statusFail, fmt.Sprintf("chain present but current agent uid %d udp/53 DNS drop rule missing or appears after the agent catch-all drop", current.agentUID), false
+	}
+	if !chainLinesHaveAgentDNSDropBeforeCatchAll(lines, current.agentUID, "tcp") {
+		return statusFail, fmt.Sprintf("chain present but current agent uid %d tcp/53 DNS drop rule missing or appears after the agent catch-all drop", current.agentUID), false
+	}
+	if chainLinesHaveUnsafeVerdictBeforeAgentDrop(lines, current, env.port) {
+		return statusFail, "chain contains unexpected verdict before agent drop", false
+	}
+	if env.nftPersistUnitPath != "" && env.nftRulesPath != "" {
+		// Persistence failures are reported as structural. The only consumer
+		// of the classification, the doctor chain reader, clears
+		// nftPersistUnitPath, so this branch never feeds it; split read errors
+		// out before wiring persistence into a classified caller.
+		if err := verifyNFTPersistence(env, current); err != nil {
+			return statusFail, err.Error(), false
+		}
+		if env.nftExpiryTimerPath != "" || env.nftExpiryServicePath != "" {
+			status, detail := probeContainmentExpiryTimer(ctx, env)
+			if status != statusPass {
+				return status, detail, false
+			}
+		}
+	}
+	persistence := ""
+	if env.nftPersistUnitPath != "" && env.nftRulesPath != "" {
+		persistence = "; persistence unit verified"
+	}
+	return statusPass, fmt.Sprintf("table inet %s has chain %s with current agent uid %d direct-DNS drops and catch-all skuid drop rule; loopback access is owned by the private network namespace%s",
+		env.nftTable, env.nftChain, current.agentUID, persistence), false
+}
+
+// nftOutputConfirmsAbsent reports whether failed nft list output states that
+// the table or chain does not exist, as opposed to a failure to read it.
+func nftOutputConfirmsAbsent(out string) bool {
+	low := strings.ToLower(out)
+	return strings.Contains(low, "no such file") || strings.Contains(low, "does not exist")
+}
+
+// probeContainmentExpiryTimer verifies the privileged reconciliation timer
+// separately from the nftables-chain probe. A host whose timer is disabled,
+// masked, or pointed at the wrong service otherwise keeps a declared
+// loopback accept past expiry without any visible failure.
+func probeContainmentExpiryTimer(ctx context.Context, env *probeEnv) (string, string) {
+	if env.nftPersistUnitPath == "" {
+		return statusSkip, "containment persistence unit path is not configured"
+	}
+	if _, err := env.readFile(env.nftPersistUnitPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return statusSkip, "containment is not installed"
+		}
+		return statusFail, fmt.Sprintf("read nftables persistence unit %s: %v", env.nftPersistUnitPath, err)
+	}
+	if err := verifyNFTExpiryTimer(ctx, env); err != nil {
+		return statusFail, err.Error()
+	}
+	return statusPass, "containment loopback expiry reconciliation timer is installed and enabled"
+}
+
+type containmentUIDs struct {
+	operatorUID   int
+	operatorKnown bool
+	proxyUID      int
+	agentUID      int
+}
+
+func containmentUIDsFromProbeEnv(env *probeEnv) (containmentUIDs, error) {
+	proxyUID, err := lookupUID(env.lookupUser, env.proxyUserName)
+	if err != nil {
+		return containmentUIDs{}, fmt.Errorf("lookup proxy uid %s: %w", env.proxyUserName, err)
+	}
+	if proxyUID == 0 {
+		return containmentUIDs{}, fmt.Errorf("%s resolves to uid 0; containment proxy user must be non-root", env.proxyUserName)
+	}
+	agentUID, err := lookupUID(env.lookupUser, env.agentUserName)
+	if err != nil {
+		return containmentUIDs{}, fmt.Errorf("lookup agent uid %s: %w", env.agentUserName, err)
+	}
+	if agentUID == 0 {
+		return containmentUIDs{}, fmt.Errorf("%s resolves to uid 0; contained agent user must be non-root", env.agentUserName)
+	}
+
+	current := containmentUIDs{proxyUID: proxyUID, agentUID: agentUID}
+	if proxyUID == agentUID {
+		return containmentUIDs{}, fmt.Errorf("%s and %s both resolve to uid %d; containment users must be distinct", env.proxyUserName, env.agentUserName, agentUID)
+	}
+	if env.nftRulesPath == "" {
+		return current, nil
+	}
+	data, err := env.readFile(env.nftRulesPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return current, nil
+		}
+		return containmentUIDs{}, fmt.Errorf("read nftables rules file %s: %w", env.nftRulesPath, err)
+	}
+	header, ok, err := parseNFTRulesHeaderUIDs(data)
+	if err != nil {
+		return containmentUIDs{}, fmt.Errorf("parse nftables rules file %s: %w", env.nftRulesPath, err)
+	}
+	if !ok {
+		return current, nil
+	}
+	if header.proxyUID != proxyUID {
+		return containmentUIDs{}, fmt.Errorf("nftables rules file proxy uid %d does not match current %s uid %d", header.proxyUID, env.proxyUserName, proxyUID)
+	}
+	if header.agentUID != agentUID {
+		return containmentUIDs{}, fmt.Errorf("nftables rules file agent uid %d does not match current %s uid %d", header.agentUID, env.agentUserName, agentUID)
+	}
+	if header.operatorUID == agentUID {
+		return containmentUIDs{}, fmt.Errorf("nftables rules file operator uid %d matches current %s uid; contained agent must not be allow-listed", header.operatorUID, env.agentUserName)
+	}
+	current.operatorUID = header.operatorUID
+	current.operatorKnown = true
+	return current, nil
+}
+
+func lookupUID(lookup lookupUserFunc, name string) (int, error) {
+	u, err := lookup(name)
+	if err != nil {
+		return 0, err
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, fmt.Errorf("parse uid: %w", err)
+	}
+	return uid, nil
+}
+
+type nftRulesHeaderUIDs struct {
+	operatorUID int
+	proxyUID    int
+	agentUID    int
+	proxyPort   int
+}
+
+func parseNFTRulesHeaderUIDs(data []byte) (nftRulesHeaderUIDs, bool, error) {
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if !strings.HasPrefix(line, "#") || !strings.Contains(line, "operator=") {
+			continue
+		}
+		fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "#")))
+		values := map[string]int{}
+		for _, field := range fields {
+			key, value, ok := strings.Cut(field, "=")
+			if !ok {
+				continue
+			}
+			switch key {
+			case "operator", "pipelock-proxy", "pipelock-agent", "proxy-port":
+				uid, err := strconv.Atoi(value)
+				if err != nil {
+					return nftRulesHeaderUIDs{}, true, fmt.Errorf("%s value %q: %w", key, value, err)
+				}
+				values[key] = uid
+			}
+		}
+		operatorUID, hasOperator := values["operator"]
+		proxyUID, hasProxy := values["pipelock-proxy"]
+		agentUID, hasAgent := values["pipelock-agent"]
+		proxyPort, hasPort := values["proxy-port"]
+		if !hasOperator || !hasProxy || !hasAgent {
+			return nftRulesHeaderUIDs{}, true, errors.New("managed uid header missing operator, pipelock-proxy, or pipelock-agent uid")
+		}
+		if !hasPort {
+			proxyPort = defaultProxyPort
+		}
+		if err := validatePort(proxyPort); err != nil {
+			return nftRulesHeaderUIDs{}, true, fmt.Errorf("managed proxy-port: %w", err)
+		}
+		// nft(8) meta skuid identifies a Unix UID. Retain the same identity
+		// separation as containmentUIDsFromProbeEnv: an agent must never be
+		// included in the operator/proxy allow rules, including after recovery.
+		if operatorUID < 0 || proxyUID < 0 || agentUID < 0 || operatorUID == agentUID || proxyUID == agentUID {
+			return nftRulesHeaderUIDs{}, true, errors.New("managed uid header must use nonnegative uids and keep the agent distinct from operator and proxy; contained agent must not be allow-listed")
+		}
+		return nftRulesHeaderUIDs{operatorUID: operatorUID, proxyUID: proxyUID, agentUID: agentUID, proxyPort: proxyPort}, true, nil
+	}
+	return nftRulesHeaderUIDs{}, false, nil
+}
+
+func verifyNFTPersistence(env *probeEnv, current containmentUIDs) error {
+	data, err := env.readFile(env.nftPersistUnitPath)
+	if err != nil {
+		return fmt.Errorf("read nftables persistence unit %s: %w", env.nftPersistUnitPath, err)
+	}
+	body := string(data)
+	if !unitHasExactEntry(body, "Unit", "DefaultDependencies", "no") {
+		return fmt.Errorf("%s missing exact DefaultDependencies=no", env.nftPersistUnitPath)
+	}
+	if !unitEntryHasWord(body, "After", "local-fs.target") {
+		return fmt.Errorf("%s missing After dependency on local-fs.target", env.nftPersistUnitPath)
+	}
+	if !unitHasExactEntry(body, "Unit", "Before", "network-pre.target") {
+		return fmt.Errorf("%s missing exact Before=network-pre.target", env.nftPersistUnitPath)
+	}
+	if !unitEntryHasWord(body, "Wants", "network-pre.target") {
+		return fmt.Errorf("%s missing Wants=network-pre.target", env.nftPersistUnitPath)
+	}
+	if !unitHasExactEntry(body, "Unit", "ConditionPathExists", env.nftRulesPath) {
+		return fmt.Errorf("%s missing ConditionPathExists for %s", env.nftPersistUnitPath, env.nftRulesPath)
+	}
+	if !unitHasExactEntry(body, "Service", "Type", "oneshot") {
+		return fmt.Errorf("%s missing exact Type=oneshot", env.nftPersistUnitPath)
+	}
+	if !unitHasExactEntry(body, "Service", "RemainAfterExit", "yes") {
+		return fmt.Errorf("%s missing exact RemainAfterExit=yes", env.nftPersistUnitPath)
+	}
+	if !unitHasExactEntry(body, "Service", "ExecStart", env.pipelockTarget+" contain reload-nft-rules") {
+		return fmt.Errorf("%s missing ExecStart for managed nft reloader", env.nftPersistUnitPath)
+	}
+	if !unitHasExactEntry(body, "Install", "WantedBy", "multi-user.target") {
+		return fmt.Errorf("%s missing WantedBy=multi-user.target", env.nftPersistUnitPath)
+	}
+	rules, err := env.readFile(env.nftRulesPath)
+	if err != nil {
+		return fmt.Errorf("read persisted nftables rules file %s: %w", env.nftRulesPath, err)
+	}
+	if !current.operatorKnown {
+		return fmt.Errorf("persisted nftables rules file %s is missing the managed operator uid header", env.nftRulesPath)
+	}
+	operatorUID := current.operatorUID
+	if env.operatorUser != "" {
+		operatorUID, err = lookupUID(env.lookupUser, env.operatorUser)
+		if err != nil {
+			return fmt.Errorf("lookup operator uid %s: %w", env.operatorUser, err)
+		}
+		if operatorUID == current.agentUID {
+			return fmt.Errorf("%s and %s both resolve to uid %d; contained agent must not be allow-listed", env.operatorUser, env.agentUserName, current.agentUID)
+		}
+		if current.operatorUID != operatorUID {
+			return fmt.Errorf("nftables rules file operator uid %d does not match current %s uid %d", current.operatorUID, env.operatorUser, operatorUID)
+		}
+	}
+	loopbackServices, _, _ := declaredContainmentLoopbackServicesForVerify(env, env.port)
+	listenerData, listenerReadErr := env.readFile(env.configPath)
+	if listenerReadErr != nil && !errors.Is(listenerReadErr, os.ErrNotExist) {
+		return fmt.Errorf("read managed listener config: %w", listenerReadErr)
+	}
+	agentListener, listenerErr := agentListenerFromConfigBytes(listenerData)
+	if listenerErr != nil {
+		return fmt.Errorf("parse managed listener config: %w", listenerErr)
+	}
+	want := renderNFTRulesWithServices(nftRuleOptions{
+		OperatorUID:      operatorUID,
+		ProxyUID:         current.proxyUID,
+		AgentUID:         current.agentUID,
+		ProxyPort:        env.port,
+		Table:            env.nftTable,
+		Chain:            env.nftChain,
+		LoopbackServices: loopbackServices,
+		AgentListener:    agentListener,
+	})
+	if string(rules) != want {
+		return fmt.Errorf("persisted nftables rules file %s does not match the canonical containment boundary; rerun %s before reboot", env.nftRulesPath, installCommandForPort(env.port))
+	}
+	return nil
+}
+
+func unitEntryHasWord(body, key, want string) bool {
+	inSection := false
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			inSection = line == "[Unit]"
+			continue
+		}
+		if inSection && strings.HasPrefix(line, key+"=") {
+			for _, value := range strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, key+"="))) {
+				if value == want {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func verifyNFTExpiryTimer(ctx context.Context, env *probeEnv) error {
+	timerBody, err := env.readFile(env.nftExpiryTimerPath)
+	if err != nil {
+		return fmt.Errorf("read containment expiry timer %s: %w", env.nftExpiryTimerPath, err)
+	}
+	if !unitHasExactEntry(string(timerBody), "Timer", "Unit", filepath.Base(env.nftExpiryServicePath)) {
+		return fmt.Errorf("%s missing exact Unit linkage to %s", env.nftExpiryTimerPath, filepath.Base(env.nftExpiryServicePath))
+	}
+	if !unitHasExactEntry(string(timerBody), "Timer", "OnCalendar", containmentExpiryTimerCalendar) ||
+		!unitHasExactEntry(string(timerBody), "Timer", "Persistent", "true") ||
+		!unitHasExactEntry(string(timerBody), "Timer", "AccuracySec", containmentExpiryTimerAccuracy) {
+		return fmt.Errorf("%s does not contain the managed expiry schedule", env.nftExpiryTimerPath)
+	}
+	if !unitHasExactEntry(string(timerBody), "Install", "WantedBy", "timers.target") {
+		return fmt.Errorf("%s missing WantedBy=timers.target", env.nftExpiryTimerPath)
+	}
+
+	serviceBody, err := env.readFile(env.nftExpiryServicePath)
+	if err != nil {
+		return fmt.Errorf("read containment expiry service %s: %w", env.nftExpiryServicePath, err)
+	}
+	if !unitHasExactEntry(string(serviceBody), "Service", "Type", "oneshot") {
+		return fmt.Errorf("%s missing exact Type=oneshot for containment expiry reconciliation", env.nftExpiryServicePath)
+	}
+	if !unitHasExactEntry(string(serviceBody), "Service", "TimeoutStartSec", containmentExpiryServiceTimeout) {
+		return fmt.Errorf("%s missing exact TimeoutStartSec for containment expiry reconciliation", env.nftExpiryServicePath)
+	}
+	if !unitHasExactEntry(string(serviceBody), "Service", "ExecStart", env.pipelockTarget+" contain reload-nft-rules") {
+		return fmt.Errorf("%s missing exact ExecStart for containment expiry reconciliation", env.nftExpiryServicePath)
+	}
+
+	timerUnit := filepath.Base(env.nftExpiryTimerPath)
+	timerState, code, err := env.runCmd(ctx, "systemctl", "is-enabled", timerUnit)
+	if err != nil {
+		return fmt.Errorf("systemctl unavailable while checking %s: %w", timerUnit, err)
+	}
+	timerState = strings.TrimSpace(timerState)
+	if timerState == "masked" {
+		return fmt.Errorf("%s is masked; unmask the affected unit and %s", timerUnit, installRemedyForPort(env.port))
+	}
+	if code != 0 || timerState != systemctlEnabled {
+		return fmt.Errorf("%s is not enabled (%s); %s", timerUnit, oneLine(timerState), installRemedyForPort(env.port))
+	}
+	activeState, activeCode, err := env.runCmd(ctx, "systemctl", "is-active", timerUnit)
+	if err != nil {
+		return fmt.Errorf("systemctl unavailable while checking %s: %w", timerUnit, err)
+	}
+	activeState = strings.TrimSpace(activeState)
+	if activeCode != 0 || activeState != systemctlActive {
+		return fmt.Errorf("%s is not active (%s); %s", timerUnit, oneLine(activeState), installRemedyForPort(env.port))
+	}
+
+	serviceUnit := filepath.Base(env.nftExpiryServicePath)
+	serviceState, serviceCode, err := env.runCmd(ctx, "systemctl", "is-enabled", serviceUnit)
+	if err != nil {
+		return fmt.Errorf("systemctl unavailable while checking %s: %w", serviceUnit, err)
+	}
+	serviceState = strings.TrimSpace(serviceState)
+	if serviceState == "masked" {
+		return fmt.Errorf("%s is masked; unmask the affected unit and %s", serviceUnit, installRemedyForPort(env.port))
+	}
+	if serviceCode != 0 || serviceState != "static" {
+		return fmt.Errorf("systemctl is-enabled %s exit=%d: %s", serviceUnit, serviceCode, oneLine(serviceState))
+	}
+	return nil
+}
+
+// unitHasExactEntry reports whether a systemd unit has exactly one assignment
+// for key in section and that assignment has value. List-valued directives
+// such as OnCalendar and ExecStart accumulate across repeated assignments,
+// while a later single-valued assignment overrides the managed value. Both
+// shapes must fail verification rather than accepting the first match.
+func unitHasExactEntry(body, section, key, value string) bool {
+	current := ""
+	entries := 0
+	for _, raw := range strings.Split(body, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			current = strings.TrimSpace(line[1 : len(line)-1])
+			continue
+		}
+		if current != section || line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		actualKey, actualValue, found := strings.Cut(line, "=")
+		if !found || strings.TrimSpace(actualKey) != key {
+			continue
+		}
+		entries++
+		if strings.TrimSpace(actualValue) != value {
+			return false
+		}
+	}
+	return entries == 1
+}
+
+func probeNFTExecutable(env *probeEnv) string {
+	if env != nil && env.nftPath != "" {
+		return env.nftPath
+	}
+	return "nft"
+}
+
+func chainLinesHaveAgentCatchAllDrop(lines []string, uid int) bool {
+	return chainLinesHaveLine(lines, func(line string) bool {
+		return lineHasTerminalSkuidVerdict(line, uid, "drop")
+	})
+}
+
+func chainLinesHaveSkuidAcceptForUID(lines []string, uid int) bool {
+	return chainLinesHaveLine(lines, func(line string) bool {
+		return lineHasTerminalSkuidVerdict(line, uid, "accept")
+	})
+}
+
+func chainLinesHaveAgentProxyLoopbackAllowBeforeDrop(lines []string, agentUID, port int) bool {
+	return chainLinesHaveLineBeforeAgentDrop(lines, agentUID, func(line string) bool {
+		return lineHasAgentProxyLoopbackAllow(line, agentUID, port)
+	})
+}
+
+func chainLinesHaveAgentListenerGuard(lines []string, listener string, proxyUID int) bool {
+	host, port, err := net.SplitHostPort(listener)
+	if err != nil {
+		return false
+	}
+	family := "ip"
+	if net.ParseIP(host).To4() == nil {
+		family = "ip6"
+	}
+	found := 0
+	for _, line := range lines {
+		fields := nftLineFields(line)
+		if len(fields) == 0 || fields[0] == "type" || fields[0] == "chain" || fields[0] == "{" || fields[0] == "}" {
+			continue
+		}
+		if found == 0 && lineHasAnyToken(line, "accept") && acceptMayReachAgentListener(fields, host, port) {
+			return false
+		}
+		if !strings.Contains(line, "pipelock_agent_listener_blocked") {
+			continue
+		}
+		if len(fields) < 13 || !slices.Equal(fields[:7], []string{"meta", "skuid", "!=", "{", "0,", strconv.Itoa(proxyUID), "}"}) {
+			return false
+		}
+		if fields[7] == family && fields[8] == "daddr" && fields[9] == host &&
+			fields[10] == "tcp" && fields[11] == "dport" && fields[12] == port &&
+			fieldsHaveNFTCounterLogDrop(fields[13:], "pipelock_agent_listener_blocked ") {
+			found++
+			continue
+		}
+		return false
+	}
+	return found == 1
+}
+
+// An earlier accept only bypasses the guard when it could admit the first
+// packet of a new connection to the configured listener. A rule limited to
+// reply-direction or already-established traffic cannot open a connection,
+// and neither can one pinned to a different destination. Unknown nft
+// expressions stay conservative.
+func acceptMayReachAgentListener(fields []string, host, port string) bool {
+	if acceptCannotStartConnection(fields) {
+		return false
+	}
+	for i := 0; i+2 < len(fields); i++ {
+		if fields[i] == "tcp" && fields[i+1] == "dport" && fields[i+2] != port {
+			if _, err := strconv.Atoi(fields[i+2]); err == nil {
+				return false
+			}
+		}
+		if (fields[i] == "ip" || fields[i] == "ip6") && fields[i+1] == "daddr" {
+			if fields[i+2] == host {
+				continue
+			}
+			prefix, err := netip.ParsePrefix(fields[i+2])
+			addr, addrErr := netip.ParseAddr(host)
+			if err == nil && addrErr == nil && !prefix.Contains(addr) {
+				return false
+			}
+			if err != nil {
+				other, parseErr := netip.ParseAddr(fields[i+2])
+				if parseErr == nil && addrErr == nil && other != addr {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// nfConntrackStateNew is the conntrack NEW bit as `nft -n` prints ct state
+// (invalid 0x1, established 0x2, related 0x4, new 0x8).
+const nfConntrackStateNew = 0x8
+
+// acceptCannotStartConnection reports whether a rule only matches packets
+// that belong to an existing connection: reply direction (`ct direction 1`,
+// as `nft -n` prints reply) or a single ct state value without NEW. Sets,
+// negations and anything unparsed return false, so the caller stays
+// conservative.
+func acceptCannotStartConnection(fields []string) bool {
+	for i := 0; i+2 < len(fields); i++ {
+		if fields[i] != "ct" {
+			continue
+		}
+		switch fields[i+1] {
+		case "direction":
+			if fields[i+2] == "1" || fields[i+2] == "reply" {
+				return true
+			}
+		case "state":
+			value := fields[i+2]
+			if strings.HasPrefix(value, "0x") {
+				bits, err := strconv.ParseUint(value[2:], 16, 32)
+				if err == nil && bits != 0 && bits&nfConntrackStateNew == 0 {
+					return true
+				}
+				continue
+			}
+			names := strings.Split(value, ",")
+			known := len(names) > 0
+			for _, name := range names {
+				switch name {
+				case "established", "related":
+				default:
+					known = false
+				}
+			}
+			if known {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func chainLinesHaveAgentListenerGuardLine(lines []string) bool {
+	return chainLinesHaveLine(lines, func(line string) bool {
+		return strings.Contains(line, "pipelock_agent_listener_blocked")
+	})
+}
+
+func lineHasAgentProxyLoopbackAllow(line string, agentUID, port int) bool {
+	fields := nftLineFields(line)
+	want := []string{
+		"meta", "skuid", strconv.Itoa(agentUID),
+		"ip", "daddr", "127.0.0.1",
+		"tcp", "dport", strconv.Itoa(port),
+		"accept",
+	}
+	if len(fields) < len(want) {
+		return false
+	}
+	for i, field := range want {
+		if fields[i] != field {
+			return false
+		}
+	}
+	return nftRuleTailIsCommentOnly(fields[len(want):])
+}
+
+// lineHasAgentLoopbackAllowAnyPortAnyHost recognizes the managed agent-owned
+// loopback allow regardless of which port it names, on EITHER "ip daddr
+// 127.0.0.1" or "ip6 daddr ::1". Reconciliation matches the legacy block so
+// it can delete it, and pinning that match to the CURRENT proxy port left a
+// previous-port block in place after an operator changed the proxy port; its
+// catch-all DROP then sat ahead of the freshly appended canonical rules and
+// dropped the agent's traffic to the new port. The dual-stack match exists
+// for the same reason on the other axis: reload's variable-length
+// managed-block scan (managedNFTBlockLength) must recognize a declared ::1
+// loopback service the same way it recognizes the implicit IPv4 proxy-port
+// allow, or a managed block that carries one looks unrecognized, and the
+// next reload appends a second block behind the old one instead of
+// replacing it -- the exact trap declaring loopback services exists to
+// close.
+func lineHasAgentLoopbackAllowAnyPortAnyHost(line string, agentUID int) bool {
+	_, _, ok := agentLoopbackAllowHostPort(line, agentUID, false)
+	return ok
+}
+
+// agentLoopbackAllowHostPort extracts a managed loopback allow. The optional
+// interface requirement distinguishes current declared-service rules from the
+// older interface-unrestricted form that reload must still recognize to delete.
+func agentLoopbackAllowHostPort(line string, agentUID int, requireLoopbackInterface bool) (string, int, bool) {
+	fields := nftLineFields(line)
+	const prefixLen = 3
+	if len(fields) < prefixLen || fields[0] != "meta" || fields[1] != "skuid" || fields[2] != strconv.Itoa(agentUID) {
+		return "", 0, false
+	}
+	i := prefixLen
+	if len(fields) >= i+2 && fields[i] == "oifname" && fields[i+1] == `"lo"` {
+		i += 2
+	} else if requireLoopbackInterface {
+		return "", 0, false
+	}
+	if len(fields) < i+7 {
+		return "", 0, false
+	}
+	host := fields[i+2]
+	validHostPair := (fields[i] == "ip" && fields[i+1] == "daddr" && host == "127.0.0.1") ||
+		(fields[i] == "ip6" && fields[i+1] == "daddr" && host == "::1")
+	if !validHostPair || fields[i+3] != "tcp" || fields[i+4] != "dport" || !isTCPPort(fields[i+5]) || fields[i+6] != "accept" ||
+		!nftRuleTailIsCommentOnly(fields[i+7:]) {
+		return "", 0, false
+	}
+	port, err := strconv.Atoi(fields[i+5])
+	if err != nil {
+		return "", 0, false
+	}
+	return host, port, true
+}
+
+func chainLinesHaveAgentDNSDropBeforeCatchAll(lines []string, agentUID int, protocol string) bool {
+	return chainLinesHaveLineBeforeAgentDrop(lines, agentUID, func(line string) bool {
+		return lineHasSkuidDNSDrop(line, agentUID, protocol)
+	})
+}
+
+// lineHasAgentLoopbackAllowForHost matches an agent-owned loopback accept for
+// an arbitrary loopback host (127.0.0.1 or ::1) and port. lineHasAgentProxyLoopbackAllow
+// stays IPv4-only and proxy-port-specific because every existing caller only
+// ever needs that one case; this is the general form declared loopback
+// services need.
+func lineHasAgentLoopbackAllowForHost(line string, agentUID int, host string, port int) bool {
+	gotHost, gotPort, ok := agentLoopbackAllowHostPort(line, agentUID, true)
+	return ok && gotHost == host && gotPort == port
+}
+
+// lineHasAgentLoopbackReplyForHost matches the exact managed reply half of a
+// declared loopback-service pair. Keep this distinct from the broader legacy
+// established-reply recognizer so verification and reconciliation never claim
+// an unrelated hand-written reply rule as a declared service.
+func lineHasAgentLoopbackReplyForHost(line string, agentUID int, host string, port int) bool {
+	fields := nftLineFields(line)
+	saddrKeyword := []string{"ip", "saddr"}
+	if host == "::1" {
+		saddrKeyword = []string{"ip6", "saddr"}
+	}
+	want := append([]string{"meta", "skuid", strconv.Itoa(agentUID), "oifname", `"lo"`}, saddrKeyword...)
+	want = append(want, host, "tcp", "sport", strconv.Itoa(port), "ct", "state")
+	if len(fields) < len(want)+5 {
+		return false
+	}
+	for i, field := range want {
+		if fields[i] != field {
+			return false
+		}
+	}
+	tail := fields[len(want):]
+	if !nftEstablishedState(tail[0]) || tail[1] != "ct" || tail[2] != "direction" || !nftReplyDirection(tail[3]) || tail[4] != "accept" {
+		return false
+	}
+	return nftRuleTailIsCommentOnly(tail[5:])
+}
+
+// nftEstablishedState and nftReplyDirection accept both the named literals in
+// the rendered rules and nft's numeric spelling in `nft -n -a list chain`.
+// Reconciliation and verification consume the latter, so accepting only the
+// source spelling causes an already-installed paired block to be appended.
+func nftEstablishedState(value string) bool {
+	return value == "established" || value == "0x2"
+}
+
+func nftReplyDirection(value string) bool {
+	return value == "reply" || value == "1"
+}
+
+// nftVerdictTokens are the rule tokens that can end or redirect evaluation.
+// nft(8) VERDICT STATEMENT lists accept, drop, queue, return, jump and goto
+// (continue only resumes evaluation); REJECT STATEMENT is terminal. A verdict
+// map (vmap) picks one of those per element, so its accept is either hidden in
+// a named map the chain listing doesn't expand or printed with a trailing comma
+// ("accept,"). The token itself has to count as a verdict.
+var nftVerdictTokens = []string{"accept", "drop", "reject", "return", "jump", "goto", "queue", "vmap"}
+
+// chainLinesHaveUnsafeVerdictBeforeAgentDrop treats declarations as namespace
+// state only. They cannot authorize additional host nft accepts.
+func chainLinesHaveUnsafeVerdictBeforeAgentDrop(lines []string, uids containmentUIDs, proxyPort int) bool {
+	return chainLinesHaveLineBeforeAgentDrop(lines, uids.agentUID, func(line string) bool {
+		// Before the agent catch-all drop, only the managed operator/proxy
+		// accepts, the agent's proxy loopback allow, and DNS drops are safe.
+		// Declared loopback services are namespace-local socket forwarders, so
+		// any additional host nft accept is stale and unsafe. Any other
+		// terminal/control-flow
+		// verdict can bypass containment under the base-chain "policy accept"
+		// default or intercept the direct canary before it reaches the counter
+		// used for attribution. An agent-owned loopback accept that is NOT the
+		// proxy port is exactly the stale or hand-inserted carve-out this check
+		// exists to catch.
+		if !lineHasAnyToken(line, nftVerdictTokens...) {
+			return false
+		}
+		if uids.operatorKnown && lineHasTerminalSkuidVerdict(line, uids.operatorUID, "accept") {
+			return false
+		}
+		if lineHasTerminalSkuidVerdict(line, uids.proxyUID, "accept") {
+			return false
+		}
+		if lineHasAgentProxyLoopbackAllow(line, uids.agentUID, proxyPort) {
+			return false
+		}
+		if lineHasAgentListenerGuardForProxy(line, uids.proxyUID) {
+			return false
+		}
+		if lineHasAgentEstablishedReplyAllow(line, uids.agentUID) {
+			return false
+		}
+		if lineHasSkuidDNSDrop(line, uids.agentUID, "udp") ||
+			lineHasSkuidDNSDrop(line, uids.agentUID, "tcp") {
+			return false
+		}
+		for _, verdict := range []string{"accept", "drop", "reject"} {
+			if uid, ok := terminalSkuidUIDVerdict(line, verdict); ok && uid != uids.agentUID {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// declaredContainmentLoopbackServicesForVerify reads containment.loopback_services
+// from the managed config verify already reads for probeManagedConfigMetrics
+// (env.configPath). ANY failure to read, parse, or validate the managed
+// config -- missing, unreadable without root, malformed YAML, or an
+// unusable declared entry -- is returned as a named problem. Namespace and
+// nft probes consume that problem separately: declarations create socket
+// forwarders now and never widen the host nft allowlist.
+// declaredContainmentLoopbackServicesForVerify additionally returns a
+// non-empty problem string whenever it falls back to an empty declared set
+// because the managed config could not be read/parsed or a declared entry
+// is malformed/expired -- not when the managed config is simply absent or
+// genuinely declares nothing. Callers surface this alongside the generic
+// relevant FAIL so an operator sees why a declared service cannot be
+// reconciled, including its host, owner, and expiry context.
+// The bool reports whether the managed config EXISTS and declares something
+// this probe cannot honor, which is the only one of these states that is the
+// operator's own unusable declaration rather than a host that has not got one
+// yet. A missing or unreadable config is not that: it is indistinguishable
+// from a host that never declared a service, and failing the probe on it
+// would refuse every host without a managed config at this path.
+func declaredContainmentLoopbackServicesForVerify(env *probeEnv, proxyPort int) ([]config.ContainmentLoopbackService, string, bool) {
+	decl := readVerifyLoopbackDeclaration(env, proxyPort)
+	return decl.services, decl.problem, decl.unusable
+}
+
+// verifyLoopbackDeclaration is what verify learned from the managed config's
+// containment.loopback_services. When lapsedOnly is set the only defect is one
+// or more expired entries: services holds the unexpired ones, which a probe
+// can still check, and the probe must still FAIL naming the expired entry.
+type verifyLoopbackDeclaration struct {
+	services   []config.ContainmentLoopbackService
+	problem    string
+	unusable   bool
+	lapsedOnly bool
+}
+
+func readVerifyLoopbackDeclaration(env *probeEnv, proxyPort int) verifyLoopbackDeclaration {
+	data, err := env.readFile(env.configPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// A genuinely absent managed config is a known, explainable
+			// state -- distinct from an unreadable one -- so name it rather
+			// than reporting no problem at all: an operator who expects a
+			// declared service reachable needs to know verify found no
+			// managed config to read it from.
+			return verifyLoopbackDeclaration{problem: fmt.Sprintf("no managed config was found at %s; containment.loopback_services cannot be honored until it exists", env.configPath)}
+		}
+		return verifyLoopbackDeclaration{problem: fmt.Sprintf("managed config %s could not be read (%v); treating the declared set as empty until it is readable again", env.configPath, err)}
+	}
+	declared, lapsed, err := parseContainmentLoopbackServicesWithLapsed(data, proxyPort, time.Now())
+	if err != nil {
+		return verifyLoopbackDeclaration{problem: fmt.Sprintf("managed config %s declares containment.loopback_services that Pipelock cannot honor (%v); treating the declared set as empty until it is fixed and containment is reconciled -- remove or re-approve the offending entry, then run the reconciliation command", env.configPath, err), unusable: true}
+	}
+	if len(lapsed) > 0 {
+		// An expired entry is a lapsed grant: the usable entries are still
+		// returned so a caller can check them, and the bool still reports an
+		// unusable declaration so the probe FAILS and names the expired one.
+		return verifyLoopbackDeclaration{services: declared, problem: lapsedLoopbackServicesProblem(env.configPath, lapsed), unusable: true, lapsedOnly: true}
+	}
+	return verifyLoopbackDeclaration{services: declared}
+}
+
+// lapsedLoopbackServicesProblem names every expired containment.loopback_services
+// entry for verify and doctor output. The unexpired entries are still
+// reconciled and checked; the FAIL stays until the expired entry is renewed or
+// removed from the managed config.
+func lapsedLoopbackServicesProblem(configPath string, lapsed []config.LapsedContainmentGrant) string {
+	names := make([]string, 0, len(lapsed))
+	for _, grant := range lapsed {
+		names = append(names, grant.Message)
+	}
+	return fmt.Sprintf("managed config %s declares expired containment.loopback_services (%s); the expired entry is dropped from the effective set and unexpired entries are still checked -- renew or remove it, then run the reconciliation command", configPath, strings.Join(names, "; "))
+}
+
+// containmentBypassDetailPrefix is the single wording for a definite agent-UID
+// bypass. doctorChainStructureReader matches on it to distinguish a definite
+// CONTAINMENT HOLE from an inconclusive structural result, so the prefix and
+// the formatted detail must not drift apart into independent literals.
+const (
+	containmentHoleDetailPrefix   = "CONTAINMENT HOLE:"
+	containmentBypassDetailPrefix = containmentHoleDetailPrefix + " agent UID accept rule"
+	containmentBypassDetailFormat = containmentBypassDetailPrefix + " bypasses managed catch-all DROP: %s"
+)
+
+// agentUIDBareAcceptBeforeDrop identifies the one pre-drop rule shape whose
+// meaning is unambiguous: it admits every packet from the contained agent.
+// Counters, logs, comments, and nft handle annotations are bookkeeping, not
+// predicates. Any additional match predicate intentionally remains unknown.
+func agentUIDBareAcceptBeforeDrop(lines []string, agentUID int) (string, bool) {
+	var offending string
+	found := chainLinesHaveLineBeforeAgentDrop(lines, agentUID, func(line string) bool {
+		if !lineHasBareAgentUIDAccept(line, agentUID) {
+			return false
+		}
+		offending = strings.TrimSpace(line)
+		return true
+	})
+	return offending, found
+}
+
+// agentUIDConditionalAcceptBeforeDrop recognizes direct accepts for the
+// agent UID using the expressions documented by lineHasDefiniteAgentAccept.
+// Other predicates and legacy marks keep their existing diagnostics.
+func agentUIDConditionalAcceptBeforeDrop(lines []string, uids containmentUIDs, port int) (string, bool) {
+	var offending string
+	found := chainLinesHaveLineBeforeAgentDrop(lines, uids.agentUID, func(line string) bool {
+		if !lineHasDefiniteAgentAccept(line, uids.agentUID, port) {
+			return false
+		}
+		offending = strings.TrimSpace(line)
+		return true
+	})
+	return offending, found
+}
+
+// lineHasDefiniteAgentAccept recognizes nft(8)'s literal destination and TCP
+// destination-port expressions followed by accept. Sets, other expressions,
+// and malformed literals remain with the general unexpected-verdict guard;
+// they are refused but their reachability has not been established here.
+func lineHasDefiniteAgentAccept(line string, agentUID, proxyPort int) bool {
+	fields := nftLineFields(line)
+	if len(fields) < 7 || !slices.Equal(fields[:3], []string{"meta", "skuid", strconv.Itoa(agentUID)}) {
+		return false
+	}
+	i := 3
+	destination := ""
+	if fields[i] == "ip" || fields[i] == "ip6" {
+		if len(fields) <= i+3 || fields[i+1] != "daddr" {
+			return false
+		}
+		destination = fields[i+2]
+		ip := net.ParseIP(destination)
+		if ip == nil {
+			parsed, network, err := net.ParseCIDR(destination)
+			if err != nil {
+				return false
+			}
+			// RFC 4632: a full-width prefix denotes exactly one address.
+			// Treat the proxy's /32 the same as its literal, so a narrower
+			// spelling never becomes a claimed direct-egress bypass.
+			if ones, bits := network.Mask.Size(); ones == bits {
+				destination = parsed.String()
+			}
+		}
+		if (fields[i] == "ip") == strings.Contains(destination, ":") {
+			return false
+		}
+		i += 3
+	}
+	port := 0
+	if len(fields) > i+3 && fields[i] == "tcp" && fields[i+1] == "dport" && isTCPPort(fields[i+2]) {
+		port, _ = strconv.Atoi(fields[i+2])
+		i += 3
+	} else if destination == "" {
+		return false
+	}
+	acceptAt := indexTokenAfter(fields, "accept", i)
+	if acceptAt < 0 || !fieldsAreNFTBookkeeping(fields[i:acceptAt]) || !nftRuleTailIsCommentOnly(fields[acceptAt+1:]) {
+		return false
+	}
+	return destination != "127.0.0.1" || port != proxyPort
+}
+
+func lineHasBareAgentUIDAccept(line string, agentUID int) bool {
+	fields := nftLineFields(line)
+	skuidAt := indexSkuidUID(fields, strconv.Itoa(agentUID))
+	if skuidAt != 2 || fields[0] != "meta" {
+		return false
+	}
+	acceptAt := indexTokenAfter(fields, "accept", skuidAt+1)
+	if acceptAt == -1 {
+		return false
+	}
+	return fieldsAreNFTBookkeeping(fields[skuidAt+1:acceptAt]) &&
+		nftRuleTailIsCommentOnly(fields[acceptAt+1:])
+}
+
+// containmentBypassError preserves a definite structural bypass through the
+// counter-reader API so direct-egress probes can report FAIL rather than hide
+// it behind an otherwise inconclusive attribution error.
+type containmentBypassError struct{ rule string }
+
+func (e *containmentBypassError) Error() string {
+	return fmt.Sprintf("agent UID accept rule bypasses managed catch-all DROP: %s", e.rule)
+}
+
+func definiteContainmentBypassRule(err error) (string, bool) {
+	var bypass *containmentBypassError
+	if !errors.As(err, &bypass) {
+		return "", false
+	}
+	return bypass.rule, true
+}
+
+// lineHasAgentEstablishedReplyAllow recognizes a narrow server reply path.
+// Established TCP replies cannot admit the NEW outbound connection used by the
+// direct-egress canary. The explicit conntrack direction prevents an
+// established original-direction flow from being mistaken for a reply.
+func lineHasAgentEstablishedReplyAllow(line string, agentUID int) bool {
+	fields := nftLineFields(line)
+	const predicatesLen = 17
+	if len(fields) <= predicatesLen {
+		return false
+	}
+	interfaceOK := fields[3] == "oifname" && isQuotedNFTName(fields[4]) ||
+		fields[3] == "oif" && isPositiveInteger(fields[4])
+	if fields[0] != "meta" || fields[1] != "skuid" || fields[2] != strconv.Itoa(agentUID) ||
+		!interfaceOK ||
+		fields[5] != "ip" || (fields[6] != "saddr" && fields[6] != "daddr") || net.ParseIP(fields[7]).To4() == nil ||
+		fields[8] != "tcp" || fields[9] != "sport" || !isTCPPort(fields[10]) ||
+		fields[11] != "ct" || fields[12] != "state" || (fields[13] != "established" && fields[13] != "0x2") ||
+		fields[14] != "ct" || fields[15] != "direction" || (fields[16] != "reply" && fields[16] != "1") {
+		return false
+	}
+	acceptAt := indexTokenAfter(fields, "accept", predicatesLen)
+	return acceptAt != -1 &&
+		fieldsAreNFTBookkeeping(fields[predicatesLen:acceptAt]) &&
+		nftRuleTailIsCommentOnly(fields[acceptAt+1:])
+}
+
+func isQuotedNFTName(value string) bool {
+	return len(value) >= 3 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)
+}
+
+func isTCPPort(value string) bool {
+	port, err := strconv.Atoi(value)
+	return err == nil && port >= 1 && port <= 65535
+}
+
+func isPositiveInteger(value string) bool {
+	n, err := strconv.Atoi(value)
+	return err == nil && n > 0
+}
+
+// terminalSkuidUIDVerdict extracts the UID from an exact skuid verdict rule.
+func terminalSkuidUIDVerdict(line, verdict string) (int, bool) {
+	fields := nftLineFields(line)
+	if len(fields) < 4 || fields[0] != "meta" || fields[1] != "skuid" {
+		return 0, false
+	}
+	uid, err := strconv.Atoi(fields[2])
+	return uid, err == nil && lineHasTerminalSkuidVerdict(line, uid, verdict)
+}
+
+// lineHasTerminalSkuidVerdict matches an exact UID with a terminal verdict.
+// nft(8) evaluates expressions in order. A predicate before skuid still limits
+// the verdict and must never establish an unconditional catch-all boundary.
+func lineHasTerminalSkuidVerdict(line string, uid int, verdict string) bool {
+	fields := nftLineFields(line)
+	if len(fields) < 4 || !slices.Equal(fields[:3], []string{"meta", "skuid", strconv.Itoa(uid)}) {
+		return false
+	}
+	verdictAt := indexTokenAfter(fields, verdict, 3)
+	if verdictAt == -1 {
+		return false
+	}
+	return fieldsAreNFTBookkeeping(fields[3:verdictAt]) && nftRuleTailIsCommentOnly(fields[verdictAt+1:])
+}
+
+// lineHasSkuidDNSDrop matches the canonical UID/protocol drop rule for DNS,
+// destination port 53 (RFC 1035 section 4.2).
+func lineHasSkuidDNSDrop(line string, uid int, protocol string) bool {
+	fields := nftLineFields(line)
+	skuidAt := indexSkuidUID(fields, strconv.Itoa(uid))
+	if skuidAt != 2 || fields[0] != "meta" || fields[1] != "skuid" || skuidAt+3 >= len(fields) {
+		return false
+	}
+	if fields[skuidAt+1] != protocol || fields[skuidAt+2] != "dport" || fields[skuidAt+3] != "53" {
+		return false
+	}
+	verdictAt := indexTokenAfter(fields, "drop", skuidAt+4)
+	if verdictAt == -1 {
+		return false
+	}
+	return fieldsAreNFTBookkeeping(fields[skuidAt+4:verdictAt]) && nftRuleTailIsCommentOnly(fields[verdictAt+1:])
+}
+
+func indexSkuidUID(fields []string, uidText string) int {
+	for i := 0; i+1 < len(fields); i++ {
+		if fields[i] == "skuid" && fields[i+1] == uidText {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func indexTokenAfter(fields []string, want string, start int) int {
+	for i := start; i < len(fields); i++ {
+		if fields[i] == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// fieldsAreNFTBookkeeping accepts only counter and log tokens between the
+// managed rule's UID predicate and DROP verdict.
+// nftLogOptionsWithValue lists the `log` statement options nft renders with one
+// following argument (nft(8), "LOG STATEMENT"). They change what gets logged,
+// never whether a packet matches, so a rule that carries them is still a bare
+// agent-UID accept. `flags` is handled separately because its `tcp` and `ip`
+// forms take a second token (`flags tcp sequence,options`, `flags ip options`).
+var nftLogOptionsWithValue = map[string]struct{}{
+	"level": {}, "group": {}, "queue-threshold": {}, "snaplen": {},
+}
+
+func fieldsAreNFTBookkeeping(fields []string) bool {
+	inPrefix := false
+	seenCounter := false
+	seenLog := false
+	expectCount := false
+	expectLogValue := false
+	expectLogFlags := false
+	for _, field := range fields {
+		if inPrefix {
+			if strings.HasSuffix(field, `"`) {
+				inPrefix = false
+			}
+			continue
+		}
+		if expectLogFlags {
+			// `log flags` takes `tcp <sequence|options|sequence,options>`,
+			// `ip options`, `skuid`, `ether`, or `all`; the tcp and ip
+			// forms carry one more token.
+			expectLogFlags = false
+			if field == "tcp" || field == "ip" {
+				expectLogValue = true
+			}
+			continue
+		}
+		if expectLogValue {
+			// A log option's single argument: a level name, flag word,
+			// or number. Only its presence matters here.
+			expectLogValue = false
+			continue
+		}
+		if seenLog && field == "flags" {
+			expectLogFlags = true
+			continue
+		}
+		if _, isLogOption := nftLogOptionsWithValue[field]; isLogOption && seenLog {
+			expectLogValue = true
+			continue
+		}
+		if expectCount {
+			// `nft list` renders an inline counter as
+			// "counter packets <n> bytes <n>"; consume the numeric
+			// argument that follows the packets/bytes keyword.
+			expectCount = false
+			if _, err := strconv.ParseUint(field, 10, 64); err == nil {
+				continue
+			}
+			return false
+		}
+		switch field {
+		case "counter":
+			seenCounter = true
+		case "log":
+			seenLog = true
+		case "packets", "bytes":
+			if !seenCounter {
+				return false
+			}
+			expectCount = true
+		case "prefix":
+			if !seenLog {
+				return false
+			}
+			inPrefix = true
+		default:
+			return false
+		}
+	}
+	return !inPrefix && !expectCount && !expectLogValue && !expectLogFlags
+}
+
+func nftRuleTailIsCommentOnly(fields []string) bool {
+	if len(fields) == 0 {
+		return true
+	}
+	return len(fields) == 2 && fields[0] == "comment" && strings.HasPrefix(fields[1], `"`) && strings.HasSuffix(fields[1], `"`)
+}
+
+// lineHasAnyToken finds any requested unquoted nft syntax token.
+func lineHasAnyToken(line string, wants ...string) bool {
+	for _, field := range nftLineFields(line) {
+		for _, want := range wants {
+			if field == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// nftLineFields tokenizes one nft list-output line without treating whitespace
+// or verdict-looking words inside quoted strings as rule syntax. A trailing
+// "# handle N" annotation is a comment and is omitted. This is intentionally a
+// small list-output tokenizer, not a general nft parser: the verifier only
+// needs stable tokens for the canonical rules renderNFTRules emits.
+func nftLineFields(line string) []string {
+	fields := make([]string, 0, 16)
+	var field strings.Builder
+	inQuote := false
+	escaped := false
+	flush := func() {
+		if field.Len() == 0 {
+			return
+		}
+		fields = append(fields, field.String())
+		field.Reset()
+	}
+
+	for _, r := range line {
+		if inQuote {
+			field.WriteRune(r)
+			switch {
+			case escaped:
+				escaped = false
+			case r == '\\':
+				escaped = true
+			case r == '"':
+				inQuote = false
+			}
+			continue
+		}
+
+		switch r {
+		case '#':
+			flush()
+			return fields
+		case '"':
+			inQuote = true
+			field.WriteRune(r)
+		case ' ', '\t', '\r', '\n', '\v', '\f':
+			flush()
+		default:
+			field.WriteRune(r)
+		}
+	}
+	flush()
+	return fields
+}
+
+// nftLineBraceDelta counts structural braces while ignoring braces inside
+// quoted comments/log prefixes and trailing "# handle N" annotations.
+func nftLineBraceDelta(line string) int {
+	delta := 0
+	inQuote := false
+	escaped := false
+	for _, r := range line {
+		if inQuote {
+			switch {
+			case escaped:
+				escaped = false
+			case r == '\\':
+				escaped = true
+			case r == '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch r {
+		case '#':
+			return delta
+		case '"':
+			inQuote = true
+		case '{':
+			delta++
+		case '}':
+			delta--
+		}
+	}
+	return delta
+}
+
+// nftLineHasBalancedQuotes rejects malformed list output before chain traversal.
+// Without this check, an unterminated quoted comment could hide the target
+// chain's closing brace and make rules in a later chain look attributable to it.
+func nftLineHasBalancedQuotes(line string) bool {
+	inQuote := false
+	escaped := false
+	for _, r := range line {
+		if inQuote {
+			switch {
+			case escaped:
+				escaped = false
+			case r == '\\':
+				escaped = true
+			case r == '"':
+				inQuote = false
+			}
+			continue
+		}
+		switch r {
+		case '#':
+			return true
+		case '"':
+			inQuote = true
+		}
+	}
+	return !inQuote
+}
+
+// isNFTChainDeclaration reports whether line declares exactly chainName.
+func isNFTChainDeclaration(line, chainName string) bool {
+	if !nftLineHasBalancedQuotes(line) {
+		return false
+	}
+	fields := nftLineFields(line)
+	if len(fields) == 3 {
+		return fields[0] == "chain" && fields[1] == chainName && fields[2] == "{"
+	}
+	// Retain support for compact synthetic listings used by older tests while
+	// requiring an exact name rather than a prefix match.
+	return line == "chain "+chainName+"{"
+}
+
+// outputHasNFTChainDeclaration finds an exact chain declaration in nft output.
+func outputHasNFTChainDeclaration(out, chainName string) bool {
+	for _, raw := range strings.Split(out, "\n") {
+		if isNFTChainDeclaration(strings.TrimSpace(raw), chainName) {
+			return true
+		}
+	}
+	return false
+}
+
+// attributedNFTChainLines accepts only output from an exact
+// `nft list chain inet <table> <chain>` query. The command itself attributes
+// the following rules to the requested chain; this parser rejects ambiguous
+// table-wide output that includes a different chain and never searches later
+// chains for missing evidence.
+func attributedNFTChainLines(out, chainName string) ([]string, error) {
+	var lines []string
+	declared := false
+	for _, raw := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "table ") || line == "}" {
+			continue
+		}
+		if strings.HasPrefix(line, "chain ") {
+			if !isNFTChainDeclaration(line, chainName) {
+				return nil, fmt.Errorf("nft output is not positively attributed to chain %s", chainName)
+			}
+			if declared {
+				return nil, fmt.Errorf("nft output declares chain %s more than once", chainName)
+			}
+			declared = true
+			continue
+		}
+		if !declared {
+			return nil, fmt.Errorf("nft output for chain %s has rule content before the chain declaration", chainName)
+		}
+		if !nftLineHasBalancedQuotes(line) {
+			return nil, fmt.Errorf("nft output for chain %s contains malformed quoted rule content", chainName)
+		}
+		lines = append(lines, line)
+	}
+	if !declared {
+		return nil, fmt.Errorf("chain %s missing from nft output", chainName)
+	}
+	return lines, nil
+}
+
+// chainLinesHaveLine applies match only to nft lines already attributed by an
+// exact list-chain command. A malformed line fails closed by not matching.
+func chainLinesHaveLine(lines []string, match func(string) bool) bool {
+	for _, line := range lines {
+		if !nftLineHasBalancedQuotes(line) {
+			return false
+		}
+		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// chainLinesHaveLineBeforeAgentDrop applies match only before the managed
+// agent DROP in nft lines already attributed to the exact live chain.
+func chainLinesHaveLineBeforeAgentDrop(lines []string, agentUID int, match func(string) bool) bool {
+	for _, line := range lines {
+		if !nftLineHasBalancedQuotes(line) {
+			return false
+		}
+		if lineHasTerminalSkuidVerdict(line, agentUID, "drop") {
+			return false
+		}
+		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// chainHasLineBeforeAgentDrop applies match only before the managed agent DROP.
+func chainHasLineBeforeAgentDrop(out, chainName string, agentUID int, match func(string) bool) bool {
+	lines, err := attributedNFTChainLines(out, chainName)
+	if err != nil {
+		return false
+	}
+	return chainLinesHaveLineBeforeAgentDrop(lines, agentUID, match)
+}
+
+// ---------------------------------------------------------------------------
+// Probe 4: wrapper_scripts_installed
+// ---------------------------------------------------------------------------
+
+func probeWrapperScripts(_ context.Context, env *probeEnv) (string, string) {
+	info, err := os.Stat(filepath.Clean(env.launchPath))
+	if err != nil {
+		return statusFail, fmt.Sprintf("%s missing: %v", env.launchPath, err)
+	}
+	mode := info.Mode().Perm()
+	if mode != 0o755 {
+		return statusFail, fmt.Sprintf("%s has perm 0o%03o, want 0o755", env.launchPath, mode)
+	}
+
+	metaPath := filepath.Join(env.wrapperDir, "plk")
+	info, err = os.Stat(filepath.Clean(metaPath))
+	if err != nil {
+		return statusFail, fmt.Sprintf("%s missing: %v", metaPath, err)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 {
+		return statusFail, fmt.Sprintf("%s is not a non-empty executable wrapper file", metaPath)
+	}
+	mode = info.Mode().Perm()
+	if mode != 0o755 {
+		return statusFail, fmt.Sprintf("%s has perm 0o%03o, want 0o755", metaPath, mode)
+	}
+
+	wrappers, err := wrappersForVerify(env)
+	if err != nil {
+		return statusFail, err.Error()
+	}
+	var foundNames []string
+	for _, name := range wrappers {
+		if strings.TrimSpace(name) == "" {
+			return statusFail, "wrapper inventory contains empty wrapper name"
+		}
+		p := filepath.Join(env.wrapperDir, name)
+		info, err := os.Stat(filepath.Clean(p))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return statusFail, fmt.Sprintf("%s stat failed: %v", p, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() == 0 {
+			return statusFail, fmt.Sprintf("%s is not a non-empty executable wrapper file", p)
+		}
+		mode := info.Mode().Perm()
+		if mode != 0o755 {
+			return statusFail, fmt.Sprintf("%s has perm 0o%03o, want 0o755", p, mode)
+		}
+		foundNames = append(foundNames, name)
+	}
+	if len(foundNames) == 0 {
+		return statusFail, fmt.Sprintf("no tool wrappers found in %s (expected one of %v)",
+			env.wrapperDir, wrappers)
+	}
+	return statusPass, fmt.Sprintf("plk + plk-launch + %d tool wrapper(s): %s",
+		len(foundNames), strings.Join(foundNames, ","))
+}
+
+func wrappersForVerify(env *probeEnv) ([]string, error) {
+	if env.wrapperInvPath == "" {
+		return append([]string(nil), env.toolWrappers...), nil
+	}
+	data, err := env.readFile(env.wrapperInvPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return append([]string(nil), env.toolWrappers...), nil
+		}
+		return nil, fmt.Errorf("read wrapper inventory %s: %w", env.wrapperInvPath, err)
+	}
+	var inv wrapperInventory
+	if err := json.Unmarshal(data, &inv); err != nil {
+		return nil, fmt.Errorf("parse wrapper inventory %s: %w", env.wrapperInvPath, err)
+	}
+	if len(inv.Wrappers) == 0 {
+		return nil, fmt.Errorf("wrapper inventory %s is empty", env.wrapperInvPath)
+	}
+	return append([]string(nil), inv.Wrappers...), nil
+}
+
+// ---------------------------------------------------------------------------
+// Probe 5: ca_bundle_present
+// ---------------------------------------------------------------------------
+
+func probeCABundle(ctx context.Context, env *probeEnv) (string, string) {
+	data, err := os.ReadFile(filepath.Clean(env.caBundlePath))
+	if err != nil {
+		return statusFail, fmt.Sprintf("read %s: %v", env.caBundlePath, err)
+	}
+
+	count, pipelockCN, parseErr := scanPipelockCertCN(data)
+	if parseErr != nil {
+		return statusFail, fmt.Sprintf("parse %s: %v", env.caBundlePath, parseErr)
+	}
+	if count == 0 {
+		return statusFail, fmt.Sprintf("%s parsed 0 certificates", env.caBundlePath)
+	}
+	if pipelockCN == "" {
+		return statusFail, fmt.Sprintf("%s has %d cert(s); none match Pipelock", env.caBundlePath, count)
+	}
+	// A subject common name is chosen by whoever mints the certificate, so two
+	// different Pipelock CAs carry the same one. This bundle is what every
+	// contained client actually trusts (SSL_CERT_FILE, NODE_EXTRA_CA_CERTS and
+	// their siblings all point here), so matching a name would let a rotated-out
+	// CA keep passing verification while clients trust material the proxy no
+	// longer presents. Require the selected CA's own bytes to be in the bundle.
+	currentReader := env.currentCA
+	if currentReader == nil {
+		currentReader = currentCAForVerify
+	}
+	current, err := currentReader(ctx, env)
+	if err != nil {
+		return statusFail, fmt.Sprintf("read the selected Pipelock CA to check %s: %v; run `pipelock contain ca-refresh` after the proxy is healthy", env.caBundlePath, err)
+	}
+	currentDER, err := firstCertificateDER(current)
+	if err != nil {
+		return statusFail, fmt.Sprintf("decode the selected Pipelock CA: %v", err)
+	}
+	if !bundleContainsCertificate(data, currentDER) {
+		return statusFail, fmt.Sprintf("%s does not contain the selected Pipelock CA (it has %d cert(s), including CN=%s); run `pipelock contain ca-refresh`", env.caBundlePath, count, pipelockCN)
+	}
+	// Presence of the current CA is not sufficient. A rotation that appended
+	// the new CA without removing the old one leaves BOTH trusted, so every
+	// contained client still accepts anything the retired CA signed. Requiring
+	// the current CA to be the ONLY Pipelock CA in the bundle is what makes a
+	// rotation actually retire the previous one.
+	if stale := stalePipelockCertsInBundle(data, currentDER); stale > 0 {
+		return statusFail, fmt.Sprintf("%s still contains %d retired Pipelock CA certificate(s) alongside the selected one, so contained clients keep trusting material the proxy no longer presents; run `pipelock contain ca-refresh`", env.caBundlePath, stale)
+	}
+	return statusPass, fmt.Sprintf("%d certs in bundle, including the selected Pipelock CA CN=%s (matched by certificate material, not subject name)", count, pipelockCN)
+}
+
+// firstCertificateDER returns the DER bytes of the first CERTIFICATE block in a
+// PEM input, so comparisons are on certificate material rather than on an
+// encoding that can differ while describing the same certificate.
+func firstCertificateDER(pemBytes []byte) ([]byte, error) {
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return nil, errors.New("no CERTIFICATE block found")
+		}
+		if block.Type == "CERTIFICATE" {
+			return block.Bytes, nil
+		}
+	}
+}
+
+// bundleContainsCertificate reports whether a PEM bundle carries a certificate
+// with exactly the given DER bytes.
+func bundleContainsCertificate(bundle, wantDER []byte) bool {
+	rest := bundle
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return false
+		}
+		if block.Type == "CERTIFICATE" && bytes.Equal(block.Bytes, wantDER) {
+			return true
+		}
+	}
+}
+
+// scanPipelockCertCN walks a PEM blob and returns the total cert
+// count and the CN of the first certificate whose subject CN
+// contains "pipelock" (case-insensitive).
+
+// stalePipelockCertsInBundle counts Pipelock-issued certificates in the bundle
+// that are NOT the currently selected CA. Each one is a CA whose signatures
+// contained clients still accept after it should have been retired.
+func stalePipelockCertsInBundle(bundle, currentDER []byte) int {
+	stale := 0
+	rest := bundle
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			return stale
+		}
+		if block.Type != "CERTIFICATE" || bytes.Equal(block.Bytes, currentDER) {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			// Unparseable entries are counted by the bundle parse above; this
+			// check only judges certificates it can read.
+			continue
+		}
+		if strings.Contains(strings.ToLower(cert.Subject.CommonName), "pipelock") {
+			stale++
+		}
+	}
+}
+
+func scanPipelockCertCN(data []byte) (int, string, error) {
+	var count int
+	var pipelockCN string
+	rest := data
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return count, pipelockCN, fmt.Errorf("certificate %d: %w", count+1, err)
+		}
+		count++
+		if pipelockCN == "" && strings.Contains(strings.ToLower(cert.Subject.CommonName), "pipelock") {
+			pipelockCN = cert.Subject.CommonName
+		}
+	}
+	return count, pipelockCN, nil
+}
+
+// ---------------------------------------------------------------------------
+// Probe 6: pipelock_listening_loopback
+// ---------------------------------------------------------------------------
+
+func probeLoopbackListen(ctx context.Context, env *probeEnv) (string, string) {
+	addr := net.JoinHostPort("127.0.0.1", fmt.Sprintf("%d", env.port))
+	start := time.Now()
+	timeout := env.readinessTimeout
+	if timeout <= 0 {
+		timeout = readinessTimeout
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	maxAttempts := int(timeout/readinessInterval) + 1
+	const serviceStatePollEvery = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		conn, err := env.dialCtx(readyCtx, "tcp", addr, min(probeDialTimeout, readinessInterval))
+		if err == nil {
+			elapsed := time.Since(start)
+			_ = conn.Close()
+			return statusPass, fmt.Sprintf("%s accepted TCP within %s", addr, formatDialDuration(elapsed))
+		}
+		lastErr = err
+
+		if attempt%serviceStatePollEvery == 0 || attempt == maxAttempts-1 {
+			out, code, showErr := env.runCmd(readyCtx, "systemctl", "show", env.serviceName,
+				"--property=ActiveState,SubState",
+			)
+			if showErr == nil && code == 0 {
+				fields := parseSystemdShow(out)
+				if fields["ActiveState"] != systemctlActive || fields["SubState"] != "running" {
+					return statusFail, fmt.Sprintf("dial %s: %v; service exited before readiness (ActiveState=%s SubState=%s)",
+						addr, err, fields["ActiveState"], fields["SubState"])
+				}
+			}
+		}
+		if attempt == maxAttempts-1 {
+			break
+		}
+		if err := env.wait(readyCtx, readinessInterval); err != nil {
+			break
+		}
+	}
+	return statusFail, fmt.Sprintf("dial %s: service did not become ready within %s (last error: %v)", addr, timeout, lastErr)
+}
+
+// formatDialDuration renders an elapsed dial time at millisecond
+// resolution, special-casing sub-millisecond results so they don't
+// appear as a misleading "0s".
+func formatDialDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return "<1ms"
+	}
+	return d.Round(time.Millisecond).String()
+}
+
+// ---------------------------------------------------------------------------
+// Probe 7: no_proxy_env_correct
+// ---------------------------------------------------------------------------
+
+func probeNoProxyEnv(_ context.Context, env *probeEnv) (string, string) {
+	data, err := os.ReadFile(filepath.Clean(env.launchPath))
+	if err != nil {
+		return statusFail, fmt.Sprintf("read %s: %v", env.launchPath, err)
+	}
+	actual := extractNoProxy(data)
+	if actual == "" {
+		return statusFail, fmt.Sprintf("NO_PROXY assignment not found in %s", env.launchPath)
+	}
+	if actual != expectedNoProxy {
+		return statusFail, fmt.Sprintf("NO_PROXY value differs from policy: %q (want %q)", actual, expectedNoProxy)
+	}
+	return statusPass, expectedNoProxy
+}
+
+// extractNoProxy finds the first NO_PROXY=<value> assignment in the
+// wrapper script and returns the full assignment string up to the
+// first whitespace or shell line continuation. Returns "" if no
+// assignment is present.
+func extractNoProxy(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			field = strings.TrimSuffix(field, "\\")
+			if strings.HasPrefix(field, "NO_PROXY=") {
+				return field
+			}
+		}
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Probe 8: cc_agent_egress_denied
+// ---------------------------------------------------------------------------
+
+func curlNoProxyArgsFor(curl string) []string {
+	if curl == "" {
+		curl = defaultCurlPath
+	}
+	return []string{
+		curl,
+		"--connect-timeout", curlConnectTimeout,
+		"--max-time", curlMaxTime,
+		"--noproxy", "*",
+		"-sS",
+		"-o", "/dev/null",
+		"-w", "%{http_code}",
+		canaryURL,
+	}
+}
+
+// curlDirectCanaryArgsFor builds the bounded DNS-free direct-egress probe.
+func curlDirectCanaryArgsFor(curl string) []string {
+	if curl == "" {
+		curl = defaultCurlPath
+	}
+	return []string{
+		curl,
+		"--connect-timeout", directCurlConnectTimeout,
+		"--max-time", directCurlMaxTime,
+		"--noproxy", "*",
+		"-sS",
+		"-o", "/dev/null",
+		"-w", directCurlWriteOut,
+		directEgressCanaryURL,
+	}
+}
+
+// readContainmentDropCounter reads the packet counter on the single managed
+// catch-all DROP rule for the current contained-agent UID. Probe 8 uses a
+// literal IP and therefore must reach this rule rather than either DNS rule.
+func readContainmentDropCounter(ctx context.Context, env *probeEnv) (uint64, error) {
+	current, err := containmentUIDsFromProbeEnv(env)
+	if err != nil {
+		return 0, err
+	}
+	out, code, err := env.runCmd(ctx, probeNFTExecutable(env), "-n", "-a", "list", "chain", "inet", env.nftTable, env.nftChain)
+	if err != nil {
+		return 0, fmt.Errorf("list nft chain: %w", err)
+	}
+	if code != 0 {
+		return 0, fmt.Errorf("list nft chain exit=%d: %s", code, oneLine(out))
+	}
+	_, loopbackProblem, loopbackUnusable := declaredContainmentLoopbackServicesForVerify(env, env.port)
+	return containmentDropCounterFromChainText(out, env.nftChain, current, env.port, loopbackProblem, loopbackUnusable)
+}
+
+// containmentDropCounterFromChainText is the single recognizer behind probe
+// 8's DROP-counter attribution. Production feeds it live `nft list chain`
+// output; the published conformance fixtures feed it fixture chain text. One
+// function, not two copies, so the artifact that exists to prove the egress
+// test is real can never drift from what `contain verify` actually checks.
+func containmentDropCounterFromChainText(out, chainName string, uids containmentUIDs, port int, loopbackProblem string, loopbackUnusable bool) (uint64, error) {
+	lines, err := attributedNFTChainLines(out, chainName)
+	if err != nil {
+		return 0, err
+	}
+	if !nftChainLinesHaveManagedOutputBaseChain(lines) {
+		return 0, fmt.Errorf("chain %s is not the managed output base chain (want type filter hook output priority filter/0 policy accept)", chainName)
+	}
+	if rule, ok := agentUIDBareAcceptBeforeDrop(lines, uids.agentUID); ok {
+		return 0, &containmentBypassError{rule: rule}
+	}
+	// Same refusal probeNFTContainment makes, for the same reason. A
+	// declaration this host cannot honor makes the direct-canary
+	// attribution below unsafe even when the chain is canonical, because
+	// the count is then being read against a policy nobody could verify.
+	// Surfacing the problem only alongside an unsafe verdict, as the
+	// branch below once did alone, left exactly this path reporting a
+	// clean count for an unusable policy.
+	if loopbackUnusable {
+		return 0, fmt.Errorf("chain %s: containment.loopback_services cannot be honored, so direct-canary attribution is unsafe: %s", chainName, loopbackProblem)
+	}
+	if chainLinesHaveUnsafeVerdictBeforeAgentDrop(lines, uids, port) {
+		if loopbackProblem != "" {
+			return 0, fmt.Errorf("chain %s has an unexpected verdict before managed catch-all DROP; direct-canary attribution is unsafe: %s", chainName, loopbackProblem)
+		}
+		return 0, fmt.Errorf("chain %s has an unexpected verdict before managed catch-all DROP; direct-canary attribution is unsafe", chainName)
+	}
+	return managedContainmentDropPacketCountFromLines(lines, chainName, uids.agentUID)
+}
+
+// chainHasManagedOutputBaseChain confirms the requested chain is attached to
+// the local-output hook with the declaration renderNFTRules installs. nft may
+// print the standard "filter" priority symbolically or as its numeric value 0.
+// Without this check, a regular/unhooked lookalike chain could provide a benign
+// counter that the direct-canary packet never traverses.
+func chainHasManagedOutputBaseChain(out, chainName string) bool {
+	lines, err := attributedNFTChainLines(out, chainName)
+	if err != nil {
+		return false
+	}
+	return nftChainLinesHaveManagedOutputBaseChain(lines)
+}
+
+func nftChainLinesHaveManagedOutputBaseChain(lines []string) bool {
+	return chainLinesHaveLine(lines, func(line string) bool {
+		fields := nftLineFields(strings.ReplaceAll(line, ";", " "))
+		if len(fields) != 8 {
+			return false
+		}
+		return fields[0] == "type" &&
+			fields[1] == "filter" &&
+			fields[2] == "hook" &&
+			fields[3] == "output" &&
+			fields[4] == "priority" &&
+			(fields[5] == "filter" || fields[5] == "0") &&
+			fields[6] == "policy" &&
+			fields[7] == "accept"
+	})
+}
+
+// managedContainmentDropPacketCount extracts the packet count from exactly one
+// canonical managed agent catch-all DROP rule in the requested chain. Duplicate
+// lookalikes, wrong-chain rules, DNS counters, and rules with extra predicates
+// are rejected rather than accepted as attribution evidence.
+func managedContainmentDropPacketCount(out, chainName string, agentUID int) (uint64, error) {
+	lines, err := attributedNFTChainLines(out, chainName)
+	if err != nil {
+		return 0, err
+	}
+	return managedContainmentDropPacketCountFromLines(lines, chainName, agentUID)
+}
+
+func managedContainmentDropPacketCountFromLines(lines []string, chainName string, agentUID int) (uint64, error) {
+	var packets uint64
+	var parseErr error
+	matched := 0
+	for _, line := range lines {
+		if !nftLineHasBalancedQuotes(line) {
+			parseErr = fmt.Errorf("managed catch-all DROP rule has malformed quoted rule content: %s", oneLine(line))
+			break
+		}
+		if !strings.Contains(line, `log prefix "`+nftLogPrefix(EgressClassNotRoutingThroughPipelock)+` "`) {
+			continue
+		}
+
+		fields := nftLineFields(line)
+		uidAt := indexSkuidUID(fields, strconv.Itoa(agentUID))
+		// renderNFTRules emits the catch-all expression as the complete
+		// `meta skuid <uid>` predicate. Requiring it at the start rejects a
+		// destination/interface/etc. predicate placed before skuid; such a
+		// lookalike would not necessarily see the direct-canary packet.
+		if uidAt != 2 || fields[0] != "meta" || fields[1] != "skuid" {
+			continue
+		}
+		dropAt := indexTokenAfter(fields, "drop", uidAt+1)
+		if dropAt == -1 || uidAt+1 >= dropAt || fields[uidAt+1] != "counter" {
+			continue
+		}
+		packetsAt := -1
+		for i := uidAt + 1; i+2 < dropAt; i++ {
+			if fields[i] == "counter" && fields[i+1] == "packets" {
+				if packetsAt != -1 {
+					parseErr = fmt.Errorf("managed catch-all DROP rule has multiple packet counters: %s", oneLine(line))
+					break
+				}
+				packetsAt = i + 2
+			}
+		}
+		if parseErr != nil {
+			break
+		}
+		if packetsAt == -1 {
+			parseErr = fmt.Errorf("managed catch-all DROP rule has no expanded packet counter: %s", oneLine(line))
+			break
+		}
+		parsed, err := strconv.ParseUint(fields[packetsAt], 10, 64)
+		if err != nil {
+			parseErr = fmt.Errorf("parse managed catch-all DROP packet counter %q: %w", fields[packetsAt], err)
+			break
+		}
+		if !fieldsAreNFTBookkeeping(fields[uidAt+1 : dropAt]) {
+			continue
+		}
+		if packets > math.MaxUint64-parsed {
+			parseErr = fmt.Errorf("managed catch-all DROP packet counters overflow uint64 in chain %s for agent uid %d", chainName, agentUID)
+			break
+		}
+		packets += parsed
+		matched++
+	}
+	if parseErr != nil {
+		return 0, parseErr
+	}
+	if matched == 0 {
+		return 0, fmt.Errorf("no managed catch-all DROP packet counter found in chain %s for agent uid %d", chainName, agentUID)
+	}
+	return packets, nil
+}
+
+// probeCCAgentEgressDenied verifies that curl's probe-specific time_connect
+// reports no completed TCP dial and that the exact managed catch-all DROP
+// counter also increased. The counter is UID-wide corroboration only: it cannot
+// turn a completed or unattributable canary dial into PASS.
+func probeCCAgentEgressDenied(ctx context.Context, env *probeEnv) (string, string) {
+	var before uint64
+	var beforeErr error
+	if env.dropCounter != nil {
+		before, beforeErr = env.dropCounter(ctx, env)
+	}
+	curlArgs := curlDirectCanaryArgsFor(env.curlPath)
+	curlPath := curlArgs[0]
+	args := append([]string{"-n", "-u", env.agentUserName, "--"}, curlArgs...)
+	out, code, err := env.runCmd(ctx, "sudo", args...)
+	if err != nil {
+		return statusSkip, fmt.Sprintf("sudo/curl unavailable: %v", err)
+	}
+	if isSudoRefusal(out) {
+		return statusSkip, "sudo refused without password; configure NOPASSWD entry to enable canary"
+	}
+	if isSudoUserMissing(out) {
+		return statusSkip, fmt.Sprintf("%s user not present; install containment model first", env.agentUserName)
+	}
+	if isSudoTargetCommandMissing(out) {
+		return statusSkip, fmt.Sprintf("sudo could not execute %s; install curl to enable canary", curlPath)
+	}
+	if rule, ok := definiteContainmentBypassRule(beforeErr); ok {
+		return statusFail, fmt.Sprintf(containmentBypassDetailFormat, rule)
+	}
+	if code == 0 {
+		return statusFail, fmt.Sprintf("unexpected curl success: HTTP %s from direct canary %s", oneLine(out), directEgressCanaryURL)
+	}
+	dialCompletion := parseDirectCurlDialCompletion(out)
+	outcome, after, afterErr := classifyDirectEgressAttribution(code, dialCompletion, env.dropCounter != nil, before, beforeErr, func() (uint64, error) {
+		return env.dropCounter(ctx, env)
+	})
+	switch outcome {
+	case egressAttrFailPostConnect:
+		return statusFail, fmt.Sprintf("CONTAINMENT HOLE: direct egress reached the network before curl failed (exit=%d): %s", code, oneLine(out))
+	case egressAttrUnknownDialCompletion:
+		return statusUnknown, fmt.Sprintf("curl failed (exit=%d), but probe-specific time_connect was missing or unparseable; refusing to claim containment", code)
+	case egressAttrUnknownNoCounter:
+		return statusUnknown, fmt.Sprintf("curl failed (exit=%d), but no DROP counter reader is available; containment attribution is inconclusive", code)
+	case egressAttrUnknownBeforeErr:
+		return statusUnknown, fmt.Sprintf("curl failed (exit=%d), but containment attribution is inconclusive: read DROP counter before probe: %v", code, beforeErr)
+	case egressAttrUnknownAfterErr:
+		return statusUnknown, fmt.Sprintf("curl failed (exit=%d), but containment attribution is inconclusive: read DROP counter after probe: %v", code, afterErr)
+	case egressAttrUnknownNoDelta:
+		return statusUnknown, fmt.Sprintf("curl failed (exit=%d), but managed DROP counter did not increase (%d -> %d); failure may be unrelated to containment", code, before, after)
+	case egressAttrUnknownUnexpectedExit:
+		return statusUnknown, fmt.Sprintf("curl failed with unexpected exit=%d despite a counter delta; the DNS-free HTTP canary expected a connect refusal or timeout", code)
+	case egressAttrPass:
+		return statusPass, fmt.Sprintf("curl dial did not complete (exit=%d, time_connect=0); managed DROP counter increased (%d -> %d) — containment enforced", code, before, after)
+	default:
+		// Fail closed: an unhandled attribution outcome (e.g. a future enum
+		// value) must never fall through to PASS.
+		return statusUnknown, fmt.Sprintf("unexpected direct-egress attribution outcome %d (exit=%d); refusing to claim containment", outcome, code)
+	}
+}
+
+// egressAttribution is the transport-neutral verdict of the shared direct-egress
+// counter-attribution decision tree. Callers map it to their own result type.
+type egressAttribution int
+
+const (
+	egressAttrFailPostConnect       egressAttribution = iota // connection established -> containment hole
+	egressAttrUnknownDialCompletion                          // probe-specific dial completion is missing/unparseable
+	egressAttrUnknownNoCounter                               // no DROP counter reader available
+	egressAttrUnknownBeforeErr                               // reading the counter before the probe failed
+	egressAttrUnknownAfterErr                                // reading the counter after the probe failed
+	egressAttrUnknownNoDelta                                 // counter did not increase -> unattributable
+	egressAttrUnknownUnexpectedExit                          // counter delta but a non-dial-blocked exit
+	egressAttrPass                                           // dial-blocked exit AND positive counter delta
+)
+
+// classifyDirectEgressAttribution is the SINGLE source of truth for the
+// direct-egress containment verdict on a NON-ZERO canary exit, shared by
+// `contain verify` (probeCCAgentEgressDenied) and `contain doctor`
+// (checkRawEgressBlocked) so the two can never silently disagree about whether
+// containment held. Callers handle skip cases and the code==0 unexpected-success
+// case first, then map the returned attribution to their own result type and
+// wording. Branch order is security-critical: probe-specific evidence that the
+// dial completed, or an independently post-connect exit, is a containment hole
+// regardless of the counter. Missing probe-specific timing stays UNKNOWN. PASS
+// requires a dial that did not complete, a dial-blocked exit, and a positive
+// managed DROP-counter delta. readAfter is invoked lazily so completed,
+// post-connect, unknown-timing, and no-counter paths perform no counter read.
+func classifyDirectEgressAttribution(code int, dialCompletion directDialCompletion, hasCounter bool, before uint64, beforeErr error, readAfter func() (uint64, error)) (outcome egressAttribution, after uint64, afterErr error) {
+	if dialCompletion == directDialCompleted {
+		return egressAttrFailPostConnect, 0, nil
+	}
+	if isPostConnectCurlExit(code) {
+		return egressAttrFailPostConnect, 0, nil
+	}
+	if dialCompletion != directDialNotCompleted {
+		return egressAttrUnknownDialCompletion, 0, nil
+	}
+	if !hasCounter {
+		return egressAttrUnknownNoCounter, 0, nil
+	}
+	after, afterErr = readAfter()
+	if beforeErr != nil {
+		return egressAttrUnknownBeforeErr, after, afterErr
+	}
+	if afterErr != nil {
+		return egressAttrUnknownAfterErr, after, afterErr
+	}
+	if after <= before {
+		return egressAttrUnknownNoDelta, after, afterErr
+	}
+	if !isDirectEgressBlockedCurlExit(code) {
+		return egressAttrUnknownUnexpectedExit, after, afterErr
+	}
+	return egressAttrPass, after, afterErr
+}
+
+// directDialCompletion is curl's probe-specific account of whether its TCP
+// connection completed. Unknown is deliberately distinct from not-completed:
+// missing or malformed write-out evidence can never support PASS.
+type directDialCompletion int
+
+const (
+	directDialUnknown directDialCompletion = iota
+	directDialNotCompleted
+	directDialCompleted
+)
+
+// parseDirectCurlDialCompletion reads curl's stable time_connect sentinel.
+// strconv.ParseFloat is locale-independent, and curl's write-out variables use
+// a dot decimal separator. Exactly zero means TCP never connected; any finite
+// positive value means the direct dial escaped containment.
+func parseDirectCurlDialCompletion(out string) directDialCompletion {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, directCurlTimeConnectPrefix) {
+			continue
+		}
+		raw := strings.TrimSpace(strings.TrimPrefix(line, directCurlTimeConnectPrefix))
+		value, err := strconv.ParseFloat(raw, 64)
+		if err != nil || value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+			return directDialUnknown
+		}
+		if value == 0 {
+			return directDialNotCompleted
+		}
+		return directDialCompleted
+	}
+	return directDialUnknown
+}
+
+// isDirectEgressBlockedCurlExit identifies dial outcomes consistent with either
+// an explicit rejection (7) or a silently dropped SYN that times out (28).
+// Exit 28 is a generic curl timeout, so the caller separately requires this
+// canary's time_connect to be exactly zero before either exit can support PASS.
+// The UID-wide managed DROP-counter delta then corroborates that no-dial result;
+// it is never treated as probe attribution on its own.
+func isDirectEgressBlockedCurlExit(code int) bool {
+	return code == 7 || code == 28
+}
+
+// isPostConnectCurlExit identifies curl failures that require a connection to
+// have progressed beyond the outbound dial. These are containment failures even
+// if unrelated same-UID traffic also increments the managed DROP counter.
+func isPostConnectCurlExit(code int) bool {
+	switch code {
+	// Server/protocol responses or completed transfer setup.
+	case 8, 16, 18, 21, 22, 23, 25, 30, 31, 33, 36, 38, 39, 47,
+		52, 61, 63, 64, 67, 68, 69, 70, 71, 72, 73, 74, 78, 79,
+		84, 85, 86, 87, 88, 92, 94, 95, 96:
+		return true
+	// TLS peer/handshake evidence or network I/O after connect.
+	case 35, 51, 55, 56, 60, 80, 83, 90, 91, 97:
+		return true
+	default:
+		return false
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Probe 9: operator_egress_reachable
+// ---------------------------------------------------------------------------
+
+func probeOperatorEgress(ctx context.Context, env *probeEnv) (string, string) {
+	var out string
+	var code int
+	var err error
+
+	if env.operatorUser == "" {
+		curlArgs := curlNoProxyArgsFor(env.curlPath)
+		out, code, err = env.runCmd(ctx, curlArgs[0], curlArgs[1:]...)
+	} else {
+		args := append([]string{"-n", "-u", env.operatorUser, "--"}, curlNoProxyArgsFor(env.curlPath)...)
+		out, code, err = env.runCmd(ctx, "sudo", args...)
+	}
+
+	if err != nil {
+		return statusSkip, fmt.Sprintf("curl unavailable: %v", err)
+	}
+	if isSudoRefusal(out) {
+		return statusSkip, "sudo refused without password; rerun curl manually as operator"
+	}
+	if isSudoUserMissing(out) {
+		return statusSkip, fmt.Sprintf("%s user not present", env.operatorUser)
+	}
+	if isSudoTargetCommandMissing(out) {
+		return statusSkip, "curl not executable for operator canary"
+	}
+	if code != 0 {
+		return statusFail, fmt.Sprintf("operator curl failed (exit=%d): %s", code, oneLine(out))
+	}
+	// Probe 9 contract is "any 2xx/3xx HTTP". Curl with -w '%{http_code}'
+	// exits 0 even on 4xx/5xx, so we must inspect the printed status
+	// code instead of trusting curl's exit code alone. A captive portal
+	// or carrier intercept returning a synthetic 4xx would otherwise
+	// look like "operator reachable". realRunCommand merges stdout and
+	// stderr, so benign sudo/PAM/libnss warnings can land in front of
+	// curl's HTTP code; take the trailing whitespace-separated token
+	// since `-w '%{http_code}'` writes the code last with no newline.
+	fields := strings.Fields(oneLine(out))
+	if len(fields) == 0 {
+		return statusFail, "operator curl produced no output"
+	}
+	httpCodeStr := fields[len(fields)-1]
+	httpCode, parseErr := strconv.Atoi(httpCodeStr)
+	if parseErr != nil {
+		return statusFail, fmt.Sprintf("operator returned unparseable HTTP code: %q", httpCodeStr)
+	}
+	if httpCode < 200 || httpCode >= 400 {
+		return statusFail, fmt.Sprintf("operator returned non-2xx/3xx HTTP %d", httpCode)
+	}
+	return statusPass, fmt.Sprintf("HTTP %d from example.com", httpCode)
+}
+
+// isSudoRefusal scans subprocess output for the well-known sudo
+// failure modes that indicate no NOPASSWD entry, not a curl-level
+// failure. Used by probes 8 and 9 to disambiguate skip vs fail.
+func isSudoRefusal(out string) bool {
+	low := strings.ToLower(out)
+	switch {
+	case strings.Contains(low, "password is required"),
+		strings.Contains(low, "may not run"),
+		strings.Contains(low, "not allowed to execute"),
+		strings.Contains(low, "no tty present"):
+		return true
+	}
+	return false
+}
+
+// isSudoUserMissing detects sudo's "unknown user" failure mode. If the
+// target user (pipelock-agent or the operator) does not exist on the system,
+// sudo exits non-zero before invoking the target command. Probes 8
+// and 9 must treat this as skip rather than fail, otherwise an
+// uninstalled containment model would falsely report PASS on the
+// canary.
+func isSudoUserMissing(out string) bool {
+	return strings.Contains(strings.ToLower(out), "unknown user")
+}
+
+func isSudoTargetCommandMissing(out string) bool {
+	low := strings.ToLower(out)
+	return strings.Contains(low, "command not found") ||
+		strings.Contains(low, "no such file or directory")
+}
+
+// oneLine trims and collapses whitespace, and removes control/format runes so
+// subprocess output cannot inject terminal escapes or bidirectional formatting
+// into text-mode evidence.
+func oneLine(s string) string {
+	fields := strings.FieldsFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.In(r, unicode.Cf)
+	})
+	return strings.Join(fields, " ")
+}
+
+// credentialGuardConfigRoots returns the directories the credential guard holds
+// at traverse-only for the operator, from the same list the guard renders. An
+// unknown operator yields no roots, so every path keeps the read requirement.
+func credentialGuardConfigRoots(env *probeEnv) map[string]bool {
+	roots := map[string]bool{}
+	if env.operatorUser == "" || env.lookupUser == nil {
+		return roots
+	}
+	operator, err := env.lookupUser(env.operatorUser)
+	if err != nil || operator.HomeDir == "" {
+		return roots
+	}
+	for _, root := range credentialGuardWatchRoots(filepath.Clean(operator.HomeDir))[1:] {
+		roots[root] = true
+	}
+	return roots
+}
+
+// xvncPathForVerify resolves Xvnc exactly as install did, so the expected
+// ExecStart matches the rendered unit. With no candidate installed it keeps
+// the default path; the unit comparison then names the missing binary.
+func xvncPathForVerify(stat func(string) (os.FileInfo, error)) string {
+	if path := resolveXvncPath(stat); path != "" {
+		return path
+	}
+	return defaultXvncPath
+}

@@ -1,0 +1,210 @@
+{
+  "format": "pipelock-evidence-transform-corpus/v1",
+  "profile_digest": "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37",
+  "vectors": [
+    {
+      "id": "partial",
+      "input_b64": "JTQxJVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "QSVaWg=="
+    },
+    {
+      "id": "partial-tail",
+      "input_b64": "JTQxJQ==",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "QSU="
+    },
+    {
+      "id": "nested",
+      "input_b64": "JTI1NDElWlo=",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "QSVaWg=="
+    },
+    {
+      "id": "plus",
+      "input_b64": "JTJCKyU0MSVRUQ==",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "ICBBJVFR"
+    },
+    {
+      "id": "unicode",
+      "input_b64": "JUMzJUE5JVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "w6klWlo="
+    },
+    {
+      "id": "invalid-percent-utf8",
+      "input_b64": "JUZGJVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "want_error": "invalid UTF-8"
+    },
+    {
+      "id": "concat-partial",
+      "input_b64": "YT0lNDElWlomYj0lNDI=",
+      "recipe": [
+        {
+          "kind": "ordered_query_concat"
+        }
+      ],
+      "output_b64": "QSVaWkI="
+    },
+    {
+      "id": "subsequence-partial",
+      "input_b64": "YT0lNDElWlomYj1za2lwJmM9JTQy",
+      "recipe": [
+        {
+          "kind": "query_subsequence",
+          "indices": [
+            0,
+            2
+          ]
+        }
+      ],
+      "output_b64": "QSVaWkI="
+    },
+    {
+      "id": "v1-query-frozen",
+      "input_b64": "JTQxJVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "JTQxJVpa",
+      "transform_profile_digest": "sha256:3de14968449593cae58da869cfc97855cb098e491494390a12ba742cb0b70f94"
+    },
+    {
+      "id": "v2-query-frozen",
+      "input_b64": "JTQxJVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "JTQxJVpa",
+      "transform_profile_digest": "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7"
+    },
+    {
+      "id": "v3-query-frozen",
+      "input_b64": "JTQxJVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "JTQxJVpa",
+      "transform_profile_digest": "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e"
+    },
+    {
+      "id": "v2-malformed-query_unescape",
+      "input_b64": "JTQxJVpa",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "JTQxJVpa",
+      "transform_profile_digest": "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7"
+    },
+    {
+      "id": "v2-malformed-ordered_query_concat",
+      "input_b64": "YT0lNDElWlomYj0lNDI=",
+      "recipe": [
+        {
+          "kind": "ordered_query_concat"
+        }
+      ],
+      "output_b64": "JTQxJVpaQg==",
+      "transform_profile_digest": "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7"
+    },
+    {
+      "id": "nested-utf8-two-byte",
+      "input_b64": "JUMzJTI1QTk=",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "w6k="
+    },
+    {
+      "id": "nested-utf8-three-byte",
+      "input_b64": "JUUyJTI1ODIlMjVBQw==",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "4oKs"
+    },
+    {
+      "id": "nested-utf8-malformed",
+      "input_b64": "JUMzJTI1QTklWlo=",
+      "recipe": [
+        {
+          "kind": "query_unescape"
+        }
+      ],
+      "output_b64": "w6klWlo="
+    },
+    {
+      "id": "matching-hangul-nfc",
+      "input_b64": "4YSA4YWh",
+      "recipe": [
+        {
+          "kind": "matching_normalize",
+          "profile": "pipelock-matching-v1"
+        }
+      ],
+      "output_b64": "6rCA"
+    },
+    {
+      "id": "ordered_query_concat-nested-utf8-malformed",
+      "input_b64": "YT0lQzMlMjVBOSVaWiZiPSVFMiUyNTgyJTI1QUM=",
+      "recipe": [
+        {
+          "kind": "ordered_query_concat"
+        }
+      ],
+      "output_b64": "w6klWlrigqw="
+    },
+    {
+      "id": "query_subsequence-nested-utf8-malformed",
+      "input_b64": "YT0lQzMlMjVBOSVaWiZiPXNraXAmYz0lRTIlMjU4MiUyNUFD",
+      "recipe": [
+        {
+          "kind": "query_subsequence",
+          "indices": [
+            0,
+            2
+          ]
+        }
+      ],
+      "output_b64": "w6klWlrigqw="
+    }
+  ]
+}

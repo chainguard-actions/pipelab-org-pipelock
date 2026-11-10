@@ -1,0 +1,146 @@
+<!-- Copyright 2026 Josh Waldrep -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
+# AARP v0.1 assurance-envelope verifier (Python)
+
+This is the Python reference verifier for the AARP (Agent Action Receipt
+Profile) v0.1 assurance envelope and the in-repo EvidenceReceipt v2 span
+conformance fixture. It is one of four reference verifiers (Go, TypeScript,
+Rust, Python). The Go implementation in `internal/aarp/` is the AARP reference;
+this package ports **from** it so that, given the same envelope and the same
+trust file, every verifier emits byte-identical comparable output.
+Cross-language divergence is the bug class the shared hostile corpus
+(`sdk/conformance/testdata/aarp-corpus/`) exists to kill.
+
+The normative contract is `sdk/conformance/AARP-CORPUS-CONTRACT.md`.
+
+**This is a conformance reference impl, not a published package.** Like the
+in-repo TypeScript (`sdk/verifiers/ts`) and Rust (`sdk/verifiers/rust`)
+verifiers, it exists only to prove the AARP spec is unambiguous across languages
+in CI; nobody `pip install`s it. The shipped, user-facing Python verifier is
+`pipelock-verify` on PyPI (which already covers receipt v1/v2); folding AARP into
+that package is a separate, deliberate release. The `pyproject.toml` here is
+marked `Private :: Do Not Upload` so it can never be published by accident.
+
+## What it does
+
+Given an AARP envelope (or a JSONL chain of envelopes) and a pinned trust file,
+the verifier appraises the envelope and reports — grouped by axis — exactly which
+claims it could cryptographically confirm, plus the fixed `does_not_assert` list.
+It never emits "trusted" or "safe". Per-signature problems (unknown suite,
+untrusted key, bad signature) are reported per signature, never as an envelope
+rejection, so one bad parallel signature can neither mask nor poison a good one.
+
+## CLI
+
+```
+python -m pipelock_aarp_verify aarp PATH --trust TRUST_JSON [--chain] [--allow-prefix] [--expect-head HASH] [--expect-seq N] [--json]
+python -m pipelock_aarp_verify receipt PATH --key PUBLIC_KEY_HEX [--json] [--chain] [--group] [--allow-unpinned] [--allow-prefix] [--expect-head HASH] [--expect-seq N]
+```
+
+- `PATH`: a single envelope (`*.aarp.json`) or, with `--chain`, a JSONL stream
+  (`*.aarp.jsonl`, one envelope per line).
+- `--trust TRUST_JSON`: the pinned trust file. Optional for single-envelope
+  appraisal; absent means empty trust (every signature is `unknown_key`). Chain
+  verification requires at least one valid trusted signature on each envelope.
+- `--json`: print the cross-language comparable output on stdout.
+- `--chain`: verify contiguous links, trusted signatures, and the chain endpoint.
+  The first envelope must be the genesis link. Because AARP has no terminal
+  record, a linked chain exits `3` with `VALID PREFIX, END UNPROVEN` unless an
+  independent endpoint pin matches. `--expect-head` pins the final payload
+  digest; `--expect-seq` pins the final sequence. Either matching pin proves the
+  endpoint. `--allow-prefix` returns `0` while keeping the partial verdict.
+
+The `receipt` subcommand verifies an EvidenceReceipt v2 file against a pinned
+Ed25519 public key. Its conformance coverage includes `proxy_decision_with_spans`
+and the fixture-only `secret_egress_decision_v1` kind. The latter validates typed
+finding, byte-release, fallback and registry-commitment facts; a valid signature
+does not prove registry membership, policy compliance, producer coverage or
+durable append. Existing JCS formatting semantics remain unchanged.
+
+The secret-egress CLI corpus gate uses this in-repo reference explicitly. It does
+not replace the separately pinned published Python verifier in the ordinary
+legacy corpus gate or claim that the published package supports this new kind.
+
+Exit codes: `0` appraised / linked, `1` fatal / not linked, `2` I/O or
+trust-file error, `3` valid receipt-chain prefix with an unproven end,
+`64` usage error. A fatal envelope with `--json` prints
+`{"envelope_fatal": true, ...}` and exits non-zero.
+
+There is no console-script entry point on purpose (this is a reference impl, not
+a CLI product): always invoke it as the module form above.
+
+## Running without installing
+
+The conformance gate and CI run it straight from the source tree, no install:
+
+```
+PYTHONPATH=sdk/verifiers/python/src python -m pipelock_aarp_verify aarp \
+    <envelope> --trust <trust.json> --json
+```
+
+The only runtime dependency is `cryptography` (Ed25519 verification). Evidence-
+provenance transforms use Python 3.12's built-in Unicode 15.0.0 database; the
+package's `<3.13` upper bound prevents a newer Unicode table from silently
+changing canonicalization. No network access is performed in any code path.
+
+## Install (hash-pinned, offline-friendly)
+
+```
+pip install --require-hashes -r sdk/verifiers/python/requirements.txt
+pip install --no-deps sdk/verifiers/python
+```
+
+`requirements.txt` pins `cryptography` and its transitive tree (`cffi`,
+`pycparser`) with hashes, matching the install style already used in CI for the
+companion v1-receipt verifier.
+
+## Formatter and linter
+
+This package uses **ruff** as both formatter and linter (the project default).
+Configuration lives in `pyproject.toml` (`[tool.ruff]`). Before committing:
+
+```
+cd sdk/verifiers/python
+ruff format .
+ruff check .
+```
+
+## Tests
+
+```
+cd sdk/verifiers/python
+PYTHONPATH=src pytest --cov=pipelock_aarp_verify --cov-report=term-missing
+```
+
+The suite includes a corpus-driven conformance test over **every** fixture in
+`sdk/conformance/testdata/aarp-corpus/`: appraise fixtures must produce output
+byte-equal to the committed `.appraisal.json` and exit `0`; fatal fixtures must
+exit non-zero. The four-language gate (`sdk/conformance/aarp-corpus-gate.sh`)
+additionally checks that this verifier agrees with the Go reference on every row.
+The AARP chain CLI also consumes `sdk/conformance/testdata/aarp-end-proof/` for
+truncated tails, head cuts, forged signatures, endpoint pins, and prefix opt-in.
+
+## Cross-language hazards handled
+
+- **JCS canonicalization** matches Go `json.Marshal` per string exactly: NFC
+  normalization; `<` `>` `&` → `<` `>` `&`; U+2028 / U+2029 →
+  ` ` / ` `; the Go short control escapes (`\b \t \n \f \r`) with
+  `\u00xx` for other controls; all other code points (DEL U+007F and any
+  non-ASCII) emitted raw UTF-8. Object keys are sorted by Unicode code point;
+  NFC key collisions are rejected.
+- **I-JSON number safety**: a strict parser preserves number literals so float /
+  exponent / negative-zero / out-of-range detection happens on the source text
+  before any lossy conversion. Duplicate keys at any depth and trailing tokens
+  are rejected.
+- **RFC3339Nano timestamps** are validated against an explicit grammar plus a
+  calendar check, matching Go's `time.Parse(time.RFC3339Nano, ...)` acceptance
+  (Python's `datetime.fromisoformat` is too lenient).
+
+## Receipt-chain endpoints
+
+Receipt-chain CLI verification returns 0 only when integrity verifies and the end is proven for the declared scope. A valid open prefix returns 3 with `VALID PREFIX, END UNPROVEN`. Invalid evidence returns 1. `--allow-prefix` returns 0 for that prefix while preserving the label and JSON status; it never accepts a broken chain or a mismatching pin.
+
+A terminal signed `session_close` proves the action-chain endpoint when its run's `session_open` names a per-run recorder session (`<base>.run.<id>`). Chains written before Pipelock v3.6.0 recorded every run under one shared session and resumed it after each restart, so their closes don't prove the end; pin those or accept the prefix. A complete receipt-group close proves its group scope. `--expect-head HASH` or `--expect-seq N` checks an independently known final receipt hash or sequence. A signer key, restart link, or recovery seal alone doesn't prove an end. Mixed action/evidence input verifies both chains, with pins applied to the evidence chain. Use `receipt FILE --chain` for a file or `receipt DIR --group ID` for a group directory.
+
+JSON separates `integrity`, `end_proof` (`proven` and checked `evidence`), `scope`, and `status` from signer trust. Low-level prefix-verification APIs and signed formats retain their existing contracts. Provenance and single-receipt commands retain their existing exit codes. AARP chain mode returns `3` for a valid prefix unless an endpoint pin or `--allow-prefix` is supplied.

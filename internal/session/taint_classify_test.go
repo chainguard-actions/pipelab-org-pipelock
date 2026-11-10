@@ -1,0 +1,272 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package session_test
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+func TestClassifyURLSource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		rawURL string
+		want   session.TaintLevel
+	}{
+		{name: "localhost is trusted", rawURL: "http://localhost:3000/docs", want: session.TaintTrusted},
+		{name: "loopback is trusted", rawURL: "http://127.0.0.1:8080/health", want: session.TaintTrusted},
+		{name: "allowlisted docs are references", rawURL: testGitHubCopilotDocs, want: session.TaintAllowlistedReference},
+		{name: "allowlisted single-label gateway is reference", rawURL: "http://litellm:4000/v1/chat/completions", want: session.TaintAllowlistedReference},
+		{name: "random site is untrusted", rawURL: "https://evil.example/backdoor", want: session.TaintExternalUntrusted},
+		{name: "bad url is untrusted", rawURL: "://not-a-url", want: session.TaintExternalUntrusted},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := session.ClassifyURLSource(tt.rawURL, []string{"docs.github.com", "litellm"})
+			if got != tt.want {
+				t.Fatalf("ClassifyURLSource(%q) = %v, want %v", tt.rawURL, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClassifyHTTPResponseObservation_MediaSeen(t *testing.T) {
+	t.Parallel()
+
+	observation := session.ClassifyHTTPResponseObservation(
+		"https://evil.example/image.png",
+		"image/png",
+		nil,
+		false,
+	)
+	if !observation.MediaSeen {
+		t.Fatal("expected external image content to set media_seen")
+	}
+	if observation.Source.Level != session.TaintExternalUntrusted {
+		t.Fatalf("level = %v, want external_untrusted", observation.Source.Level)
+	}
+}
+
+func TestClassifyMCPToolCall(t *testing.T) {
+	t.Parallel()
+
+	protected := []string{"*/auth/*", "*/security/*", "*/.env*"}
+	elevated := []string{"*/config/*", "*/middleware*"}
+
+	tests := []struct {
+		name       string
+		toolName   string
+		argsJSON   string
+		wantClass  session.ActionClass
+		wantLevel  session.ActionSensitivity
+		wantAction string
+	}{
+		{
+			name:       "protected write tool",
+			toolName:   "write_file",
+			argsJSON:   `{"path":"/repo/auth/middleware.go","content":"x"}`,
+			wantClass:  session.ActionClassWrite,
+			wantLevel:  session.SensitivityProtected,
+			wantAction: "/repo/auth/middleware.go",
+		},
+		{
+			name:       "shell mutation is exec",
+			toolName:   "shell",
+			argsJSON:   `{"command":"git push origin main"}`,
+			wantClass:  session.ActionClassExec,
+			wantLevel:  session.SensitivityElevated,
+			wantAction: "",
+		},
+		{
+			name:       "secret path is secret use",
+			toolName:   "read_file",
+			argsJSON:   `{"path":"/home/developer/.ssh/id_rsa"}`,
+			wantClass:  session.ActionClassSecret,
+			wantLevel:  session.SensitivityProtected,
+			wantAction: "/home/developer/.ssh/id_rsa",
+		},
+		{
+			name:       "browse tool stays browse",
+			toolName:   "browse_url",
+			argsJSON:   `{"url":"https://example.com/docs"}`,
+			wantClass:  session.ActionClassBrowse,
+			wantLevel:  session.SensitivityNormal,
+			wantAction: "https://example.com/docs",
+		},
+		{
+			name:       "non mutating shell stays exec",
+			toolName:   "shell",
+			argsJSON:   `{"command":"git status"}`,
+			wantClass:  session.ActionClassExec,
+			wantLevel:  session.SensitivityProtected,
+			wantAction: "",
+		},
+		{
+			name:       "unknown tool with edit intent becomes write",
+			toolName:   "apply_changes",
+			argsJSON:   `{"path":"/repo/security/policy.go","changes":[{"text":"deny all"}]}`,
+			wantClass:  session.ActionClassWrite,
+			wantLevel:  session.SensitivityProtected,
+			wantAction: "/repo/security/policy.go",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gotClass, gotLevel, gotAction := session.ClassifyMCPToolCall(tt.toolName, tt.argsJSON, protected, elevated)
+			if gotClass != tt.wantClass {
+				t.Fatalf("action class = %v, want %v", gotClass, tt.wantClass)
+			}
+			if gotLevel != tt.wantLevel {
+				t.Fatalf("sensitivity = %v, want %v", gotLevel, tt.wantLevel)
+			}
+			if gotAction != tt.wantAction {
+				t.Fatalf("action ref = %q, want %q", gotAction, tt.wantAction)
+			}
+		})
+	}
+}
+
+func TestClassifyPathSensitivity_RootRelativePatterns(t *testing.T) {
+	t.Parallel()
+
+	protected := []string{"*/.env*", "*/auth/*"}
+	if got := session.ClassifyPathSensitivity(".env.production", protected, nil); got != session.SensitivityProtected {
+		t.Fatalf("sensitivity = %v, want protected", got)
+	}
+	if got := session.ClassifyPathSensitivity("auth/middleware.go", protected, nil); got != session.SensitivityProtected {
+		t.Fatalf("sensitivity = %v, want protected", got)
+	}
+}
+
+func TestClassifyHTTPActionWithOptions_FailSafeReadNeedsConfidence(t *testing.T) {
+	t.Parallel()
+
+	off := session.ClassifyHTTPActionWithOptions("GET", "", nil, nil, session.ClassificationOptions{})
+	if off.Class != session.ActionClassRead || off.Sensitivity != session.SensitivityNormal || off.Confident {
+		t.Fatalf("fail-safe off classification = %+v, want read normal low-confidence", off)
+	}
+
+	on := session.ClassifyHTTPActionWithOptions("GET", "", nil, nil, session.ClassificationOptions{FailSafe: true})
+	if on.Class != session.ActionClassRead || on.Sensitivity != session.SensitivityProtected || on.Confident {
+		t.Fatalf("fail-safe on classification = %+v, want read protected low-confidence", on)
+	}
+}
+
+func TestClassifyMCPToolCallWithOptions_FailSafeUnknownTool(t *testing.T) {
+	t.Parallel()
+
+	off := session.ClassifyMCPToolCallWithOptions("mystery_tool", `{}`, nil, nil, session.ClassificationOptions{})
+	if off.Class != session.ActionClassRead || off.Sensitivity != session.SensitivityNormal || off.Confident {
+		t.Fatalf("fail-safe off classification = %+v, want read normal low-confidence", off)
+	}
+
+	on := session.ClassifyMCPToolCallWithOptions("mystery_tool", `{}`, nil, nil, session.ClassificationOptions{FailSafe: true})
+	if on.Class != session.ActionClassRead || on.Sensitivity != session.SensitivityProtected || on.Confident {
+		t.Fatalf("fail-safe on classification = %+v, want read protected low-confidence", on)
+	}
+}
+
+func TestClassifyHTTPAction_QueryIsPublish(t *testing.T) {
+	t.Parallel()
+
+	// The HTTP QUERY method carries a request body; it is classified with the
+	// body-bearing write methods (Publish), not the bodyless read methods, so an
+	// agent cannot move a body to an upstream at lower taint risk than POST.
+	class, _ := session.ClassifyHTTPAction("QUERY", "/search", nil, nil)
+	if class != session.ActionClassPublish {
+		t.Fatalf("ClassifyHTTPAction(QUERY) class = %v, want publish", class)
+	}
+}
+
+func TestClassifyMCPToolCall_QueryMethodIsMutatingNetworkIntent(t *testing.T) {
+	t.Parallel()
+
+	// An MCP tool call that tunnels a QUERY request (a body-bearing method)
+	// must classify as publish, exactly like POST — otherwise an agent could
+	// move a body to an upstream at lower taint risk by choosing QUERY. The
+	// neutral tool name "invoke" isolates the method-based classification: it
+	// matches no name heuristic, so only the QUERY method drives the verdict.
+	class, _, target := session.ClassifyMCPToolCall(
+		"invoke",
+		`{"method":"QUERY","url":"https://api.example.com/search"}`,
+		nil,
+		nil,
+	)
+	if class != session.ActionClassPublish {
+		t.Fatalf("ClassifyMCPToolCall(invoke, method=QUERY) class = %v, want publish", class)
+	}
+	if target != "https://api.example.com/search" {
+		t.Fatalf("target = %q, want the request URL", target)
+	}
+}
+
+func TestClassifyMCPToolCall_MutatingNetworkIntentWithSpacedJSON(t *testing.T) {
+	t.Parallel()
+
+	class, sensitivity, target := session.ClassifyMCPToolCall(
+		"http_request",
+		"{\n  \"method\": \"POST\",\n  \"url\": \"https://api.example.com/publish\"\n}",
+		nil,
+		nil,
+	)
+	if class != session.ActionClassPublish {
+		t.Fatalf("action class = %v, want publish", class)
+	}
+	if sensitivity != session.SensitivityElevated {
+		t.Fatalf("sensitivity = %v, want elevated", sensitivity)
+	}
+	if target != "https://api.example.com/publish" {
+		t.Fatalf("target = %q, want publish URL", target)
+	}
+}
+
+func TestClassifyResponseFindingsMatchesBooleanClassification(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		kinds []session.HostileFindingKind
+		want  []session.HostileFindingKind
+	}{
+		{name: "no findings", kinds: nil, want: nil},
+		{name: "wording", kinds: []session.HostileFindingKind{session.FindingWording}, want: []session.HostileFindingKind{session.FindingWording}},
+		{name: "mixed with duplicate", kinds: []session.HostileFindingKind{session.FindingDLP, session.FindingWording, session.FindingDLP}, want: []session.HostileFindingKind{session.FindingDLP, session.FindingWording}},
+		{name: "unknown label", kinds: []session.HostileFindingKind{"not-a-kind"}, want: []session.HostileFindingKind{session.FindingUnattributed}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			hit := len(tt.kinds) > 0
+			want := tt.want
+
+			httpGot := session.ClassifyHTTPResponseFindings("https://evil.example/page", "text/html", nil, tt.kinds)
+			httpWant := session.ClassifyHTTPResponseObservation("https://evil.example/page", "text/html", nil, hit)
+			assertFindingsObservation(t, "http", httpGot, httpWant, want)
+
+			mcpGot := session.ClassifyMCPResponseFindings("tool_result", true, tt.kinds)
+			mcpWant := session.ClassifyMCPResponseObservation("tool_result", true, hit)
+			assertFindingsObservation(t, "mcp", mcpGot, mcpWant, want)
+		})
+	}
+}
+
+func assertFindingsObservation(t *testing.T, surface string, got, boolean session.RiskObservation, kinds []session.HostileFindingKind) {
+	t.Helper()
+	if !reflect.DeepEqual(got.FindingKinds, kinds) {
+		t.Fatalf("%s finding kinds = %v, want %v", surface, got.FindingKinds, kinds)
+	}
+	got.FindingKinds = nil
+	if !reflect.DeepEqual(got, boolean) {
+		t.Fatalf("%s observation = %+v, want boolean classification %+v", surface, got, boolean)
+	}
+}

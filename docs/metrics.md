@@ -1,0 +1,517 @@
+# Metrics Reference
+
+Pipelock collects metrics internally without exposing them by default. Set `metrics_listen` to serve Prometheus metrics at `/metrics` and JSON statistics at `/stats` on a dedicated listener. The agent-facing proxy listener never serves either route. Omitted, YAML null, and blank `metrics_listen` values expose neither route and create no metrics listener. All metric names are prefixed with `pipelock_` (or `pipelock_learn_` for the observation-pipeline family).
+
+```yaml
+# pipelock.yaml
+metrics_listen: 127.0.0.1:9091
+```
+
+This applies to `pipelock run`, standalone `pipelock sandbox`, and `pipelock mcp proxy`. Changes to the listener address require a restart. The dedicated listener has no authentication: restrict network access so agents cannot connect directly. Loopback alone does not separate processes on the same host; use operating-system or container network controls. The proxy blocks mediated requests to the configured metrics address, but direct connections need those network controls.
+
+Contained deployments keep the dedicated listener on loopback by default. A contained listener on another numeric address needs a current `containment.metrics_exposure` policy that lists the exact scraper source CIDRs. That policy permits `/metrics` only. `/stats` remains loopback-only because it includes blocked domains and scanner categories. See [`pipelock contain`](contain-cli.md#managed-metrics-invariant) for the required policy fields and expiry behavior.
+
+## Scrape Configuration
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: pipelock
+    static_configs:
+      - targets: ["127.0.0.1:9091"]
+```
+
+For Kubernetes deployments using a PodMonitor:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: pipelock
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: pipelock
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+```
+
+## HTTP Request Metrics
+
+These track plain HTTP requests flowing through the proxy. HTTPS traffic
+uses CONNECT tunnels (see below) and does not increment request counters.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_requests_total` | counter | `result`, `agent` | Total HTTP requests. `result` is `allowed` or `blocked`. `agent` is the agent *profile* name (matched against the `agents` config section), not the raw `X-Pipelock-Agent` header — bounded cardinality for Prometheus. Unknown/unmatched agents fall to `_default`. For per-request raw agent identity, read the `actor` field on signed receipts. |
+| `pipelock_request_duration_seconds` | histogram | (none) | HTTP request latency. Buckets: 10ms to 10s. |
+| `pipelock_scanner_hits_total` | counter | `scanner`, `agent` | Blocks by scanner type (e.g. `dlp`, `prompt_injection`, `domain`). `agent` follows the same profile-mapping rule as `pipelock_requests_total`. |
+
+## Denial-of-Wallet Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_denial_of_wallet_events_total` | counter | `action`, `agent`, `subject_trust` | MCP denial-of-wallet limit events. `action` is `block`, `warn`, or `unknown` for an unsupported action. `agent` is the resolved configured profile, or `_default` when none exists. `subject_trust` is `principal`, `agent`, `network`, `default` for the stdio bucket, or `unknown` for an unsupported grade. Raw subject identifiers are never metric labels. |
+
+The `agent` label follows the profile mapping used by the other proxy metrics
+and tracks at most 100 agent buckets per process, including the reserved
+`_default` bucket. Up to 99 configured profile names are tracked separately;
+later names collapse to `_other`, which bounds cardinality even if hot reloads
+keep introducing new profiles. `subject_trust` and `action` use closed value sets whose `unknown`
+fallback prevents unsupported input from creating unbounded labels. The per-subject
+discriminator exists only in the audit event because putting it in Prometheus
+would create a new time series for every client. Standalone `pipelock mcp
+proxy` exposes the same registry when `metrics_listen` is configured, even when
+session profiling is disabled.
+
+## CONNECT Tunnel Metrics
+
+In forward-proxy mode, HTTPS traffic uses CONNECT tunnels, which are opaque TCP
+pipes that pipelock cannot inspect beyond the hostname. These are the primary
+traffic metrics for forward-proxy deployments.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_tunnels_total` | counter | `result`, `agent` | Total CONNECT tunnels. `result` is `completed` or `blocked`. |
+| `pipelock_tunnel_duration_seconds` | histogram | (none) | Tunnel lifetime. Buckets: 1s to 300s. |
+| `pipelock_tunnel_bytes_total` | counter | (none) | Total bytes transferred through all tunnels. |
+| `pipelock_active_tunnels` | gauge | (none) | Currently open CONNECT tunnels. |
+| `pipelock_sni_total` | counter | `category`, `agent` | SNI verification results. `category` is `match`, `mismatch`, `not_tls`, `no_extension`, `malformed_tls`, or `timeout`. |
+
+## TLS Interception Metrics
+
+When `tls_interception.enabled` is true, pipelock performs TLS MITM on
+CONNECT tunnels and records additional metrics for interception outcomes,
+handshake latency, and per-request/response blocking.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_tls_intercept_total` | counter | `outcome` | Total TLS-intercepted CONNECT tunnels. `outcome` is `intercepted` or `handshake_error`. |
+| `pipelock_tls_handshake_duration_seconds` | histogram | `side` | TLS handshake latency. `side` is `client` or `upstream`. Buckets: 1ms to 500ms. |
+| `pipelock_tls_request_blocked_total` | counter | `reason` | Requests blocked inside intercepted tunnels. `reason` is `authority_mismatch`, `body_dlp`, `body_prompt_injection`, or `header_dlp`. |
+| `pipelock_tls_response_blocked_total` | counter | `reason` | Responses blocked inside intercepted tunnels. `reason` is `compressed`, `read_error`, `oversized`, or `injection`. |
+| `pipelock_tls_cert_cache_size` | gauge | (none) | Current number of cached forged leaf certificates. |
+
+## URL Check Decisions
+
+`pipelock_url_check_decisions_total{check,outcome,transport,part}` counts the selected URL scan's check outcomes before transport enforcement. Fetch, forward proxy, CONNECT, TLS interception, WebSocket URL admission, submit-profile reverse proxy, and redirect scans record it. Redirect preflights count as scans even when the proxy returns the redirect to the client. The internal watchdog probe isn't counted.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_url_check_decisions_total` | counter | `check`, `outcome`, `transport`, `part` | Per-check outcomes of the top-level URL scan. Counts overlap; see below. |
+
+| Label | Values |
+|-------|--------|
+| `check` | `context`, `length`, `parser`, `scheme`, `crlf_injection`, `path_traversal`, `allowlist`, `blocklist`, `core_ssrf`, `core_dlp`, `dlp`, `entropy`, `subdomain_entropy`, `nested_destination`, `ssrf`, `ratelimit`, `databudget` |
+| `outcome` | `fired`, `allowed`, `blocked`, `relieved`, `not_evaluated` |
+| `transport` | `fetch`, `forward`, `connect`, `intercept`, `websocket`, `reverse` |
+| `part` | `url_query` for the composite nested-destination check (`check="nested_destination"`); `url` for every other check |
+
+All 510 permitted series (17 check/part pairs × 5 outcomes × 6 transports) are created with the registry. Recording uses fixed-size scanner state, immutable counter handles and atomic increments. Unknown transports are dropped. Labels contain no hosts, URLs, paths, values, pattern names or agent names. No length or shape buckets are collected. The counter uses the existing local registry and optional metrics listener.
+
+Outcomes overlap. `allowed` means the check ran and returned an allow, including checks that return early because they're disabled or exempt. `fired` increments once when the check observes a finding or refusal; warnings increment both `fired` and `allowed`. `blocked` means the check refused the URL. Transport audit or warn policy can still release that refusal, so it isn't a count of requests denied upstream. Existing request counters report those final decisions.
+
+`relieved` increments once when the check observes at least one finding that an allowance released. In the DLP check that is a provider credential allowed at its declared audience. In the entropy check it is an issuer-observed query value, path or server-issued segment, an operator query-parameter exclusion, a credential-audience value, a release-grant signed query value, or a native OAuth authorization value. Whole-host and path exclusions skip their part of the entropy check without evaluating it, so they count as `allowed`, not `relieved`. A relieved check also increments `fired`; a check can relieve one finding and still block a different finding. TLS interception records the selected issuer rescan once: the provisional entropy refusal doesn't add a block. If no allowance applies, only the original scan counts. Later receipt or transport failures don't undo the scanner's observations.
+
+`not_evaluated` means the pipeline returned before that check reached a verdict. It doesn't mean that an evaluated check found nothing. A request context that ends mid-scan, such as a client disconnect during the SSRF stage, is counted once as a `context` block; the check it interrupted stays `not_evaluated`. Context and parser labels each combine their validation sites into one outcome. A check label names the pipeline stage, not the refusal's scanner label: the `ssrf` stage includes cloud-metadata refusals, and the `entropy` stage includes its database-URI guard. The nested-destination stage is counted as a composite; its individual allowlist, blocklist and SSRF subchecks aren't counted separately.
+
+These counts cover the URL pipeline only. They don't count body, header, response, MCP, standalone Scan API, dial-time rebind checks or core-floor-only fallback scans. Existing metrics for those paths still apply. Other bypasses, including SigV4 scrubbing, domain exclusions and published-format recognizers, aren't inferred as `fired` or `relieved`. No extra scan, policy simulation, budget update or learning step runs to produce counts. Counts alone can't establish that a block was false or classify an opaque value's origin.
+
+## Request Scanning Metrics
+
+Request body and header scanning detects secrets and prompt injection in POST/PUT/PATCH bodies,
+form data, multipart uploads, and HTTP headers on forward-proxy traffic.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_body_dlp_hits_total` | counter | `action`, `agent` | Request body DLP detections. `action` is `warn` or `block`. |
+| `pipelock_body_prompt_injection_hits_total` | counter | `action`, `agent` | Request body prompt-injection detections. `action` is `warn` or `block`. |
+| `pipelock_body_redactions_total` | counter | `transport`, `agent`, `provider`, `parser`, `class` | Request body redactions by transport surface, agent profile, provider format, parser, and redaction class. Incremented once per redacted field (not per request), so a single request body can produce several counts. |
+| `pipelock_dlp_warn_matches_total` | counter | `pattern`, `transport` | Warn-mode DLP matches by pattern name and transport. Only incremented when the configured DLP action is `warn`; blocked matches are reflected in `pipelock_body_dlp_hits_total` instead. |
+| `pipelock_dlp_dropped_matches_total` | counter | `pattern`, `surface`, `reason` | DLP matches deliberately not enforced. `surface` is `body`, `header`, `mcp_sse`, or `mcp_stdio`; `reason` is `suppressed`, `disabled`, or `low_confidence`. WebSocket upgrade headers count as `header`; matches dropped inside WebSocket frames are not counted. |
+| `pipelock_dlp_credential_audience_allows_total` | counter | `pattern`, `surface` | Compiled credential DLP matches allowed at their declared audience (see [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md)). |
+| `pipelock_issuer_id_blocks_total` | counter | `scope` | Newly tainted caller ID-history buckets (`session`) and the transition to refusing new buckets at capacity (`capacity`). No identity, address, host or ID labels. Existing peers retain their IDs at capacity. Restarting or disabling and re-enabling issuer evidence clears history; enabled reloads preserve it. |
+| `pipelock_header_dlp_hits_total` | counter | `action`, `agent` | Request header DLP detections. `action` is `warn` or `block`. |
+| `pipelock_response_scan_exempt_total` | counter | `reason`, `transport` | Response scanning exemptions. `reason` is `exempt_domain` (a skipped scan, counted once per response), `suppress` (a suppressed finding, counted once per finding), or `core_observed` (a core finding withheld from blocking by a declared observe exception, counted once per finding; the scan still ran); current emitters use transports such as `fetch`, `forward`, `connect`, `reverse`, and `websocket`. Together they show how much traffic skipped injection scanning and how many findings were not enforced. |
+| `pipelock_response_suppressed_matches_total` | counter | `pattern`, `surface`, `reason` | Individual response-scan findings withheld from enforcement. `reason` is `suppressed` (dropped by a non-core `suppress` entry) or `core_observed` (immutable-floor finding withheld by a declared `core_observe_exceptions` entry). |
+
+## WebSocket Proxy Metrics
+
+WebSocket connections are upgraded from CONNECT tunnels when the target
+matches a known WebSocket API host. Unlike opaque tunnels, pipelock can
+inspect WebSocket frames for DLP and prompt injection.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_ws_connections_total` | counter | `result` | Total WebSocket connections. `result` is `completed` or `blocked`. |
+| `pipelock_ws_duration_seconds` | histogram | (none) | WebSocket connection lifetime. Buckets: 1s to 3600s. |
+| `pipelock_ws_bytes_total` | counter | `direction` | Bytes transferred. `direction` is `client_to_server` or `server_to_client`. |
+| `pipelock_ws_active_connections` | gauge | (none) | Currently open WebSocket connections. |
+| `pipelock_ws_frames_total` | counter | `type` | Frames by type (e.g. `text`, `binary`). |
+| `pipelock_ws_scan_hits_total` | counter | `scanner` | WebSocket frame scan detections by scanner. |
+| `pipelock_forward_ws_redirect_hint_total` | counter | (none) | CONNECT requests to known WebSocket API hosts (potential upgrade candidates). |
+
+## Build Information
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_info` | gauge | `version` | Build information. Always 1. The `version` label identifies the running release (e.g. `2.2.0`). |
+| `pipelock_kill_switch_active` | gauge | `source` | Whether each kill switch source is active (1) or inactive (0). `source` is `config`, `api`, `conductor_remote`, `conductor_stale`, `conductor_apply_failure`, `signal`, or `sentinel`. Reported fresh on every scrape via a custom collector; the value is never stale. |
+
+## Security Event Metrics
+
+These counters track enforcement actions. In a healthy deployment, all of
+these should be zero or very low. Any sustained increase warrants
+investigation.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_kill_switch_denials_total` | counter | `transport`, `endpoint` | Requests denied by the kill switch. |
+| `pipelock_chain_detections_total` | counter | `pattern`, `severity`, `action` | Tool call chain pattern detections. |
+
+## Evidence Health Metrics
+
+These metrics summarize the live evidence pipeline. They are observability only:
+they do not make traffic decisions, and a missing value means the evidence
+health sampler is not measuring that fact in the current runtime.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_evidence_local_recorder_operational` | gauge | (none) | One when this process's recorder and every receipt chain's emitter are running, every chain's disk tail has been verified against its in-memory head, and no sequence gap, self-audit failure, or ungated fsync failure was observed locally. This does not check for a competing writer, prove corpus-wide integrity, or award an AEL grade. |
+| `pipelock_evidence_corpus_integrity_ok` | textfile gauge | (none) | One when the most recent complete deployment-managed whole-corpus audit found no structural damage. `pipelock init` installs the producer as a user-systemd timer; Prometheus must scrape its configured textfile directory. This metric never gates proxy traffic. |
+| `pipelock_evidence_corpus_last_audit_timestamp_seconds` | textfile gauge | (none) | Unix timestamp of the most recent whole-corpus audit. The generated corpus-integrity alert treats an audit older than 30 minutes as unhealthy. |
+| `pipelock_evidence_current_ael` | gauge | (none) | **Deprecated.** Always `NaN` (not a number). A live process cannot independently grade its own in-memory state. The series remains for one compatibility window so dashboards fail visibly instead of silently changing meaning. |
+| `pipelock_evidence_ael_requirement_ok` | gauge | `requirement` | **Deprecated.** Diagnostic inputs from the former live AEL estimate. Requirement labels are `recorder_enabled`, `emitter_healthy`, `durability_gate`, `heartbeats`, `anchoring_fresh`, `cpc_active`, and `selfaudit_ok`. These values do not award an AEL grade. |
+| `pipelock_evidence_chain_head_seq` | gauge | (none) | Last emitted in-memory receipt sequence of the process chain, omitted when evidence health is not measured. With `receipt_chains` above 1, per-chain heads are in `/stats` under `evidence_health.self_audit.shards`. |
+| `pipelock_evidence_chain_head_age_seconds` | gauge | (none) | Seconds since the newest chain entry on any receipt chain, omitted when evidence health is not measured. |
+| `pipelock_evidence_heartbeat_interval_seconds` | gauge | (none) | Configured receipt heartbeat interval in seconds; absent from JSON stats until heartbeats are enabled. |
+| `pipelock_evidence_anchor_lag_receipts` | gauge | (none) | Receipts between a chain head and that chain's latest accepted anchor-state marker; the largest lag across receipt chains. |
+| `pipelock_evidence_last_anchor_timestamp_seconds` | gauge | (none) | Unix timestamp of the oldest chain's latest accepted local anchor-state marker, or zero while any chain has never been anchored. |
+| `pipelock_evidence_anchored_final_seq` | gauge | (none) | Final receipt sequence covered by that same marker, or zero while any chain has never been anchored. |
+| `pipelock_evidence_sequence_gaps_total` | counter | `source` | Observed sequence gaps by bounded source. Source labels are `resume`, `self_audit`, and `unknown`. |
+| `pipelock_evidence_fsync_errors_total` | counter | `gated` | Per-action durability confirmation failures. `gated=true` means fail-closed receipt gating was active. |
+| `pipelock_evidence_selfaudit_ok` | gauge | (none) | One while evidence self-audit checks pass; latches to zero after a proven failure in the process. An unverified chain (pending) does not latch it; see `self_audit.state`. |
+| `pipelock_evidence_selfaudit_failures_total` | counter | `check` | Evidence self-audit failures by bounded check label: `durability_invariant`, `tail_divergence`, or `sampler_error`. |
+
+The `/stats` endpoint also includes a nullable `evidence_health` object. In the
+`pipelock.evidencehealth.v2` object:
+
+- `current_ael` is retained as the string `UNAVAILABLE` for one compatibility
+  window. The string is deliberate: numeric clients fail visibly instead of
+  silently turning JSON `null` into the valid-looking number zero.
+- `local_recorder_operational` is the same process-local status as the new gauge.
+- `requirements.heartbeats` becomes true only after this process has recorded a
+  heartbeat. A fresh process is pending until its first scheduled heartbeat;
+  the generated corpus alert does not consume this process-local diagnostic.
+- `self_audit.state` is the worst per-chain tail state. `verified` means each
+  chain's last action receipt on disk matched that chain's in-memory head.
+  `pending` means a chain could not be compared: it was never audited, failed
+  to initialize, its evidence is missing or shrank during the read, a
+  read failed, its last receipt lies beyond the self-audit's read bound (8 MiB
+  of a file, four files), or the newest receipt was written by another run,
+  as when a reload's replacement writer opens before it goes live. A newest
+  receipt from another run that persists for three checks of the same live
+  writer is reported failed. Pending is not green and does not latch.
+  `failed` is a proven mismatch (the newest receipt on disk is not the one the
+  chain last wrote, a receipt's position was assigned but its write was not
+  confirmed, or the tail is malformed) and
+  latches `selfaudit_ok` for the process lifetime. `self_audit.shards` lists
+  each chain's session, head, emitter health, tail state, and anchor coverage.
+  Every field in one entry comes from that chain alone. The self-audit checks
+  that the newest complete receipt on disk matches the chain head; it does not
+  verify the rest of the file. Use `pipelock evidence doctor` for that.
+- `requirements.emitter_healthy` and `requirements.anchoring_fresh` cover every
+  receipt chain: one unhealthy or unanchored chain makes them false. The
+  top-level `anchor` object is `null` while any chain is unanchored.
+- `run_state` is `OPEN` while the recorder process is running. `run_id` is `null`
+  until bounded per-run recording exists. These are lifecycle facts, not
+  verification states.
+- `ael_artifact_capability` is a producer declaration. Today it reports no AEL
+  artifact-format versions, no bounded runs, no closed-run export, and no
+  verification-result import. Its `known_limitations` list includes the missing
+  concurrent-writer isolation. The declaration contains no AEL grade.
+
+Treat a top-level `evidence_health: null` as "not measured," not as healthy.
+During a rolling upgrade, old instances may still emit numeric
+`pipelock_evidence_current_ael` samples while new instances emit `NaN`. Do not
+aggregate that legacy series across versions. Migrate alerts to
+`pipelock_evidence_local_recorder_operational` and keep the process-local scope
+in the alert text.
+
+## Audit Sink Metrics
+
+These metrics report delivery state for the built-in audit sinks. Every series uses only the bounded `sink` label: `webhook`, `syslog`, or `otlp`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_audit_sink_delivered_total` | counter | `sink` | Audit events delivered successfully, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_failed_total` | counter | `sink` | Audit event delivery failures, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_dropped_total` | counter | `sink` | Audit events dropped before delivery, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_abandoned_total` | counter | `sink` | Queued audit events abandoned during shutdown, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_queue_depth` | gauge | `sink` | Current number of queued audit events. |
+| `pipelock_audit_sink_queue_capacity` | gauge | `sink` | Configured capacity of the audit event delivery queue. |
+| `pipelock_audit_sink_degraded` | gauge | `sink` | One while the sink has an unresolved delivery failure or drop; otherwise zero. |
+| `pipelock_audit_sink_last_error_present` | gauge | `sink` | One while the sink has a current last error; otherwise zero. Error text is not exported. |
+
+## Session Profiling Metrics
+
+Pipelock tracks per-session behavioral profiles. Sessions that deviate
+from established patterns trigger anomalies and escalation events. Adaptive
+enforcement can upgrade later requests based on that session state, so these
+metrics are both observability and enforcement context.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_session_anomalies_total` | counter | `type` | Behavioral anomalies by type. |
+| `pipelock_session_escalations_total` | counter | `from`, `to` | Escalation events by session enforcement level transition (e.g. `elevated` → `high`, `high` → `critical`). These transitions feed adaptive enforcement decisions on later requests. |
+| `pipelock_sessions_active` | gauge | (none) | Currently tracked sessions. |
+| `pipelock_sessions_evicted_total` | counter | (none) | Sessions evicted by TTL or capacity limit. |
+| `pipelock_adaptive_sessions_current` | gauge | `level` | Currently escalated sessions. Each logical session is counted once at its strongest effective global or destination-scoped level. |
+| `pipelock_adaptive_residual_expirations_total` | counter | (none) | Positive normal-level threat scores cleared after the quiet period. Aggregate and destination scores count separately. |
+| `pipelock_session_auto_deescalation_total` | counter | `from`, `to` | Autonomous time-based session de-escalations. |
+
+## Adaptive Enforcement Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_adaptive_upgrades_total` | counter | `from_action`, `to_action`, `level` | Requests where adaptive enforcement upgraded the action (e.g. warn to block). |
+
+## Cross-Request Detection Metrics
+
+Cross-request detection tracks secrets split across multiple requests
+using entropy budgets and fragment reassembly. These metrics indicate
+active exfiltration attempts.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_cross_request_entropy_exceeded_total` | counter | (none) | Entropy budget exceeded events. |
+| `pipelock_cross_request_dlp_match_total` | counter | (none) | Fragment reassembly DLP match events. |
+| `pipelock_cross_request_json_partition_fallback_total` | counter | `reason` | JSON request bodies (forward proxy) and MCP tools/call arguments that could not be partitioned into keyed fragment streams and fell back to raw-stream scanning. `reason` is one of `malformed`, `incomplete`, `unkeyed`, `other`. A nonzero value means some outbound JSON was inspected only as a single raw stream, which cannot reconstruct a secret split across sibling fields. |
+| `pipelock_cross_request_fragment_buffer_bytes` | gauge | (none) | Total fragment buffer memory across all sessions. |
+
+## Airlock Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_airlock_sessions` | gauge | `tier` | Current sessions in each airlock tier. |
+| `pipelock_airlock_transitions_total` | counter | `from`, `to`, `trigger` | Airlock tier transitions. |
+| `pipelock_airlock_denials_total` | counter | `tier`, `transport`, `action_class` | Requests denied by airlock enforcement. `action_class` is the transport-provided action label such as `read`, `GET`, `POST`, or `CONNECT`. |
+| `pipelock_airlock_drain_completed_total` | counter | (none) | Sessions that completed drain cleanly. |
+| `pipelock_airlock_drain_timeout_total` | counter | (none) | Sessions whose drain timed out before in-flight work completed. |
+
+## Request Policy Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_request_policy_decisions_total` | counter | `rule`, `action` | `request_policy` rule matches by rule name and action. `action` values are `block`, `warn`, `shadow_block`, or `shadow_warn`. Shadow matches (would-have-blocked traffic in observe mode) are labeled `shadow_<action>` so operators can distinguish enforced blocks from shadow-mode observations. Cardinality is bounded because rule names are validated to a fixed character set at config load. |
+
+## Browser Shield Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_shield_rewrites_total` | counter | `category`, `transport` | Browser shield rewrites by category and transport. |
+| `pipelock_shield_bytes_stripped_total` | counter | `category` | Bytes stripped by browser shield. |
+| `pipelock_shield_shims_injected_total` | counter | `transport` | Shim injections by transport. |
+| `pipelock_shield_skipped_total` | counter | `reason` | Shield skips by reason. |
+| `pipelock_shield_oversize_scan_head_total` | counter | `transport` | Oversized shieldable responses handled with `oversize_action: scan_head`. |
+| `pipelock_shield_latency_seconds` | histogram | `transport` | Browser shield latency. |
+
+## Address Protection Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_address_findings_total` | counter | `chain`, `verdict` | Address poisoning findings by blockchain and verdict. |
+
+## File Sentry Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_file_sentry_findings_total` | counter | `pattern`, `severity`, `agent` | Secrets detected in agent-written files. `agent` is `true` when the write was attributed to the agent process tree, `false` otherwise. |
+
+## Scan API Metrics
+
+The Scan API (`/api/v1/scan`) is an evaluation-plane endpoint for external
+integrations. Disabled by default; set `scan_api.listen` to enable.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_scan_api_requests_total` | counter | `kind`, `decision`, `status_code` | Total scan API requests. |
+| `pipelock_scan_api_duration_seconds` | histogram | `kind` | Scan API latency. Default Prometheus buckets. |
+| `pipelock_scan_api_findings_total` | counter | `kind`, `scanner`, `severity` | Scan API findings by scanner and severity. |
+| `pipelock_scan_api_errors_total` | counter | `kind`, `error_code` | Scan API errors by kind and error code. |
+| `pipelock_scan_api_inflight_requests` | gauge | (none) | Current number of in-flight scan API requests. |
+
+## Reverse Proxy Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_reverse_proxy_requests_total` | counter | `method`, `status` | Total reverse proxy requests by method and status. |
+| `pipelock_reverse_proxy_scan_blocked_total` | counter | `direction`, `reason` | Reverse proxy requests blocked by scanning. `direction` is `request` (DLP on inbound body) or `response` (injection on response). |
+
+## Mediation Envelope Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_envelope_verify_total` | counter | `result` | Inbound mediation envelope verification attempts. `result` is `disabled` (verification off), `verified` (valid envelope), `missing` (required envelope absent), or `failed` (present but invalid). |
+
+## Signed Receipt Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_receipt_emit_failures_total` | counter | `reason` | Signed action-receipt emission failures. A non-zero rate means receipts are not being recorded; check the flight-recorder signing key and chain state. `reason` values are `chain_init`, `sign`, `hash`, `marshal`, `record`, `ael`, `sync`, `durability_inherited`, `sealed`, `unavailable`, or `unknown`. `durability_inherited` is a receipt refused because an earlier sync on the same chain failed. |
+
+## Capture System Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_capture_dropped_total` | counter | (none) | Capture entries dropped due to queue overflow. |
+| `pipelock_capture_session_id_sanitized_total` | counter | `reason` | Capture entries whose unsafe or overlength logical session ID was replaced with a bounded hashed ID. `reason` is `unsafe_path`, `overlength`, or `unknown`. |
+| `pipelock_capture_action_class_sanitized_total` | counter | `reason` | Capture entries whose `action_class` was corrected at ingestion. `reason` is `missing` (no action class supplied), `normalized` (whitespace/case correction applied), or `non_canonical` (value outside the closed action-class taxonomy, dropped). |
+
+## Observation Pipeline Metrics (pipelock_learn_*)
+
+The observation pipeline records agent actions for the learn-and-lock behavioral
+contract system. These metrics use the `pipelock_learn_` prefix to keep alerting
+on observation-pipeline health independent of core proxy alerts.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_learn_observation_events_total` | counter | `action_class` | Total observation events emitted to the recorder. `action_class` is one of: `read`, `derive`, `write`, `delegate`, `authorize`, `spend`, `commit`, `actuate`, or `unclassified`. Non-canonical values are silently dropped to prevent label cardinality drift. |
+| `pipelock_learn_regulated_data_blocked_total` | counter | `reason` | Observation events whose data class resolved to regulated and were dropped before reaching the recorder. `reason` is `field_class_regulated`, `root_class_regulated`, or `explicit_block`. |
+| `pipelock_learn_unclassified_actions_total` | counter | (none) | Subset of `pipelock_learn_observation_events_total` where `action_class=unclassified`. A non-zero rate on side-effecting or high-authority paths indicates contracts that require classification review. |
+| `pipelock_learn_unclassified_rate` | gauge | (none) | Sliding-window unclassified-event ratio. `0.0` = all events classified; `1.0` = none classified. Updated by the observation pipeline's pre-flight calculator. |
+| `pipelock_learn_inference_classify_total` | counter | `outcome` | Inference classifications produced by the contract-compile engine. `outcome` is `never_confirmed`, `brittle`, or `stable`. |
+| `pipelock_learn_inference_floor_failures_total` | counter | `floor` | Floor failures that caused an inference classification to fall back to `never_confirmed`. `floor` is `sessions`, `events`, or `windows`. Use this to identify which data-volume floor is the bottleneck on a given deployment. |
+| `pipelock_learn_capture_records_total` | counter | (none) | Capture records durably written by the learn-and-lock capture writer. |
+| `pipelock_learn_capture_dropped_total` | counter | (none) | Capture records dropped before durable write. Distinct from `pipelock_capture_dropped_total`, which tracks queue overflow in the general capture system. |
+
+## Conductor Metrics (enterprise build, `pipelock_conductor_*`)
+
+These metrics are only registered in the enterprise build
+(`-tags enterprise`). They are absent from the standard binary. Each metric
+name appears once in `/metrics` output regardless of how many followers are
+enrolled; the per-follower audit transport emits into the same time series via
+labels.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_conductor_audit_queue_pending` | gauge | (none) | Current pending audit batches in the durable queue awaiting first delivery. |
+| `pipelock_conductor_audit_queue_inflight` | gauge | (none) | Current claimed audit batches awaiting ack, retry, or dead-letter. |
+| `pipelock_conductor_audit_queue_dead` | gauge | (none) | Current dead-lettered audit batches (delivery attempts exhausted). |
+| `pipelock_conductor_audit_deliveries_total` | counter | `outcome`, `reason` | Total audit batch delivery outcomes. `outcome` is `ok`, `retry`, or `dead`. |
+| `pipelock_conductor_server_requests_total` | counter | `route`, `method`, `status` | Total Conductor server HTTP requests by route, method, and HTTP status code. |
+| `pipelock_conductor_server_request_duration_seconds` | histogram | `route`, `method` | Conductor server HTTP request duration by route and method. Default Prometheus buckets. |
+| `pipelock_conductor_server_audit_ingest_total` | counter | `outcome`, `reason` | Total Conductor server audit ingest outcomes. |
+| `pipelock_conductor_server_audit_queries_total` | counter | `outcome`, `reason` | Total Conductor server audit query outcomes. |
+
+## Counter Initialization
+
+Prometheus `CounterVec` metrics only appear in `/metrics` output after
+their first increment. If you see a metric missing from a fresh instance,
+it means that event type hasn't occurred yet, not that the metric is
+broken. For example, `pipelock_requests_total` won't appear if all traffic
+is HTTPS (CONNECT tunnels).
+
+## Observability Export
+
+### Prometheus and JSON stats
+
+The `/metrics` endpoint serves all registered Prometheus metrics. A JSON
+summary is available at `/stats` on the same port:
+
+```bash
+curl http://localhost:9091/stats | jq .
+```
+
+```json
+{
+  "uptime_seconds": 3600.5,
+  "requests": {
+    "total": 42,
+    "allowed": 40,
+    "blocked": 2,
+    "block_rate": 0.0476
+  },
+  "tunnels": 1523,
+  "websockets": 0,
+  "top_blocked_domains": [
+    {"name": "evil.com", "count": 2}
+  ],
+  "top_scanners": [
+    {"name": "dlp", "count": 2}
+  ],
+  "sessions": {
+    "active": 3,
+    "anomalies": 0,
+    "escalations": 0,
+    "top_anomalies": []
+  },
+  "agents": {
+    "claude-code": {"allowed": 35, "blocked": 1, "tunnels": 1200},
+    "cursor": {"allowed": 5, "blocked": 1, "tunnels": 323}
+  },
+  "evidence_health": null
+}
+```
+
+The `agents` field is omitted when no agent-scoped traffic has been recorded.
+
+### OTLP export
+
+The `emit.otlp` configuration sends audit events as **OTLP log records** to
+an OpenTelemetry-compatible collector. The endpoint is `/v1/logs` (not
+`/v1/traces`). Pipelock does not currently emit distributed traces; all OTLP
+export is log-based. Events are structured as `LogRecord` bodies with
+`pipelock.instance` and event-specific key-value attributes.
+
+See the [SIEM Integration Guide](guides/siem-integration.md) for collector
+configuration and the OTLP attribute schema.
+
+### SIEM / webhook events and signing
+
+Audit events emitted via webhook, syslog, and OTLP are **not
+individually signed**. They are structured log records and are not
+cryptographically authenticated at the transport layer.
+
+Signed attestation is a separate feature: the flight recorder emits
+Ed25519-signed, hash-chained **action receipts** stored as JSONL on disk.
+Action receipts and SIEM events record the same enforcement decisions but
+serve different purposes — receipts provide tamper-evident proof for
+auditors and compliance workflows; SIEM events are for real-time alerting
+and analysis. See [receipt-verification.md](guides/receipt-verification.md)
+for receipt verification, and [flight-recorder.md](guides/flight-recorder.md)
+for the chain model.
+
+## Grafana Dashboard
+
+An importable Grafana dashboard is included at
+[`configs/grafana-dashboard.json`](../configs/grafana-dashboard.json).
+Import it via **Dashboards → Import → Upload JSON file** in Grafana.
+
+The bundled dashboard covers core traffic, TLS interception, security
+event, WebSocket, adaptive enforcement, and Scan API panels. Newer families
+(airlock, browser shield, observation pipeline, conductor) are registered
+in Prometheus; operators can add panels for them using the metric names
+in this document.
+
+## Alert Rules
+
+Example Prometheus alert rules are available at
+[`examples/prometheus/pipelock-alerts.yaml`](../examples/prometheus/pipelock-alerts.yaml).
+`pipelock init` also writes the corpus-integrity rule named
+`PipelockEvidenceCorpusIntegrityFailed` to
+`$XDG_CONFIG_HOME/pipelock/prometheus/rules/`. Include that directory through
+Prometheus `rule_files`; its metric comes from the textfile collector path
+described in the [Flight Recorder Guide](guides/flight-recorder.md#whole-corpus-auditor).
+See the [SIEM Integration Guide](guides/siem-integration.md) for
+Alertmanager routing and automated response patterns.
+
+## Go Runtime Metrics
+
+The standard Go runtime and process collectors are also registered on the
+same Prometheus registry. These expose `go_memstats_heap_alloc_bytes`,
+`go_goroutines`, `process_resident_memory_bytes`, and related metrics —
+useful for capacity planning and for comparing against RSS in benchmarks.

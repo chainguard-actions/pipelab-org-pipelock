@@ -1,0 +1,55 @@
+# Governance
+
+## Project Leadership
+
+Pipelock is maintained by Joshua Waldrep ([@luckyPipewrench](https://github.com/luckyPipewrench)).
+
+## Decision-Making
+
+This is a single-project-lead project. Joshua Waldrep makes final decisions on:
+
+- Feature direction and roadmap priorities
+- Release timing and versioning
+- Dependency additions
+- Security policy and vulnerability response
+- Contribution acceptance
+
+## Contributions
+
+All contributions are welcome via pull request. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, coding standards, and testing requirements.
+
+Pull requests require:
+
+- Passing every required CI context listed in [CONTRIBUTING.md](CONTRIBUTING.md#pull-requests)
+- At least one approving review
+- All review threads resolved
+
+## Releases
+
+Releases follow [Semantic Versioning](https://semver.org/). Tags pushed to `main` trigger automated builds via GoReleaser, producing signed binaries, container images, and Homebrew formulae.
+
+## Security
+
+Vulnerabilities are reported through [GitHub Security Advisories](https://github.com/luckyPipewrench/pipelock/security/advisories/new) and handled per the timeline in [SECURITY.md](SECURITY.md).
+
+### Repository Access
+
+Accounts with write or administrative repository access, or access to private
+vulnerability reports, must use two-factor authentication. SMS alone does not
+satisfy this policy; acceptable methods are passkeys, hardware security keys,
+TOTP authenticator applications, or GitHub Mobile. Privileged access must be
+removed if the account no longer maintains an acceptable second factor.
+
+## Continuity
+
+Repository admin access is shared with at least one trusted continuity
+administrator so the project can continue accepting contributions, triaging
+issues, and cutting releases if the project lead is unavailable. Continuity or
+review access does not by itself make that person a Pipelab employee,
+representative, or project decision-maker.
+
+## Contact
+
+- **Security issues:** [GitHub Security Advisories](https://github.com/luckyPipewrench/pipelock/security/advisories/new)
+- **Bugs and features:** [GitHub Issues](https://github.com/luckyPipewrench/pipelock/issues)
+- **General questions:** [GitHub Discussions](https://github.com/luckyPipewrench/pipelock/discussions)

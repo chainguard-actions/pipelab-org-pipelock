@@ -1,0 +1,1938 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package rules
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	domrules "github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// Official bundle registry base URL. Bundles are served as static files
+// from the pipelab.org Hugo site via Cloudflare Pages.
+const officialRegistryURL = "https://pipelab.org/rules"
+
+var (
+	errOfficialRegistryOrigin   = errors.New("official rules registry origin refused")
+	errOfficialRegistryRedirect = errors.New("official rules registry redirect refused")
+)
+
+var discoverRulesConfigPath = cliutil.DiscoverConfigPathStrict
+
+// rulesAllowUnversionedLoad reads the retained compatibility setting for the
+// min-version gate. Unprovable development versions now always load with a
+// warning, so the value no longer changes that outcome.
+func rulesAllowUnversionedLoad(configFile string, stderr io.Writer) bool {
+	cfg, err := loadRulesConfig(configFile, stderr)
+	if err != nil {
+		// An unreadable configuration cannot prove the operator relaxed the
+		// gate, so the command keeps the strict refusal.
+		return false
+	}
+	if cfg == nil {
+		// No configuration at all means the shipped default applies, exactly
+		// as the runtime loader would apply it.
+		return config.Defaults().Rules.AllowUnversionedBundleLoad
+	}
+	return cfg.Rules.AllowUnversionedBundleLoad
+}
+
+// checkBundleMinVersion applies the same strict-or-warn decision the runtime
+// loader makes: a checked failure refuses, an unprovable running version
+// refuses when the operator kept the strict setting and otherwise warns and
+// continues. Install and update must not stage a bundle the runtime would
+// refuse to load.
+func checkBundleMinVersion(w io.Writer, minPipelock string, allowUnversioned bool) error {
+	err := domrules.CheckMinPipelockVerdict(minPipelock, cliutil.Version)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, domrules.ErrUnverifiableVersion) || !allowUnversioned {
+		return err
+	}
+	warnUnverifiableBundleVersion(w, err)
+	return nil
+}
+
+// warnUnverifiableBundleVersion reports an unchecked development-build gate.
+// The runtime loader makes the same warning and keeps the bundle loaded.
+func warnUnverifiableBundleVersion(w io.Writer, err error) {
+	_, _ = fmt.Fprintf(w, "warning: %v\n", err)
+	_, _ = fmt.Fprintf(w, "warning: the bundle remains eligible to load at runtime, but its minimum version was not proven\n")
+}
+
+func warnTestedThroughPipelock(w io.Writer, testedThrough, currentVersion string) error {
+	warning, err := domrules.TestedThroughPipelockWarning(testedThrough, currentVersion)
+	if err != nil {
+		return err
+	}
+	if warning != "" {
+		_, _ = fmt.Fprintf(w, "warning: %s\n", warning)
+	}
+	return nil
+}
+
+// loadRulesConfig loads the pipelock config for trusted key resolution.
+// Resolution is explicit --config, then PIPELOCK_CONFIG, then the shared
+// user/system discovery path. CWD-local pipelock.yaml is intentionally ignored:
+// rules_dir and trusted_keys are security decisions and must not be discovered
+// from a hostile repository working directory.
+func loadRulesConfig(configFile string, stderr ...io.Writer) (*config.Config, error) {
+	provenance := io.Discard
+	if len(stderr) > 0 && stderr[0] != nil {
+		provenance = stderr[0]
+	}
+
+	// Explicit flag: hard error on failure.
+	if configFile != "" {
+		cfg, err := config.LoadForRules(configFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading config %q: %w", configFile, err)
+		}
+		_, _ = fmt.Fprintf(provenance, "pipelock rules: using config %s\n", configFile)
+		return cfg, nil
+	}
+
+	if envPath := os.Getenv("PIPELOCK_CONFIG"); envPath != "" {
+		clean, err := filepath.Abs(filepath.Clean(envPath))
+		if err != nil {
+			return nil, fmt.Errorf("resolving PIPELOCK_CONFIG %q: %w", envPath, err)
+		}
+		if err := cliutil.ConfigPathIsSecure(clean); err != nil {
+			return nil, fmt.Errorf("rejecting PIPELOCK_CONFIG %q: %w", clean, err)
+		}
+		cfg, err := config.LoadForRules(clean)
+		if err != nil {
+			return nil, fmt.Errorf("loading PIPELOCK_CONFIG %q: %w", clean, err)
+		}
+		_, _ = fmt.Fprintf(provenance, "pipelock rules: using config %s\n", clean)
+		return cfg, nil
+	}
+
+	discovered, discoverErr := discoverRulesConfigPath()
+	if discoverErr != nil {
+		return nil, fmt.Errorf("discovering config: %w", discoverErr)
+	}
+	if discovered != "" {
+		cfg, err := config.LoadForRules(discovered)
+		if err != nil {
+			return nil, fmt.Errorf("loading discovered config %q: %w", discovered, err)
+		}
+		_, _ = fmt.Fprintf(provenance, "pipelock rules: using config %s\n", discovered)
+		return cfg, nil
+	}
+
+	_, _ = fmt.Fprintln(provenance, "pipelock rules: using built-in defaults (no config found)")
+	return nil, nil
+}
+
+// HTTP fetch timeout for remote bundle downloads.
+const httpFetchTimeout = 30 * time.Second
+
+// URL scheme constants.
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
+// Cmd returns the top-level "rules" command with all subcommands.
+func Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rules",
+		Short: "Manage rule bundles",
+		Long:  "Install, update, list, verify, diff, remove, and inspect rule bundles.",
+	}
+	cmd.AddCommand(
+		rulesSchemaCmd(),
+		rulesStatusCmd(),
+		rulesInstallCmd(),
+		rulesUpdateCmd(),
+		rulesListCmd(),
+		rulesVerifyCmd(),
+		rulesDiffCmd(),
+		rulesRemoveCmd(),
+		rulesResetFreshnessCmd(),
+	)
+	return cmd
+}
+
+// ---------- rules status ----------
+
+func rulesStatusCmd() *cobra.Command {
+	var (
+		configFile string
+		jsonOut    bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Show rule tier status, versions, and health",
+		Long: `Display the effective state of all rule tiers: core (compiled),
+standard (bundle or compiled fallback), and community/pro bundles.
+Uses the same config resolution as runtime for accurate reporting.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			out := cmd.OutOrStdout()
+
+			// Load full config to respect rules_dir, include_defaults,
+			// min_confidence, disabled, and trusted_keys.
+			cfg, err := loadRulesConfig(configFile, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			if cfg == nil {
+				cfg = config.Defaults()
+			}
+			cfg.ApplyDefaults()
+
+			// Run the same merge path as runtime to get effective state.
+			result := domrules.MergeIntoConfig(cfg, cliutil.Version)
+
+			// Count compiled (non-bundle, non-user) patterns for standard tier fallback.
+			// Only count patterns with Compiled=true to exclude user-defined patterns.
+			var compiledDLP, compiledResp int
+			for _, p := range cfg.DLP.Patterns {
+				if p.Bundle == "" && p.Compiled {
+					compiledDLP++
+				}
+			}
+			for _, p := range cfg.ResponseScanning.Patterns {
+				if p.Bundle == "" && p.Compiled {
+					compiledResp++
+				}
+			}
+
+			status := statusReport{
+				Core: tierStatus{
+					Source:   "compiled",
+					DLP:      scanner.CoreDLPCount(),
+					Response: scanner.CoreResponseCount(),
+				},
+				StandardDLPSource:      string(result.StandardDLP),
+				StandardResponseSource: string(result.StandardResponse),
+			}
+
+			// Standard tier DLP details.
+			switch result.StandardDLP {
+			case domrules.StandardSourceBundle:
+				for _, lb := range result.Loaded {
+					if lb.Name == domrules.StandardBundleName {
+						status.StandardDLP = &tierDetail{Source: "bundle", Version: lb.Version, Count: lb.DLP}
+						break
+					}
+				}
+			case domrules.StandardSourceCompiled:
+				dlpCount := compiledDLP - scanner.CoreDLPCount()
+				if dlpCount < 0 {
+					dlpCount = 0
+				}
+				status.StandardDLP = &tierDetail{Source: "compiled fallback", Count: dlpCount}
+			case domrules.StandardSourceNone:
+				status.StandardDLP = &tierDetail{Source: "disabled"}
+			}
+
+			// Standard tier response details.
+			switch result.StandardResponse {
+			case domrules.StandardSourceBundle:
+				for _, lb := range result.Loaded {
+					if lb.Name == domrules.StandardBundleName {
+						status.StandardResponse = &tierDetail{Source: "bundle", Version: lb.Version, Count: lb.Injection}
+						break
+					}
+				}
+			case domrules.StandardSourceCompiled:
+				respCount := compiledResp - scanner.CoreResponseCount()
+				if respCount < 0 {
+					respCount = 0
+				}
+				status.StandardResponse = &tierDetail{Source: "compiled fallback", Count: respCount}
+			case domrules.StandardSourceNone:
+				status.StandardResponse = &tierDetail{Source: "disabled"}
+			}
+
+			for _, lb := range result.Loaded {
+				if lb.Name == domrules.StandardBundleName {
+					continue
+				}
+				status.Bundles = append(status.Bundles, bundleStatus{
+					Name:    lb.Name,
+					Version: lb.Version,
+					Tier:    lb.Tier,
+					DLP:     lb.DLP,
+					Inj:     lb.Injection,
+					Poison:  lb.ToolPoison,
+					Signed:  !lb.Unsigned,
+				})
+			}
+
+			for _, e := range result.Errors {
+				status.Errors = append(status.Errors, e.Name+": "+e.Reason)
+			}
+			status.Warnings = result.Warnings
+			status.Degraded = result.Degraded || len(status.Errors) > 0
+			status.Healthy = !status.Degraded
+
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(status); err != nil {
+					return err
+				}
+				if status.Degraded {
+					return cliutil.ExitCodeError(1, fmt.Errorf("%d bundle error(s)", len(status.Errors)))
+				}
+				return nil
+			}
+
+			_, _ = fmt.Fprintf(out, "Core:     %d DLP + %d response (compiled, immutable)\n",
+				status.Core.DLP, status.Core.Response)
+			if d := status.StandardDLP; d != nil {
+				_, _ = fmt.Fprintf(out, "Std DLP:  %d patterns (%s", d.Count, d.Source)
+				if d.Version != "" {
+					_, _ = fmt.Fprintf(out, ", v%s", d.Version)
+				}
+				_, _ = fmt.Fprintln(out, ")")
+			}
+			if r := status.StandardResponse; r != nil {
+				_, _ = fmt.Fprintf(out, "Std Resp: %d patterns (%s", r.Count, r.Source)
+				if r.Version != "" {
+					_, _ = fmt.Fprintf(out, ", v%s", r.Version)
+				}
+				_, _ = fmt.Fprintln(out, ")")
+			}
+
+			for _, b := range status.Bundles {
+				_, _ = fmt.Fprintf(out, "Bundle:   %-25s v%-12s %s (%d DLP, %d inj, %d poison)\n",
+					b.Name, b.Version, b.Tier, b.DLP, b.Inj, b.Poison)
+			}
+
+			if len(status.Errors) > 0 {
+				_, _ = fmt.Fprintln(out, "\nErrors:")
+				for _, e := range status.Errors {
+					_, _ = fmt.Fprintf(out, "  %s\n", e)
+				}
+			}
+			if len(status.Warnings) > 0 {
+				_, _ = fmt.Fprintln(out, "\nWarnings:")
+				for _, w := range status.Warnings {
+					_, _ = fmt.Fprintf(out, "  %s\n", w)
+				}
+			}
+
+			if status.Degraded {
+				_, _ = fmt.Fprintln(out, "\nDEGRADED: rule bundle verification/load failures detected. Protection may be reduced.")
+				return cliutil.ExitCodeError(1, fmt.Errorf("%d bundle error(s)", len(status.Errors)))
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&configFile, "config", "", "config file (default: auto-discovery)")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	return cmd
+}
+
+type statusReport struct {
+	Healthy                bool           `json:"healthy"`
+	Degraded               bool           `json:"degraded"`
+	Core                   tierStatus     `json:"core"`
+	StandardDLP            *tierDetail    `json:"standard_dlp"`
+	StandardResponse       *tierDetail    `json:"standard_response"`
+	StandardDLPSource      string         `json:"standard_dlp_source"`
+	StandardResponseSource string         `json:"standard_response_source"`
+	Bundles                []bundleStatus `json:"bundles,omitempty"`
+	Errors                 []string       `json:"errors,omitempty"`
+	Warnings               []string       `json:"warnings,omitempty"`
+}
+
+type tierStatus struct {
+	Source   string `json:"source"`
+	DLP      int    `json:"dlp"`
+	Response int    `json:"response"`
+}
+
+type tierDetail struct {
+	Source  string `json:"source"`
+	Version string `json:"version,omitempty"`
+	Count   int    `json:"count"`
+}
+
+type bundleStatus struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Tier    string `json:"tier"`
+	DLP     int    `json:"dlp"`
+	Inj     int    `json:"injection"`
+	Poison  int    `json:"tool_poison"`
+	Signed  bool   `json:"signed"`
+}
+
+// acquireRulesLock is defined in rules_lock_unix.go and rules_lock_windows.go.
+// It acquires an advisory file lock for mutating operations. Returns a release
+// function and an error. The caller must call the release function when done.
+
+// ensureDir creates a directory with 0o750 permissions if it does not exist.
+func ensureDir(path string) error {
+	return os.MkdirAll(path, 0o750)
+}
+
+// validateBundlePath sanitizes a bundle name and returns the resolved bundle
+// directory. It rejects names that escape the rules directory via path traversal
+// or symlinks. This MUST be called before any filesystem operation on user-
+// supplied bundle names (update, diff, remove).
+func validateBundlePath(rulesDir, name string) (string, error) {
+	cleaned := filepath.Clean(name)
+	if cleaned != name || strings.Contains(cleaned, string(filepath.Separator)) || cleaned == "." || cleaned == ".." {
+		return "", fmt.Errorf("invalid bundle name %q: must be a plain directory name", name)
+	}
+
+	bundleDir := filepath.Join(rulesDir, cleaned)
+
+	// Resolve symlinks for containment check.
+	resolvedRules, err := filepath.EvalSymlinks(rulesDir)
+	if err != nil {
+		return "", fmt.Errorf("resolving rules directory: %w", err)
+	}
+
+	resolvedBundle, err := filepath.EvalSymlinks(bundleDir)
+	if err != nil {
+		// If the directory doesn't exist yet (install path), just verify the
+		// cleaned name doesn't escape. EvalSymlinks fails for non-existent paths.
+		if errors.Is(err, os.ErrNotExist) {
+			return bundleDir, nil
+		}
+		return "", fmt.Errorf("resolving bundle directory: %w", err)
+	}
+
+	rel, err := filepath.Rel(resolvedRules, resolvedBundle)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", fmt.Errorf("bundle name %q escapes rules directory", name)
+	}
+
+	return bundleDir, nil
+}
+
+// fetchRemoteBundle fetches bundle.yaml and bundle.yaml.sig from a remote URL.
+// Requires HTTPS. Returns the bundle data and signature data.
+func fetchRemoteBundle(ctx context.Context, bundleURL string) ([]byte, []byte, error) {
+	return fetchRemoteBundleWithClient(ctx, bundleURL, httpsOnlyClient)
+}
+
+// fetchOfficialRegistryBundle fetches a bundle from the built-in registry URL.
+// It pins both the initial URL and every redirect to the official HTTPS origin.
+func fetchOfficialRegistryBundle(ctx context.Context, bundleURL string) ([]byte, []byte, error) {
+	if !isOfficialRegistryURL(bundleURL) {
+		return nil, nil, fmt.Errorf("%w: expected %s, got %s", errOfficialRegistryOrigin, officialRegistryURL, bundleURL)
+	}
+	return fetchRemoteBundleWithClient(ctx, bundleURL, officialRegistryClient)
+}
+
+// fetchBundleForRecordedSource fetches a bundle whose URL came from an
+// installed bundle's lock file rather than from the operator's --source flag.
+// A bundle installed by official name records the official registry URL as its
+// source, so update and diff must re-fetch it under the same pinned redirect
+// policy the install used; otherwise the pin covers only the one-time install
+// and not the commands an operator runs repeatedly afterwards.
+//
+// Routing keys on the RECORDED source string, not on install provenance.
+// LockFile carries no field saying whether the install used the official name
+// (internal/rules/lock.go), so a --source install that spelled the official URL
+// is pinned on later update and diff even though its install was not. That
+// direction is fail-closed, and the reverse is not possible: an official-name
+// install can never fall back to the general client. The cost is narrow and
+// worth stating, because update has no --source override: an operator who
+// installed from an official-looking URL that later redirects off-origin has no
+// in-command way to accept that redirect on update.
+//
+// Install itself does keep the separation. installRemote selects the client
+// from the official-name branch, not from the URL, so a --source install is
+// never pinned at install time however it is spelled.
+func fetchBundleForRecordedSource(ctx context.Context, source string) ([]byte, []byte, error) {
+	if isOfficialRegistryURL(source) {
+		return fetchOfficialRegistryBundle(ctx, source)
+	}
+	return fetchRemoteBundle(ctx, source)
+}
+
+func fetchRemoteBundleWithClient(ctx context.Context, bundleURL string, client *http.Client) ([]byte, []byte, error) {
+	if !strings.HasPrefix(bundleURL, "https://") {
+		return nil, nil, fmt.Errorf("remote source must use HTTPS: %s", bundleURL)
+	}
+
+	bundleData, err := httpGetWithClient(ctx, bundleURL, client)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetching bundle: %w", err)
+	}
+
+	sigURL := bundleURL + signing.SigExtension
+	sigData, err := httpGetWithClient(ctx, sigURL, client)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fetching signature: %w", err)
+	}
+
+	return bundleData, sigData, nil
+}
+
+// maxBundleRedirects bounds a redirect chain. Setting CheckRedirect at all
+// replaces net/http's default callback, and the ten-hop cap lives IN that
+// default, so a custom callback that never inspects via silently removes the
+// bound. Without this, a redirect loop spins until the request context expires
+// instead of failing fast.
+const maxBundleRedirects = 10
+
+// httpsOnlyClient is a shared HTTP client that rejects HTTPS-to-HTTP
+// redirect downgrades. Bundle fetches must stay on HTTPS.
+var httpsOnlyClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxBundleRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxBundleRedirects)
+		}
+		if req.URL.Scheme != schemeHTTPS {
+			return fmt.Errorf("refusing redirect to non-HTTPS URL: %s", req.URL)
+		}
+		return nil
+	},
+}
+
+// officialRegistryClient allows redirects only when they stay on the exact
+// official registry origin. User-supplied --source URLs never use this client.
+var officialRegistryClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= maxBundleRedirects {
+			return fmt.Errorf("stopped after %d redirects", maxBundleRedirects)
+		}
+		if !isOfficialRegistryURL(req.URL.String()) {
+			return fmt.Errorf("%w: redirects must stay on %s (got %s); if the registry moved, install explicitly with --source <url>", errOfficialRegistryRedirect, officialRegistryURL, req.URL)
+		}
+		return nil
+	},
+}
+
+func isOfficialRegistryURL(rawURL string) bool {
+	got, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	want, err := url.Parse(officialRegistryURL)
+	if err != nil {
+		return false
+	}
+	return got.Scheme == want.Scheme && got.Host == want.Host && got.User == nil
+}
+
+// httpGet performs an HTTP GET with context and timeout.
+func httpGet(ctx context.Context, url string) ([]byte, error) {
+	return httpGetWithClient(ctx, url, httpsOnlyClient)
+}
+
+func httpGetWithClient(ctx context.Context, url string, client *http.Client) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, httpFetchTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP GET %s: %w", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, statusError(url, resp)
+	}
+
+	// Enforce size limit.
+	limited := io.LimitReader(resp.Body, int64(domrules.MaxBundleFileSize)+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("reading response body: %w", err)
+	}
+
+	if len(data) > domrules.MaxBundleFileSize {
+		return nil, fmt.Errorf("response exceeds maximum bundle size (%d bytes)", domrules.MaxBundleFileSize)
+	}
+
+	return data, nil
+}
+
+// statusError turns a non-200 bundle fetch into an operator-readable error.
+//
+// A Pipelock proxy sitting between this command and the registry answers a
+// blocked fetch with its own 403 and the block-reason header set. Without this,
+// that arrives as a bare "status 403" indistinguishable from the registry being
+// down, and nothing tells the operator that their own proxy made the decision
+// or which control governs it.
+//
+// Only the headers are read. The body is attacker-influenced bytes of
+// arbitrary content and echoing it into an operator's terminal buys nothing the
+// bounded reason vocabulary does not already say.
+//
+// This message does NOT claim who blocked the request, because nothing here can
+// establish that. blockreason.FromHeader performs no trust check, the headers
+// carry no authenticated Pipelock signal, and a configured proxy is not
+// necessarily a Pipelock: an ordinary corporate proxy forwarding an upstream 403
+// satisfies both conditions. So the wording reports what is actually known, that
+// the response CARRIES these headers, and leaves attribution to the operator who
+// knows their own topology.
+//
+// The proxy check is kept as a relevance gate rather than as proof. With no
+// proxy configured for this request there is nothing in the path to have set the
+// headers on our behalf, so printing proxy configuration advice would send the
+// operator to a control they do not have.
+func statusError(url string, resp *http.Response) error {
+	info, ok := blockreason.FromHeader(resp.Header)
+	if !ok || !proxyConfiguredFor(resp.Request) {
+		return fmt.Errorf("HTTP GET %s: status %d", url, resp.StatusCode)
+	}
+	msg := fmt.Sprintf(
+		"HTTP GET %s: status %d: the response carries Pipelock block-reason headers (reason=%s, layer=%s), which points to a Pipelock proxy in front of this fetch refusing to release the bundle rather than the registry being down; any server can send these headers, so confirm the refusal in that proxy's log",
+		url, resp.StatusCode, info.Reason, layerOrUnset(info.Layer),
+	)
+	if remedy := authenticatedArtifactRemedy(url, info.Reason); remedy != "" {
+		msg += remedy
+	}
+	return errors.New(msg)
+}
+
+// proxyConfiguredFor reports whether this request would have been routed through
+// a proxy. It asks the SAME resolver net/http used to dial, so the answer tracks
+// the actual route rather than a guess at the environment: HTTP_PROXY,
+// HTTPS_PROXY, NO_PROXY and their lowercase forms are all honored, including a
+// NO_PROXY entry that exempts this specific host.
+//
+// A nil request or a resolver error is treated as "no proxy", which keeps the
+// attribution fail-closed: the worst case is a real Pipelock block reported as a
+// bare status code, which is the behavior that shipped before this message
+// existed. The opposite default would let any server borrow Pipelock's name.
+func proxyConfiguredFor(req *http.Request) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	proxyURL, err := proxyResolver(&http.Request{URL: req.URL})
+	return err == nil && proxyURL != nil
+}
+
+// proxyResolver is the proxy lookup, indirected so a test can drive both
+// directions. It is NOT merely a convenience: http.ProxyFromEnvironment reads
+// the environment once per process and caches it, so the attribution branch
+// would otherwise be decided by whatever was set when the binary started and
+// could not be exercised either way from a test.
+var proxyResolver = http.ProxyFromEnvironment
+
+func layerOrUnset(layer string) string {
+	if layer == "" {
+		return "unset"
+	}
+	return layer
+}
+
+// authenticatedArtifactRemedy names the one control that would have changed
+// this outcome, and returns empty when no control would have.
+//
+// The exception is scoped to response injection scanning, so it is offered only
+// for a prompt_injection block: response_scanning.authenticated_artifacts is
+// consulted in the proxy's response path before injection matching runs
+// (internal/proxy/authenticated_artifact.go, wired into both the forward proxy
+// and decrypted CONNECT). A block from any other layer would be unaffected by
+// it, and pointing an operator at a setting that would not have helped teaches
+// them policy changed when nothing did.
+//
+// host and path are the exact strings the proxy compares against, so they are
+// taken from the URL rather than described. bundle_name cannot be: it must
+// equal the name field inside the bundle that was just refused, which this
+// command never got to read.
+func authenticatedArtifactRemedy(rawURL string, reason blockreason.Reason) string {
+	if reason != blockreason.PromptInjection {
+		return ""
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Hostname() == "" {
+		return ""
+	}
+	return fmt.Sprintf(`
+
+A rules bundle is a list of detection patterns, so its own contents read as injection
+text to a response scanner. Pipelock can verify and release this exact artifact instead
+of scanning it. In the PROXY's config (not this machine's rules directory):
+
+  response_scanning:
+    authenticated_artifacts:
+      - host: %q
+        path: %q
+        bundle_name: "<the bundle's own name field>"
+
+The proxy then re-fetches the signature itself and verifies the bundle against its
+official keyring before releasing the body. Only injection matching is skipped;
+request-side DLP, an unsigned bundle, a non-official signer, a redirect, and any
+other host or path are all still refused.
+
+bundle_name is required and must equal the name field inside the bundle itself;
+the placeholder above is not valid configuration. docs/rules.md names the value
+for the official bundle, and for any other bundle it is the top-level name in its
+YAML.`, parsed.Hostname(), parsed.EscapedPath())
+}
+
+// decodeSignatureBytes decodes a base64-encoded signature from raw bytes.
+// This mirrors signing.LoadSignature but works on in-memory data instead
+// of a file path (for HTTP-fetched signatures).
+func decodeSignatureBytes(data []byte) ([]byte, error) {
+	sig, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil {
+		return nil, fmt.Errorf("decoding signature: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("invalid signature length: got %d, want %d", len(sig), ed25519.SignatureSize)
+	}
+	return sig, nil
+}
+
+// verifyRemoteSignature verifies bundleData against sigData using the configured
+// rules signing trust policy. Returns the verification result.
+func verifyRemoteSignature(bundleData, sigData []byte, policy domrules.TrustPolicy) (*domrules.VerifyResult, error) {
+	// decodeSignatureBytes already labels both of its failures ("decoding signature:"
+	// for a base64 error, "invalid signature length:" for a size mismatch). Re-wrapping
+	// here produced "decoding signature: decoding signature: illegal base64 data" and
+	// mislabeled a length mismatch as a decode failure, so pass the specific error up.
+	sig, err := decodeSignatureBytes(sigData)
+	if err != nil {
+		return nil, err
+	}
+
+	return domrules.VerifyBundleSignatureBytes(bundleData, sig, policy)
+}
+
+// sha256Hex returns the lowercase hex SHA-256 digest of data.
+func sha256Hex(data []byte) string {
+	h := sha256.Sum256(data)
+	return hex.EncodeToString(h[:])
+}
+
+// timeNowUTC returns the current time in RFC3339 UTC format.
+func timeNowUTC() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
+// ---------- rules list ----------
+
+// bundleListEntry is the JSON representation for "rules list --json".
+type bundleListEntry struct {
+	Name                  string `json:"name"`
+	Version               string `json:"version"`
+	TestedThroughPipelock string `json:"tested_through_pipelock,omitempty"`
+	Source                string `json:"source"`
+	Signed                bool   `json:"signed"`
+	LastChk               string `json:"last_check,omitempty"`
+	CompatibilityWarning  string `json:"compatibility_warning,omitempty"`
+	CompatibilityStatus   string `json:"compatibility_status,omitempty"`
+}
+
+func rulesListCmd() *cobra.Command {
+	var (
+		rulesDir   string
+		jsonOut    bool
+		configFile string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List installed rule bundles",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			dir := domrules.ResolveRulesDir(rulesDir)
+			out := cmd.OutOrStdout()
+			policy, policyErr := rulesTrustPolicy(configFile, cmd.ErrOrStderr())
+
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					_, _ = fmt.Fprintln(out, "No bundles installed.")
+					return nil
+				}
+				return fmt.Errorf("reading rules directory: %w", err)
+			}
+
+			var bundles []bundleListEntry
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || strings.HasSuffix(e.Name(), ".bak") {
+					continue
+				}
+				lockPath := filepath.Join(dir, e.Name(), "bundle.lock")
+				lf, err := domrules.ReadLockFile(lockPath)
+				if err != nil {
+					continue // skip directories without lock files
+				}
+				entry := bundleListEntry{
+					Name:    e.Name(),
+					Version: lf.InstalledVersion,
+					Source:  lf.Source,
+					Signed:  !lf.Unsigned,
+					LastChk: lf.LastCheck,
+				}
+				bundlePath := filepath.Clean(filepath.Join(dir, e.Name(), "bundle.yaml"))
+				if policyErr != nil {
+					entry.CompatibilityStatus = "unverified: loading trust policy: " + policyErr.Error()
+				} else if data, readErr := os.ReadFile(bundlePath); readErr == nil {
+					if verifyErr := domrules.VerifyIntegrityBytesWithPolicy(data, filepath.Dir(bundlePath), lf.Unsigned, lf.SignerFingerprint, lf.BundleSHA256, policy); verifyErr != nil {
+						entry.CompatibilityStatus = "unverified: " + verifyErr.Error()
+					} else if bundle, parseErr := domrules.ParseBundle(data); parseErr != nil {
+						entry.CompatibilityStatus = "unverified: parsing bundle: " + parseErr.Error()
+					} else {
+						entry.TestedThroughPipelock = bundle.TestedThroughPipelock
+						entry.CompatibilityWarning, _ = domrules.TestedThroughPipelockWarning(bundle.TestedThroughPipelock, cliutil.Version)
+						entry.CompatibilityStatus = "verified"
+					}
+				} else {
+					entry.CompatibilityStatus = "unverified: reading bundle: " + readErr.Error()
+				}
+				bundles = append(bundles, entry)
+			}
+
+			if len(bundles) == 0 {
+				_, _ = fmt.Fprintln(out, "No bundles installed.")
+				return nil
+			}
+
+			if jsonOut {
+				enc := json.NewEncoder(out)
+				enc.SetIndent("", "  ")
+				return enc.Encode(bundles)
+			}
+
+			for _, b := range bundles {
+				signedLabel := "signed"
+				if !b.Signed {
+					signedLabel = "unsigned"
+				}
+				_, _ = fmt.Fprintf(out, "%-30s v%-14s %s  (%s)\n", b.Name, b.Version, signedLabel, b.Source)
+				if b.LastChk != "" {
+					_, _ = fmt.Fprintf(out, "  last checked: %s\n", b.LastChk)
+				}
+				if b.CompatibilityStatus != "" {
+					_, _ = fmt.Fprintf(out, "  compatibility metadata: %s\n", b.CompatibilityStatus)
+				}
+				if b.TestedThroughPipelock != "" {
+					_, _ = fmt.Fprintf(out, "  tested through Pipelock: %s\n", b.TestedThroughPipelock)
+				}
+				if b.CompatibilityWarning != "" {
+					_, _ = fmt.Fprintf(out, "  warning: %s\n", b.CompatibilityWarning)
+				}
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
+	cmd.Flags().StringVar(&configFile, "config", "", "config file for trusted keys")
+	return cmd
+}
+
+// ---------- rules install ----------
+
+func rulesInstallCmd() *cobra.Command {
+	var (
+		sourceURL   string
+		localPath   string
+		allowUnsign bool
+		rulesDir    string
+		configFile  string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "install [name]",
+		Short: "Install a rule bundle",
+		Long: `Install a rule bundle from the official registry, a third-party URL, or a local directory.
+
+Examples:
+  pipelock rules install pipelock-community
+  pipelock rules install --source https://example.com/bundle.yaml
+  pipelock rules install --path ./my-rules/ --allow-unsigned`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			dir := domrules.ResolveRulesDir(rulesDir)
+
+			if err := ensureDir(dir); err != nil {
+				return fmt.Errorf("creating rules directory: %w", err)
+			}
+
+			unlock, err := acquireRulesLock(dir)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
+			// Determine install mode.
+			switch {
+			case localPath != "":
+				return installLocal(out, dir, localPath, allowUnsign, rulesAllowUnversionedLoad(configFile, cmd.ErrOrStderr()))
+			case sourceURL != "":
+				return installRemote(installRemoteOptions{
+					out:        out,
+					stderr:     cmd.ErrOrStderr(),
+					rulesDir:   dir,
+					bundleURL:  sourceURL,
+					configFile: configFile,
+				})
+			case len(args) == 1:
+				name := args[0]
+				url := officialRegistryURL + "/" + name + "/bundle.yaml"
+				return installRemote(installRemoteOptions{
+					out:          out,
+					stderr:       cmd.ErrOrStderr(),
+					rulesDir:     dir,
+					bundleURL:    url,
+					configFile:   configFile,
+					expectedName: name,
+					official:     true,
+				})
+			default:
+				return fmt.Errorf("specify a bundle name, --source URL, or --path DIR")
+			}
+		},
+	}
+
+	cmd.Flags().StringVar(&sourceURL, "source", "", "third-party bundle URL")
+	cmd.Flags().StringVar(&localPath, "path", "", "local bundle directory")
+	cmd.Flags().BoolVar(&allowUnsign, "allow-unsigned", false, "allow unsigned local bundles")
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	cmd.Flags().StringVar(&configFile, "config", "", "config file for trusted keys")
+	return cmd
+}
+
+// installLocal installs a bundle from a local directory.
+func installLocal(out io.Writer, rulesDir, localPath string, allowUnsigned, allowUnversioned bool) error {
+	if !allowUnsigned {
+		return fmt.Errorf("local installs require --allow-unsigned (local bundles cannot be signature-verified)")
+	}
+
+	bundlePath := filepath.Join(filepath.Clean(localPath), "bundle.yaml")
+	data, err := os.ReadFile(filepath.Clean(bundlePath))
+	if err != nil {
+		return fmt.Errorf("reading local bundle: %w", err)
+	}
+
+	if len(data) > domrules.MaxBundleFileSize {
+		return fmt.Errorf("bundle file exceeds maximum size (%d bytes)", domrules.MaxBundleFileSize)
+	}
+
+	bundle, err := domrules.ParseBundle(data)
+	if err != nil {
+		return fmt.Errorf("parsing bundle: %w", err)
+	}
+	if bundle.FormatVersion >= 2 {
+		return fmt.Errorf("local unsigned installs support only format_version 1; format_version %d bundles must be signed and installed from HTTPS", bundle.FormatVersion)
+	}
+
+	if err := checkBundleMinVersion(out, bundle.MinPipelock, allowUnversioned); err != nil {
+		return err
+	}
+	if err := warnTestedThroughPipelock(out, bundle.TestedThroughPipelock, cliutil.Version); err != nil {
+		return err
+	}
+
+	// Check pipelock-* prefix reservation: local unsigned bundles cannot use it.
+	if strings.HasPrefix(bundle.Name, "pipelock-") {
+		return fmt.Errorf("bundle name %q uses reserved prefix %q: only officially signed bundles may use this prefix", bundle.Name, "pipelock-")
+	}
+
+	digest := sha256Hex(data)
+	destDir := filepath.Join(rulesDir, bundle.Name)
+
+	// Check if already installed with same version+digest.
+	if err := checkExistingInstall(destDir, bundle.Version, digest); err != nil {
+		return err
+	}
+
+	// Build lock file and stage everything atomically.
+	now := timeNowUTC()
+	lf := &domrules.LockFile{
+		InstalledVersion: bundle.Version,
+		InstalledAt:      now,
+		Source:           "local:" + filepath.Clean(localPath),
+		LastCheck:        now,
+		BundleSHA256:     digest,
+		Unsigned:         true,
+	}
+	if err := stageLocalBundleWithFormatFloor(rulesDir, bundle, data, lf); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(out, "Installed %s v%s (unsigned, local)\n", bundle.Name, bundle.Version)
+	_, _ = fmt.Fprintf(out, "  %d rules\n", len(bundle.Rules))
+	return nil
+}
+
+func stageLocalBundleWithFormatFloor(rulesDir string, bundle *domrules.Bundle, data []byte, lf *domrules.LockFile) error {
+	return domrules.WithFreshnessLock(rulesDir, func() error {
+		if err := domrules.RecoverBundleTransactionsLocked(rulesDir); err != nil {
+			return fmt.Errorf("recovering rules transactions: %w", err)
+		}
+		if err := checkInstalledBundleIdentity(filepath.Join(rulesDir, bundle.Name), bundle); err != nil {
+			return err
+		}
+		if lf != nil {
+			if err := checkExistingInstall(filepath.Join(rulesDir, bundle.Name), bundle.Version, lf.BundleSHA256); err != nil {
+				return err
+			}
+		}
+		state, err := domrules.LoadFreshnessStateLocked(rulesDir)
+		if err != nil {
+			return fmt.Errorf("loading rules freshness state: %w", err)
+		}
+		if fr := domrules.CheckFormatFloor(bundle, state); !fr.OK {
+			return fmt.Errorf("install %s: %s", bundle.Name, fr.Message)
+		}
+		previous := cloneFreshnessState(state)
+		domrules.RecordFormat(state, bundle.Name, bundle.FormatVersion)
+		redo, err := domrules.NewBundleTransactionRedo(bundle.Name, data, nil, bundle, lf, state)
+		if err != nil {
+			return fmt.Errorf("prepare rules transaction: %w", err)
+		}
+		return stageBundleTransactionWithRedo(rulesDir, bundle.Name, data, nil, lf, redo, func() error {
+			return commitFreshnessState(rulesDir, state, previous)
+		})
+	})
+}
+
+type installRemoteOptions struct {
+	out          io.Writer
+	stderr       io.Writer
+	rulesDir     string
+	bundleURL    string
+	configFile   string
+	expectedName string
+	official     bool
+}
+
+// installRemote installs a bundle from a remote URL.
+// rulesTrustPolicy resolves the rule-bundle signing trust policy from config: the
+// operator's configured third-party keys plus whether the compiled-in official
+// keyring is trusted. Centralized so the two values cannot drift apart at a call
+// site, and so a missing config falls back to the permissive default rather than to
+// a zero value, whose TrustEmbeddedKeys=false would silently mean private-root-only.
+func rulesTrustPolicy(configFile string, stderr io.Writer) (domrules.TrustPolicy, error) {
+	policy := domrules.DefaultTrustPolicy(nil)
+	cfg, err := loadRulesConfig(configFile, stderr)
+	if err != nil {
+		return domrules.TrustPolicy{}, err
+	}
+	if cfg != nil {
+		policy.TrustedKeys = cfg.Rules.TrustedKeys
+		policy.TrustEmbeddedKeys = cfg.Rules.TrustEmbeddedKeys
+	}
+	return policy, nil
+}
+
+func installRemote(opts installRemoteOptions) error {
+	allowUnversioned := rulesAllowUnversionedLoad(opts.configFile, opts.stderr)
+	out := opts.out
+	ctx := context.Background()
+
+	// Load the signing trust policy from config (explicit flag, env, or discovery).
+	policy, err := rulesTrustPolicy(opts.configFile, opts.stderr)
+	if err != nil {
+		return err
+	}
+
+	var bundleData, sigData []byte
+	if opts.official {
+		bundleData, sigData, err = fetchOfficialRegistryBundle(ctx, opts.bundleURL)
+	} else {
+		bundleData, sigData, err = fetchRemoteBundle(ctx, opts.bundleURL)
+	}
+	if err != nil {
+		return err
+	}
+
+	result, err := verifyRemoteSignature(bundleData, sigData, policy)
+	if err != nil {
+		return fmt.Errorf("signature verification: %w", err)
+	}
+
+	bundle, err := domrules.ParseBundle(bundleData)
+	if err != nil {
+		return fmt.Errorf("parsing bundle: %w", err)
+	}
+
+	// If an expected name was given (official install), verify it matches.
+	if opts.expectedName != "" && bundle.Name != opts.expectedName {
+		return fmt.Errorf("bundle name %q does not match expected %q", bundle.Name, opts.expectedName)
+	}
+
+	// Enforce pipelock-* prefix reservation: only official keys allowed.
+	if strings.HasPrefix(bundle.Name, "pipelock-") && result.Tier != domrules.TrustTierOfficial {
+		return fmt.Errorf("bundle name %q uses reserved prefix %q but signer is not official", bundle.Name, "pipelock-")
+	}
+
+	if err := checkBundleMinVersion(out, bundle.MinPipelock, allowUnversioned); err != nil {
+		return err
+	}
+	if err := warnTestedThroughPipelock(out, bundle.TestedThroughPipelock, cliutil.Version); err != nil {
+		return err
+	}
+
+	digest := sha256Hex(bundleData)
+	// Build lock file and stage everything atomically.
+	now := timeNowUTC()
+	lf := &domrules.LockFile{
+		InstalledVersion:  bundle.Version,
+		InstalledAt:       now,
+		Source:            opts.bundleURL,
+		LastCheck:         now,
+		BundleSHA256:      digest,
+		SignerFingerprint: result.SignerFingerprint,
+	}
+	if err := stageRemoteBundleWithFreshness(opts.rulesDir, bundle, bundleData, sigData, lf, true); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(opts.out, "Installed %s v%s (%s)\n", bundle.Name, bundle.Version, result.Tier)
+	_, _ = fmt.Fprintf(opts.out, "  %d rules, signer: %s\n", len(bundle.Rules), result.SignerFingerprint[:16]+"...")
+	return nil
+}
+
+// stageRemoteBundleWithFreshness validates and advances rollback state before
+// replacing installed bytes. Advancing first is deliberately fail-closed: if
+// staging then fails or the process stops, retrying the same candidate repairs
+// the install, while the older installed bundle cannot erase the new floor.
+func stageRemoteBundleWithFreshness(rulesDir string, bundle *domrules.Bundle, bundleData, sigData []byte, lf *domrules.LockFile, checkInstalled bool) error {
+	return domrules.WithFreshnessLock(rulesDir, func() error {
+		if err := domrules.RecoverBundleTransactionsLocked(rulesDir); err != nil {
+			return fmt.Errorf("recovering rules transactions: %w", err)
+		}
+		if err := checkInstalledBundleIdentity(filepath.Join(rulesDir, bundle.Name), bundle); err != nil {
+			return err
+		}
+		if checkInstalled {
+			if err := checkExistingInstall(filepath.Join(rulesDir, bundle.Name), bundle.Version, lf.BundleSHA256); err != nil {
+				return err
+			}
+		}
+
+		state, err := domrules.LoadFreshnessStateLocked(rulesDir)
+		if err != nil {
+			return fmt.Errorf("loading rules freshness state: %w", err)
+		}
+		if fr := domrules.CheckFormatFloor(bundle, state); !fr.OK {
+			return fmt.Errorf("install %s: %s", bundle.Name, fr.Message)
+		}
+		previous := cloneFreshnessState(state)
+		if bundle.FormatVersion >= 2 {
+			if err := domrules.CheckTierKeyBinding(bundle, lf.SignerFingerprint, nil); err != nil {
+				return fmt.Errorf("install %s: %w", bundle.Name, err)
+			}
+			if err := domrules.CheckRequiredFeatures(bundle.RequiredFeatures); err != nil {
+				return fmt.Errorf("install %s: %w", bundle.Name, err)
+			}
+			if fr := domrules.CheckFreshness(bundle, state, time.Now().UTC(), false); !fr.OK {
+				return fmt.Errorf("install %s: %s", bundle.Name, fr.Message)
+			}
+			domrules.RecordVersion(state, bundle.Tier, bundle.Name, bundle.MonotonicVersion)
+		}
+		domrules.RecordFormat(state, bundle.Name, bundle.FormatVersion)
+		redo, err := domrules.NewBundleTransactionRedo(bundle.Name, bundleData, sigData, bundle, lf, state)
+		if err != nil {
+			return fmt.Errorf("prepare rules transaction: %w", err)
+		}
+		return stageBundleTransactionWithRedo(rulesDir, bundle.Name, bundleData, sigData, lf, redo, func() error {
+			return commitFreshnessState(rulesDir, state, previous)
+		})
+	})
+}
+
+func cloneFreshnessState(state *domrules.FreshnessState) *domrules.FreshnessState {
+	clone := &domrules.FreshnessState{
+		HighestSeen: make(map[string]uint64, len(state.HighestSeen)),
+		FormatFloor: make(map[string]int, len(state.FormatFloor)),
+	}
+	for key, value := range state.HighestSeen {
+		clone.HighestSeen[key] = value
+	}
+	for key, value := range state.FormatFloor {
+		clone.FormatFloor[key] = value
+	}
+	return clone
+}
+
+func commitFreshnessState(rulesDir string, next, previous *domrules.FreshnessState) error {
+	return commitFreshnessStateWithSave(rulesDir, next, previous, domrules.SaveFreshnessState)
+}
+
+func commitFreshnessStateWithSave(rulesDir string, next, previous *domrules.FreshnessState, save func(string, *domrules.FreshnessState) error) error {
+	if err := save(rulesDir, next); err != nil {
+		if restoreErr := save(rulesDir, previous); restoreErr != nil {
+			return fmt.Errorf("updating and restoring rules freshness state: %w", errors.Join(err, restoreErr))
+		}
+		return fmt.Errorf("updating rules freshness state: %w", err)
+	}
+	return nil
+}
+
+func checkInstalledBundleIdentity(destDir string, candidate *domrules.Bundle) error {
+	data, err := domrules.ReadBundleFile(filepath.Join(destDir, "bundle.yaml"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading installed bundle identity: %w", err)
+	}
+	installed, err := domrules.ParseBundle(data)
+	if err != nil {
+		return fmt.Errorf("parsing installed bundle identity: %w", err)
+	}
+	if installed.FormatVersion >= 2 && candidate.FormatVersion >= 2 && installed.Tier != candidate.Tier {
+		return fmt.Errorf("install %s: tier change from %q to %q is not allowed for an installed bundle name", candidate.Name, installed.Tier, candidate.Tier)
+	}
+	if installed.FormatVersion > candidate.FormatVersion {
+		return fmt.Errorf("install %s: format rollback from installed format_version %d to %d", candidate.Name, installed.FormatVersion, candidate.FormatVersion)
+	}
+	return nil
+}
+
+// checkExistingInstall rejects replacement with an older calendar version. Same version + same digest skips the
+// install; same version + a different digest rejects a possible republish.
+func checkExistingInstall(destDir, version, digest string) error {
+	lockPath := filepath.Join(destDir, "bundle.lock")
+	lf, err := domrules.ReadLockFile(lockPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // not installed
+		}
+		return fmt.Errorf("reading installed bundle lock: %w", err)
+	}
+	newVersion, err := domrules.ParseCalVer(version)
+	if err != nil {
+		return fmt.Errorf("parsing candidate version %q: %w", version, err)
+	}
+	installedVersion, err := domrules.ParseCalVer(lf.InstalledVersion)
+	if err != nil {
+		return fmt.Errorf("parsing installed version %q: %w", lf.InstalledVersion, err)
+	}
+	if newVersion.Compare(installedVersion) < 0 {
+		return fmt.Errorf("bundle v%s is older than installed v%s", version, lf.InstalledVersion)
+	}
+
+	if lf.InstalledVersion == version {
+		if lf.BundleSHA256 == digest {
+			return fmt.Errorf("bundle already installed at v%s with same digest (skipping)", version)
+		}
+		return fmt.Errorf("bundle v%s already installed with different digest (possible republish attack)", version)
+	}
+
+	return nil
+}
+
+// stageBundle writes bundle files and lock into a temp directory under rulesDir,
+// then atomically swaps to the final location. The lock file is included in the
+// staged directory so that no observer (startup, verify, concurrent CLI) can see
+// a bundle without matching provenance. If an existing bundle is present, it is
+// moved to a backup before the swap and removed only after success.
+func stageBundle(rulesDir, bundleName string, bundleData, sigData []byte, lf *domrules.LockFile) error {
+	return stageBundleTransaction(rulesDir, bundleName, bundleData, sigData, lf, nil)
+}
+
+func stageBundleTransaction(rulesDir, bundleName string, bundleData, sigData []byte, lf *domrules.LockFile, commit func() error) error {
+	return stageBundleTransactionWithRedo(rulesDir, bundleName, bundleData, sigData, lf, nil, commit)
+}
+
+func stageBundleTransactionWithRedo(rulesDir, bundleName string, bundleData, sigData []byte, lf *domrules.LockFile, redo *domrules.BundleTransactionRedo, commit func() error) error {
+	destDir := filepath.Join(rulesDir, bundleName)
+	if err := recoverBundleTransaction(destDir); err != nil {
+		return err
+	}
+
+	// Create temp staging directory (MkdirTemp creates 0o700, tighten to 0o750).
+	tmpDir, err := os.MkdirTemp(rulesDir, ".stage-"+bundleName+"-*")
+	if err != nil {
+		return fmt.Errorf("creating staging directory: %w", err)
+	}
+	if err := os.Chmod(tmpDir, 0o750); err != nil { //nolint:gosec // G302: 0o750 is correct for directories per project policy
+		return fmt.Errorf("setting staging directory permissions: %w", err)
+	}
+
+	// Clean up staging dir on failure.
+	success := false
+	defer func() {
+		if !success {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+
+	// Write bundle.yaml.
+	bundlePath := filepath.Join(tmpDir, "bundle.yaml")
+	if err := os.WriteFile(bundlePath, bundleData, 0o600); err != nil {
+		return fmt.Errorf("writing staged bundle: %w", err)
+	}
+
+	// Write signature if present.
+	if sigData != nil {
+		sigPath := filepath.Join(tmpDir, "bundle.yaml.sig")
+		if err := os.WriteFile(sigPath, sigData, 0o600); err != nil {
+			return fmt.Errorf("writing staged signature: %w", err)
+		}
+	}
+
+	// Write lock file inside the staged directory so the rename is fully atomic:
+	// no window where bundle exists without matching provenance.
+	lockPath := filepath.Join(tmpDir, "bundle.lock")
+	if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+		return fmt.Errorf("writing staged lock file: %w", err)
+	}
+	// The redo record is the durable link between an active candidate and its
+	// monotonic freshness update. It is intentionally written before either
+	// rename, while the old bundle is still available for identity capture.
+	recordPath, err := domrules.WriteBundleTransactionRedo(rulesDir, redo)
+	if err != nil {
+		return fmt.Errorf("writing bundle transaction redo: %w", err)
+	}
+	removeRedo := func() error {
+		if err := domrules.RemoveBundleTransactionRedo(recordPath); err != nil {
+			return fmt.Errorf("removing bundle transaction redo: %w", err)
+		}
+		return nil
+	}
+
+	// If the destination already exists, move it to a backup instead of deleting.
+	// This preserves the last known-good bundle if the rename fails.
+	backupDir := ""
+	if _, statErr := os.Stat(destDir); statErr == nil {
+		backupDir = destDir + ".bak"
+		_ = os.RemoveAll(backupDir) // remove stale backup from prior failed attempt
+		if err := os.Rename(destDir, backupDir); err != nil {
+			return fmt.Errorf("backing up existing bundle: %w", err)
+		}
+	}
+
+	// Atomic rename into final location.
+	if err := os.Rename(tmpDir, destDir); err != nil {
+		// Restore backup if rename failed.
+		if backupDir != "" {
+			_ = os.Rename(backupDir, destDir)
+		}
+		return fmt.Errorf("installing bundle (rename): %w", err)
+	}
+	if commit != nil {
+		if err := commit(); err != nil {
+			rollbackErr := rollbackBundleTransaction(destDir, backupDir)
+			if rollbackErr != nil {
+				return fmt.Errorf("committing and restoring installed bundle: %w", errors.Join(err, rollbackErr))
+			}
+			if redoErr := removeRedo(); redoErr != nil {
+				return fmt.Errorf("committing bundle and clearing recovered transaction: %w", errors.Join(err, redoErr))
+			}
+			return fmt.Errorf("committing bundle: %w", err)
+		}
+	}
+
+	// Remove backup after successful swap.
+	if backupDir != "" {
+		_ = os.RemoveAll(backupDir)
+	}
+	if err := removeRedo(); err != nil {
+		return err
+	}
+
+	success = true
+	return nil
+}
+
+func rollbackBundleTransaction(destDir, backupDir string) error {
+	return rollbackBundleTransactionWithRename(destDir, backupDir, os.Rename)
+}
+
+func rollbackBundleTransactionWithRename(destDir, backupDir string, rename func(string, string) error) error {
+	failedDir := destDir + ".failed"
+	_ = os.RemoveAll(failedDir)
+	if err := rename(destDir, failedDir); err != nil {
+		return fmt.Errorf("preserving failed candidate: %w", err)
+	}
+	if backupDir == "" {
+		return os.RemoveAll(failedDir)
+	}
+	if err := rename(backupDir, destDir); err != nil {
+		if recoveryErr := rename(failedDir, destDir); recoveryErr != nil {
+			return errors.Join(fmt.Errorf("restoring prior bundle: %w", err), fmt.Errorf("restoring failed candidate: %w", recoveryErr))
+		}
+		return fmt.Errorf("restoring prior bundle: %w", err)
+	}
+	return os.RemoveAll(failedDir)
+}
+
+func recoverBundleTransaction(destDir string) error {
+	return recoverBundleTransactionWithRename(destDir, os.Rename)
+}
+
+func recoverBundleTransactionWithRename(destDir string, rename func(string, string) error) error {
+	if _, err := os.Stat(destDir); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking installed bundle recovery: %w", err)
+	}
+	backupDir := destDir + ".bak"
+	if _, err := os.Stat(backupDir); err == nil {
+		if err := rename(backupDir, destDir); err != nil {
+			return fmt.Errorf("recovering prior installed bundle: %w", err)
+		}
+		_ = os.RemoveAll(destDir + ".failed")
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking prior bundle recovery: %w", err)
+	}
+	failedDir := destDir + ".failed"
+	if _, err := os.Stat(failedDir); err == nil {
+		if err := rename(failedDir, destDir); err != nil {
+			return fmt.Errorf("recovering failed candidate: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("checking failed candidate recovery: %w", err)
+	}
+	return nil
+}
+
+// ---------- rules update ----------
+
+func rulesUpdateCmd() *cobra.Command {
+	var (
+		force          bool
+		allowKeyRotate bool
+		rulesDir       string
+		configFile     string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "update [name]",
+		Short: "Update installed rule bundles",
+		Long: `Update all installed bundles or a specific named bundle.
+Local (unsigned) bundles are skipped during update.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			dir := domrules.ResolveRulesDir(rulesDir)
+
+			if err := ensureDir(dir); err != nil {
+				return fmt.Errorf("creating rules directory: %w", err)
+			}
+
+			unlock, err := acquireRulesLock(dir)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
+			policy, err := rulesTrustPolicy(configFile, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			allowUnversioned := rulesAllowUnversionedLoad(configFile, cmd.ErrOrStderr())
+
+			if len(args) == 1 {
+				return updateBundle(updateBundleOpts{
+					Out:              out,
+					RulesDir:         dir,
+					Name:             args[0],
+					Policy:           policy,
+					Force:            force,
+					AllowKeyRotation: allowKeyRotate,
+					AllowUnversioned: allowUnversioned,
+				})
+			}
+
+			// Update all.
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					_, _ = fmt.Fprintln(out, "No bundles installed.")
+					return nil
+				}
+				return fmt.Errorf("reading rules directory: %w", err)
+			}
+
+			var updated, failures int
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || strings.HasSuffix(e.Name(), ".bak") {
+					continue
+				}
+				err := updateBundle(updateBundleOpts{
+					Out:              out,
+					RulesDir:         dir,
+					Name:             e.Name(),
+					Policy:           policy,
+					Force:            force,
+					AllowKeyRotation: allowKeyRotate,
+					AllowUnversioned: allowUnversioned,
+				})
+				if err != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "error updating %s: %v\n", e.Name(), err)
+					failures++
+				} else {
+					updated++
+				}
+			}
+
+			if updated == 0 && failures == 0 {
+				_, _ = fmt.Fprintln(out, "No bundles updated.")
+			}
+			if failures > 0 {
+				return fmt.Errorf("%d bundle(s) failed to update", failures)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolVar(&force, "force", false, "force update (allow downgrades and republish)")
+	cmd.Flags().BoolVar(&allowKeyRotate, "allow-key-rotation", false, "allow signer key changes")
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	cmd.Flags().StringVar(&configFile, "config", "", "config file for trusted keys")
+	return cmd
+}
+
+// updateBundle updates a single installed bundle.
+// updateBundleOpts groups the update inputs. The positional form reached seven
+// parameters, past the point where the call sites read as a row of bare
+// booleans and a transposed pair would compile silently.
+type updateBundleOpts struct {
+	Out              io.Writer
+	RulesDir         string
+	Name             string
+	Policy           domrules.TrustPolicy
+	Force            bool
+	AllowKeyRotation bool
+	AllowUnversioned bool
+}
+
+func updateBundle(opts updateBundleOpts) error {
+	bundleDir, err := validateBundlePath(opts.RulesDir, opts.Name)
+	if err != nil {
+		return err
+	}
+	lockPath := filepath.Join(bundleDir, "bundle.lock")
+
+	lf, err := domrules.ReadLockFile(lockPath)
+	if err != nil {
+		return fmt.Errorf("bundle %q not installed", opts.Name)
+	}
+
+	// Skip local/unsigned bundles.
+	if lf.Unsigned || !strings.HasPrefix(lf.Source, "https://") {
+		_, _ = fmt.Fprintf(opts.Out, "skipping %s: installed from local path\n", opts.Name)
+		return nil
+	}
+
+	// Fetch latest from source.
+	ctx := context.Background()
+	bundleData, sigData, err := fetchBundleForRecordedSource(ctx, lf.Source)
+	if err != nil {
+		return fmt.Errorf("fetching update for %s: %w", opts.Name, err)
+	}
+
+	result, err := verifyRemoteSignature(bundleData, sigData, opts.Policy)
+	if err != nil {
+		return fmt.Errorf("signature verification for %s: %w", opts.Name, err)
+	}
+
+	// Check signer pinning.
+	if lf.SignerFingerprint != "" {
+		if err := domrules.CheckSignerPinning(lf.SignerFingerprint, result.SignerFingerprint, opts.AllowKeyRotation); err != nil {
+			return fmt.Errorf("update %s: %w", opts.Name, err)
+		}
+	}
+
+	bundle, err := domrules.ParseBundle(bundleData)
+	if err != nil {
+		return fmt.Errorf("parsing updated bundle %s: %w", opts.Name, err)
+	}
+
+	// Reject opts.Name changes: a source cannot silently rename a bundle on update.
+	if bundle.Name != opts.Name {
+		return fmt.Errorf("update %s: bundle manifest name changed from %q to %q (rejected)", opts.Name, opts.Name, bundle.Name)
+	}
+
+	// Re-run reserved prefix check: updates must also enforce pipelock-* reservation.
+	if strings.HasPrefix(bundle.Name, "pipelock-") && result.Tier != domrules.TrustTierOfficial {
+		return fmt.Errorf("update %s: bundle name %q uses reserved prefix %q but signer is not official", opts.Name, bundle.Name, "pipelock-")
+	}
+
+	if err := checkBundleMinVersion(opts.Out, bundle.MinPipelock, opts.AllowUnversioned); err != nil {
+		return err
+	}
+	if err := warnTestedThroughPipelock(opts.Out, bundle.TestedThroughPipelock, cliutil.Version); err != nil {
+		return err
+	}
+
+	// Compare versions.
+	newVer, err := domrules.ParseCalVer(bundle.Version)
+	if err != nil {
+		return fmt.Errorf("parsing new version: %w", err)
+	}
+	oldVer, err := domrules.ParseCalVer(lf.InstalledVersion)
+	if err != nil {
+		return fmt.Errorf("parsing installed version: %w", err)
+	}
+
+	newDigest := sha256Hex(bundleData)
+	now := timeNowUTC()
+
+	cmp := newVer.Compare(oldVer)
+	switch {
+	case cmp < 0:
+		return fmt.Errorf("update %s: new version %s is older than installed %s", opts.Name, bundle.Version, lf.InstalledVersion)
+
+	case cmp == 0 && newDigest == lf.BundleSHA256:
+		// Same version, same digest: just update last_check.
+		lf.LastCheck = now
+		if err := domrules.WriteLockFile(lockPath, lf); err != nil {
+			return fmt.Errorf("updating last_check for %s: %w", opts.Name, err)
+		}
+		_, _ = fmt.Fprintf(opts.Out, "%s v%s: already up to date\n", opts.Name, bundle.Version)
+		return nil
+
+	case cmp == 0 && newDigest != lf.BundleSHA256 && !opts.Force:
+		return fmt.Errorf("update %s: same version %s but different digest (possible republish attack, use --force to override)", opts.Name, bundle.Version)
+	}
+
+	// Build lock file and stage everything atomically.
+	newLF := &domrules.LockFile{
+		InstalledVersion:  bundle.Version,
+		InstalledAt:       now,
+		Source:            lf.Source,
+		LastCheck:         now,
+		BundleSHA256:      newDigest,
+		SignerFingerprint: result.SignerFingerprint,
+	}
+	if err := stageRemoteBundleWithFreshness(opts.RulesDir, bundle, bundleData, sigData, newLF, false); err != nil {
+		return err
+	}
+
+	_, _ = fmt.Fprintf(opts.Out, "Updated %s: v%s -> v%s\n", opts.Name, lf.InstalledVersion, bundle.Version)
+	return nil
+}
+
+func rulesResetFreshnessCmd() *cobra.Command {
+	var rulesDir string
+	cmd := &cobra.Command{
+		Use:   "reset-freshness",
+		Short: "Reset rules rollback freshness state from installed bundles",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			dir := domrules.ResolveRulesDir(rulesDir)
+			if err := domrules.WithFreshnessLock(dir, func() error {
+				if err := domrules.RecoverBundleTransactionsLocked(dir); err != nil {
+					return fmt.Errorf("recovering rules transactions: %w", err)
+				}
+				return domrules.ResetFreshnessStateFromInstalledBundles(dir)
+			}); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Reset rules freshness state from installed bundles in %s\n", dir)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	return cmd
+}
+
+// ---------- rules verify ----------
+
+func rulesVerifyCmd() *cobra.Command {
+	var rulesDir string
+	var configFile string
+
+	cmd := &cobra.Command{
+		Use:   "verify",
+		Short: "Re-verify integrity of all installed bundles",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			out := cmd.OutOrStdout()
+			dir := domrules.ResolveRulesDir(rulesDir)
+
+			policy, err := rulesTrustPolicy(configFile, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					_, _ = fmt.Fprintln(out, "No bundles installed.")
+					return nil
+				}
+				return fmt.Errorf("reading rules directory: %w", err)
+			}
+
+			var failures int
+			var checked int
+			for _, e := range entries {
+				if !e.IsDir() || strings.HasPrefix(e.Name(), ".") || strings.HasSuffix(e.Name(), ".bak") {
+					continue
+				}
+				checked++
+				bundleDir := filepath.Join(dir, e.Name())
+				lockPath := filepath.Join(bundleDir, "bundle.lock")
+
+				lf, err := domrules.ReadLockFile(lockPath)
+				if err != nil {
+					_, _ = fmt.Fprintf(out, "FAIL  %s: missing lock file\n", e.Name())
+					failures++
+					continue
+				}
+
+				err = domrules.VerifyIntegrityWithPolicy(bundleDir, lf.Unsigned, lf.SignerFingerprint, lf.BundleSHA256, policy)
+				if err != nil {
+					_, _ = fmt.Fprintf(out, "FAIL  %s: %v\n", e.Name(), err)
+					failures++
+				} else {
+					label := "signature OK"
+					if lf.Unsigned {
+						label = "SHA-256 OK"
+					}
+					_, _ = fmt.Fprintf(out, "OK    %s (%s)\n", e.Name(), label)
+				}
+			}
+
+			if checked == 0 {
+				_, _ = fmt.Fprintln(out, "No bundles installed.")
+				return nil
+			}
+
+			if failures > 0 {
+				return fmt.Errorf("%d bundle(s) failed verification", failures)
+			}
+
+			_, _ = fmt.Fprintf(out, "\nAll %d bundle(s) verified.\n", checked)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	cmd.Flags().StringVar(&configFile, "config", "", "config file for trusted keys")
+	return cmd
+}
+
+// ---------- rules diff ----------
+
+func rulesDiffCmd() *cobra.Command {
+	var rulesDir string
+	var sourceURL string
+
+	cmd := &cobra.Command{
+		Use:   "diff <name>",
+		Short: "Show differences between installed and remote bundle",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			dir := domrules.ResolveRulesDir(rulesDir)
+			name := args[0]
+
+			bundleDir, pathErr := validateBundlePath(dir, name)
+			if pathErr != nil {
+				return pathErr
+			}
+			lockPath := filepath.Join(bundleDir, "bundle.lock")
+
+			lf, err := domrules.ReadLockFile(lockPath)
+			if err != nil {
+				return fmt.Errorf("bundle %q not installed", name)
+			}
+
+			// Determine source URL.
+			fetchURL := sourceURL
+			if fetchURL == "" {
+				fetchURL = lf.Source
+			}
+
+			if !strings.HasPrefix(fetchURL, "https://") {
+				return fmt.Errorf("cannot diff local bundles (source: %s); use --source to specify a remote URL", fetchURL)
+			}
+
+			// Read installed bundle.
+			installedPath := filepath.Join(bundleDir, "bundle.yaml")
+			installedData, err := os.ReadFile(filepath.Clean(installedPath))
+			if err != nil {
+				return fmt.Errorf("reading installed bundle: %w", err)
+			}
+
+			installedBundle, err := domrules.ParseBundle(installedData)
+			if err != nil {
+				return fmt.Errorf("parsing installed bundle: %w", err)
+			}
+
+			// Fetch remote bundle.
+			ctx := context.Background()
+			// Only a RECORDED official source gets the pinned client. An
+			// explicit --source override stays on the general path, so it
+			// cannot acquire official-path handling by spelling the URL.
+			var remoteData []byte
+			if sourceURL == "" {
+				remoteData, _, err = fetchBundleForRecordedSource(ctx, fetchURL)
+			} else {
+				remoteData, _, err = fetchRemoteBundle(ctx, fetchURL)
+			}
+			if err != nil {
+				return fmt.Errorf("fetching remote bundle: %w", err)
+			}
+
+			remoteBundle, err := domrules.ParseBundle(remoteData)
+			if err != nil {
+				return fmt.Errorf("parsing remote bundle: %w", err)
+			}
+
+			// Build rule maps.
+			installedRules := make(map[string]*domrules.Rule, len(installedBundle.Rules))
+			for i := range installedBundle.Rules {
+				r := &installedBundle.Rules[i]
+				installedRules[r.ID] = r
+			}
+
+			remoteRules := make(map[string]*domrules.Rule, len(remoteBundle.Rules))
+			for i := range remoteBundle.Rules {
+				r := &remoteBundle.Rules[i]
+				remoteRules[r.ID] = r
+			}
+
+			// Calculate diffs.
+			var added, removed, changed []string
+
+			for id := range remoteRules {
+				nsID := domrules.NamespacedID(name, id)
+				if _, ok := installedRules[id]; !ok {
+					added = append(added, nsID)
+				}
+			}
+
+			for id := range installedRules {
+				nsID := domrules.NamespacedID(name, id)
+				if _, ok := remoteRules[id]; !ok {
+					removed = append(removed, nsID)
+				}
+			}
+
+			for id, installedRule := range installedRules {
+				remoteRule, ok := remoteRules[id]
+				if !ok {
+					continue
+				}
+				if ruleChanged(installedRule, remoteRule) {
+					changed = append(changed, domrules.NamespacedID(name, id))
+				}
+			}
+
+			// Print diff.
+			_, _ = fmt.Fprintf(out, "Diff: %s (installed v%s vs remote v%s)\n\n", name, installedBundle.Version, remoteBundle.Version)
+
+			if len(added) == 0 && len(removed) == 0 && len(changed) == 0 {
+				_, _ = fmt.Fprintln(out, "No differences found.")
+				return nil
+			}
+
+			for _, id := range added {
+				_, _ = fmt.Fprintf(out, "+ %s\n", id)
+			}
+			for _, id := range removed {
+				_, _ = fmt.Fprintf(out, "- %s\n", id)
+			}
+			for _, id := range changed {
+				_, _ = fmt.Fprintf(out, "~ %s\n", id)
+			}
+
+			_, _ = fmt.Fprintf(out, "\nSummary: %d added, %d removed, %d changed\n", len(added), len(removed), len(changed))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	cmd.Flags().StringVar(&sourceURL, "source", "", "override source URL for comparison")
+	return cmd
+}
+
+// ruleChanged returns true if two rules differ in any meaningful field.
+func ruleChanged(a, b *domrules.Rule) bool {
+	if a.Type != b.Type {
+		return true
+	}
+	if a.Status != b.Status {
+		return true
+	}
+	if a.Severity != b.Severity {
+		return true
+	}
+	if a.Pattern.Regex != b.Pattern.Regex {
+		return true
+	}
+	if a.Description != b.Description {
+		return true
+	}
+	return false
+}
+
+// ---------- rules remove ----------
+
+func rulesRemoveCmd() *cobra.Command {
+	var rulesDir string
+
+	cmd := &cobra.Command{
+		Use:   "remove <name>",
+		Short: "Remove an installed rule bundle",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			dir := domrules.ResolveRulesDir(rulesDir)
+			name := args[0]
+
+			if err := ensureDir(dir); err != nil {
+				return fmt.Errorf("creating rules directory: %w", err)
+			}
+
+			unlock, err := acquireRulesLock(dir)
+			if err != nil {
+				return err
+			}
+			defer unlock()
+
+			bundleDir, pathErr := validateBundlePath(dir, name)
+			if pathErr != nil {
+				return pathErr
+			}
+			info, err := os.Stat(bundleDir)
+			if err != nil || !info.IsDir() {
+				return fmt.Errorf("bundle %q is not installed", name)
+			}
+
+			if err := os.RemoveAll(bundleDir); err != nil {
+				return fmt.Errorf("removing bundle %q: %w", name, err)
+			}
+
+			_, _ = fmt.Fprintf(out, "Removed %s\n", name)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&rulesDir, "rules-dir", "", "override rules directory")
+	return cmd
+}

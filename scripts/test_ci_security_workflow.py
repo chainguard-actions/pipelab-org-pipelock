@@ -1,0 +1,461 @@
+# Copyright 2026 Pipelock contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Contract tests for required CI security-check coverage."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yaml"
+# Every producer result the required build gate must see succeed.
+BUILD_GATE_RESULTS = (
+    "SECURITY_SCAN_RESULT",
+    "TEST_GO126_RESULT",
+    "TEST_GO127_RESULT",
+    "LINT_RESULT",
+    "LINT_POLICY_RESULT",
+    "LINT_ENTERPRISE_RESULT",
+    "CONFIG_EXAMPLES_RESULT",
+    "CROSS_TARGET_RESULT",
+    "HELM_RESULT",
+    "BUILD_BINARIES_RESULT",
+    "AGENT_REVIEW_CONTRACT_RESULT",
+    "BENCHMARK_SMOKE_RESULT",
+)
+# The subset a documentation-only pull request skips on purpose.
+DOCS_SKIPPABLE_RESULTS = (
+    "LINT_RESULT",
+    "LINT_ENTERPRISE_RESULT",
+    "CROSS_TARGET_RESULT",
+    "HELM_RESULT",
+    "BUILD_BINARIES_RESULT",
+    # Skippable only because the classifier ruled out benchmark inputs.
+    "BENCHMARK_SMOKE_RESULT",
+)
+
+
+def job_block(workflow: str, name: str) -> str:
+    """Return one top-level GitHub Actions job without parsing YAML's `on` key."""
+    marker = f"  {name}:\n"
+    start = workflow.index(marker)
+    next_job = re.search(r"(?m)^  [A-Za-z0-9_-]+:\n", workflow[start + len(marker) :])
+    end = len(workflow) if next_job is None else start + len(marker) + next_job.start()
+    return workflow[start:end]
+
+
+def step_script(job: str, name: str) -> str:
+    """Return the shell body for one literal-block run step."""
+    lines = job.splitlines()
+    step = next(index for index, line in enumerate(lines) if line.strip() == f"- name: {name}")
+    run = next(index for index in range(step + 1, len(lines)) if lines[index].strip() == "run: |")
+    run_indent = len(lines[run]) - len(lines[run].lstrip())
+    body: list[str] = []
+    for line in lines[run + 1 :]:
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and indent <= run_indent:
+            break
+        body.append(line)
+    return textwrap.dedent("\n".join(body))
+
+
+class CISecurityWorkflowTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.govulncheck = job_block(self.workflow, "govulncheck")
+        self.cross_target = job_block(self.workflow, "test-cross-target")
+        self.build_binaries = job_block(self.workflow, "build-binaries")
+        self.build = job_block(self.workflow, "build")
+
+    def test_changed_test_classifier_fails_closed(self) -> None:
+        script = step_script(job_block(self.workflow, "test-changed-race-go126"), "Detect test source changes")
+        for event, merge_status, diff_status, want, output in (
+            ("pull_request", 0, 0, 0, "changed=false"),
+            ("merge_group", 0, 1, 0, "changed=true"),
+            ("pull_request", 1, 0, 1, ""),
+            ("pull_request", 0, 128, 128, ""),
+            ("unknown", 0, 0, 1, ""),
+        ):
+            with self.subTest(event=event, merge=merge_status, diff=diff_status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                git = root / "git"
+                git.write_text("#!/bin/bash\ncase \"$1\" in\n"
+                               "merge-base) echo base; exit \"$MERGE_STATUS\" ;;\n"
+                               "diff) exit \"$DIFF_STATUS\" ;;\nesac\n")
+                git.chmod(0o700)
+                target = root / "output"
+                target.touch()
+                env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
+                       "EVENT_NAME": event, "BASE_SHA": "base", "HEAD_SHA": "head",
+                       "MERGE_STATUS": str(merge_status), "DIFF_STATUS": str(diff_status), "GITHUB_OUTPUT": str(target)}
+                result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, want, result.stderr)
+                self.assertEqual(target.read_text().strip(), output)
+
+    def assert_govulncheck_contract(self, job: str) -> None:
+        self.assertIn(
+            "go install golang.org/x/vuln/cmd/govulncheck@v1.1.4",
+            job,
+        )
+        self.assertRegex(job, r"(?m)^\s+govulncheck \./\.\.\. \|\| default_status=\$\?$")
+        self.assertRegex(job, r"(?m)^\s+govulncheck -tags enterprise \./\.\.\. \|\| enterprise_status=\$\?$")
+
+    def run_govulncheck_step(self, default_status: int, enterprise_status: int) -> tuple[int, list[str]]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            calls = temp / "calls"
+            executable = temp / "govulncheck"
+            executable.write_text(
+                """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$CALL_LOG"
+if [ "$1" = "-tags" ]; then
+  exit "$ENTERPRISE_STATUS"
+fi
+exit "$DEFAULT_STATUS"
+""",
+                encoding="utf-8",
+            )
+            executable.chmod(0o700)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CALL_LOG": str(calls),
+                    "DEFAULT_STATUS": str(default_status),
+                    "ENTERPRISE_STATUS": str(enterprise_status),
+                    "PATH": f"{temp}{os.pathsep}{env['PATH']}",
+                }
+            )
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", step_script(self.govulncheck, "Run govulncheck")],
+                check=False,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            return result.returncode, calls.read_text(encoding="utf-8").splitlines()
+
+    def test_scanner_build_retries_modules_in_trusted_tree(self) -> None:
+        security = self.workflow.split("  security-scan:", 1)[1].split("  changed-files:", 1)[0]
+        script = step_script(security, "Build scanner from origin/main")
+        self.assertIn('git worktree add --detach "${build_tree}" "${main_sha}"', script)
+        self.assertLess(script.index('cd "${build_tree}"'), script.index("bash scripts/ci-retry.sh go mod download"))
+        self.assertLess(script.index("bash scripts/ci-retry.sh go mod download"), script.index("go build -o"))
+
+    def test_required_govulncheck_covers_default_and_enterprise_reachability(self) -> None:
+        # The required job must scan both graphs with the executable installed
+        # from the pinned module version. Checking the job block rather than the
+        # whole workflow prevents another job's command from satisfying this
+        # contract while the required context silently loses coverage.
+        self.assert_govulncheck_contract(self.govulncheck)
+
+    def test_govulncheck_contract_rejects_missing_enterprise_scan(self) -> None:
+        # A synthetic omission proves the predicate is not merely documenting
+        # the desired command: it rejects the exact false-green regression.
+        without_enterprise = self.govulncheck.replace(
+            "          govulncheck -tags enterprise ./... || enterprise_status=$?\n",
+            "",
+            1,
+        )
+        with self.assertRaises(AssertionError):
+            self.assert_govulncheck_contract(without_enterprise)
+
+    def test_govulncheck_runs_both_graphs_before_reporting_failure(self) -> None:
+        for default_status, enterprise_status, want_status in (
+            (0, 0, 0),
+            (7, 0, 1),
+            (0, 9, 1),
+            (7, 9, 1),
+        ):
+            with self.subTest(default_status=default_status, enterprise_status=enterprise_status):
+                got_status, calls = self.run_govulncheck_step(default_status, enterprise_status)
+                self.assertEqual(want_status, got_status)
+                self.assertEqual(["./...", "-tags enterprise ./..."], calls)
+
+    def test_required_build_keeps_helm_as_a_transitive_gate(self) -> None:
+        # `helm` is not an independent required ruleset context. Its result is
+        # intentionally carried by required `build`; dropping it would turn a
+        # Helm failure into a mergeable advisory without any ruleset change.
+        needs_match = re.search(r"(?m)^\s+needs:\s*\[([^]]+)\]$", self.build)
+        self.assertIsNotNone(needs_match, "build needs list not found")
+        build_needs = {
+            dependency.strip()
+            for dependency in needs_match.group(1).split(",")
+            if dependency.strip()
+        }
+        self.assertIn("helm", build_needs)
+        self.assertIn(
+            "the required `build` context\n  # intentionally carries its result through `needs`",
+            self.workflow,
+        )
+
+    def test_build_compiles_in_parallel_without_weakening_required_gate(self) -> None:
+        producer_needs = re.search(r"(?m)^\s+needs:\s*\[([^]]+)\]$", self.build_binaries)
+        self.assertIsNotNone(producer_needs, "build-binaries needs list not found")
+        # changed-files only lets a documentation-only pull request skip it.
+        self.assertEqual(
+            {"security-scan", "changed-files"},
+            {dependency.strip() for dependency in producer_needs.group(1).split(",")},
+        )
+
+        gate_needs = re.search(r"(?m)^\s+needs:\s*\[([^]]+)\]$", self.build)
+        self.assertIsNotNone(gate_needs, "build needs list not found")
+        self.assertEqual(
+            {
+                "security-scan",
+                "changed-files",
+                "test-go126",
+                "test-go127",
+                "lint",
+                "lint-enterprise",
+                "lint-policy",
+                "config-examples",
+                "test-cross-target",
+                "helm",
+                "build-binaries",
+                "agent-review-contract",
+                "benchmark-smoke",
+            },
+            {dependency.strip() for dependency in gate_needs.group(1).split(",")},
+        )
+        self.assertIn("if: ${{ always() }}", self.build)
+        for result in BUILD_GATE_RESULTS:
+            self.assertIn(f'"${result}"', self.build)
+
+    def test_required_build_gate_fails_closed_for_every_incomplete_result(self) -> None:
+        script = step_script(self.build, "Report required build evidence")
+        result_names = BUILD_GATE_RESULTS
+        base_env = os.environ.copy()
+        base_env.update({name: "success" for name in result_names})
+        base_env["BENCHMARK_SMOKE_REQUIRED"] = "true"
+        base_env.update({
+            "CHANGED_FILES_RESULT": "success",
+            "DOCS_ONLY": "false",
+            "EVENT_NAME": "pull_request",
+            "QUEUE_TREE_TESTED": "false",
+        })
+        success = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", script],
+            check=False,
+            env=base_env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(0, success.returncode, success.stderr)
+
+        for name in result_names:
+            for evidence in ("failure", "cancelled", "skipped", ""):
+                with self.subTest(name=name, evidence=evidence):
+                    env = base_env.copy()
+                    env[name] = evidence
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", script],
+                        check=False,
+                        env=env,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertNotEqual(0, result.returncode)
+
+    def test_required_build_gate_requires_classifier_success_on_pull_requests(self) -> None:
+        # A failed changed-files classifier skips the upper-lane producers, and
+        # test (1.27) accepts a skip on pull_request. The required build gate
+        # must refuse that unless the classifier itself succeeded.
+        script = step_script(self.build, "Report required build evidence")
+        base_env = os.environ.copy()
+        base_env.update({name: "success" for name in BUILD_GATE_RESULTS})
+        base_env["BENCHMARK_SMOKE_REQUIRED"] = "true"
+
+        def run(event: str, classifier: str) -> int:
+            env = base_env.copy()
+            env.update({
+                "EVENT_NAME": event,
+                "CHANGED_FILES_RESULT": classifier,
+                "DOCS_ONLY": "false",
+                "QUEUE_TREE_TESTED": "false",
+            })
+            return subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script], check=False, env=env, text=True, capture_output=True
+            ).returncode
+
+        for event in ("pull_request", "merge_group"):
+            self.assertEqual(0, run(event, "success"))
+            for classifier in ("failure", "cancelled", "skipped", ""):
+                with self.subTest(event=event, classifier=classifier):
+                    self.assertNotEqual(0, run(event, classifier))
+        # changed-files runs only on pull requests, so a push to main skips it.
+        self.assertEqual(0, run("push", "skipped"))
+
+    def test_documentation_only_skips_need_classifier_proof(self) -> None:
+        script = step_script(self.build, "Report required build evidence")
+        base_env = os.environ.copy()
+        base_env.update({name: "success" for name in BUILD_GATE_RESULTS})
+        base_env["BENCHMARK_SMOKE_REQUIRED"] = "true"
+
+        def run(event: str, classifier: str, docs: str, **results: str) -> int:
+            env = base_env | {"EVENT_NAME": event, "CHANGED_FILES_RESULT": classifier, "DOCS_ONLY": docs,
+                              "BENCHMARK_SMOKE_REQUIRED": "false", "QUEUE_TREE_TESTED": "false"} | results
+            return subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script], check=False, env=env, text=True, capture_output=True
+            ).returncode
+
+        for event in ("pull_request", "merge_group"):
+            skipped = dict.fromkeys(DOCS_SKIPPABLE_RESULTS, "skipped")
+            self.assertEqual(0, run(event, "success", "true", **skipped))
+            for docs in ("false", "", "TRUE"):
+                with self.subTest(docs=docs):
+                    self.assertNotEqual(0, run(event, "success", docs, **skipped))
+            for classifier in ("failure", "cancelled", "skipped", ""):
+                with self.subTest(classifier=classifier):
+                    self.assertNotEqual(0, run(event, classifier, "true", **skipped))
+            # A push never has a documentation-only proof.
+            self.assertNotEqual(0, run("push", "skipped", "true", **skipped))
+            # The skip covers only "skipped": a docs-only change cannot hide a failure.
+            for name in DOCS_SKIPPABLE_RESULTS:
+                with self.subTest(failed=name):
+                    self.assertNotEqual(0, run(event, "success", "true", **(skipped | {name: "failure"})))
+            # Producers a documentation-only change still needs can never skip.
+            for name in sorted(set(BUILD_GATE_RESULTS) - set(DOCS_SKIPPABLE_RESULTS)):
+                with self.subTest(always_required=name):
+                    self.assertNotEqual(0, run(event, "success", "true", **(skipped | {name: "skipped"})))
+
+    def test_queue_tree_reuse_skips_need_classifier_proof(self) -> None:
+        # A merge group whose exact tree a green pull request run already
+        # tested may skip what a documentation-only change skips, plus the
+        # benchmark smoke, but only on that event with an exact "true".
+        script = step_script(self.build, "Report required build evidence")
+        base_env = os.environ.copy() | {name: "success" for name in BUILD_GATE_RESULTS}
+        skipped = dict.fromkeys(DOCS_SKIPPABLE_RESULTS, "skipped")
+
+        def run(event: str, classifier: str, tree: str, **results: str) -> int:
+            env = base_env | {"EVENT_NAME": event, "CHANGED_FILES_RESULT": classifier, "DOCS_ONLY": "false",
+                              "BENCHMARK_SMOKE_REQUIRED": "true", "QUEUE_TREE_TESTED": tree} | results
+            return subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script], check=False, env=env, text=True, capture_output=True
+            ).returncode
+
+        self.assertEqual(0, run("merge_group", "success", "true", **skipped))
+        for tree in ("false", "", "TRUE", "true "):
+            with self.subTest(tree=tree):
+                self.assertNotEqual(0, run("merge_group", "success", tree, **skipped))
+        for event in ("pull_request", "push"):
+            with self.subTest(event=event):
+                self.assertNotEqual(0, run(event, "success", "true", **skipped))
+        for classifier in ("failure", "cancelled", "skipped", ""):
+            with self.subTest(classifier=classifier):
+                self.assertNotEqual(0, run("merge_group", classifier, "true", **skipped))
+        # The reuse covers only "skipped": it cannot hide a failure.
+        for name in DOCS_SKIPPABLE_RESULTS:
+            for evidence in ("failure", "cancelled", ""):
+                with self.subTest(failed=name, evidence=evidence):
+                    self.assertNotEqual(0, run("merge_group", "success", "true", **(skipped | {name: evidence})))
+        # Producers that still run on a reused queue run can never skip.
+        for name in sorted(set(BUILD_GATE_RESULTS) - set(DOCS_SKIPPABLE_RESULTS)):
+            with self.subTest(always_required=name):
+                self.assertNotEqual(0, run("merge_group", "success", "true", **(skipped | {name: "skipped"})))
+
+    def test_govulncheck_runs_on_reused_queue_trees(self) -> None:
+        # Its verdict depends on the live vulnerability database, not only the
+        # tree, so a reused merge group must still run it.
+        condition = re.search(r"(?m)^    if: (.+)$", self.govulncheck)
+        self.assertIsNotNone(condition)
+        self.assertNotIn("queue_tree_tested", condition.group(1))
+        self.assertIn("docs_only != 'true'", condition.group(1))
+
+    def test_tested_tree_upload_cannot_red_build(self) -> None:
+        # Reuse is an optimization; a failed upload must fall back to the full
+        # queue suite rather than fail the required build check.
+        start = self.build.index("- name: Upload the tested tree")
+        step = self.build[start:].split("\n      - ", 1)[0]
+        self.assertIn("continue-on-error: true", step)
+        self.assertIn("actions/upload-artifact@", step)
+
+    def test_summary_accepts_reuse_skips_only_for_tree_independent_checks(self) -> None:
+        summary = job_block(self.workflow, "pipelock-ci-summary")
+        script = step_script(summary, "Report required check evidence")
+        results = {
+            "SECURITY_SCAN_RESULT": "success", "TEST_GO126_RESULT": "success", "TEST_GO127_RESULT": "success",
+            "MACOS_RESULT": "success", "LINT_RESULT": "success", "BUILD_RESULT": "success",
+            "GOVULNCHECK_RESULT": "success",
+        }
+
+        def run(event: str, tree: str, docs: str, **overrides: str) -> int:
+            with tempfile.TemporaryDirectory() as directory:
+                env = os.environ.copy() | results | {
+                    "EVENT_NAME": event, "CHANGED_FILES_RESULT": "success", "DOCS_ONLY": docs,
+                    "QUEUE_TREE_TESTED": tree, "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary.md"),
+                } | overrides
+                return subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", script], check=False, env=env, text=True, capture_output=True,
+                ).returncode
+
+        reused = {"MACOS_RESULT": "skipped", "LINT_RESULT": "skipped"}
+        self.assertEqual(0, run("merge_group", "true", "false", **reused))
+        self.assertNotEqual(0, run("merge_group", "true", "false", **reused, GOVULNCHECK_RESULT="skipped"))
+        self.assertNotEqual(0, run("pull_request", "true", "false", **reused))
+        # A documentation-only change may still skip all three.
+        self.assertEqual(0, run("pull_request", "false", "true", **reused, GOVULNCHECK_RESULT="skipped"))
+
+    def test_benchmark_smoke_skip_needs_classifier_proof(self) -> None:
+        script = step_script(self.build, "Report required build evidence")
+        base_env = os.environ.copy() | {name: "success" for name in BUILD_GATE_RESULTS}
+
+        def run(event: str, classifier: str, required: str, smoke: str) -> int:
+            env = base_env | {"EVENT_NAME": event, "CHANGED_FILES_RESULT": classifier, "DOCS_ONLY": "false",
+                              "BENCHMARK_SMOKE_REQUIRED": required, "BENCHMARK_SMOKE_RESULT": smoke,
+                              "QUEUE_TREE_TESTED": "false"}
+            return subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", script], check=False, env=env, text=True, capture_output=True
+            ).returncode
+
+        for event in ("pull_request", "merge_group"):
+            self.assertEqual(0, run(event, "success", "false", "skipped"))
+            self.assertEqual(0, run(event, "success", "true", "success"))
+            for required in ("true", "", "FALSE"):
+                with self.subTest(event=event, required=required):
+                    self.assertNotEqual(0, run(event, "success", required, "skipped"))
+            for smoke in ("failure", "cancelled", ""):
+                with self.subTest(event=event, smoke=smoke):
+                    self.assertNotEqual(0, run(event, "success", "false", smoke))
+        self.assertNotEqual(0, run("push", "skipped", "", "skipped"))
+        self.assertEqual(0, run("push", "skipped", "", "success"))
+
+    def test_cross_target_compile_has_an_independent_timeout_and_required_gate(self) -> None:
+        self.assertIn("timeout-minutes: 15", self.cross_target)
+        # One job per published target other than the runner's linux/amd64;
+        # each one vets both build variants for its target.
+        self.assertIn(
+            "target: ['linux/arm64', 'darwin/amd64', 'darwin/arm64', 'windows/amd64', 'windows/arm64']",
+            self.cross_target,
+        )
+        self.assertIn("fail-fast: false", self.cross_target)
+        self.assertIn('GOOS="${TARGET%%/*}" GOARCH="${TARGET##*/}" go vet ./...', self.cross_target)
+        self.assertIn('GOOS="${TARGET%%/*}" GOARCH="${TARGET##*/}" go vet -tags enterprise ./...', self.cross_target)
+        self.assertNotIn("Test code compiles for every published target", job_block(self.workflow, "lint"))
+
+    def test_helm_transitive_gate_contract_rejects_removed_dependency(self) -> None:
+        needs_match = re.search(r"(?m)^(\s+needs:\s*\[)([^]]+)(\])$", self.build)
+        self.assertIsNotNone(needs_match, "build needs list not found")
+        without_helm = self.build.replace(
+            needs_match.group(0),
+            f"{needs_match.group(1)}{','.join(need for need in needs_match.group(2).split(',') if need.strip() != 'helm')}{needs_match.group(3)}",
+            1,
+        )
+        mutated_needs = re.search(r"(?m)^\s+needs:\s*\[([^]]+)\]$", without_helm)
+        self.assertIsNotNone(mutated_needs, "mutated build needs list not found")
+        with self.assertRaises(AssertionError):
+            self.assertIn(
+                "helm",
+                {dependency.strip() for dependency in mutated_needs.group(1).split(",")},
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

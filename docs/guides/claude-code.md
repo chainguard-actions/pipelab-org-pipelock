@@ -1,0 +1,371 @@
+# Using Pipelock with Claude Code
+
+Pipelock sits between Claude Code and MCP servers, scanning every response for
+prompt injection before it reaches the agent. This guide covers both MCP proxy
+mode and HTTP fetch proxy mode.
+
+## Quick Start
+
+```bash
+# 1. Install pipelock
+git clone --branch v3.8.0 --depth 1 https://github.com/pipelab-org/pipelock.git
+make -C pipelock install
+
+# 2. Verify it works
+pipelock version
+
+# 3. Generate a config from the Claude Code preset
+pipelock generate config --preset claude-code -o pipelock.yaml
+
+# 4. Wrap an MCP server with it
+pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+```
+
+## MCP Proxy Mode
+
+Pipelock wraps any MCP server as a stdio proxy with bidirectional scanning.
+Client requests are scanned for DLP leaks and injection in tool arguments.
+Server responses are scanned for prompt injection before forwarding to the client.
+Tool descriptions are scanned for poisoned instructions and tracked for rug-pull changes.
+
+```text
+# Local subprocess (stdio)
+Claude Code  <-->  pipelock mcp proxy  <-->  MCP Server
+  (client)         (scan both directions)     (subprocess)
+
+# Remote server (Streamable HTTP)
+Claude Code  <-->  pipelock mcp proxy --upstream  <-->  Remote MCP Server
+  (client)         (scan both directions)                (HTTP)
+```
+
+### How It Works
+
+1. Pipelock starts the MCP server as a child process (or connects to `--upstream` URL)
+2. Client requests (stdin) are scanned for DLP patterns, env leaks, and injection
+3. Clean requests are forwarded; flagged requests are blocked or warned per config
+4. Server responses (stdout) are scanned line-by-line for injection patterns
+5. Clean responses are forwarded; threats trigger the configured action
+6. Server stderr is forwarded to pipelock's stderr for diagnostics
+
+### Actions
+
+| Action | Behavior | Use When |
+|--------|----------|----------|
+| `warn` | Log detection, forward response unchanged | Tuning patterns, low-risk environments |
+| `block` | Replace response with JSON-RPC error (-32000) | Production, unattended agents |
+| `strip` | Redact matched patterns, forward modified response | When partial content is acceptable |
+| `ask` | Terminal y/N/s prompt with timeout (requires TTY) | Attended sessions, manual review |
+
+## Configuring Claude Code
+
+### Project-Level (`.mcp.json`)
+
+Create `.mcp.json` in your project root. This is shared via git so all team
+members get the same MCP security configuration.
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "pipelock",
+      "args": [
+        "mcp", "proxy",
+        "--config", "pipelock.yaml",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"
+      ]
+    }
+  }
+}
+```
+
+Restart Claude Code after changing `.mcp.json`. When Claude Code asks you to
+approve a project MCP server, review the server and make that approval yourself.
+Then use Claude Code's MCP status view and a harmless tool action to confirm it
+connected. A project configuration entry is not itself a connection result.
+
+### User-Level (`~/.claude.json`)
+
+For personal MCP servers that shouldn't be in git:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "pipelock",
+      "args": [
+        "mcp", "proxy",
+        "--config", "/home/you/.config/pipelock.yaml",
+        "--",
+        "npx", "-y", "@modelcontextprotocol/server-filesystem", "/home/you/projects"
+      ]
+    }
+  }
+}
+```
+
+### Multiple Servers
+
+Wrap each MCP server independently:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "pipelock",
+      "args": ["mcp", "proxy", "--config", "pipelock.yaml", "--",
+               "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    },
+    "postgres": {
+      "command": "pipelock",
+      "args": ["mcp", "proxy", "--config", "pipelock.yaml", "--",
+               "npx", "-y", "@modelcontextprotocol/server-postgres",
+               "postgresql://localhost/mydb"]
+    },
+    "github": {
+      "command": "pipelock",
+      "args": ["mcp", "proxy", "--config", "pipelock.yaml", "--",
+               "npx", "-y", "@modelcontextprotocol/server-github"]
+    }
+  }
+}
+```
+
+### Remote MCP Servers (Streamable HTTP)
+
+For MCP servers accessible over HTTP (e.g., hosted services, Docker containers),
+use `--upstream` instead of `--`:
+
+```json
+{
+  "mcpServers": {
+    "remote-tools": {
+      "command": "pipelock",
+      "args": [
+        "mcp", "proxy",
+        "--config", "pipelock.yaml",
+        "--upstream", "http://localhost:8080/mcp"
+      ]
+    }
+  }
+}
+```
+
+Pipelock bridges Claude Code's stdio transport to the upstream HTTP server,
+applying the same bidirectional scanning as subprocess mode. Session IDs are
+tracked automatically, and a GET SSE stream is opened for server-initiated
+messages when the server supports it.
+
+## HTTP Fetch Proxy Mode
+
+For scanning URLs fetched by Claude Code (via WebFetch or other tools), run
+pipelock as an HTTP proxy server:
+
+```bash
+# Start the proxy (background or separate terminal)
+pipelock run --config pipelock.yaml
+```
+
+The proxy listens on `127.0.0.1:8888` by default and exposes:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `/fetch?url=<target>` | Fetch a URL through the scanner |
+| `/health` | Health check |
+
+The proxy port doesn't serve `/metrics` or `/stats`. Set `metrics_listen` to serve them on a dedicated listener; see [Metrics](../metrics.md).
+
+### Claude Code Hooks (PreToolUse)
+
+Pipelock integrates with Claude Code's hook system to scan tool calls before
+execution. The `pipelock claude setup` command installs hooks automatically:
+
+```bash
+# Install hooks (writes to ~/.claude/settings.json)
+pipelock claude setup
+
+# Install hooks with an explicit policy file
+pipelock claude setup --config ~/.config/pipelock/pipelock.yaml
+
+# Or install to a project-local settings file
+pipelock claude setup --project
+
+# Preview without writing
+pipelock claude setup --dry-run
+
+# Remove hooks
+pipelock claude remove
+```
+
+At install time, Pipelock validates the config path, embeds the resolved
+absolute path into the generated hook command, and prints the config source. If
+no standard config is available, the hook is installed with built-in defaults
+and the setup output says so.
+
+`pipelock claude setup` and `pipelock claude remove` modify
+`~/.claude/settings.json` by default; add `--project` for
+`.claude/settings.json` in the current project. Preview the same scope before
+writing it. Both operations preserve unrelated settings and hooks, and a real
+change saves the previous file as a one-version `.bak` backup.
+
+```bash
+# Preview and remove only Pipelock-managed hooks from the user scope.
+pipelock claude remove --dry-run
+pipelock claude remove
+
+# Use this form for the current project's .claude/settings.json.
+pipelock claude remove --project --dry-run
+pipelock claude remove --project
+```
+
+Restart Claude Code and check the affected hooks or MCP connection after a
+change. If the settings file is not usable, inspect the `.bak` alongside that
+same settings file before restoring it; it contains only the version that
+immediately preceded the last real setup or removal.
+
+This registers pipelock as a `PreToolUse` hook for security-relevant tools:
+
+| Matcher | Tools | What's scanned |
+|---------|-------|----------------|
+| `Bash\|WebFetch\|Write\|Edit` | Built-in tools | Commands, URLs, file content for DLP and policy |
+| `Read`, `Grep` | Built-in file reads | File path against the same credential-path policy as other file reads (SSH private keys, AWS credentials, `/etc/shadow` and similar; SSH public keys stay allowed), plus DLP and injection on every argument. A `Grep` whose target (or, with no path, the working directory) is `~/.ssh` or `~/.aws`, sits inside one, or contains one, such as your home directory, is refused. A recursive search that reaches a `.env` or `.netrc` file elsewhere is not path-checked, because the hook sees the search target, not the files the search opens |
+| `NotebookEdit` | Built-in notebook edits | Notebook path and new cell content for DLP and policy, the same as `Write`/`Edit` |
+| `mcp__.*` | All MCP tools | Tool arguments for DLP and injection |
+
+### Fail-closed defaults
+
+The hook fails closed (denies) on every supported input path it cannot positively classify as safe. Concretely:
+
+- **Unsupported hook events** — any `hook_event_name` outside the supported set deny rather than fall through to allow.
+- **Unknown tools** — unrecognized `tool_name` values route through the generic tool-use scanner with their full `tool_name` and `tool_input` instead of falling through to allow.
+- **Malformed payloads** — missing or unparseable JSON returns a deny verdict.
+- **Null tool input** — a null `tool_input` returns an explicit error rather than bypassing tool-use inspection.
+
+The closed default applies in both `JSON-decision` mode (`permissionDecision: "deny"`) and `--exit-code` mode (exit 2). The black-box pen-test suite covers both decision modes for unsupported-event and unknown-tool paths.
+
+The hook reads JSON from stdin and returns allow/deny decisions. An `--exit-code`
+mode is also available (exit 0 for allow, exit 2 for deny):
+
+```bash
+# Default mode (JSON response on stdout)
+echo '{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t1"}' | pipelock claude hook
+
+# Exit-code mode
+echo '...' | pipelock claude hook --exit-code
+```
+
+## TLS Interception
+
+When using pipelock as an HTTP forward proxy, CONNECT tunnels are opaque by
+default: pipelock only sees the hostname, not the request body or response
+content. Enabling TLS interception closes this gap by performing a MITM on
+HTTPS connections, giving you full DLP and response injection detection through
+CONNECT tunnels.
+
+To enable it:
+
+1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
+2. Launch Claude Code with the running proxy's config and CA:
+
+```bash
+pipelock exec --config pipelock.yaml -- claude
+```
+
+[`pipelock exec`](../cli/exec.md) checks the running proxy before launch and sets the proxy and trust variables below. It steers cooperative clients; use containment or sandboxing for operating-system enforcement. For built-in Node HTTP/HTTPS and fetch clients, use Node 22.21+ or 24.5+.
+
+<!-- BEGIN launchcontract:exec -->
+| Variable | Value |
+|---|---|
+| `HTTP_PROXY` | proxy URL |
+| `http_proxy` | proxy URL |
+| `HTTPS_PROXY` | proxy URL |
+| `https_proxy` | proxy URL |
+| `ALL_PROXY` | proxy URL |
+| `all_proxy` | proxy URL |
+| `NO_PROXY` | explicit bypass list |
+| `no_proxy` | explicit bypass list |
+| `npm_config_noproxy` | explicit bypass list |
+| `SSL_CERT_FILE` | combined CA bundle |
+| `REQUESTS_CA_BUNDLE` | combined CA bundle |
+| `CURL_CA_BUNDLE` | combined CA bundle |
+| `GIT_SSL_CAINFO` | combined CA bundle |
+| `CARGO_HTTP_CAINFO` | combined CA bundle |
+| `PIP_CERT` | combined CA bundle |
+| `NODE_EXTRA_CA_CERTS` | combined CA bundle |
+| `npm_config_cafile` | combined CA bundle |
+| `CODEX_CA_CERTIFICATE` | Pipelock CA file |
+| `DENO_CERT` | combined CA bundle |
+| `NODE_USE_ENV_PROXY` | 1 |
+<!-- END launchcontract:exec -->
+
+MCP proxy mode (stdio wrapping) and Claude Code hooks do not require TLS
+interception. They scan traffic directly without certificates.
+
+## Choosing a Config
+
+Pipelock ships with agent-specific presets. A preset is selected when the config is
+generated, with `pipelock generate config --preset <name> -o pipelock.yaml`, and the
+resulting file is what `run` and `mcp proxy` take through `--config`. Run
+`pipelock presets` to list them:
+
+| Preset | Action | Entropy | Rate Limit | Best For |
+|--------|--------|---------|------------|----------|
+| `claude-code` | block | 5.0 | 120/min | Claude Code (unattended) |
+| `cursor` | block | 5.0 | 120/min | Cursor IDE (unattended) |
+| `generic-agent` | warn | 5.5 | 120/min | New agents (tuning phase) |
+| `balanced` | warn | 4.5 | 60/min | General purpose |
+| `strict` | block | 3.5 | 30/min | High-security environments |
+
+Start with `generic-agent` if you're unsure. Once you've verified there
+are no false positives for your workflow, switch to `claude-code` or
+`strict`.
+
+## Troubleshooting
+
+### MCP server not starting
+
+Verify the command works without pipelock first:
+
+```bash
+# Test the server directly
+npx -y @modelcontextprotocol/server-filesystem /tmp
+
+# Then wrap it
+pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+```
+
+### Config file not found
+
+Use an absolute path in `.mcp.json` if the relative path doesn't resolve:
+
+```json
+"args": ["mcp", "proxy", "--config", "/absolute/path/to/pipelock.yaml", "--", ...]
+```
+
+### Input scanning and injection patterns
+
+MCP input scanning reuses your `response_scanning.patterns` for injection
+detection in tool arguments. If you configure custom injection patterns, they
+apply to both directions. DLP patterns work independently.
+
+### False positives
+
+If legitimate responses are being blocked, switch to `warn` mode first to see
+what's being flagged:
+
+```yaml
+response_scanning:
+  action: warn  # log but don't block
+```
+
+Check stderr output for detection logs, then adjust patterns or thresholds.
+
+### Seeing pipelock output
+
+Pipelock logs to stderr (which Claude Code captures). To see real-time output
+during development, run the MCP server manually:
+
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
+  pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+```

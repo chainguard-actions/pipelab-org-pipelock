@@ -1,0 +1,853 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package applycache
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+var testNow = time.Date(2026, 5, 24, 12, 0, 0, 0, time.UTC)
+
+func TestStoreVerifiedPersistsLastKnownGood(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	bundle := signedTestBundle(t, key, "bundle-1", 1, "")
+
+	verified, err := cache.storeVerified(bundle, testVerifyOptions(key))
+	if err != nil {
+		t.Fatalf("storeVerified() error = %v", err)
+	}
+	if verified.BundleHash == "" {
+		t.Fatal("BundleHash = empty")
+	}
+	if _, err := os.Stat(verified.ConfigPath); err != nil {
+		t.Fatalf("active config not persisted: %v", err)
+	}
+
+	reopened, err := Open(Config{Dir: cache.dir})
+	if err != nil {
+		t.Fatalf("Open(reopen) error = %v", err)
+	}
+	active, err := reopened.Active()
+	if err != nil {
+		t.Fatalf("Active() error = %v", err)
+	}
+	if active.Bundle.BundleID != "bundle-1" || active.Bundle.Version != 1 {
+		t.Fatalf("active bundle = %s/%d, want bundle-1/1", active.Bundle.BundleID, active.Bundle.Version)
+	}
+	if active.ConfigPath != verified.ConfigPath {
+		t.Fatalf("ConfigPath = %q, want %q", active.ConfigPath, verified.ConfigPath)
+	}
+}
+
+func TestStoreVerifiedRejectsTamperedSignature(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	bundle := signedTestBundle(t, key, "bundle-1", 1, "")
+	bundle.Version = 2
+
+	_, err := cache.storeVerified(bundle, testVerifyOptions(key))
+	if !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("storeVerified(tampered) error = %v, want ErrSignatureVerification", err)
+	}
+	if _, activeErr := cache.Active(); !errors.Is(activeErr, ErrNoValidBundle) {
+		t.Fatalf("Active() after rejected bundle = %v, want ErrNoValidBundle", activeErr)
+	}
+}
+
+func TestStoreVerifiedRejectsWrongAudience(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	bundle := signedTestBundle(t, key, "bundle-1", 1, "")
+	opts := testVerifyOptions(key)
+	opts.Identity.InstanceID = "other-instance"
+
+	_, err := cache.storeVerified(bundle, opts)
+	if !errors.Is(err, conductor.ErrAudienceMismatch) {
+		t.Fatalf("storeVerified(wrong audience) error = %v, want ErrAudienceMismatch", err)
+	}
+}
+
+func TestStoreVerifiedRollbackRequiresAuthorization(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	v1 := signedTestBundle(t, key, "bundle-1", 1, "")
+	if _, err := cache.storeVerified(v1, testVerifyOptions(key)); err != nil {
+		t.Fatalf("storeVerified(v1) error = %v", err)
+	}
+	v1Hash, err := v1.CanonicalHash()
+	if err != nil {
+		t.Fatalf("CanonicalHash(v1) error = %v", err)
+	}
+	v2 := signedTestBundle(t, key, "bundle-2", 2, v1Hash)
+	if _, err := cache.storeVerified(v2, testVerifyOptions(key)); err != nil {
+		t.Fatalf("storeVerified(v2) error = %v", err)
+	}
+
+	_, err = cache.storeVerified(v1, testVerifyOptions(key))
+	if !errors.Is(err, ErrRollbackRequired) {
+		t.Fatalf("storeVerified(rollback without auth) error = %v, want ErrRollbackRequired", err)
+	}
+}
+
+func TestStoreVerifiedForwardRequiresPreviousBundleHash(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	v1 := signedTestBundle(t, key, "bundle-1", 1, "")
+	if _, err := cache.storeVerified(v1, testVerifyOptions(key)); err != nil {
+		t.Fatalf("storeVerified(v1) error = %v", err)
+	}
+	v2 := signedTestBundle(t, key, "bundle-2", 2, "")
+
+	_, err := cache.storeVerified(v2, testVerifyOptions(key))
+	if !errors.Is(err, conductor.ErrInvalidRollback) {
+		t.Fatalf("storeVerified(v2 missing previous hash) error = %v, want ErrInvalidRollback", err)
+	}
+}
+
+func TestStoreVerifiedRollbackAuthorizationAllowsDowngrade(t *testing.T) {
+	policyKey := newTestKey(t)
+	rollbackKey1 := newPurposeKey(t, "rollback-1", signing.PurposePolicyBundleRollback)
+	rollbackKey2 := newPurposeKey(t, "rollback-2", signing.PurposePolicyBundleRollback)
+	cache := openTestCache(t)
+
+	v1 := signedTestBundle(t, policyKey, "bundle-1", 1, "")
+	if _, err := cache.storeVerified(v1, testVerifyOptions(policyKey, rollbackKey1, rollbackKey2)); err != nil {
+		t.Fatalf("storeVerified(v1) error = %v", err)
+	}
+	v1Hash, err := v1.CanonicalHash()
+	if err != nil {
+		t.Fatalf("CanonicalHash(v1) error = %v", err)
+	}
+	v2 := signedTestBundle(t, policyKey, "bundle-2", 2, v1Hash)
+	if _, err := cache.storeVerified(v2, testVerifyOptions(policyKey, rollbackKey1, rollbackKey2)); err != nil {
+		t.Fatalf("storeVerified(v2) error = %v", err)
+	}
+	auth := signedRollbackAuthorization(t, rollbackKey1, rollbackKey2, v2, v1)
+	opts := testVerifyOptions(policyKey, rollbackKey1, rollbackKey2)
+	opts.AllowRollback = true
+	opts.Rollback = &auth
+
+	active, err := cache.storeVerified(v1, opts)
+	if err != nil {
+		t.Fatalf("storeVerified(authorized rollback) error = %v", err)
+	}
+	if active.Bundle.BundleID != "bundle-1" {
+		t.Fatalf("active bundle = %q, want bundle-1", active.Bundle.BundleID)
+	}
+}
+
+func TestDecideStale(t *testing.T) {
+	key := newTestKey(t)
+	active := VerifiedBundle{Bundle: signedTestBundle(t, key, "bundle-1", 1, "")}
+	policy := config.ConductorStalePolicy{GraceMultiplier: 1, AfterGrace: config.ConductorStaleStrictDenyAll}
+
+	if got := DecideStale(&active, policy, testNow.Add(30*time.Minute)); got.State != StaleStateActive {
+		t.Fatalf("active decision = %s, want active", got.State)
+	}
+	if got := DecideStale(&active, policy, testNow.Add(90*time.Minute)); got.State != StaleStateLastKnownGood {
+		t.Fatalf("grace decision = %s, want last_known_good", got.State)
+	}
+	if got := DecideStale(&active, policy, testNow.Add(3*time.Hour)); got.State != StaleStateStrictDenyNoBundle {
+		t.Fatalf("post-grace decision = %s, want strict deny", got.State)
+	}
+	policy.AfterGrace = config.ConductorStaleContinueLastKnownGood
+	if got := DecideStale(&active, policy, testNow.Add(3*time.Hour)); got.State != StaleStateLastKnownGood {
+		t.Fatalf("continue decision = %s, want last_known_good", got.State)
+	}
+	if got := DecideStale(nil, policy, testNow); got.State != StaleStateStrictDenyNoBundle {
+		t.Fatalf("nil decision = %s, want strict deny", got.State)
+	}
+}
+
+func TestBoundaryApplyLoadsActiveYAMLAndCallsReload(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	var reloaded *config.Config
+	boundary := Boundary{
+		Cache:        cache,
+		Identity:     testIdentity(),
+		Resolver:     testResolver(key),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+		Reload: func(cfg *config.Config) error {
+			reloaded = cfg
+			return nil
+		},
+	}
+
+	applied, err := boundary.Apply(signedTestBundle(t, key, "bundle-1", 1, ""), ApplyOptions{})
+	if err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	if applied.ReloadedConfigHash == "" {
+		t.Fatal("ReloadedConfigHash = empty")
+	}
+	if reloaded == nil {
+		t.Fatal("Reload was not called")
+	}
+	if reloaded.Mode != config.ModeStrict {
+		t.Fatalf("reloaded Mode = %q, want strict", reloaded.Mode)
+	}
+	if filepath.Dir(applied.ConfigPath) != cache.configsDir {
+		t.Fatalf("ConfigPath = %q, want under %q", applied.ConfigPath, cache.configsDir)
+	}
+}
+
+func TestBoundaryApplyDoesNotActivateWhenReloadFails(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	boundary := Boundary{
+		Cache:        cache,
+		Identity:     testIdentity(),
+		Resolver:     testResolver(key),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+		Reload: func(_ *config.Config) error {
+			return errors.New("reload rejected")
+		},
+	}
+
+	_, err := boundary.Apply(signedTestBundle(t, key, "bundle-1", 1, ""), ApplyOptions{})
+	if err == nil {
+		t.Fatal("Apply() error = nil, want reload error")
+	}
+	if _, activeErr := cache.Active(); !errors.Is(activeErr, ErrNoValidBundle) {
+		t.Fatalf("Active() after failed reload = %v, want ErrNoValidBundle", activeErr)
+	}
+}
+
+func TestBoundaryRecoverActiveReverifiesBeforeReloading(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	seed := Boundary{
+		Cache:        cache,
+		Identity:     testIdentity(),
+		Resolver:     testResolver(key),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+		Reload:       func(*config.Config) error { return nil },
+	}
+	bundle := signedTestBundle(t, key, "bundle-recover", 1, "")
+	bundle.MinPipelockVersion = "1.2.3"
+	bundle.Signatures = []conductor.SignatureProof{signProof(t, key, bundle.SignablePreimage)}
+	if _, err := seed.Apply(bundle, ApplyOptions{}); err != nil {
+		t.Fatalf("seed Apply: %v", err)
+	}
+	before, err := os.ReadFile(activePath(cache))
+	if err != nil {
+		t.Fatalf("read active record before recovery: %v", err)
+	}
+
+	t.Run("unverifiable local version preserves active record", func(t *testing.T) {
+		reloadCalled := false
+		boundary := seed
+		boundary.LocalVersion = "0.0.0-dev.unknown"
+		boundary.Reload = func(*config.Config) error {
+			reloadCalled = true
+			return nil
+		}
+		if _, err := boundary.RecoverActive(); !errors.Is(err, ErrUnsupportedMinVersion) {
+			t.Fatalf("RecoverActive() error = %v, want ErrUnsupportedMinVersion", err)
+		}
+		if reloadCalled {
+			t.Fatal("RecoverActive() called Reload after version verification failed")
+		}
+		after, err := os.ReadFile(activePath(cache))
+		if err != nil {
+			t.Fatalf("read active record after rejected recovery: %v", err)
+		}
+		if string(after) != string(before) {
+			t.Fatal("rejected recovery changed the durable active record")
+		}
+	})
+
+	t.Run("valid cached policy reloads without changing active record", func(t *testing.T) {
+		var reloaded *config.Config
+		boundary := seed
+		boundary.Reload = func(cfg *config.Config) error {
+			reloaded = cfg
+			return nil
+		}
+		if _, err := boundary.RecoverActive(); err != nil {
+			t.Fatalf("RecoverActive() error = %v", err)
+		}
+		if reloaded == nil || reloaded.Mode != config.ModeStrict {
+			t.Fatalf("recovered config = %+v, want strict policy", reloaded)
+		}
+		after, err := os.ReadFile(activePath(cache))
+		if err != nil {
+			t.Fatalf("read active record after recovery: %v", err)
+		}
+		if string(after) != string(before) {
+			t.Fatal("successful recovery changed the durable active record")
+		}
+	})
+
+	t.Run("lost entitlement prevents cached reload", func(t *testing.T) {
+		reloadCalled := false
+		boundary := seed
+		boundary.Reload = func(*config.Config) error {
+			reloadCalled = true
+			return nil
+		}
+		boundary.StillEntitled = func() bool { return false }
+		if _, err := boundary.RecoverActive(); !errors.Is(err, ErrEntitlementLost) {
+			t.Fatalf("RecoverActive() error = %v, want ErrEntitlementLost", err)
+		}
+		if reloadCalled {
+			t.Fatal("RecoverActive() called Reload after entitlement loss")
+		}
+	})
+}
+
+func TestBoundaryRecoverActivePreservesStaleLifecycle(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		elapsed    time.Duration
+		afterGrace string
+		want       StaleState
+	}{
+		{"within grace", 90 * time.Second, config.ConductorStaleStrictDenyAll, StaleStateLastKnownGood},
+		{"strict after grace", 5 * time.Minute, config.ConductorStaleStrictDenyAll, StaleStateStrictDenyNoBundle},
+		{"continue after grace", 5 * time.Minute, config.ConductorStaleContinueLastKnownGood, StaleStateLastKnownGood},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			key := newTestKey(t)
+			cache := openTestCache(t)
+			now := testNow
+			boundary := Boundary{
+				Cache: cache, Identity: testIdentity(), Resolver: testResolver(key),
+				LocalVersion: "1.2.3", Now: func() time.Time { return now },
+				Reload: func(*config.Config) error { return nil },
+			}
+			bundle := signedTestBundle(t, key, "bundle-recover-stale", 1, "")
+			bundle.ExpiresAt = testNow.Add(time.Minute)
+			bundle.Signatures = []conductor.SignatureProof{signProof(t, key, bundle.SignablePreimage)}
+			if _, err := boundary.Apply(bundle, ApplyOptions{}); err != nil {
+				t.Fatalf("seed Apply: %v", err)
+			}
+			now = testNow.Add(tt.elapsed)
+			var reloaded *config.Config
+			boundary.Reload = func(cfg *config.Config) error { reloaded = cfg; return nil }
+			recovered, err := boundary.RecoverActive()
+			if err != nil {
+				t.Fatalf("RecoverActive within stale lifecycle: %v", err)
+			}
+			if reloaded == nil || reloaded.Mode != config.ModeStrict {
+				t.Fatal("recovery did not install the signed strict policy")
+			}
+			policy := config.ConductorStalePolicy{GraceMultiplier: 1, AfterGrace: tt.afterGrace}
+			if got := DecideStale(&recovered.VerifiedBundle, policy, now); got.State != tt.want {
+				t.Fatalf("stale decision = %s, want %s", got.State, tt.want)
+			}
+			if _, err := boundary.Apply(bundle, ApplyOptions{}); !errors.Is(err, conductor.ErrExpired) {
+				t.Fatalf("network Apply of expired bundle = %v, want ErrExpired", err)
+			}
+		})
+	}
+}
+
+// TestBoundaryRecoverActiveUsesVerifiedPayloadSnapshot replaces the cache after
+// Active has validated it, using signature resolution as a deterministic seam.
+func TestBoundaryRecoverActiveUsesVerifiedPayloadSnapshot(t *testing.T) {
+	for _, replacement := range []string{"regular", "symlink", "oversized"} {
+		t.Run(replacement, func(t *testing.T) {
+			key := newTestKey(t)
+			cache := openTestCache(t)
+			bundle := signedTestBundle(t, key, "bundle-recovery-snapshot", 1, "")
+			active, err := cache.storeVerified(bundle, testVerifyOptions(key))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resolve := testResolver(key)
+			replaced := false
+			var reloaded *config.Config
+			boundary := Boundary{
+				Cache: cache, Identity: testIdentity(), LocalVersion: "1.2.3",
+				Now: func() time.Time { return testNow },
+				Resolver: func(id string) (conductor.SignatureKey, error) {
+					if !replaced {
+						replaced = true
+						payload := "mode: balanced\n"
+						if replacement == "oversized" {
+							payload += "#" + strings.Repeat("x", conductor.MaxConfigYAMLBytes)
+						}
+						target := filepath.Join(t.TempDir(), "replacement.yaml")
+						if err := os.WriteFile(target, []byte(payload), 0o600); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Remove(active.ConfigPath); err != nil {
+							t.Fatal(err)
+						}
+						if replacement == "symlink" {
+							if err := os.Symlink(target, active.ConfigPath); err != nil {
+								t.Skipf("symlink unavailable: %v", err)
+							}
+						} else if err := os.Rename(target, active.ConfigPath); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return resolve(id)
+				},
+				Reload: func(cfg *config.Config) error { reloaded = cfg; return nil },
+			}
+			if _, err := boundary.RecoverActive(); err != nil {
+				t.Fatalf("RecoverActive: %v", err)
+			}
+			if !replaced || reloaded == nil {
+				t.Fatalf("recovery did not exercise replacement and reload: replaced=%v", replaced)
+			}
+			if reloaded.Mode != config.ModeStrict {
+				t.Fatalf("recovery loaded mode %q instead of signed strict policy", reloaded.Mode)
+			}
+			if len(reloaded.APIAllowlist) != 1 || reloaded.APIAllowlist[0] != "api.example.com" {
+				t.Fatalf("recovered allowlist = %v", reloaded.APIAllowlist)
+			}
+		})
+	}
+}
+
+// TestBoundaryCustomLoaderMustMatchSignedBytes keeps the existing loader hook
+// usable while refusing a different file snapshot before any live reload.
+func TestBoundaryCustomLoaderMustMatchSignedBytes(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		for _, substitute := range []bool{false, true} {
+			t.Run(fmt.Sprintf("recovery=%v/substitute=%v", recovery, substitute), func(t *testing.T) {
+				key := newTestKey(t)
+				cache := openTestCache(t)
+				bundle := signedTestBundle(t, key, "bundle-loader-snapshot", 1, "")
+				if recovery {
+					if _, err := cache.storeVerified(bundle, testVerifyOptions(key)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				reloads := 0
+				boundary := Boundary{
+					Cache: cache, Identity: testIdentity(), Resolver: testResolver(key),
+					LocalVersion: "1.2.3", Now: func() time.Time { return testNow },
+					LoadConfig: func(path string) (*config.Config, error) {
+						if substitute {
+							if err := os.WriteFile(filepath.Clean(path), []byte("mode: balanced\n"), 0o600); err != nil {
+								return nil, err
+							}
+						}
+						return config.Load(path)
+					},
+					Reload: func(*config.Config) error { reloads++; return nil },
+				}
+				var err error
+				if recovery {
+					_, err = boundary.RecoverActive()
+				} else {
+					_, err = boundary.Apply(bundle, ApplyOptions{})
+				}
+				if substitute {
+					if !errors.Is(err, ErrInvalidActiveRecord) || reloads != 0 {
+						t.Fatalf("substituted loader: err=%v reloads=%d", err, reloads)
+					}
+				} else if err != nil || reloads != 1 {
+					t.Fatalf("authentic loader: err=%v reloads=%d", err, reloads)
+				}
+			})
+		}
+	}
+}
+
+func TestBoundaryRecoverActiveFailurePaths(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	boundary := Boundary{
+		Cache: cache, Identity: testIdentity(), Resolver: testResolver(key),
+		LocalVersion: "1.2.3", Now: func() time.Time { return testNow },
+		Reload: func(*config.Config) error { return nil },
+	}
+	bundle := signedTestBundle(t, key, "bundle-recovery-errors", 1, "")
+	bundle.ExpiresAt = testNow.Add(time.Minute)
+	bundle.Signatures = []conductor.SignatureProof{signProof(t, key, bundle.SignablePreimage)}
+	if _, err := boundary.Apply(bundle, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(activePath(cache))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loadFailure := errors.New("cached config unavailable")
+	reloadFailure := errors.New("runtime reload refused")
+	for _, tt := range []struct {
+		name   string
+		mutate func(*Boundary)
+		want   error
+	}{
+		{"missing cache", func(b *Boundary) { b.Cache = nil }, ErrCacheRequired},
+		{"missing reload", func(b *Boundary) { b.Reload = nil }, nil},
+		{"empty cache", func(b *Boundary) { b.Cache = openTestCache(t) }, ErrNoValidBundle},
+		{"load failure", func(b *Boundary) {
+			b.LoadConfig = func(string) (*config.Config, error) { return nil, loadFailure }
+		}, loadFailure},
+		{"nil loaded config", func(b *Boundary) {
+			b.LoadConfig = func(string) (*config.Config, error) { return nil, nil }
+		}, ErrInvalidActiveRecord},
+		{"reload failure", func(b *Boundary) { b.Reload = func(*config.Config) error { return reloadFailure } }, reloadFailure},
+		{"wrong audience", func(b *Boundary) { b.Identity.OrgID = "other-org" }, conductor.ErrAudienceMismatch},
+		{"not yet valid", func(b *Boundary) {
+			b.Now = func() time.Time { return bundle.NotBefore.Add(-conductor.MessageNotBeforeSkew - time.Second) }
+		}, conductor.ErrNotYetValid},
+		{"expired signer remains refused", func(b *Boundary) {
+			b.Now = func() time.Time { return testNow.Add(2 * time.Hour) }
+		}, conductor.ErrSignatureVerification},
+		{"expired policy with unsupported binary", func(b *Boundary) {
+			b.Now = func() time.Time { return testNow.Add(5 * time.Minute) }
+			b.LocalVersion = "0.0.0-dev.unknown"
+		}, ErrUnsupportedMinVersion},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			attempt := boundary
+			tt.mutate(&attempt)
+			if _, err := attempt.RecoverActive(); err == nil || (tt.want != nil && !errors.Is(err, tt.want)) {
+				t.Fatalf("RecoverActive() = %v, want %v", err, tt.want)
+			}
+			after, err := os.ReadFile(activePath(cache))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("failed recovery changed durable active record: %v", err)
+			}
+		})
+	}
+}
+
+func TestBoundaryApplyRequiresCacheAndReload(t *testing.T) {
+	key := newTestKey(t)
+	bundle := signedTestBundle(t, key, "bundle-1", 1, "")
+	base := Boundary{
+		Identity:     testIdentity(),
+		Resolver:     testResolver(key),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+	}
+	if _, err := base.Apply(bundle, ApplyOptions{}); !errors.Is(err, ErrCacheRequired) {
+		t.Fatalf("Apply(missing cache) = %v, want ErrCacheRequired", err)
+	}
+	base.Cache = openTestCache(t)
+	if _, err := base.Apply(bundle, ApplyOptions{}); err == nil {
+		t.Fatal("Apply(missing reload) = nil, want error")
+	}
+}
+
+func TestBoundaryApplySurfacesStageAndLoadFailures(t *testing.T) {
+	key := newTestKey(t)
+	bundle := signedTestBundle(t, key, "bundle-1", 1, "")
+	boundary := Boundary{
+		Cache:        openTestCache(t),
+		Identity:     testIdentity(),
+		Resolver:     testResolver(key),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+		Reload:       func(_ *config.Config) error { return nil },
+	}
+	wrongAudience := boundary
+	wrongAudience.Identity.InstanceID = "other"
+	if _, err := wrongAudience.Apply(bundle, ApplyOptions{}); !errors.Is(err, conductor.ErrAudienceMismatch) {
+		t.Fatalf("Apply(wrong audience) = %v, want ErrAudienceMismatch", err)
+	}
+
+	boundary.LoadConfig = func(string) (*config.Config, error) {
+		return nil, errors.New("load rejected")
+	}
+	if _, err := boundary.Apply(bundle, ApplyOptions{}); err == nil || !strings.Contains(err.Error(), "loading verified") {
+		t.Fatalf("Apply(load failure) = %v, want loading error", err)
+	}
+}
+
+func TestBoundaryApplyDoesNotActivateWhenActivationFails(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+	var loadedPath string
+	boundary := Boundary{
+		Cache:        cache,
+		Identity:     testIdentity(),
+		Resolver:     testResolver(key),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+		LoadConfig: func(path string) (*config.Config, error) {
+			loadedPath = path
+			return config.Load(path)
+		},
+		Reload: func(_ *config.Config) error {
+			if err := os.Remove(loadedPath); err != nil {
+				return err
+			}
+			return nil
+		},
+	}
+	_, err := boundary.Apply(signedTestBundle(t, key, "bundle-1", 1, ""), ApplyOptions{})
+	if err == nil || !strings.Contains(err.Error(), "activating verified") {
+		t.Fatalf("Apply(activation failure) = %v, want activating error", err)
+	}
+	if _, activeErr := cache.Active(); !errors.Is(activeErr, ErrNoValidBundle) {
+		t.Fatalf("Active() after failed activation = %v, want ErrNoValidBundle", activeErr)
+	}
+}
+
+type testKey struct {
+	id      string
+	purpose signing.KeyPurpose
+	pub     ed25519.PublicKey
+	priv    ed25519.PrivateKey
+}
+
+func newTestKey(t *testing.T) testKey {
+	t.Helper()
+	return newPurposeKey(t, "policy-signer-1", signing.PurposePolicyBundleSigning)
+}
+
+func newPurposeKey(t *testing.T, id string, purpose signing.KeyPurpose) testKey {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	return testKey{id: id, purpose: purpose, pub: pub, priv: priv}
+}
+
+func openTestCache(t *testing.T) *Cache {
+	t.Helper()
+	cache, err := Open(Config{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	return cache
+}
+
+func testVerifyOptions(keys ...testKey) verifyOptions {
+	return verifyOptions{
+		Identity:     testIdentity(),
+		Resolver:     testResolver(keys...),
+		LocalVersion: "1.2.3",
+		Now:          func() time.Time { return testNow },
+	}
+}
+
+func testIdentity() Identity {
+	return Identity{
+		OrgID:      "org-1",
+		FleetID:    "fleet-1",
+		InstanceID: "instance-1",
+	}
+}
+
+func testResolver(keys ...testKey) conductor.SignatureKeyResolver {
+	lookup := make(map[string]conductor.SignatureKey, len(keys))
+	for _, key := range keys {
+		lookup[key.id] = conductor.SignatureKey{
+			PublicKey:  key.pub,
+			KeyPurpose: key.purpose,
+			NotBefore:  testNow.Add(-time.Hour),
+			NotAfter:   testNow.Add(time.Hour),
+		}
+	}
+	return func(signerKeyID string) (conductor.SignatureKey, error) {
+		key, ok := lookup[signerKeyID]
+		if !ok {
+			return conductor.SignatureKey{}, conductor.ErrSignatureVerification
+		}
+		return key, nil
+	}
+}
+
+func signedTestBundle(t *testing.T, key testKey, id string, version uint64, previousHash string) conductor.PolicyBundle {
+	t.Helper()
+	payload := conductor.PolicyBundlePayload{ConfigYAML: "mode: strict\napi_allowlist:\n  - api.example.com\n"}
+	payloadHash, err := payload.PayloadHash()
+	if err != nil {
+		t.Fatalf("PayloadHash() error = %v", err)
+	}
+	policyHash, err := payload.PolicyHash()
+	if err != nil {
+		t.Fatalf("PolicyHash() error = %v", err)
+	}
+	bundle := conductor.PolicyBundle{
+		SchemaVersion:      conductor.SchemaVersion,
+		BundleID:           id,
+		OrgID:              "org-1",
+		FleetID:            "fleet-1",
+		Environment:        "prod",
+		Audience:           conductor.Audience{InstanceIDs: []string{"instance-1"}},
+		Version:            version,
+		PreviousBundleHash: previousHash,
+		CreatedAt:          testNow.Add(-time.Minute),
+		NotBefore:          testNow.Add(-time.Minute),
+		ExpiresAt:          testNow.Add(time.Hour),
+		MinPipelockVersion: "1.2.3",
+		PolicyHash:         policyHash,
+		PayloadSHA256:      payloadHash,
+		Payload:            payload,
+	}
+	bundle.Signatures = []conductor.SignatureProof{signProof(t, key, bundle.SignablePreimage)}
+	return bundle
+}
+
+func signedRollbackAuthorization(t *testing.T, key1, key2 testKey, current, target conductor.PolicyBundle) conductor.RollbackAuthorization {
+	t.Helper()
+	auth := conductor.RollbackAuthorization{
+		SchemaVersion:   conductor.SchemaVersion,
+		AuthorizationID: "rollback-1",
+		OrgID:           "org-1",
+		FleetID:         "fleet-1",
+		CurrentBundleID: current.BundleID,
+		CurrentVersion:  current.Version,
+		TargetBundleID:  target.BundleID,
+		TargetVersion:   target.Version,
+		Counter:         1,
+		Reason:          "operator rollback",
+		CreatedAt:       testNow.Add(-time.Minute),
+		ExpiresAt:       testNow.Add(time.Hour),
+	}
+	auth.Signatures = []conductor.SignatureProof{
+		signProof(t, key1, auth.SignablePreimage),
+		signProof(t, key2, auth.SignablePreimage),
+	}
+	return auth
+}
+
+func signProof(t *testing.T, key testKey, preimage func() ([]byte, error)) conductor.SignatureProof {
+	t.Helper()
+	msg, err := preimage()
+	if err != nil {
+		t.Fatalf("SignablePreimage() error = %v", err)
+	}
+	sig := ed25519.Sign(key.priv, msg)
+	return conductor.SignatureProof{
+		SignerKeyID: key.id,
+		KeyPurpose:  key.purpose,
+		Algorithm:   conductor.SignatureAlgorithmEd25519,
+		Signature:   conductor.SignaturePrefixEd25519 + hex.EncodeToString(sig),
+	}
+}
+
+func TestLookupBundleHappyPathAndBaseHashChain(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+
+	first := signedTestBundle(t, key, "bundle-1", 1, "")
+	v1, err := cache.storeVerified(first, testVerifyOptions(key))
+	if err != nil {
+		t.Fatalf("storeVerified(first) error = %v", err)
+	}
+	firstHash, err := first.CanonicalHash()
+	if err != nil {
+		t.Fatalf("CanonicalHash(first) error = %v", err)
+	}
+	second := signedTestBundle(t, key, "bundle-2", 2, firstHash)
+	v2, err := cache.storeVerified(second, testVerifyOptions(key))
+	if err != nil {
+		t.Fatalf("storeVerified(second) error = %v", err)
+	}
+
+	// Active is bundle-2; its BaseHash points at bundle-1.
+	active, err := cache.Active()
+	if err != nil {
+		t.Fatalf("Active() error = %v", err)
+	}
+	if active.BundleHash != v2.BundleHash {
+		t.Fatalf("active hash = %q, want %q", active.BundleHash, v2.BundleHash)
+	}
+
+	curLookup, err := cache.LookupBundle(active.BundleHash)
+	if err != nil {
+		t.Fatalf("LookupBundle(active) error = %v", err)
+	}
+	if curLookup.Bundle.BundleID != "bundle-2" || curLookup.Bundle.Version != 2 {
+		t.Fatalf("current lookup bundle = %s/%d, want bundle-2/2", curLookup.Bundle.BundleID, curLookup.Bundle.Version)
+	}
+	if !strings.EqualFold(curLookup.BaseHash, v1.BundleHash) {
+		t.Fatalf("current BaseHash = %q, want %q", curLookup.BaseHash, v1.BundleHash)
+	}
+	if curLookup.ConfigPath == "" {
+		t.Fatal("current lookup ConfigPath empty")
+	}
+	if _, statErr := os.Stat(curLookup.ConfigPath); statErr != nil {
+		t.Fatalf("current lookup ConfigPath not on disk: %v", statErr)
+	}
+
+	// Walk back to the target via BaseHash.
+	targetLookup, err := cache.LookupBundle(curLookup.BaseHash)
+	if err != nil {
+		t.Fatalf("LookupBundle(base) error = %v", err)
+	}
+	if targetLookup.Bundle.BundleID != "bundle-1" || targetLookup.Bundle.Version != 1 {
+		t.Fatalf("target lookup bundle = %s/%d, want bundle-1/1", targetLookup.Bundle.BundleID, targetLookup.Bundle.Version)
+	}
+	// The first bundle ever applied has no predecessor.
+	if targetLookup.BaseHash != "" {
+		t.Fatalf("target BaseHash = %q, want empty", targetLookup.BaseHash)
+	}
+}
+
+func TestLookupBundleMissingHash(t *testing.T) {
+	cache := openTestCache(t)
+	missing := strings.Repeat("a", 64)
+	if _, err := cache.LookupBundle(missing); err == nil {
+		t.Fatal("LookupBundle(missing) expected error, got nil")
+	}
+}
+
+func TestLookupBundleRejectsHashAliasRecord(t *testing.T) {
+	key := newTestKey(t)
+	cache := openTestCache(t)
+
+	first := signedTestBundle(t, key, "bundle-1", 1, "")
+	v1, err := cache.storeVerified(first, testVerifyOptions(key))
+	if err != nil {
+		t.Fatalf("storeVerified(first) error = %v", err)
+	}
+	second := signedTestBundle(t, key, "bundle-2", 2, v1.BundleHash)
+	v2, err := cache.storeVerified(second, testVerifyOptions(key))
+	if err != nil {
+		t.Fatalf("storeVerified(second) error = %v", err)
+	}
+
+	v2RecordPath := filepath.Join(cache.bundlesDir, v2.BundleHash+recordExt)
+	v2Record, err := os.ReadFile(filepath.Clean(v2RecordPath))
+	if err != nil {
+		t.Fatalf("read second bundle record: %v", err)
+	}
+	v1RecordPath := filepath.Join(cache.bundlesDir, v1.BundleHash+recordExt)
+	if err := os.WriteFile(v1RecordPath, v2Record, 0o600); err != nil {
+		t.Fatalf("write aliased first bundle record: %v", err)
+	}
+
+	if _, err := cache.LookupBundle(v1.BundleHash); !errors.Is(err, ErrInvalidActiveRecord) {
+		t.Fatalf("LookupBundle(alias record) err = %v, want ErrInvalidActiveRecord", err)
+	}
+}
+
+func TestLookupBundleRejectsMalformedHash(t *testing.T) {
+	cache := openTestCache(t)
+	if _, err := cache.LookupBundle("not-a-hash"); !errors.Is(err, conductor.ErrInvalidHash) {
+		t.Fatalf("LookupBundle(bad) err = %v, want ErrInvalidHash", err)
+	}
+}
+
+func TestLookupBundleNilCache(t *testing.T) {
+	var cache *Cache
+	if _, err := cache.LookupBundle(strings.Repeat("a", 64)); !errors.Is(err, ErrCacheRequired) {
+		t.Fatalf("nil cache LookupBundle err = %v, want ErrCacheRequired", err)
+	}
+}

@@ -1,0 +1,770 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package controlplane
+
+import (
+	"bytes"
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+func TestHandlerEnrollmentTokenIssuesEnrollsAndAuthenticatesAuditKey(t *testing.T) {
+	enrollments, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	pub, priv := testAuditSigner(t)
+	sink := &captureAuditSink{}
+	handler, err := NewHandler(HandlerOptions{
+		Store:        mustStore(t),
+		Capabilities: DefaultCapabilities("conductor-test"),
+		Now:          func() time.Time { return testNow },
+		FollowerIdentity: func(*http.Request) (FollowerIdentity, error) {
+			return defaultFollowerIdentity(), nil
+		},
+		AuthorizePublisher: func(*http.Request) error { return nil },
+		AuthenticateAdmin:  testAdminAuthenticator("Authorization", "Bearer admin-token"),
+		AuditSink:          sink,
+		AuditKeys:          CompositeAuditKeyResolver(enrollments, nil),
+		Enrollments:        enrollments,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+
+	createBody := createEnrollmentTokenRequest{
+		TokenID:     "enroll-token-1",
+		OrgID:       "org-main",
+		FleetID:     "prod",
+		InstanceID:  "pl-prod-1",
+		Environment: "prod",
+		ExpiresAt:   testNow.Add(time.Hour),
+	}
+	body, err := json.Marshal(createBody)
+	if err != nil {
+		t.Fatalf("Marshal(create) error = %v", err)
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollmentTokensPath, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create enrollment token status = %d body=%s, want 201", w.Code, w.Body.String())
+	}
+	var issued createEnrollmentTokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &issued); err != nil {
+		t.Fatalf("decode issued token: %v", err)
+	}
+	if issued.TokenID != "enroll-token-1" || !strings.HasPrefix(issued.Token, enrollmentTokenPrefix) {
+		t.Fatalf("issued token = %+v", issued)
+	}
+
+	enrollBody, err := json.Marshal(enrollRequest{
+		Token:          issued.Token,
+		AuditKeyID:     "audit-key-1",
+		AuditPublicKey: signing.EncodePublicKey(pub),
+	})
+	if err != nil {
+		t.Fatalf("Marshal(enroll) error = %v", err)
+	}
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollPath, bytes.NewReader(enrollBody)))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("enroll status = %d body=%s, want 201", w.Code, w.Body.String())
+	}
+	var enrolled enrollResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &enrolled); err != nil {
+		t.Fatalf("decode enrolled: %v", err)
+	}
+	if enrolled.OrgID != "org-main" || enrolled.FleetID != "prod" || enrolled.InstanceID != "pl-prod-1" || enrolled.AuditKeyID != "audit-key-1" {
+		t.Fatalf("enrolled = %+v", enrolled)
+	}
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollPath, bytes.NewReader(enrollBody)))
+	if w.Code != http.StatusUnauthorized || strings.Contains(w.Body.String(), "consumed") {
+		t.Fatalf("reused token status = %d body=%s, want generic 401", w.Code, w.Body.String())
+	}
+
+	payload := []byte(`{"entry":"from-enrolled-key"}`)
+	w = postAuditBatch(t, handler, signedAuditIngestRequest(t, defaultFollowerIdentity(), payload, priv, testNow))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("audit ingest with enrolled key status = %d body=%s, want 202", w.Code, w.Body.String())
+	}
+	if len(sink.batches) != 1 || string(sink.batches[0].Payload) != string(payload) {
+		t.Fatalf("sink batches = %+v", sink.batches)
+	}
+}
+
+func TestFileEnrollmentStoreRejectsDuplicateActiveInstance(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	first, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-1",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken(first) error = %v", err)
+	}
+	second, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-2",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken(second) error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	consume := ConsumeEnrollmentTokenRequest{
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}
+	consume.Token = first.Token
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), consume); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken(first) error = %v", err)
+	}
+	consume.Token = second.Token
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), consume); !errors.Is(err, ErrEnrollmentActiveInstance) {
+		t.Fatalf("ConsumeEnrollmentToken(second) error = %v, want ErrEnrollmentActiveInstance", err)
+	}
+}
+
+func TestFileEnrollmentStoreRejectsEnrollmentTokenReuse(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-one-use",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	consume := ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), consume); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken(first) error = %v", err)
+	}
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), consume); !errors.Is(err, ErrEnrollmentTokenConsumed) {
+		t.Fatalf("ConsumeEnrollmentToken(reuse) error = %v, want ErrEnrollmentTokenConsumed", err)
+	}
+}
+
+func TestFileEnrollmentStoreConcurrentTokenConsumeAllowsOneWinner(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-race",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	consume := ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}
+
+	const workers = 16
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := store.ConsumeEnrollmentToken(context.Background(), consume)
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+
+	successes := 0
+	consumed := 0
+	for err := range errs {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrEnrollmentTokenConsumed):
+			consumed++
+		default:
+			t.Fatalf("ConsumeEnrollmentToken(concurrent) unexpected error = %v", err)
+		}
+	}
+	if successes != 1 || consumed != workers-1 {
+		t.Fatalf("concurrent consume successes=%d consumed=%d, want 1/%d", successes, consumed, workers-1)
+	}
+
+	tokens, err := store.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{TokenID: "token-race", Now: testNow})
+	if err != nil {
+		t.Fatalf("ListEnrollmentTokens() error = %v", err)
+	}
+	if len(tokens) != 1 || tokens[0].State != EnrollmentTokenStateConsumed {
+		t.Fatalf("token state after concurrent consume = %+v, want one consumed token", tokens)
+	}
+	followers, err := store.ListEnrolledFollowers(context.Background(), FollowerListQuery{OrgID: defaultFollowerIdentity().OrgID})
+	if err != nil {
+		t.Fatalf("ListEnrolledFollowers() error = %v", err)
+	}
+	if len(followers) != 1 || followers[0].InstanceID != defaultFollowerIdentity().InstanceID {
+		t.Fatalf("followers after concurrent consume = %+v, want one enrolled follower", followers)
+	}
+}
+
+func TestFileEnrollmentStoreSeparatesEnvironments(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	prod := defaultFollowerIdentity()
+	dev := prod
+	dev.Environment = "dev"
+	first, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-prod",
+		Identity: prod,
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken(prod) error = %v", err)
+	}
+	second, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-dev",
+		Identity: dev,
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken(dev) error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	consume := ConsumeEnrollmentTokenRequest{
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}
+	consume.Token = first.Token
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), consume); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken(prod) error = %v", err)
+	}
+	consume.Token = second.Token
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), consume); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken(dev) error = %v", err)
+	}
+	if _, err := store.ResolveEnrolledAuditKey(dev, "audit-key-1"); err != nil {
+		t.Fatalf("ResolveEnrolledAuditKey(dev) error = %v", err)
+	}
+}
+
+func TestFileEnrollmentStoreValidatesInputsAndPersists(t *testing.T) {
+	if _, err := OpenFileEnrollmentStore(""); err == nil {
+		t.Fatal("OpenFileEnrollmentStore(empty) error = nil, want error")
+	}
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "-bad",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	}); !errors.Is(err, conductor.ErrInvalidIdentifier) {
+		t.Fatalf("CreateEnrollmentToken(invalid id) error = %v, want ErrInvalidIdentifier", err)
+	}
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-expired",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow,
+		Now:      testNow,
+	}); !errors.Is(err, conductor.ErrInvalidValidityWindow) {
+		t.Fatalf("CreateEnrollmentToken(expired) error = %v, want ErrInvalidValidityWindow", err)
+	}
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-1",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken(valid) error = %v", err)
+	}
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-1",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	}); !errors.Is(err, ErrEnrollmentTokenConflict) {
+		t.Fatalf("CreateEnrollmentToken(duplicate) error = %v, want ErrEnrollmentTokenConflict", err)
+	}
+	pub, _ := testAuditSigner(t)
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{}); !errors.Is(err, ErrEnrollmentTokenInvalid) {
+		t.Fatalf("ConsumeEnrollmentToken(empty) error = %v, want ErrEnrollmentTokenInvalid", err)
+	}
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "-bad",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}); !errors.Is(err, conductor.ErrInvalidIdentifier) {
+		t.Fatalf("ConsumeEnrollmentToken(invalid key id) error = %v, want ErrInvalidIdentifier", err)
+	}
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposePolicyBundleSigning,
+		},
+		Now: testNow,
+	}); !errors.Is(err, ErrAuditKeyRequired) {
+		t.Fatalf("ConsumeEnrollmentToken(wrong purpose) error = %v, want ErrAuditKeyRequired", err)
+	}
+	enrolled, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	})
+	if err != nil {
+		t.Fatalf("ConsumeEnrollmentToken(valid) error = %v", err)
+	}
+	if enrolled.Identity.InstanceID != defaultFollowerIdentity().InstanceID {
+		t.Fatalf("enrolled identity = %+v", enrolled.Identity)
+	}
+	reopened, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore(reopen) error = %v", err)
+	}
+	if _, err := reopened.ResolveEnrolledAuditKey(defaultFollowerIdentity(), "audit-key-1"); err != nil {
+		t.Fatalf("ResolveEnrolledAuditKey(reopened) error = %v", err)
+	}
+	if _, err := reopened.ResolveEnrolledAuditKey(FollowerIdentity{OrgID: "org-main", FleetID: "prod", InstanceID: "other"}, "audit-key-1"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("ResolveEnrolledAuditKey(wrong identity) error = %v, want ErrSignatureVerification", err)
+	}
+}
+
+func TestLoadEnrollmentStateRejectsDuplicateAndOversizedJSON(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		body     string
+		maxBytes int64
+	}{
+		{name: "duplicate", body: `{"tokens":{},"tokens":{},"followers":{},"runtime_status":{}}`, maxBytes: 1024},
+		{name: "oversized", body: `{"tokens":{},"followers":{},"runtime_status":{}}`, maxBytes: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "enrollments.json")
+			if err := os.WriteFile(path, []byte(tt.body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadEnrollmentState(path, tt.maxBytes); err == nil {
+				t.Fatal("loadEnrollmentState accepted hostile state")
+			}
+		})
+	}
+}
+
+func TestFileEnrollmentStoreRejectsExpiredToken(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "token-1",
+		Identity: defaultFollowerIdentity(),
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	_, err = store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow.Add(time.Hour),
+	})
+	if !errors.Is(err, ErrEnrollmentTokenExpired) {
+		t.Fatalf("ConsumeEnrollmentToken(expired) error = %v, want ErrEnrollmentTokenExpired", err)
+	}
+}
+
+func TestCompositeAuditKeyResolverFallsBack(t *testing.T) {
+	pub, _ := testAuditSigner(t)
+	fallback := auditKeyResolverFor(pub)
+	resolver := CompositeAuditKeyResolver(nil, fallback)
+	if _, err := resolver(defaultFollowerIdentity(), "audit-key-1"); err != nil {
+		t.Fatalf("resolver(fallback) error = %v", err)
+	}
+	resolver = CompositeAuditKeyResolver(nil, nil)
+	if _, err := resolver(defaultFollowerIdentity(), "audit-key-1"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("resolver(no sources) error = %v, want ErrSignatureVerification", err)
+	}
+}
+
+func TestCompositeAuditKeyResolverDoesNotFallBackAfterRemoval(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	pub, _ := testAuditSigner(t)
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "tok-composite-remove",
+		Identity: identity,
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-1",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken() error = %v", err)
+	}
+	if _, err := store.RemoveEnrolledFollower(context.Background(), RemoveEnrolledFollowerRequest{
+		Identity: identity,
+		Now:      testNow,
+	}); err != nil {
+		t.Fatalf("RemoveEnrolledFollower() error = %v", err)
+	}
+
+	fallbackHits := 0
+	fallback := func(FollowerIdentity, string) (conductor.SignatureKey, error) {
+		fallbackHits++
+		return conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		}, nil
+	}
+	resolver := CompositeAuditKeyResolver(store, fallback)
+	if _, err := resolver(identity, "audit-key-1"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("resolver(removed) error = %v, want ErrSignatureVerification", err)
+	}
+	if fallbackHits != 0 {
+		t.Fatalf("static fallback hits = %d, want 0 after follower removal", fallbackHits)
+	}
+}
+
+// TestRemovedFollowerCanReEnroll pins the availability direction of the
+// decommission tombstone. RemoveEnrolledFollower retains an inactive record so
+// audit ingest cannot be re-authorized by a static key, but that record must
+// never become a permanent bar to re-enrolling the same identity: a follower
+// rebuilt on the same host has to be able to come back. The enrollment guard
+// admits an inactive record by design; this test keeps it that way.
+func TestRemovedFollowerCanReEnroll(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	pub, _ := testAuditSigner(t)
+
+	enroll := func(tokenID, keyID string) error {
+		issued, issueErr := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+			TokenID:  tokenID,
+			Identity: identity,
+			Expires:  testNow.Add(time.Hour),
+			Now:      testNow,
+		})
+		if issueErr != nil {
+			return issueErr
+		}
+		_, consumeErr := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+			Token:      issued.Token,
+			AuditKeyID: keyID,
+			AuditKey: conductor.SignatureKey{
+				PublicKey:  pub,
+				KeyPurpose: signing.PurposeAuditBatchSigning,
+			},
+			Now: testNow,
+		})
+		return consumeErr
+	}
+
+	if err := enroll("tok-reenroll-1", "audit-key-1"); err != nil {
+		t.Fatalf("first enrollment error = %v", err)
+	}
+	if _, err := store.RemoveEnrolledFollower(context.Background(), RemoveEnrolledFollowerRequest{
+		Identity: identity,
+		Now:      testNow,
+	}); err != nil {
+		t.Fatalf("RemoveEnrolledFollower() error = %v", err)
+	}
+
+	// The tombstone must not block a fresh enrollment of the same identity.
+	if err := enroll("tok-reenroll-2", "audit-key-2"); err != nil {
+		t.Fatalf("re-enrollment after removal error = %v, want success", err)
+	}
+
+	// The re-enrolled follower resolves on its NEW key and not the retired one.
+	if _, err := store.ResolveEnrolledAuditKey(identity, "audit-key-2"); err != nil {
+		t.Fatalf("ResolveEnrolledAuditKey(new key) error = %v, want success", err)
+	}
+	if _, err := store.ResolveEnrolledAuditKey(identity, "audit-key-1"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("ResolveEnrolledAuditKey(retired key) error = %v, want ErrSignatureVerification", err)
+	}
+
+	// A re-enrolled follower is active again, so it reappears on the roster.
+	summaries, err := store.ListEnrolledFollowers(context.Background(), FollowerListQuery{OrgID: identity.OrgID, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListEnrolledFollowers() error = %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("roster entries = %d, want 1 after re-enrollment", len(summaries))
+	}
+}
+
+func TestReenrolledFollowerCannotUseRetiredStaticAuditKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	oldPub, _ := testAuditSigner(t)
+	newPub, _ := testAuditSigner(t)
+
+	enroll := func(tokenID, keyID string, pub ed25519.PublicKey) error {
+		issued, issueErr := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+			TokenID:  tokenID,
+			Identity: identity,
+			Expires:  testNow.Add(time.Hour),
+			Now:      testNow,
+		})
+		if issueErr != nil {
+			return issueErr
+		}
+		_, consumeErr := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+			Token:      issued.Token,
+			AuditKeyID: keyID,
+			AuditKey: conductor.SignatureKey{
+				PublicKey:  pub,
+				KeyPurpose: signing.PurposeAuditBatchSigning,
+			},
+			Now: testNow,
+		})
+		return consumeErr
+	}
+
+	if err := enroll("tok-retired-static-1", "audit-key-old", oldPub); err != nil {
+		t.Fatalf("initial enrollment error = %v", err)
+	}
+	if _, err := store.RemoveEnrolledFollower(context.Background(), RemoveEnrolledFollowerRequest{Identity: identity, Now: testNow}); err != nil {
+		t.Fatalf("RemoveEnrolledFollower() error = %v", err)
+	}
+	if err := enroll("tok-retired-static-2", "audit-key-new", newPub); err != nil {
+		t.Fatalf("re-enrollment error = %v", err)
+	}
+	reloaded, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore(reload) error = %v", err)
+	}
+
+	fallbackHits := 0
+	resolver := CompositeAuditKeyResolver(reloaded, func(FollowerIdentity, string) (conductor.SignatureKey, error) {
+		fallbackHits++
+		return conductor.SignatureKey{PublicKey: oldPub, KeyPurpose: signing.PurposeAuditBatchSigning}, nil
+	})
+	if _, err := resolver(identity, "audit-key-old"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("resolver(retired static key) error = %v, want ErrSignatureVerification", err)
+	}
+	if fallbackHits != 0 {
+		t.Fatalf("static fallback hits = %d, want 0 for retired key after re-enrollment", fallbackHits)
+	}
+	if _, err := resolver(identity, "audit-key-new"); err != nil {
+		t.Fatalf("resolver(active key) error = %v, want nil", err)
+	}
+}
+
+func TestCompositeAuditKeyResolverDoesNotFallBackAfterPrimaryError(t *testing.T) {
+	pub, _ := testAuditSigner(t)
+	fallbackHits := 0
+	resolver := CompositeAuditKeyResolver(truncatedPreflightEnrollmentStore{}, func(FollowerIdentity, string) (conductor.SignatureKey, error) {
+		fallbackHits++
+		return conductor.SignatureKey{PublicKey: pub, KeyPurpose: signing.PurposeAuditBatchSigning}, nil
+	})
+	if _, err := resolver(defaultFollowerIdentity(), "audit-key-1"); !errors.Is(err, conductor.ErrSignatureVerification) {
+		t.Fatalf("resolver(primary error) error = %v, want ErrSignatureVerification", err)
+	}
+	if fallbackHits != 0 {
+		t.Fatalf("static fallback hits = %d, want 0 after primary error", fallbackHits)
+	}
+}
+
+func TestHandlerEnrollmentEndpointErrors(t *testing.T) {
+	store, err := OpenFileEnrollmentStore(filepath.Join(t.TempDir(), "enrollments.json"))
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	handler := newEnrollmentTestHandler(t, store)
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		want   int
+	}{
+		{"token wrong method", http.MethodPut, EnrollmentTokensPath, http.StatusMethodNotAllowed},
+		{"enroll wrong method", http.MethodGet, EnrollPath, http.StatusMethodNotAllowed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), tc.method, tc.path, nil))
+			if w.Code != tc.want {
+				t.Fatalf("status = %d body=%s, want %d", w.Code, w.Body.String(), tc.want)
+			}
+		})
+	}
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollmentTokensPath, strings.NewReader(`{}`)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("create without admin status = %d body=%s, want 403", w.Code, w.Body.String())
+	}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollmentTokensPath, strings.NewReader(`{"token_id":"bad","expires_at":"not-time"}`))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("create invalid JSON status = %d body=%s, want 400", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollmentTokensPath, strings.NewReader(`{"token_id":"token-1","org_id":"org-main","fleet_id":"prod","instance_id":"pl-prod-1","environment":"prod","expires_at":"`+testNow.Format(time.RFC3339Nano)+`"}`))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("create expired status = %d body=%s, want 400", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollPath, strings.NewReader(`{"token":"missing","audit_key_id":"audit-key-1","audit_public_key":"not-a-key"}`))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("enroll invalid key status = %d body=%s, want 400", w.Code, w.Body.String())
+	}
+	body, err := json.Marshal(enrollRequest{
+		Token:          "missing",
+		AuditKeyID:     "audit-key-1",
+		AuditPublicKey: signing.EncodePublicKey(mustAuditPublicKey(t)),
+	})
+	if err != nil {
+		t.Fatalf("Marshal(enroll missing token) error = %v", err)
+	}
+	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollPath, bytes.NewReader(body))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("enroll missing token status = %d body=%s, want 401", w.Code, w.Body.String())
+	}
+
+	noStore := newEnrollmentTestHandler(t, nil)
+	w = httptest.NewRecorder()
+	noStore.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollmentTokensPath, nil))
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("create without store status = %d body=%s, want 501", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	noStore.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollPath, nil))
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("enroll without store status = %d body=%s, want 501", w.Code, w.Body.String())
+	}
+}
+
+func newEnrollmentTestHandler(t *testing.T, enrollments EnrollmentStore) *Handler {
+	t.Helper()
+	handler, err := NewHandler(HandlerOptions{
+		Store:        mustStore(t),
+		Capabilities: DefaultCapabilities("conductor-test"),
+		Now:          func() time.Time { return testNow },
+		FollowerIdentity: func(*http.Request) (FollowerIdentity, error) {
+			return defaultFollowerIdentity(), nil
+		},
+		AuthorizePublisher: func(*http.Request) error { return nil },
+		AuthenticateAdmin:  testAdminAuthenticator("Authorization", "Bearer admin-token"),
+		AuditSink:          discardAuditSink{},
+		AuditKeys:          rejectingAuditKeyResolver,
+		Enrollments:        enrollments,
+	})
+	if err != nil {
+		t.Fatalf("NewHandler() error = %v", err)
+	}
+	return handler
+}
+
+func mustAuditPublicKey(t *testing.T) []byte {
+	t.Helper()
+	pub, _ := testAuditSigner(t)
+	return pub
+}

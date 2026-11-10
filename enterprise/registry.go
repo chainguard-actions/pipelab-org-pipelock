@@ -1,0 +1,336 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+package enterprise
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"sync"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// cidrMapping maps a parsed network to the agent profile name that owns it.
+type cidrMapping struct {
+	network *net.IPNet
+	profile string
+}
+
+// AgentRegistry maps agent profile names to resolved agents. Built at
+// startup and on hot-reload, then swapped atomically via Edition.
+type AgentRegistry struct {
+	licenseRevoked   *licenseRevocationState
+	agents           map[string]*edition.ResolvedAgent
+	ports            map[string]string // listen addr -> profile name
+	cidrs            []cidrMapping     // source CIDR -> profile name
+	fallback         *edition.ResolvedAgent
+	ownsFallback     bool  // true when the registry created the fallback scanner
+	licenseExpiresAt int64 // Unix timestamp; 0 = perpetual. Checked on Lookup().
+}
+
+// licenseRevocationState is shared across same-token reloads. Each recovery
+// starts a new generation; snapshots from a revoked generation stay revoked.
+type licenseRevocationState struct {
+	mu      sync.Mutex
+	revoked bool
+	done    chan struct{}
+}
+
+func (s *licenseRevocationState) Store(revoked bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revoked == s.revoked {
+		return
+	}
+	s.revoked = revoked
+	if revoked {
+		close(s.done)
+	} else {
+		s.done = make(chan struct{})
+	}
+}
+
+func (s *licenseRevocationState) snapshot() (bool, <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked, s.done
+}
+
+func (s *licenseRevocationState) Load() bool {
+	revoked, _ := s.snapshot()
+	return revoked
+}
+
+// NewAgentRegistry builds a registry from the base config. Each agent profile
+// is deep-merged with the base, and a scanner is built from the merged config.
+// When no _default profile is configured, callers may provide the base scanner
+// used elsewhere in the process so fallback traffic uses the same scanner
+// instance and lifecycle.
+func NewAgentRegistry(base *config.Config, fallbackScanners ...*scanner.Scanner) (_ *AgentRegistry, err error) {
+	reg := &AgentRegistry{
+		licenseRevoked:   &licenseRevocationState{done: make(chan struct{})},
+		agents:           make(map[string]*edition.ResolvedAgent, len(base.Agents)),
+		ports:            make(map[string]string),
+		licenseExpiresAt: base.LicenseExpiresAt,
+	}
+	defer func() {
+		if err != nil {
+			reg.Close()
+		}
+	}()
+
+	for name, profile := range base.Agents {
+		merged, mergeErr := MergeAgentProfile(base, &profile)
+		if mergeErr != nil {
+			return nil, fmt.Errorf("agent %q: %w", name, mergeErr)
+		}
+		if err := ValidateMergedAgent(name, merged); err != nil {
+			return nil, err
+		}
+		sc, err := scanner.New(merged)
+		if err != nil {
+			return nil, fmt.Errorf("agent %q scanner: %w", name, err)
+		}
+		if len(fallbackScanners) > 0 {
+			sc.ForwardInjectionWarnings(fallbackScanners[0])
+		}
+		bt := NewBudgetTracker(&profile.Budget)
+
+		// BudgetTracker → BudgetChecker interface.
+		// Use NoopBudget when no budget is configured to avoid nil-interface
+		// panics in proxy handlers.
+		budget := edition.NoopBudget
+		if bt != nil {
+			budget = bt
+		}
+
+		resolved := &edition.ResolvedAgent{
+			Name:    name,
+			Config:  merged,
+			Scanner: sc,
+			Budget:  budget,
+		}
+		reg.agents[name] = resolved
+
+		for _, addr := range profile.Listeners {
+			if prev, exists := reg.ports[addr]; exists {
+				return nil, fmt.Errorf("listener %q is assigned to both %q and %q", addr, prev, name)
+			}
+			reg.ports[addr] = name
+		}
+
+		// Parse source CIDRs (already validated in config.Validate).
+		for _, cidr := range profile.SourceCIDRs {
+			_, network, err := net.ParseCIDR(cidr)
+			if err != nil {
+				return nil, fmt.Errorf("agent %q: invalid source_cidr %q: %w", name, cidr, err)
+			}
+			reg.cidrs = append(reg.cidrs, cidrMapping{network: network, profile: name})
+		}
+	}
+
+	// Set fallback: _default profile if defined, else base config.
+	if def, ok := reg.agents[edition.ProfileDefault]; ok {
+		reg.fallback = def
+	} else {
+		var sc *scanner.Scanner
+		if len(fallbackScanners) > 0 && fallbackScanners[0] != nil {
+			sc = fallbackScanners[0]
+		} else {
+			sc, err = scanner.New(base)
+			if err != nil {
+				return nil, fmt.Errorf("fallback scanner: %w", err)
+			}
+			reg.ownsFallback = true
+		}
+		reg.fallback = &edition.ResolvedAgent{
+			Name:    edition.ProfileDefault,
+			Config:  base,
+			Scanner: sc,
+			Budget:  edition.NoopBudget,
+		}
+	}
+
+	return reg, nil
+}
+
+// Fallback returns the registry's default ResolvedAgent. This is the _default
+// profile if configured, otherwise a base-config agent. Always non-nil.
+func (r *AgentRegistry) Fallback() *edition.ResolvedAgent { return r.fallback }
+
+// Lookup returns the ResolvedAgent for the given profile name.
+// Unknown names return the fallback (either _default or base config).
+// If the license has expired since startup, non-default profiles are
+// rejected and the fallback is returned instead.
+func (r *AgentRegistry) Lookup(profile string) *edition.ResolvedAgent {
+	agent, _ := r.LookupByName(profile)
+	return agent
+}
+
+// LookupByName resolves a named profile for Edition.LookupProfile.
+// Returns (resolved, true) for known profiles.
+// Returns (fallback, false) for unknown profiles.
+// Enforces runtime license expiry: expired non-default profiles return fallback.
+func (r *AgentRegistry) LookupByName(name string) (*edition.ResolvedAgent, bool) {
+	if agent, ok := r.agents[name]; ok {
+		if name == edition.ProfileDefault {
+			return agent, true
+		}
+		revoked, done := r.licenseRevoked.snapshot()
+		if revoked || (r.licenseExpiresAt > 0 && edition.CurrentLicenseClock().Now().Unix() > r.licenseExpiresAt) {
+			return r.fallback, false
+		}
+		resolved := *agent
+		resolved.LicenseRevoked = done
+		resolved.LicenseExpiresAt = r.licenseExpiresAt
+		return &resolved, true
+	}
+	return r.fallback, false
+}
+
+// ResolveFromRequest implements the 4-step agent resolution for Edition.ResolveAgent.
+// Priority: context override > CIDR > header/query > fallback.
+func (r *AgentRegistry) ResolveFromRequest(ctx context.Context, req *http.Request, defaultCfg *config.Config, defaultSc *scanner.Scanner) (*edition.ResolvedAgent, edition.AgentIdentity) {
+	// Context override (set by per-agent listener binding). The identity was
+	// injected by the listener the connection arrived on, so nothing the
+	// caller wrote into the request can change it: graded bound. Leaving the
+	// grade empty here reads as unknown downstream, which excludes the
+	// strongest identity path from OCSF/CEF identity fields and collapses
+	// per-agent CEE/DoW state keys to the client IP.
+	if profile, ok := edition.AgentOverrideFromContext(ctx); ok {
+		return r.resolveInfrastructureIdentity(profile)
+	}
+
+	// Source CIDR match: map client IP to profile. The mapping is operator
+	// config applied to the connection's own source address (RemoteAddr,
+	// never a forwarded header), so the caller cannot select a different
+	// agent per request: graded bound like the listener path.
+	if clientIP := extractIP(req); clientIP != nil {
+		if profile, ok := r.MatchCIDR(clientIP); ok {
+			return r.resolveInfrastructureIdentity(profile)
+		}
+	}
+
+	// Header/query/fallback via ResolveAgentIdentity.
+	// Identity resolution still needs configured names to recognize a revoked
+	// operator binding and downgrade its provenance when Lookup falls back.
+	// Public enumeration omits revoked profiles, but is not this trust input.
+	known := make(map[string]bool, len(r.agents))
+	for name := range r.agents {
+		known[name] = true
+	}
+	id := edition.ResolveAgentIdentity(req, known, defaultCfg.DefaultAgentIdentity, defaultCfg.BindDefaultAgentIdentity)
+	// A request-controlled name remains useful attribution, but it cannot pick
+	// the scanner, budget, or policy. Unknown provenance fails toward fallback;
+	// only infrastructure-bound and operator-configured identities select a
+	// named profile.
+	if !id.Auth.TrustedForIdentity() {
+		resolved := r.fallback
+		id.Profile = resolved.Name
+		return resolved, id
+	}
+	resolved := r.Lookup(id.Profile)
+	if resolved.Name != id.Profile {
+		id.Profile = resolved.Name
+		id.Auth = envelope.ActorAuthUnknown
+	}
+	return resolved, id
+}
+
+// resolveInfrastructureIdentity grades an identity that infrastructure
+// established (listener binding or source CIDR). It is bound only while the
+// profile it names is the profile whose policy was actually selected. When
+// Lookup falls back because the license expired, the request runs under the
+// fallback policy, and the expired profile's label must not ride into
+// OCSF/CEF identity fields or per-agent CEE/DoW state as a trusted identity,
+// so the grade is unknown and the profile is the fallback's. The name is kept
+// so the audit log still shows which mapping the connection matched.
+func (r *AgentRegistry) resolveInfrastructureIdentity(profile string) (*edition.ResolvedAgent, edition.AgentIdentity) {
+	resolved := r.Lookup(profile)
+	if resolved.Name != profile {
+		return resolved, edition.AgentIdentity{Name: profile, Profile: resolved.Name, Auth: envelope.ActorAuthUnknown}
+	}
+	return resolved, edition.AgentIdentity{Name: profile, Profile: profile, Auth: envelope.ActorAuthBound}
+}
+
+// ProfileForPort returns the agent profile name bound to a listen address.
+func (r *AgentRegistry) ProfileForPort(addr string) (string, bool) {
+	name, ok := r.ports[addr]
+	return name, ok
+}
+
+// Close releases resources (scanners) held by the registry.
+// Nil-safe: a nil registry is a no-op.
+func (r *AgentRegistry) Close() {
+	if r == nil {
+		return
+	}
+	for _, agent := range r.agents {
+		agent.Scanner.Close()
+	}
+	if r.fallback == nil {
+		return
+	}
+	if _, isMapped := r.agents[r.fallback.Name]; !isMapped && r.ownsFallback {
+		// fallback was built from base, not from agents map
+		r.fallback.Scanner.Close()
+	}
+}
+
+// Ports returns a copy of the listen-address-to-profile mapping.
+func (r *AgentRegistry) Ports() map[string]string {
+	out := make(map[string]string, len(r.ports))
+	revoked := r.licenseRevoked.Load()
+	for addr, name := range r.ports {
+		if revoked && name != edition.ProfileDefault {
+			continue
+		}
+		out[addr] = name
+	}
+	return out
+}
+
+// MatchCIDR returns the agent profile name whose source_cidrs contain ip.
+// Returns ("", false) if no CIDR matches. Linear scan is acceptable because
+// the number of agent profiles is small (typically <20).
+func (r *AgentRegistry) MatchCIDR(ip net.IP) (string, bool) {
+	for _, m := range r.cidrs {
+		if m.network.Contains(ip) {
+			return m.profile, true
+		}
+	}
+	return "", false
+}
+
+// Profiles returns configured, non-revoked profile names (excluding fallback
+// if it was synthesized from the base config). Expired names remain known so
+// callers can distinguish expiration from an unknown profile.
+func (r *AgentRegistry) Profiles() []string {
+	names := make([]string, 0, len(r.agents))
+	revoked := r.licenseRevoked.Load()
+	for name := range r.agents {
+		if revoked && name != edition.ProfileDefault {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+// extractIP parses the client IP from r.RemoteAddr, stripping the port.
+func extractIP(r *http.Request) net.IP {
+	host := r.RemoteAddr
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return net.ParseIP(host)
+}

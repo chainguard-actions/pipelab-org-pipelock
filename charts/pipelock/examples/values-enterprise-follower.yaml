@@ -1,0 +1,151 @@
+# Enterprise follower deployment.
+#
+# This remains `mode: proxy`: the follower enforces locally and only uses
+# Conductor for signed bundle polling, remote kill state, and audit batching.
+
+mode: proxy
+replicaCount: 2
+
+# Pin the follower image by digest. Leave tag empty so it does not combine with
+# the digest. Replace the digest with the one you have verified for the release
+# you are deploying.
+image:
+  tag: ""
+  digest: "sha256:e8e249d2dd1b579f995f0f5a75cfab13fb8505a8ffc33c2cec7a6418290d9098"
+
+license:
+  enabled: true
+  existingSecret: pipelock-enterprise-license
+  secretKey: license.token
+  crlSecretRef:
+    name: pipelock-license-crl
+    key: license.crl
+
+conductorFollower:
+  enabled: true
+  conductorURL: https://pipelock-conductor.pipelock-control.svc.cluster.local:8895
+  orgID: org-prod
+  fleetID: fleet-prod
+  instanceID: follower-a
+  trustRosterRootFingerprint: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  auditSigningKeyID: audit-signer-prod
+  recorderKeyID: recorder-prod
+  pollInterval: 30s
+  emergencyStream: true
+  honorRemoteKillSwitch: true
+  serverCASecretRef:
+    name: conductor-server-ca
+    key: ca.crt
+  clientSecretRef:
+    name: follower-client-tls
+  trustRosterSecretRef:
+    name: conductor-trust-roster
+    key: trust-roster.json
+  auditQueueKeyringSecretRef:
+    name: follower-audit-queue-keyring
+    key: audit-queue-keyring.json
+  persistence:
+    bundleCache:
+      enabled: true
+      size: 2Gi
+    auditQueue:
+      enabled: true
+      size: 10Gi
+
+pipelock:
+  mode: strict
+  enforce: true
+  # Strict mode requires an explicit API allowlist. Replace with the APIs
+  # your agents actually call.
+  api_allowlist:
+    - api.provider.example
+  dlp:
+    include_defaults: true
+  response_scanning:
+    enabled: true
+    action: block
+  request_body_scanning:
+    enabled: true
+  # A Conductor follower must produce signed evidence: validation requires the
+  # flight recorder enabled with signed checkpoints and a signing key. The key
+  # is mounted from a Secret via extraVolumes below; create it out of band
+  # (e.g. `pipelock keygen recorder` and store recorder.key in the Secret).
+  flight_recorder:
+    enabled: true
+    sign_checkpoints: true
+    signing_key_path: /etc/pipelock/recorder/recorder.key
+    dir: /var/lib/pipelock/evidence
+
+extraVolumes:
+  - name: recorder-signing-key
+    secret:
+      secretName: follower-recorder-key
+      defaultMode: 0400
+  # Evidence is buffered here before the durable audit queue ships it.
+  # Swap for a PVC if you need recorder evidence to survive pod replacement.
+  - name: recorder-evidence
+    emptyDir: {}
+
+extraVolumeMounts:
+  - name: recorder-signing-key
+    mountPath: /etc/pipelock/recorder
+    readOnly: true
+  - name: recorder-evidence
+    mountPath: /var/lib/pipelock/evidence
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  preset: restricted
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: agent-workloads
+          podSelector:
+            matchLabels:
+              pipelock.io/agent-egress: "true"
+      ports:
+        - port: 8888
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pipelock-ops
+          podSelector:
+            matchLabels:
+              pipelock.io/operator: "true"
+      ports:
+        - port: 9091
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: pipelock-control
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: conductor
+      ports:
+        - port: 8895
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP

@@ -1,0 +1,637 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package contain
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+)
+
+// rollbackOpts is the flag bag for rollback.
+type rollbackOpts struct {
+	dryRun     bool
+	keepData   bool
+	keepUsers  bool
+	purgeUsers bool // explicit --purge-users override; takes precedence over keepUsers
+}
+
+func rollbackCmd() *cobra.Command {
+	var opts rollbackOpts
+
+	cmd := &cobra.Command{
+		Use:   "rollback",
+		Short: "Roll back the containment model (undoes install idempotently)",
+		Long: `Reverse the changes made by ` + "`pipelock contain install`" + `.
+
+Always tries every cleanup action — a partial uninstall left from a prior
+crashed run is still safe to call rollback on. Per-action failures are
+accumulated and reported, but the chain does not stop.
+
+By default, /etc/pipelock and /var/lib/pipelock are preserved (--keep-data
+defaults true). Users are removed by default; pass --keep-users to keep
+pipelock-proxy and pipelock-agent in place (useful when re-installing soon).
+
+Must be run as root.
+
+Exit codes:
+  0  All actions completed (or already in target state).
+  1  One or more actions failed.
+  2  Precondition error (not root, missing executable).`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !opts.dryRun {
+				if err := requireContainPrivilege("rollback"); err != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+				}
+			}
+			env := defaultInstallEnv(cmd.OutOrStdout())
+			return runRollback(cmd.Context(), env, opts)
+		},
+	}
+
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "print the planned rollback actions without mutating state")
+	cmd.Flags().BoolVar(&opts.keepData, "keep-data", true, "preserve /etc/pipelock and /var/lib/pipelock (default true)")
+	cmd.Flags().BoolVar(&opts.keepUsers, "keep-users", false, "preserve the pipelock-proxy and pipelock-agent users")
+	cmd.Flags().BoolVar(&opts.purgeUsers, "purge-users", false, "force user deletion even if --keep-users is set (sticky safety net)")
+
+	return cmd
+}
+
+// runRollback walks every cleanup action in install-reverse order. Each
+// action is implemented as a step where apply is the cleanup itself. We
+// invoke them directly rather than going through runSteps because we want
+// to continue past per-action failures.
+func runRollback(ctx context.Context, env *installEnv, opts rollbackOpts) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// The cobra RunE wrapper does the os.Geteuid root check; tests drive
+	// this function directly with fakes.
+
+	actions := rollbackActions(opts)
+
+	if opts.dryRun {
+		printPlan(env.out, "pipelock contain rollback — planned actions:", actions)
+		return nil
+	}
+
+	_, _ = fmt.Fprintln(env.out, "pipelock contain rollback")
+	if err := runUndo(ctx, env, env.out, actions); err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, err)
+	}
+	_, _ = fmt.Fprintln(env.out, "rollback complete.")
+	return nil
+}
+
+// rollbackActions enumerates the cleanup steps in the order install
+// applied them, so that runUndo (which walks reverse) executes them in
+// proper reverse order:
+//
+//   - sudoers off first (so any stray plk-* wrapper invocation stops being
+//     no-password authorized immediately)
+//   - then wrappers (so even if sudoers is restored, the wrappers are gone)
+//   - then nft rules (so future `plk-launch` attempts stop being firewalled
+//     before we go and remove the firewall)
+//   - then service (so we don't leave a running pipelock pointed at a
+//     half-removed config dir)
+//   - then artifacts (binary, CA, integrity pin)
+//   - finally users + dirs (controlled by --keep-* flags)
+//
+// The runUndo helper walks the slice in reverse, so the steps are LISTED in
+// install order for readability but EXECUTED in reverse.
+func rollbackActions(opts rollbackOpts) []step {
+	return []step{
+		// Install ordering, executed in reverse by runUndo.
+		actionPreserve("preflight (no-op for rollback)"),
+		actionMaybeDeleteUser(opts, true),  // proxy
+		actionMaybeDeleteUser(opts, false), // agent
+		actionMaybeDeleteViewerUser(opts),
+		actionMaybeRemoveDir(opts, "config", func(e *installEnv) string { return e.configDir }),
+		actionMaybeRemoveDir(opts, "data", func(e *installEnv) string { return e.dataDir }),
+		// Revoke MUST execute (in reverse walk: first) before the agent
+		// user is deleted AND before the config dir removal wipes the
+		// inventory file. List position controls reverse-walk priority,
+		// so revoke sits at a higher index than both blockers.
+		actionRevokeWorkspaceACLs(opts),
+		// Revoke operator evidence ACLs before the config dir removal wipes the
+		// inventory and before the data dir removal deletes the targets. Higher
+		// list index than both removals so the reverse walk runs it first.
+		actionRevokeEvidenceACLs(opts),
+		actionPreserve("pipelock.yaml (kept with --keep-data)"),
+		actionPreserve("config chown (resolved by dir removal)"),
+		actionPreserve("data chown (resolved by dir removal)"),
+		actionRemovePath("pipelock binary", func(e *installEnv) string { return e.pipelockTarget }),
+		actionRemovePath("integrity pin", func(e *installEnv) string { return e.integrityPin }),
+		actionPreserve("user-mode pipelock (operator decides whether to re-enable)"),
+		actionRemoveSystemUnit(),
+		actionDisablePipelockService(),
+		// main restores these rather than removing them (#1624): a rollback must
+		// not destroy operator trust state it did not create.
+		actionRestorePath("pipelock CA export", func(e *installEnv) string { return e.caExportPath }),
+		actionRestorePath("combined CA bundle", func(e *installEnv) string { return e.caBundlePath }),
+		// Browser-trust removal recomputes the CA fingerprint from the export,
+		// so it must execute BEFORE the restores put the pre-install bytes
+		// back. runUndo walks this slice in reverse, so executing first means
+		// sitting at a HIGHER index: below the restores, not above them.
+		actionRemoveBrowserCATrust(),
+		actionRemoveNetworkNamespace(),
+		actionRemoveNFTRules(),
+		actionRemoveAgentDisplay(),
+		actionRemoveViewer(),
+		actionRemovePath("plk-launch tools.list", func(e *installEnv) string { return e.toolsListPath }),
+		actionRemovePath("node undici shim", undiciShimPathOrDefault),
+		actionRemoveWrapper("plk-launch", "plk-launch"),
+		actionRemoveWrapper("plk-contained-launch", "plk-contained-launch"),
+		actionRemoveWrapper("plk meta-wrapper", "plk"),
+		actionRemoveToolWrappers(),
+		actionRemoveUtilityWrappers(),
+		actionRemovePath("login-shell runtime contract", profileScriptPathOrDefault),
+		actionRemoveAgentToolConfigs(),
+		actionRemoveAgentBrowserDefaults(),
+		actionRemovePath("wrapper inventory", func(e *installEnv) string { return e.wrapperInvPath }),
+		actionRemoveSudoers(),
+	}
+}
+
+func actionMaybeDeleteViewerUser(opts rollbackOpts) step {
+	return step{name: "delete-viewer-user", desc: "delete dedicated display viewer user", undo: func(ctx context.Context, env *installEnv) error {
+		if opts.keepUsers && !opts.purgeUsers {
+			return nil
+		}
+		createdUID, err := env.readFile(viewerCreationMarkerPath(env))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("viewer creation record: %w", err)
+		}
+		account, err := env.lookupUser(viewerUserName)
+		if err != nil {
+			if errors.As(err, new(user.UnknownUserError)) {
+				return env.removeFile(viewerCreationMarkerPath(env))
+			}
+			return fmt.Errorf("viewer user lookup: %w", err)
+		}
+		if strings.TrimSpace(string(createdUID)) != account.Uid {
+			return fmt.Errorf("viewer account UID differs from its creation record; preserving account")
+		}
+		if err := removeEmptyDisplayRuntime(ctx, env); err != nil {
+			return fmt.Errorf("preserving viewer account: %w; stop the display, inspect and repair or move aside the runtime directory, then retry account removal", err)
+		}
+		if err := runOrErr(ctx, env, "userdel", "-r", viewerUserName); err != nil {
+			return err
+		}
+		return env.removeFile(viewerCreationMarkerPath(env))
+	}}
+}
+
+func actionRemoveNetworkNamespace() step {
+	return step{
+		name: "remove-agent-network-namespace",
+		desc: "remove the contained-agent network namespace and proxy forwarder units",
+		undo: func(ctx context.Context, env *installEnv) error {
+			var errs []error
+			// Close published endpoints first: their relays join the namespace
+			// removed below.
+			if err := removePublishedServices(ctx, env); err != nil {
+				errs = append(errs, err)
+			}
+			if inv, err := readLoopbackForwarderInventory(env); err != nil {
+				errs = append(errs, err)
+			} else {
+				unitDir := filepath.Dir(env.proxyForwarderSocketPath)
+				for _, record := range inv.Services {
+					socket := record.Unit + ".socket"
+					if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", socket); err != nil {
+						errs = append(errs, err)
+					}
+					for _, suffix := range []string{".socket", ".service"} {
+						path := filepath.Join(unitDir, record.Unit+suffix)
+						if err := restoreBackup(env, path); err != nil {
+							errs = append(errs, fmt.Errorf("restore %s: %w", path, err))
+						}
+					}
+				}
+			}
+			for _, path := range []string{env.proxyForwarderSocketPath, env.proxyForwarderServicePath, env.networkNamespaceUnitPath} {
+				if path == "" {
+					continue
+				}
+				unit := filepath.Base(path)
+				if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
+					errs = append(errs, fmt.Errorf("disable %s: %w", unit, err))
+				}
+				if err := restoreBackup(env, path); err != nil {
+					errs = append(errs, fmt.Errorf("restore %s: %w", path, err))
+				}
+			}
+			// Remove the prior release's cgroup anchor too. It is no longer a
+			// containment mechanism and must not survive as a second apparent
+			// source of truth after rollback or upgrade.
+			if path := env.ownedLoopbackAnchorUnitPath; path != "" {
+				unit := filepath.Base(path)
+				if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
+					errs = append(errs, fmt.Errorf("disable legacy %s: %w", unit, err))
+				}
+				if err := restoreBackup(env, path); err != nil {
+					errs = append(errs, fmt.Errorf("restore legacy %s: %w", path, err))
+				}
+			}
+			if env.loopbackForwarderInvPath != "" {
+				if err := restoreBackup(env, env.loopbackForwarderInvPath); err != nil {
+					errs = append(errs, fmt.Errorf("restore %s: %w", env.loopbackForwarderInvPath, err))
+				}
+			}
+			if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
+				errs = append(errs, err)
+			}
+			return errors.Join(errs...)
+		},
+	}
+}
+
+// actionRevokeWorkspaceACLs removes workspace ACLs before rollback deletes
+// pipelock-agent. That prevents orphan numeric ACL entries if the UID is later
+// reused by an unrelated account. The on-disk inventory is preserved when
+// --keep-data is set so a subsequent install + grant-workspace round trip
+// can rebuild ACLs from the saved mapping; otherwise it is removed alongside
+// other rollback artifacts.
+func actionRevokeWorkspaceACLs(opts rollbackOpts) step {
+	return step{
+		name: "revoke-workspace-acls",
+		desc: "revoke workspace ACLs tracked in /etc/pipelock/contain/workspaces.json",
+		undo: func(ctx context.Context, env *installEnv) error {
+			inv, err := loadWorkspaceInventory(env)
+			if err != nil {
+				return err
+			}
+			if len(inv.Workspaces) == 0 {
+				return nil
+			}
+			commands, err := workspaceRevokeAllCommands(env, inv.Workspaces, env.agentUserName)
+			if err != nil {
+				return err
+			}
+			if err := runWorkspaceCommands(ctx, env, commands); err != nil {
+				return err
+			}
+			if opts.keepData {
+				return nil
+			}
+			if err := env.removeFile(env.workspaceInvPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", env.workspaceInvPath, err)
+			}
+			_ = env.removeFile(env.workspaceInvPath + ".bak")
+			return nil
+		},
+	}
+}
+
+// actionRevokeEvidenceACLs removes the operator read+traverse evidence ACL
+// granted at install time, tracked in /etc/pipelock/contain/evidence-acls.json.
+// It mirrors actionRevokeWorkspaceACLs: best-effort, idempotent, and preserves
+// the inventory file when --keep-data is set so a re-install can rebuild it.
+func actionRevokeEvidenceACLs(opts rollbackOpts) step {
+	return step{
+		name: "revoke-evidence-acls",
+		desc: "revoke operator evidence ACLs tracked in /etc/pipelock/contain/evidence-acls.json",
+		undo: func(ctx context.Context, env *installEnv) error {
+			return revokeEvidenceACLs(ctx, env, opts.keepData)
+		},
+	}
+}
+
+// actionPreserve is a no-op slot used to keep the rollback list aligned
+// with the install list 1:1. Each slot is logged in --dry-run so the
+// operator can see the action being intentionally skipped.
+func actionPreserve(desc string) step {
+	return step{
+		name: "preserve",
+		desc: desc,
+		undo: func(context.Context, *installEnv) error { return nil },
+	}
+}
+
+// actionRemovePath removes a file managed by the install. Missing files
+// are not an error.
+func actionRemovePath(desc string, pathFn func(*installEnv) string) step {
+	return step{
+		name: "remove-" + desc,
+		desc: "remove " + desc,
+		undo: func(_ context.Context, env *installEnv) error {
+			path := pathFn(env)
+			if err := env.removeFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", path, err)
+			}
+			// Also drop the .bak if present.
+			_ = env.removeFile(path + ".bak")
+			return nil
+		},
+	}
+}
+
+// actionRestorePath reverses a backup-aware install write. It restores a
+// pre-install file when one exists and otherwise removes only the artifact the
+// installer created.
+func actionRestorePath(desc string, pathFn func(*installEnv) string) step {
+	return step{
+		name: "restore-" + desc,
+		desc: "restore or remove " + desc,
+		undo: func(_ context.Context, env *installEnv) error {
+			if err := restoreBackup(env, pathFn(env)); err != nil {
+				return fmt.Errorf("restore %s: %w", desc, err)
+			}
+			return nil
+		},
+	}
+}
+
+// actionMaybeDeleteUser deletes pipelock-proxy or pipelock-agent unless
+// --keep-users is set. --purge-users overrides --keep-users.
+func actionMaybeDeleteUser(opts rollbackOpts, proxyUser bool) step {
+	label := "agent"
+	if proxyUser {
+		label = "proxy"
+	}
+	return step{
+		name: "delete-" + label + "-user",
+		desc: "delete " + label + " user (skipped when --keep-users is set)",
+		undo: func(ctx context.Context, env *installEnv) error {
+			if opts.keepUsers && !opts.purgeUsers {
+				return nil
+			}
+			name := env.agentUserName
+			if proxyUser {
+				name = env.proxyUserName
+			}
+			if _, err := env.lookupUser(name); err != nil {
+				if errors.As(err, new(user.UnknownUserError)) {
+					return nil
+				}
+				return fmt.Errorf("user lookup %s: %w", name, err)
+			}
+			return runOrErr(ctx, env, "userdel", "-r", name)
+		},
+	}
+}
+
+// actionMaybeRemoveDir removes /etc/pipelock or /var/lib/pipelock when the
+// operator explicitly passes --keep-data=false. Default keeps them in
+// place: the most common rollback case is re-installing soon, and losing
+// /etc/pipelock means redoing TLS init and config.
+func actionMaybeRemoveDir(opts rollbackOpts, label string, pathFn func(*installEnv) string) step {
+	return step{
+		name: "remove-dir-" + label,
+		desc: "remove " + label + " directory (skipped unless --keep-data=false)",
+		undo: func(_ context.Context, env *installEnv) error {
+			if opts.keepData {
+				return nil
+			}
+			path := pathFn(env)
+			if err := os.RemoveAll(filepath.Clean(path)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("rm -rf %s: %w", path, err)
+			}
+			return nil
+		},
+	}
+}
+
+// actionRemoveSystemUnit removes the pipelock.service unit and reloads
+// systemd so it stops being known.
+func actionRemoveSystemUnit() step {
+	return step{
+		name: "remove-system-unit",
+		desc: "remove /etc/systemd/system/pipelock.service",
+		undo: func(ctx context.Context, env *installEnv) error {
+			if err := env.removeFile(env.systemUnitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", env.systemUnitPath, err)
+			}
+			_ = env.removeFile(env.systemUnitPath + ".bak")
+			if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
+				return fmt.Errorf("systemctl daemon-reload after removing %s: %w", env.systemUnitPath, err)
+			}
+			return nil
+		},
+	}
+}
+
+// actionDisablePipelockService disables + stops the system service if
+// present. Missing service is fine.
+func actionDisablePipelockService() step {
+	return step{
+		name: "disable-pipelock-service",
+		desc: "systemctl disable --now pipelock.service",
+		undo: func(ctx context.Context, env *installEnv) error {
+			if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", "pipelock"); err != nil {
+				return fmt.Errorf("disable pipelock service: %w", err)
+			}
+			return nil
+		},
+	}
+}
+
+// actionRemoveNFTRules deletes the table, removes the rules file, and removes
+// the Pipelock-owned boot-time unit. It never disables a distro nftables.service:
+// the operator may have had that enabled before our install.
+func actionRemoveNFTRules() step {
+	return step{
+		name: "remove-nft-rules",
+		desc: "drop pipelock_containment table and remove Pipelock nft persistence unit",
+		undo: func(ctx context.Context, env *installEnv) error {
+			unit := filepath.Base(env.nftPersistUnitPath)
+			if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
+				return fmt.Errorf("disable nft persistence unit %s: %w", unit, err)
+			}
+			expiryUnits := []string{}
+			if env.nftExpiryTimerPath != "" {
+				expiryUnits = append(expiryUnits, filepath.Base(env.nftExpiryTimerPath))
+			}
+			if env.nftExpiryServicePath != "" {
+				expiryUnits = append(expiryUnits, filepath.Base(env.nftExpiryServicePath))
+			}
+			for _, expiryUnit := range expiryUnits {
+				if err := runSystemctlCleanupUnit(ctx, env, "stop", expiryUnit); err != nil {
+					return fmt.Errorf("stop expiry unit %s: %w", expiryUnit, err)
+				}
+				if err := runSystemctlCleanupUnit(ctx, env, "disable", expiryUnit); err != nil {
+					return fmt.Errorf("disable expiry unit %s: %w", expiryUnit, err)
+				}
+			}
+			_, _, _ = env.runCmd(ctx, nftExecutable(env), "delete", "table", "inet", env.nftTableOrDefault())
+			if err := env.removeFile(env.nftRulesPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", env.nftRulesPath, err)
+			}
+			_ = env.removeFile(env.nftRulesPath + ".bak")
+			if err := env.removeFile(env.nftPersistUnitPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", env.nftPersistUnitPath, err)
+			}
+			_ = env.removeFile(env.nftPersistUnitPath + ".bak")
+			if env.nftExpiryTimerPath != "" {
+				if err := env.removeFile(env.nftExpiryTimerPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("remove %s: %w", env.nftExpiryTimerPath, err)
+				}
+				_ = env.removeFile(env.nftExpiryTimerPath + ".bak")
+			}
+			if env.nftExpiryServicePath != "" {
+				if err := env.removeFile(env.nftExpiryServicePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("remove %s: %w", env.nftExpiryServicePath, err)
+				}
+				_ = env.removeFile(env.nftExpiryServicePath + ".bak")
+			}
+			if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
+				return fmt.Errorf("systemctl daemon-reload after removing expiry units: %w", err)
+			}
+			for _, expiryUnit := range expiryUnits {
+				state, _, err := env.runCmd(ctx, "systemctl", "is-active", expiryUnit)
+				if err != nil {
+					return fmt.Errorf("systemctl is-active %s after removal: %w", expiryUnit, err)
+				}
+				if strings.TrimSpace(state) != systemctlInactive {
+					return fmt.Errorf("expiry unit %s remains active after removal: %s", expiryUnit, oneLine(state))
+				}
+			}
+			if env.nftMainPath != "" {
+				return restoreOrRemoveNFTMainInclude(env)
+			}
+			return nil
+		},
+	}
+}
+
+// actionRemoveWrapper removes one named wrapper from the wrapper dir.
+func actionRemoveWrapper(label, name string) step {
+	return step{
+		name: "remove-" + label,
+		desc: "remove /usr/local/bin/" + name,
+		undo: func(_ context.Context, env *installEnv) error {
+			path := filepath.Join(env.wrapperDir, name)
+			if err := env.removeFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", path, err)
+			}
+			_ = env.removeFile(path + ".bak")
+			return nil
+		},
+	}
+}
+
+// actionRemoveToolWrappers removes every wrapper listed in the inventory.
+// Falls back to the static defaultToolWrappers list when the inventory is
+// missing - that's the case when rollback runs against a half-installed
+// system where the inventory was never written.
+func actionRemoveToolWrappers() step {
+	return step{
+		name: "remove-tool-wrappers",
+		desc: "remove plk-* tool wrappers listed in /etc/pipelock/contain/wrappers.json",
+		undo: func(_ context.Context, env *installEnv) error {
+			wrappers := readWrapperInventory(env)
+			for _, w := range wrappers {
+				path := filepath.Join(env.wrapperDir, w)
+				if err := env.removeFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("remove %s: %w", path, err)
+				}
+				_ = env.removeFile(path + ".bak")
+			}
+			return nil
+		},
+	}
+}
+
+// actionRemoveUtilityWrappers removes the pipelock-curl/python/node known-good
+// wrappers placed on the agent PATH by stepWriteUtilityWrappers.
+func actionRemoveUtilityWrappers() step {
+	return step{
+		name: "remove-utility-wrappers",
+		desc: "remove pipelock-curl/python/node wrappers",
+		undo: func(_ context.Context, env *installEnv) error {
+			for _, w := range pipelockUtilityWrappers {
+				path := filepath.Join(env.wrapperDir, w)
+				if err := env.removeFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("remove %s: %w", path, err)
+				}
+				_ = env.removeFile(path + ".bak")
+			}
+			return nil
+		},
+	}
+}
+
+// actionRemoveAgentToolConfigs removes the per-tool config files written into
+// the agent home. A full rollback that deletes the agent user already removes
+// the home (userdel -r); this handles the --keep-users case where the home
+// survives. If install replaced a pre-existing config, restoreBackup preserves
+// that operator state instead of deleting the .bak.
+func actionRemoveAgentToolConfigs() step {
+	return step{
+		name: "remove-agent-tool-configs",
+		desc: "remove git/npm/pip/cargo proxy config from the agent home",
+		undo: func(_ context.Context, env *installEnv) error {
+			home := agentHomeDir(env)
+			var errs []error
+			for _, cfg := range agentToolConfigs() {
+				path := filepath.Join(home, cfg.rel)
+				if err := restoreBackup(env, path); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			return errors.Join(errs...)
+		},
+	}
+}
+
+// readWrapperInventory loads the wrapper list from /etc/pipelock/contain/
+// wrappers.json. On any error (missing, malformed, unreadable) it returns
+// the static defaultToolWrappers set so rollback never silently leaves
+// installed wrappers behind.
+func readWrapperInventory(env *installEnv) []string {
+	data, err := env.readFile(env.wrapperInvPath)
+	if err != nil {
+		if wrappers := wrappersFromToolsList(env); len(wrappers) > 0 {
+			return wrappers
+		}
+		return append([]string(nil), defaultToolWrappers...)
+	}
+	var inv wrapperInventory
+	if err := json.Unmarshal(data, &inv); err != nil || len(inv.Wrappers) == 0 {
+		if wrappers := wrappersFromToolsList(env); len(wrappers) > 0 {
+			return wrappers
+		}
+		return append([]string(nil), defaultToolWrappers...)
+	}
+	return inv.Wrappers
+}
+
+func wrappersFromToolsList(env *installEnv) []string {
+	entries, err := readToolsList(env)
+	if err != nil {
+		return nil
+	}
+	return wrapperNamesForEntries(entries)
+}
+
+// actionRemoveSudoers removes /etc/sudoers.d/50-pipelock-agent.
+func actionRemoveSudoers() step {
+	return step{
+		name: "remove-sudoers",
+		desc: "remove /etc/sudoers.d/50-pipelock-agent",
+		undo: func(_ context.Context, env *installEnv) error {
+			if err := env.removeFile(env.sudoersPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", env.sudoersPath, err)
+			}
+			_ = env.removeFile(env.sudoersPath + ".bak")
+			return nil
+		},
+	}
+}

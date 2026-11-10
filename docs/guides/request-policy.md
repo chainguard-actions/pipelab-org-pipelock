@@ -1,0 +1,285 @@
+# Request Policy
+
+Request policy is an allow-by-default deny/warn safety rail over outbound HTTP API
+**operations**. Where DLP matches on content and the domain blocklist matches on
+host, request policy matches on what the request is *trying to do*: a GraphQL
+mutation root field, a JSON-RPC command, or an admin `DELETE`. It blocks the
+dangerous operations while everything else forwards untouched.
+
+It is not a DLP scanner and not a behavioral allowlist; it composes with both. It
+runs **before** the learn-and-lock contract gate, so a contract allow can never
+suppress an operation-policy block, and it is independent of
+`request_body_scanning` (it reads a body itself only when a route-matched
+operation predicate or batch endpoint needs one).
+
+This guide is the task-oriented walkthrough. For the exhaustive field reference,
+see [Request Policy in the configuration reference](../configuration.md#request-policy).
+
+## The model
+
+A request **forwards unless a rule matches**. There is deliberately no
+section-level `default_action` knob, so the section can never be configured into a
+default-deny posture by accident. Each rule is `block` or `warn`, per rule.
+
+Every rule has a **route** (which requests it applies to) and, optionally, an
+**operation predicate**: either `graphql` or `discriminator`. When a rule carries
+both a route and a predicate, **both must match**: the route selects the request,
+then the predicate is evaluated against the operation extracted from its body.
+
+## Quick start: block dangerous GraphQL mutations
+
+```yaml
+request_policy:
+  enabled: true
+  on_parse_error: block         # block (default) | warn | allow
+  on_opaque_operation: block    # block (default) | warn | allow
+  rules:
+    - name: "block-graphql-account-mutations"
+      action: block
+      reason: "account-state mutations require human review"
+      route:
+        hosts: ["api.example.com", "*.example.net"]
+        methods: ["POST"]
+        path_prefixes: ["/graphql"]
+      graphql:
+        operation_types: ["mutation"]
+        root_field_patterns: ["^delete", "^transfer"]
+```
+
+This blocks any `POST` to the GraphQL endpoint whose document contains a mutation
+whose root field starts with `delete` or `transfer`. A query that only reads, or a
+mutation on an unrelated field, forwards.
+
+The extractor resolves **aliases to the real field** and expands top-level
+**fragment spreads and inline fragments**, so a deny rule matches the field that
+actually executes, not a cosmetic alias or a field hidden inside a fragment.
+**Every operation in a document or batch is evaluated, never just the first**, so a
+dangerous operation cannot hide behind a benign sibling.
+
+> **Scope GraphQL rules by path, not content type.** A GraphQL-over-GET request
+> (`?query=...`) carries no body and therefore no `Content-Type`, so a rule whose
+> route sets `content_types: ["application/json"]` silently never matches the GET
+> form, even though the engine still extracts the operation from the query string.
+> Constrain GraphQL rules with `path_prefixes` / `path_patterns`, or leave
+> `content_types` empty, so one rule covers both the POST-body and GET-query forms.
+
+## The fail-closed model (the important part)
+
+The two top-level knobs decide what happens when a rule's route matches but the
+operation **cannot be inspected**. Both default to `block`.
+
+| Knob | Fires when | Default |
+|------|------------|---------|
+| `on_parse_error` | The body is read but has a JSON syntax or shape error for the configured predicate, or a contained GraphQL query fails to parse. GraphQL key-integrity failures always block, independently of this setting. | `block` |
+| `on_opaque_operation` | The route matches but there is no inspectable operation: a GraphQL Automatic Persisted Query that ships only a hash, an empty/missing `query`, or a non-string discriminator value. | `block` |
+
+Leaving these at `block` is the safe posture: an attacker cannot smuggle a
+dangerous operation past a rule by making it unparseable or opaque. Set them to
+`warn` only during rollout, and to `allow` only for an endpoint you have decided is
+out of scope.
+
+Several conditions are **always** unclassifiable and fail closed regardless of the
+two knobs: duplicate GraphQL fragment names, fragment cycles, unresolved fragment
+spreads, expansion-budget exhaustion, and a duplicated top-level discriminator key
+(including case-insensitive aliases, where JSON parsers disagree on which value wins). GraphQL JSON bodies always block exact duplicate keys at any depth, noncanonical aliases of `query` and `operationName`, and invalid UTF-8 with reason `invalid_graphql_json_keys`, independently of `on_parse_error`. Keys in `variables` and `extensions` remain case-sensitive. If a route-matched body is
+**uninspectable** (unread, over `request_body_scanning.max_body_bytes` default
+5 MiB, or a read error), it is blocked outright before the two knobs even apply.
+
+## Non-GraphQL JSON APIs: the discriminator predicate
+
+For JSON APIs that signal the operation through a top-level key (an `action`,
+`type`, or `command` field), use a `discriminator` predicate instead of `graphql`:
+
+```yaml
+  rules:
+    - name: "block-account-close-commands"
+      action: block
+      reason: "account-close commands require human review"
+      route:
+        hosts: ["api.example.com"]
+        methods: ["POST"]
+        path_prefixes: ["/rpc"]
+        content_types: ["application/json"]
+      discriminator:
+        field: "action"
+        value_patterns: ["^account\\.close$", "^account\\.delete$"]
+```
+
+The predicate matches when the string value at `field` matches any pattern. An
+absent field does not match (the rail forwards). A present-but-non-string value, a
+non-object top-level body, or a duplicated `field` key is opaque and fails closed
+via `on_opaque_operation`. A rule may carry both `graphql` and `discriminator`, in
+which case both must match.
+
+## Batch endpoints
+
+A JSON batch endpoint wraps several sub-requests in one outer request. Declare it
+under `batch:` and request policy unwraps the envelope and evaluates **every**
+sub-request against the full rule set, with the **strictest decision winning**, so
+a dangerous operation cannot evade a rule by being wrapped in a batch.
+
+```yaml
+  batch:
+    - route:
+        hosts: ["api.example.com"]
+        methods: ["POST"]
+        path_prefixes: ["/$batch"]
+      requests_field: "requests"   # OData-style defaults; override per envelope shape
+      method_field: "method"
+      url_field: "url"
+      body_field: "body"
+      max_sub_requests: 64         # over the cap, the envelope fails closed
+```
+
+A sub-request whose method or URL field is missing or non-string fails closed (it
+must not silently evaluate as `method="" path="/"`). Nested batches are expanded to
+a fixed depth; beyond it, a sub-request that itself targets a batch endpoint fails
+closed.
+
+## Method-override handling
+
+A request that tunnels a different verb through `X-HTTP-Method-Override`,
+`X-Method-Override`, or `X-HTTP-Method` is evaluated against **both** the base
+method and the overridden method, and the stricter result wins. This stops a `POST`
+with `X-HTTP-Method-Override: DELETE` from dodging a `DELETE`-scoped rule, and
+equally stops a real `POST` from being downgraded by an override the upstream
+ignores. The recognized verbs include the HTTP `QUERY` method
+(draft-ietf-httpbis-safe-method-w-body), a safe method that carries a request
+body; `methods: ["QUERY"]` is valid in a route and its body is scanned like any
+other body-bearing request.
+
+## Transport coverage
+
+Request policy is enforced on the fetch proxy, forward proxy, CONNECT, TLS
+interception, reverse proxy, and redirect hops. On every HTTP transport it runs
+before the contract gate. WebSocket is covered on two surfaces: the upgrade
+handshake is matched route-only (host, `GET` method, path, content type), and once
+the socket is open each complete, UTF-8-validated client **text message** is
+evaluated per message as an operation body. Fragmented text messages are
+reassembled before evaluation; partial fragments are buffered, not forwarded or
+classified on their own. The per-message gate is checked against the live matcher,
+so a hot-reloaded rule applies to already-open sockets. Binary frames are not
+operation bodies.
+
+## Rolling out safely
+
+An enforced block rule can carry `except.requests` entries for operator-approved
+JSON requests. Each entry requires `url`, `method`, `body_sha256`, `expires_at`,
+`owner`, and `reason`. This mode cannot be combined with the existing
+`except.field` and `except.values` string exception.
+
+The URL must be absolute HTTPS with the escaped path and query spelling the
+client will send. Scheme and host case and the default port `:443` are
+normalized on both sides ([RFC 3986 scheme-based normalization](https://www.rfc-editor.org/rfc/rfc3986)), so an approval matches an
+intercepted tunnel that always carries `host:443`; any other port is part of the
+approval. The method must be an uppercase body-carrying HTTP
+method. `body_sha256` is the lowercase SHA-256 digest of the complete JSON body
+bytes after any in-path redaction. Inspect those bytes before approving their
+digest; the digest alone doesn't describe or validate the requested action.
+Whitespace and serialization changes require a new approval. `expires_at` is an
+RFC 3339 timestamp checked on each request; an expired entry grants no relief
+even without a reload. An entry can be reused until expiry or removal. It isn't
+a single-use approval token, a client identity check, or an interactive approval
+API.
+
+Only a fully inspected `application/json` request can use this exception.
+Malformed JSON, duplicate object keys at any depth, method-override headers,
+batch envelopes and extracted batch sub-requests cannot use it. Other block
+rules, DLP, SSRF, entropy, kill switches and contracts still apply. Adding an
+entry or extending its expiry produces a security-downgrade reload warning;
+strict or required-receipt deployments require a validated restart for that
+expansion. Removing an entry revokes it for subsequent request evaluations.
+
+Reload also warns when a named enforcing block rule is removed, renamed, changed to warn or shadow mode, or disabled with the policy. This check tracks named enforcement; it does not infer whether changed route or predicate constraints weaken protection.
+
+Deploy a binary that recognizes this configuration before loading it. Older
+binaries reject the unknown fields. The operator must approve the actual
+operation separately; adding a matching configuration entry records that
+decision but doesn't provide or expand its authority.
+
+Start a new rule in shadow before you enforce it:
+
+```yaml
+    - name: "warn-on-admin-deletes"
+      action: warn
+      shadow: true                 # log the would-be action, forward anyway
+      reason: "shadow rollout of admin DELETE guard"
+      route:
+        hosts: ["api.example.com"]
+        methods: ["DELETE"]
+        path_patterns: ['^/admin/']
+```
+
+A `shadow` match never enforces; an enforced match always wins over a shadow match
+of equal strictness. Promote to `action: block` (and drop `shadow`) once the logs
+show the rule matches only what you intend.
+
+## Fetch-only package registries
+
+An allowlisted helper with any-method access is a publish and relay channel: `GET`
+and `HEAD` are the package fetch, but `POST`/`PUT`/`PATCH`/`DELETE` and the WebDAV
+verbs that registries use to create or move artifacts turn the same host into a
+write path. That is operator intent about one host, not a scanner default. Defaulting
+the rail to "fetch only" would break `npm publish` and dataset pushes for operators
+who actually need those methods.
+
+The rail sees the method only with TLS interception on and the host not in
+`passthrough_domains`. Config validation already warns when a rule needs inner HTTP
+that the deployment cannot see.
+
+```yaml
+version: 1
+mode: balanced
+request_policy:
+  enabled: true
+  on_parse_error: block
+  on_opaque_operation: block
+  rules:
+    - name: "fetch-only-vendor-registry"
+      action: block
+      reason: "registry.vendor.example is allowlisted for package fetch only; write methods are a publish/relay channel"
+      route:
+        hosts: ["registry.vendor.example"]
+        methods: ["POST", "PUT", "PATCH", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"]
+```
+
+Read that rule as "these write methods are refused", not as "only fetch is permitted".
+`request_policy` is allow-by-default and has no allow-only method predicate, so a method
+absent from the list still reaches the host: `TRACE` and `OPTIONS` are accepted by
+validation, and any verb the validator does not recognise is rejected at load rather than
+silently blocked. A rule naming the write verbs a registry actually uses is the posture
+this rail can express today. If you need a true fetch-only boundary, terminate it where
+an allow-list exists, such as the registry's own credentials or an upstream gateway, and
+treat this rule as defence in depth rather than the boundary itself.
+
+
+### What this rule does and does not cover
+
+`request_policy` rules are a deny-list: a request forwards unless a rule matches
+it. This recipe therefore refuses exactly the methods it names. It is not an
+allow-only rail, and there is no `methods_except` form today. A method outside
+the list, including `OPTIONS` or any verb a future registry adds, is still
+forwarded.
+
+That is usually the right trade for a package mirror, because the risk being
+closed is publish and relocate rather than read. Name every write verb the
+registry actually accepts, and revisit the list when the registry's API changes.
+If a host genuinely needs read-only enforcement rather than a deny-list, put it
+behind an allowlist that names the paths it may serve instead of enumerating the
+methods it may not.
+
+## Enforcement, audit, and receipts
+
+A matched rule records a decision metric and an audit event with bounded,
+operator-defined labels only, never body or matched content. An enforced
+(non-shadow) `block` returns **HTTP 403** with the `request_policy_deny` block
+reason on `X-Pipelock-Block-Reason` and, when a receipt emitter is configured, a
+correlated receipt id. `warn` and `shadow` matches are logged, counted, and
+forwarded.
+
+## See also
+
+- [GraphQL request policy example](../../examples/request-policy-graphql/README.md): runnable allow and block cases
+- [Request Policy configuration reference](../configuration.md#request-policy): every field, defaults, and route-matching semantics
+- [Block-reason header](block-reason-header.md): the `request_policy_deny` reason and the full block-reason vocabulary
+- [Request redaction](redaction.md): rewriting matched values instead of blocking the request

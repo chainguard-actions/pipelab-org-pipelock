@@ -1,0 +1,404 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package proxy
+
+import (
+	"bytes"
+	"mime/multipart"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/reqpolicy"
+)
+
+const gqlDeleteMutation = "mutation { deleteRecord { id } }"
+
+// gqlJSONBody wraps a GraphQL document as a GraphQL-over-HTTP JSON request body.
+func gqlJSONBody(query string) string {
+	return `{"query":` + strconv.Quote(query) + `}`
+}
+
+// gqlOperationRule blocks a deleteRecord mutation regardless of HTTP method or
+// content type, so the GET and multipart surfaces both route-match. Operators
+// who want to catch every operation-bearing surface leave method/content_type
+// unconstrained, exactly as here.
+func gqlOperationRule() config.RequestPolicyRule {
+	return config.RequestPolicyRule{
+		Name:   rpRuleName,
+		Action: config.ActionBlock,
+		Route:  config.RequestPolicyRoute{Hosts: []string{rpTestHost}},
+		GraphQL: &config.RequestPolicyGraphQL{
+			OperationTypes:    []string{"mutation"},
+			RootFieldPatterns: []string{`^deleteRecord$`},
+		},
+		Reason: "dangerous operation requires operator approval",
+	}
+}
+
+// multipartGraphQLBody builds a graphql-multipart-request body: an "operations"
+// field carrying the GraphQL-over-HTTP JSON, plus a file part to mimic a real
+// upload. Returns the body and the content-type (with boundary).
+func multipartGraphQLBody(t *testing.T, query string) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormField("operations")
+	if err != nil {
+		t.Fatalf("CreateFormField: %v", err)
+	}
+	if _, err := fw.Write([]byte(gqlJSONBody(query))); err != nil {
+		t.Fatalf("write operations: %v", err)
+	}
+	file, err := w.CreateFormFile("0", "upload.bin")
+	if err != nil {
+		t.Fatalf("CreateFormFile: %v", err)
+	}
+	if _, err := file.Write([]byte("file-contents")); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	return buf.Bytes(), w.FormDataContentType()
+}
+
+// --- Unit: surface extractors ----------------------------------------------
+
+func TestExtractGraphQLFromQuery(t *testing.T) {
+	t.Parallel()
+	raw := "query=" + url.QueryEscape("mutation Del { deleteRecord { id } }") + "&operationName=Del"
+	ops, parseOK, opaque, ok := reqpolicy.ExtractGraphQLFromQuery(raw)
+	if !ok || !parseOK || opaque {
+		t.Fatalf("ExtractGraphQLFromQuery = ok %v parseOK %v opaque %v, want ok parseable non-opaque", ok, parseOK, opaque)
+	}
+	if len(ops) != 1 || ops[0].Kind != "mutation" || ops[0].Name != "Del" || len(ops[0].RootFields) != 1 || ops[0].RootFields[0] != "deleteRecord" {
+		t.Fatalf("ops = %#v, want Del mutation deleteRecord", ops)
+	}
+
+	if _, _, _, ok := reqpolicy.ExtractGraphQLFromQuery(""); ok {
+		t.Error("empty query string should not produce operations")
+	}
+	if _, _, _, ok := reqpolicy.ExtractGraphQLFromQuery("foo=bar"); ok {
+		t.Error("query string without a query param should not produce operations")
+	}
+	if _, _, _, ok := reqpolicy.ExtractGraphQLFromQuery("query=%zz"); ok {
+		t.Error("a malformed query string should not produce operations")
+	}
+}
+
+func TestMultipartOperationsField(t *testing.T) {
+	t.Parallel()
+	body, ct := multipartGraphQLBody(t, gqlDeleteMutation)
+	got, ok := multipartOperationsField(ct, body)
+	if !ok {
+		t.Fatal("expected to find the operations field")
+	}
+	if !bytes.Contains(got, []byte("deleteRecord")) {
+		t.Errorf("operations field missing query: %s", got)
+	}
+
+	// No boundary -> not parseable.
+	if _, ok := multipartOperationsField("multipart/form-data", body); ok {
+		t.Error("missing boundary should fail extraction")
+	}
+	// A multipart body with no operations field -> ok=false.
+	var nob bytes.Buffer
+	w := multipart.NewWriter(&nob)
+	_, _ = w.CreateFormField("other")
+	_ = w.Close()
+	if _, ok := multipartOperationsField(w.FormDataContentType(), nob.Bytes()); ok {
+		t.Error("body without an operations field should fail extraction")
+	}
+}
+
+func TestMultipartOperationsField_OverCapFailsClosed(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	fw, err := w.CreateFormField("operations")
+	if err != nil {
+		t.Fatalf("CreateFormField: %v", err)
+	}
+	// An operations field larger than the cap must be rejected, not truncated
+	// and classified - otherwise a dangerous op padded past the cap is hidden.
+	huge := gqlJSONBody("mutation { deleteRecord(pad: \"" + strings.Repeat("a", multipartOperationsMaxBytes) + "\") { id } }")
+	if _, err := fw.Write([]byte(huge)); err != nil {
+		t.Fatalf("write operations: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, ok := multipartOperationsField(w.FormDataContentType(), buf.Bytes()); ok {
+		t.Fatal("an over-cap multipart operations field must fail closed (ok=false)")
+	}
+}
+
+func TestIsMultipartFormData(t *testing.T) {
+	t.Parallel()
+	cases := map[string]bool{
+		"multipart/form-data; boundary=x": true,
+		"multipart/form-data":             true,
+		"MULTIPART/FORM-DATA; boundary=x": true,
+		"application/json":                false,
+		"multipart/mixed":                 false,
+		"":                                false,
+	}
+	for ct, want := range cases {
+		if got := isMultipartFormData(ct); got != want {
+			t.Errorf("isMultipartFormData(%q) = %v, want %v", ct, got, want)
+		}
+	}
+}
+
+func TestExtractRequestPolicyOperations_Dispatch(t *testing.T) {
+	t.Parallel()
+	// multipart surface
+	body, ct := multipartGraphQLBody(t, gqlDeleteMutation)
+	ops, parseOK, _ := extractRequestPolicyOperations(requestPolicyInput{ContentType: ct, Body: body})
+	if !parseOK || len(ops) != 1 || ops[0].Kind != "mutation" {
+		t.Fatalf("multipart dispatch: ops=%+v parseOK=%v", ops, parseOK)
+	}
+	// GET query surface (no body)
+	ops, parseOK, _ = extractRequestPolicyOperations(requestPolicyInput{
+		Query: "query=" + url.QueryEscape(gqlDeleteMutation),
+	})
+	if !parseOK || len(ops) != 1 || ops[0].Kind != "mutation" {
+		t.Fatalf("GET dispatch: ops=%+v parseOK=%v", ops, parseOK)
+	}
+	// JSON body surface
+	ops, parseOK, _ = extractRequestPolicyOperations(requestPolicyInput{
+		ContentType: "application/json", Body: []byte(gqlJSONBody(gqlDeleteMutation)),
+	})
+	if !parseOK || len(ops) != 1 || ops[0].Kind != "mutation" {
+		t.Fatalf("JSON dispatch: ops=%+v parseOK=%v", ops, parseOK)
+	}
+	// multipart with no operations field -> parseOK=false (fail closed upstream)
+	var nob bytes.Buffer
+	w := multipart.NewWriter(&nob)
+	_, _ = w.CreateFormField("other")
+	_ = w.Close()
+	if _, parseOK, _ := extractRequestPolicyOperations(requestPolicyInput{ContentType: w.FormDataContentType(), Body: nob.Bytes()}); parseOK {
+		t.Error("multipart without operations field should report parseOK=false")
+	}
+}
+
+// --- applyRequestPolicy: GET + multipart enforce ----------------------------
+
+func TestApplyRequestPolicy_GraphQLOverGETBlocks(t *testing.T) {
+	t.Parallel()
+	p := newTestProxyWithConfig(t, reqPolicyConfig(gqlOperationRule()))
+	res := p.applyRequestPolicy(requestPolicyInput{
+		Host:      rpTestHost,
+		Method:    http.MethodGet,
+		Path:      "/graphql",
+		Query:     "query=" + url.QueryEscape(gqlDeleteMutation),
+		BodyRead:  true, // GET has no body
+		Transport: TransportFetch,
+		AuditCtx:  audit.LogContext{},
+	})
+	if !res.Block {
+		t.Fatal("GraphQL-over-GET deleteRecord mutation should block")
+	}
+}
+
+func TestApplyRequestPolicy_GraphQLOverGETBenignForwards(t *testing.T) {
+	t.Parallel()
+	p := newTestProxyWithConfig(t, reqPolicyConfig(gqlOperationRule()))
+	res := p.applyRequestPolicy(requestPolicyInput{
+		Host:      rpTestHost,
+		Method:    http.MethodGet,
+		Path:      "/graphql",
+		Query:     "query=" + url.QueryEscape("query { record { id } }"),
+		BodyRead:  true,
+		Transport: TransportFetch,
+		AuditCtx:  audit.LogContext{},
+	})
+	if res.Block {
+		t.Fatal("a benign GraphQL-over-GET query must forward")
+	}
+}
+
+func TestApplyRequestPolicy_GraphQLMultipartBlocks(t *testing.T) {
+	t.Parallel()
+	body, ct := multipartGraphQLBody(t, gqlDeleteMutation)
+	p := newTestProxyWithConfig(t, reqPolicyConfig(gqlOperationRule()))
+	res := p.applyRequestPolicy(requestPolicyInput{
+		Host:        rpTestHost,
+		Method:      http.MethodPost,
+		Path:        "/graphql",
+		ContentType: ct,
+		Body:        body,
+		BodyRead:    true,
+		Transport:   TransportForward,
+		AuditCtx:    audit.LogContext{},
+	})
+	if !res.Block {
+		t.Fatal("multipart GraphQL deleteRecord mutation should block")
+	}
+}
+
+// --- Transport parity: GraphQL-over-GET through the fetch handler -----------
+
+func TestRequestPolicy_FetchGraphQLOverGET_Blocks(t *testing.T) {
+	t.Parallel()
+	p := newTestProxyWithConfig(t, reqPolicyConfig(gqlOperationRule()))
+	handler := p.buildHandler(p.buildMux())
+
+	inner := "http://" + rpTestHost + "/graphql?query=" + url.QueryEscape(gqlDeleteMutation)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+url.QueryEscape(inner), nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assertRequestPolicyBlock(t, w)
+}
+
+func TestTopLevelDuplicateJSONKeys(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want []string
+	}{
+		{"no duplicate", `{"a":1,"b":2}`, nil},
+		{"single duplicate", `{"a":1,"a":2}`, []string{"a"}},
+		{"triple counts once", `{"a":1,"a":2,"a":3}`, []string{"a"}},
+		{"two distinct duplicates", `{"a":1,"a":2,"b":3,"b":4}`, []string{"a", "b"}},
+		{"nested duplicate not counted", `{"a":{"x":1,"x":2},"b":2}`, nil},
+		{"duplicate alongside nested", `{"a":{"x":1},"a":{"x":2}}`, []string{"a"}},
+		{"non-object array", `[1,2,3]`, nil},
+		{"non-object scalar", `"hello"`, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := topLevelDuplicateJSONKeys([]byte(tt.body))
+			if len(got) != len(tt.want) {
+				t.Fatalf("dup keys = %v, want %v", got, tt.want)
+			}
+			for _, k := range tt.want {
+				if _, ok := got[k]; !ok {
+					t.Fatalf("expected duplicate key %q in %v", k, got)
+				}
+			}
+		})
+	}
+}
+
+func TestKeyAliasesRequestPolicyBinding(t *testing.T) {
+	rule := config.RequestPolicyRule{
+		Name: rpRuleName, Action: config.ActionBlock,
+		Route:         config.RequestPolicyRoute{Hosts: []string{rpTestHost}},
+		Discriminator: &config.RequestPolicyDiscriminator{Field: "action", ValuePatterns: []string{"^delete"}},
+	}
+	p := newTestProxyWithConfig(t, reqPolicyConfig(rule))
+	for _, tc := range []struct {
+		raw   string
+		block bool
+	}{
+		{`{"action":"list"}`, false},
+		{`{"action":"delete"}`, true},
+		{`{"action":"list","Action":"delete"}`, true},
+		{`{"Action":"delete","action":"list"}`, true},
+		{`{"Action":"delete"}`, true},
+	} {
+		res := p.applyRequestPolicy(requestPolicyInput{
+			Host: rpTestHost, Method: http.MethodPost, Path: "/rpc", ContentType: "application/json",
+			Body: []byte(tc.raw), BodyRead: true, Transport: TransportFetch,
+		})
+		if res.Block != tc.block {
+			t.Errorf("%s: block=%v, want %v", tc.raw, res.Block, tc.block)
+		}
+	}
+}
+
+func TestRequestPolicyGraphQLKeyAliases(t *testing.T) {
+	cfg := reqPolicyConfig(gqlOperationRule())
+	cfg.RequestPolicy.OnParseError = config.ActionBlock
+	p := newTestProxyWithConfig(t, cfg)
+	for _, raw := range []string{
+		`{"query":"query{record{id}}","Query":"mutation{deleteRecord{id}}"}`,
+		`{"query":"mutation{deleteRecord{id}}","query":"query{record{id}}"}`,
+		`[{"query":"query{record{id}}"},{"query":"query{record{id}}","operationName":"Read","OperationName":"Write"}]`,
+	} {
+		res := p.applyRequestPolicy(requestPolicyInput{Host: rpTestHost, Method: http.MethodPost, Path: "/graphql", ContentType: "application/json", Body: []byte(raw), BodyRead: true, Transport: TransportForward})
+		if !res.Block {
+			t.Errorf("ambiguous GraphQL did not block: %s", raw)
+		}
+	}
+	res := p.applyRequestPolicy(requestPolicyInput{Host: rpTestHost, Method: http.MethodPost, Path: "/graphql", ContentType: "application/json", Body: []byte(gqlJSONBody("query{record{id}}")), BodyRead: true, Transport: TransportForward})
+	if res.Block {
+		t.Fatal("canonical query control blocked")
+	}
+}
+
+func TestGraphQLKeyGuardCannotDowngradePolicy(t *testing.T) {
+	for _, action := range []string{config.ActionBlock, config.ActionWarn, config.ActionAllow} {
+		t.Run(action, func(t *testing.T) {
+			cfg := reqPolicyConfig(gqlOperationRule())
+			cfg.RequestPolicy.OnParseError = action
+			p := newTestProxyWithConfig(t, cfg)
+			for _, tc := range []struct {
+				name, body string
+				block      bool
+			}{
+				{"extensions duplicate", `{"query":"mutation{deleteRecord{id}}","extensions":{"note":1,"note":2}}`, true},
+				{"variables duplicate", `{"query":"mutation{deleteRecord{id}}","variables":{"note":1,"note":2}}`, true},
+				{"schema alias", `{"query":"query{record{id}}","Query":"mutation{deleteRecord{id}}"}`, true},
+				{"batch duplicate", `[{"query":"query{record{id}}"},{"query":"mutation{deleteRecord{id}}","extensions":{"note":1,"note":2}}]`, true},
+				{"invalid UTF-8", "{\"query\":\"query{record{id}}\",\"extensions\":{\"note\":\"\xff\"}}", true},
+				{"benign", `{"query":"query{record{id}}","variables":{"id":1,"ID":2}}`, false},
+				{"mutation", `{"query":"mutation{deleteRecord{id}}"}`, true},
+				{"syntax", `{"query":`, action == config.ActionBlock},
+				{"shape", `{"query":123}`, action == config.ActionBlock},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					for _, multipartBody := range []bool{false, true} {
+						body, contentType := []byte(tc.body), "application/json"
+						if multipartBody {
+							var buf bytes.Buffer
+							w := multipart.NewWriter(&buf)
+							if err := w.WriteField("operations", tc.body); err != nil {
+								t.Fatal(err)
+							}
+							if err := w.Close(); err != nil {
+								t.Fatal(err)
+							}
+							body, contentType = buf.Bytes(), w.FormDataContentType()
+						}
+						res := p.applyRequestPolicy(requestPolicyInput{Host: rpTestHost, Method: http.MethodPost, Path: "/graphql", ContentType: contentType, Body: body, BodyRead: true, Transport: TransportForward})
+						if res.Block != tc.block {
+							t.Fatalf("multipart=%v: block=%v, want %v", multipartBody, res.Block, tc.block)
+						}
+						switch tc.name {
+						case "extensions duplicate", "variables duplicate", "schema alias", "batch duplicate", "invalid UTF-8":
+							if res.Reason != "invalid_graphql_json_keys" {
+								t.Fatalf("reason=%q", res.Reason)
+							}
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestGraphQLKeyGuardPreservesEnforcedDiscriminator(t *testing.T) {
+	rule := gqlOperationRule()
+	rule.Shadow = true
+	cfg := reqPolicyConfig(rule, config.RequestPolicyRule{
+		Name: "deny-discriminator", Action: config.ActionBlock,
+		Route:         config.RequestPolicyRoute{Hosts: []string{rpTestHost}},
+		Discriminator: &config.RequestPolicyDiscriminator{Field: "action", ValuePatterns: []string{"^delete$"}},
+	})
+	cfg.RequestPolicy.OnParseError = config.ActionAllow
+	p := newTestProxyWithConfig(t, cfg)
+	res := p.applyRequestPolicy(requestPolicyInput{Host: rpTestHost, Method: http.MethodPost, Path: "/graphql", ContentType: "application/json", Body: []byte(`{"query":"query{record{id}}","action":"delete","extensions":{"note":1,"note":2}}`), BodyRead: true, Transport: TransportForward})
+	if !res.Block {
+		t.Fatal("shadow GraphQL key decision suppressed enforced discriminator")
+	}
+}

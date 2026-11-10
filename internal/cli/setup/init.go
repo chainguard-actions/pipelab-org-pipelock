@@ -1,0 +1,893 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package setup
+
+import (
+	"context"
+	"crypto/ed25519"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
+
+	"github.com/luckyPipewrench/pipelock/internal/cli/presets"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/discover"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// Exit codes for init command.
+const (
+	initExitSuccess = 0
+	initExitFailure = 1
+	initExitError   = 2
+)
+
+const flightRecorderPublicKeyMode os.FileMode = 0o640
+
+// defaultConfigSubdir is the subdirectory under os.UserConfigDir() for pipelock config.
+const defaultConfigSubdir = "pipelock"
+
+// initResult holds the outcome of each phase for reporting.
+const initCheckScope = "Local configuration and synthetic URL-scanner checks; does not verify real client routing."
+
+type initResult struct {
+	Scope    string              `json:"scope"`
+	Discover *initDiscoverResult `json:"discover"`
+	Setup    *initSetupResult    `json:"setup"`
+	Auditor  *initAuditorResult  `json:"evidence_corpus_auditor,omitempty"`
+	Verify   *initVerifyResult   `json:"verify,omitempty"`
+	Canary   *initCanaryResult   `json:"canary,omitempty"`
+}
+
+type initDiscoverResult struct {
+	ClientsFound int `json:"clients_found"`
+	ServersFound int `json:"servers_found"`
+	Protected    int `json:"protected"`
+	Unprotected  int `json:"unprotected"`
+	Unconfirmed  int `json:"unconfirmed"`
+	Unknown      int `json:"unknown"`
+}
+
+type initSetupResult struct {
+	ConfigPath     string `json:"config_path"`
+	Source         string `json:"config_source"`
+	Preset         string `json:"preset"`
+	Written        bool   `json:"written"`
+	SkippedExsting bool   `json:"skipped_existing,omitempty"`
+}
+
+type initAuditorResult struct {
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	ServicePath string `json:"service_path,omitempty"`
+	TimerPath   string `json:"timer_path,omitempty"`
+	AlertPath   string `json:"alert_path,omitempty"`
+	MetricPath  string `json:"metric_path,omitempty"`
+}
+
+// Auditor phase status values reported in the init summary and JSON output.
+const (
+	auditorStatusInstalled        = "installed"
+	auditorStatusSkippedFlag      = "skipped_flag"
+	auditorStatusSkippedDryRun    = "skipped_dry_run"
+	auditorStatusSkippedNoSystemd = "skipped_no_systemd"
+	// An existing config that cannot be loaded, or that configures no
+	// flight_recorder.dir, leaves nothing for the auditor to watch. That
+	// outcome still gets a status: "not installed" must never be reported by
+	// saying nothing at all.
+	auditorStatusSkippedNoRecorderDir = "skipped_no_recorder_dir"
+	// An existing config that will not load at all is a different outcome from
+	// one that loads and configures no directory. Reporting both as
+	// "no recorder dir" hides a malformed or unreadable file behind a reason
+	// that is not true of it.
+	auditorStatusSkippedUnreadableConfig = "skipped_unreadable_config"
+)
+
+type initVerifyResult struct {
+	Passed  int    `json:"passed"`
+	Failed  int    `json:"failed"`
+	Skipped bool   `json:"skipped"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+type initCanaryResult struct {
+	Detected bool   `json:"detected"`
+	Skipped  bool   `json:"skipped"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// InitCmd returns the "pipelock init" command.
+func InitCmd() *cobra.Command {
+	var (
+		preset       string
+		skipCanary   bool
+		skipValidate bool
+		dryRun       bool
+		force        bool
+		output       string
+		jsonOutput   bool
+		scanHome     string
+		noAuditor    bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Set up pipelock in one command",
+		Long: `Discover IDE and agent configs, generate a pipelock config, and validate
+it parses. Checks use the saved or retained config; dry runs check the proposed
+config. Client routing must be configured and verified separately.
+
+Workflow:
+  1. Discover:  find IDE configs (Claude Code, Cursor, VS Code, JetBrains)
+  2. Setup:     generate a config file with sensible defaults
+  3. Validate:  check the saved or retained config parses and compiles (skippable)
+  4. Canary:    run a synthetic secret through the real scanner (skippable)
+  5. Summary:   show what was discovered, configured, and validated
+
+Examples:
+  pipelock init
+  pipelock init --preset strict
+  pipelock init --dry-run
+  pipelock init --output ./pipelock.yaml
+  pipelock init --skip-canary --skip-validate
+  pipelock init --no-auditor`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runInit(cmd, initOptions{
+				preset:       preset,
+				skipCanary:   skipCanary,
+				skipValidate: skipValidate,
+				dryRun:       dryRun,
+				force:        force,
+				output:       output,
+				jsonOutput:   jsonOutput,
+				scanHome:     scanHome,
+				noAuditor:    noAuditor,
+			})
+		},
+	}
+
+	cmd.Flags().StringVar(&preset, "preset", config.ModeBalanced, presets.FlagHelp)
+	cmd.Flags().BoolVar(&skipCanary, "skip-canary", false, "skip the canary detection test")
+	cmd.Flags().BoolVar(&skipValidate, "skip-validate", false, "skip config validation checks")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "show what would be done without writing files")
+	cmd.Flags().BoolVar(&force, "force", false, "overwrite existing config file")
+	cmd.Flags().StringVarP(&output, "output", "o", "", "config output path (default: OS config dir)")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "machine-readable JSON output")
+	cmd.Flags().StringVar(&scanHome, "scan-home", "", "override home directory for discovery (default: $HOME)")
+	cmd.Flags().BoolVar(&noAuditor, "no-auditor", false, "skip installing the evidence corpus auditor timer")
+
+	cmd.AddCommand(SidecarCmd())
+
+	return cmd
+}
+
+type initOptions struct {
+	preset       string
+	skipCanary   bool
+	skipValidate bool
+	dryRun       bool
+	force        bool
+	output       string
+	jsonOutput   bool
+	scanHome     string
+	noAuditor    bool
+}
+
+func runInit(cmd *cobra.Command, opts initOptions) error {
+	// Resolve the user's home directory for discovery (--scan-home or $HOME).
+	// An explicit --scan-home inspects that tree only; the running
+	// process's own CLAUDE_CONFIG_DIR describes this user, not that one.
+	home := opts.scanHome
+	var discoverOpts discover.Options
+	if home == "" {
+		h, err := os.UserHomeDir()
+		if err != nil {
+			return cliutil.ExitCodeError(initExitError, fmt.Errorf("determining home directory: %w", err))
+		}
+		home = h
+		discoverOpts = discover.AmbientOptions(os.Getenv)
+	}
+
+	presetCfg, err := presets.Config(opts.preset)
+	if err != nil {
+		return cliutil.ExitCodeError(initExitError,
+			err)
+	}
+
+	result := &initResult{Scope: initCheckScope}
+	w := cmd.OutOrStdout()
+
+	// Phase 1: Discover
+	if !opts.jsonOutput {
+		_, _ = fmt.Fprintln(w, "Pipelock Init")
+		_, _ = fmt.Fprintln(w, "=============")
+		_, _ = fmt.Fprintln(w)
+		_, _ = fmt.Fprintln(w, "[1/5] Discovering IDE and agent configs...")
+	}
+
+	report, err := discover.DiscoverWithOptions(home, discoverOpts)
+	if err != nil {
+		return cliutil.ExitCodeError(initExitError, fmt.Errorf("discovery failed: %w", err))
+	}
+
+	result.Discover = &initDiscoverResult{
+		ClientsFound: report.Summary.TotalClients,
+		ServersFound: report.Summary.TotalServers,
+		Protected:    report.Summary.ProtectedPipelock + report.Summary.ProtectedOther,
+		Unprotected:  report.Summary.Unprotected,
+		Unconfirmed:  report.Summary.Unconfirmed,
+		Unknown:      report.Summary.Unknown,
+	}
+
+	if !opts.jsonOutput {
+		printDiscoverPhase(w, report)
+	}
+
+	// Phase 2: Setup (generate config)
+	if !opts.jsonOutput {
+		_, _ = fmt.Fprintln(w, "[2/5] Generating config...")
+	}
+
+	cfg, err := buildConfigFromPreset(presetCfg, report)
+	if err != nil {
+		return cliutil.ExitCodeError(initExitError, err)
+	}
+	configPath := opts.output
+	if configPath == "" {
+		cfgDir, err := os.UserConfigDir()
+		if err != nil {
+			return cliutil.ExitCodeError(initExitError, fmt.Errorf("determining config directory: %w", err))
+		}
+		configPath = filepath.Join(cfgDir, defaultConfigSubdir, "pipelock.yaml")
+	}
+
+	configPath, err = filepath.Abs(configPath)
+	if err != nil {
+		return cliutil.ExitCodeError(initExitError, fmt.Errorf("resolving config path: %w", err))
+	}
+
+	// Wire the flight recorder to disk so receipts ("verify the boundary") are
+	// live out of the box: a recorder directory and an Ed25519 signing key beside
+	// the config. Absolute paths so the generated config records regardless of
+	// the proxy's working directory (Load does not resolve flight_recorder paths
+	// relative to the config file). The key file is generated only on an actual
+	// write (below), never on --dry-run.
+	recorderDir, signingKeyPath := flightRecorderInitPaths(configPath)
+	cfg.FlightRecorder.Dir = recorderDir
+	cfg.FlightRecorder.SigningKeyPath = signingKeyPath
+
+	result.Setup = &initSetupResult{
+		ConfigPath: configPath,
+		Source:     "proposed",
+		Preset:     opts.preset,
+	}
+
+	if opts.dryRun {
+		result.Setup.Written = false
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  Would write config to: %s\n", configPath)
+			_, _ = fmt.Fprintf(w, "  Preset: %s\n\n", opts.preset)
+		}
+	} else {
+		// Refuse to overwrite an existing config without --force.
+		if _, err := os.Stat(configPath); err == nil && !opts.force {
+			if !opts.jsonOutput {
+				_, _ = fmt.Fprintf(w, "  Config already exists at: %s\n", configPath)
+				_, _ = fmt.Fprintln(w, "  Use --force to overwrite, or --output to write elsewhere.")
+				_, _ = fmt.Fprintln(w)
+			}
+			result.Setup.Written = false
+			result.Setup.SkippedExsting = true
+			result.Setup.Source = "retained"
+			result.Setup.Preset = "" // The requested preset was not applied.
+		} else {
+			if err := ensureFlightRecorderSigningKey(signingKeyPath, recorderDir); err != nil {
+				return cliutil.ExitCodeError(initExitError, fmt.Errorf("provisioning flight recorder: %w", err))
+			}
+			if err := writeConfig(cfg, configPath, opts.preset); err != nil {
+				return cliutil.ExitCodeError(initExitError, fmt.Errorf("writing config: %w", err))
+			}
+			result.Setup.Written = true
+			result.Setup.Source = "saved"
+			if !opts.jsonOutput {
+				_, _ = fmt.Fprintf(w, "  Config written to: %s\n", configPath)
+				_, _ = fmt.Fprintf(w, "  Preset: %s\n\n", opts.preset)
+			}
+		}
+	}
+	if runtime.GOOS == "linux" {
+		auditorResult, auditorErr := runEvidenceAuditorPhase(cmd, opts, cfg, result, configPath, w)
+		if auditorErr != nil {
+			return cliutil.ExitCodeError(initExitError, fmt.Errorf("installing evidence corpus auditor: %w", auditorErr))
+		}
+		result.Auditor = auditorResult
+	}
+
+	// Validate the bytes that subsequent commands will load, not an unused preset.
+	// Dry runs deliberately check the proposed config without reading the target.
+	var configLoadErr error
+	if !opts.dryRun && (!opts.skipValidate || !opts.skipCanary) {
+		cfg, configLoadErr = config.Load(configPath)
+	}
+
+	// Phase 3: Validate config
+	if opts.skipValidate {
+		result.Verify = &initVerifyResult{Skipped: true}
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintln(w, "[3/5] Validate: skipped (--skip-validate)")
+			_, _ = fmt.Fprintln(w)
+		}
+	} else {
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintln(w, "[3/5] Validating config...")
+		}
+		var vr *initVerifyResult
+		if configLoadErr != nil {
+			vr = &initVerifyResult{Failed: 1, Detail: fmt.Sprintf("loading config %q: %v", configPath, configLoadErr)}
+		} else {
+			vr = runInitVerify(cfg)
+		}
+		result.Verify = vr
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  Passed: %d, Failed: %d\n", vr.Passed, vr.Failed)
+			if vr.Detail != "" {
+				_, _ = fmt.Fprintf(w, "  %s\n", vr.Detail)
+			}
+			_, _ = fmt.Fprintln(w)
+		}
+	}
+
+	// Phase 4: Canary
+	if opts.skipCanary {
+		result.Canary = &initCanaryResult{Skipped: true}
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintln(w, "[4/5] Canary: skipped (--skip-canary)")
+			_, _ = fmt.Fprintln(w)
+		}
+	} else {
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintln(w, "[4/5] Testing canary detection...")
+		}
+		var cr *initCanaryResult
+		if configLoadErr != nil {
+			cr = &initCanaryResult{Skipped: true, Detail: "Canary not run: saved configuration could not be loaded."}
+		} else {
+			cr = runInitCanary(cfg)
+		}
+		result.Canary = cr
+		if !opts.jsonOutput {
+			if cr.Detected {
+				_, _ = fmt.Fprintln(w, "  Synthetic canary detected by the local URL scanner. This does not verify client routing.")
+			} else {
+				_, _ = fmt.Fprintf(w, "  %s\n", cr.Detail)
+			}
+			_, _ = fmt.Fprintln(w)
+		}
+	}
+
+	// Phase 5: Summary
+	if opts.jsonOutput {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(result); err != nil {
+			return cliutil.ExitCodeError(initExitError, fmt.Errorf("encoding JSON: %w", err))
+		}
+	} else if configLoadErr != nil {
+		_, _ = fmt.Fprintf(w, "Fix the configuration file %q and rerun the same pipelock init command.\n", configPath)
+	} else {
+		printProof(w, result, cfg)
+	}
+
+	if configLoadErr != nil {
+		return cliutil.ExitCodeError(initExitError, fmt.Errorf("loading config %q: %w", configPath, configLoadErr))
+	}
+
+	// Exit 1 if validation failed or canary was not detected.
+	if result.Verify != nil && !result.Verify.Skipped && result.Verify.Failed > 0 {
+		return &cliutil.ExitError{Err: fmt.Errorf("config validation failed"), Code: initExitFailure}
+	}
+	if result.Canary != nil && !result.Canary.Skipped && !result.Canary.Detected {
+		return &cliutil.ExitError{Err: fmt.Errorf("%s", result.Canary.Detail), Code: initExitFailure}
+	}
+
+	return nil
+}
+
+// evidenceAuditorInstall is the seam for the install itself. The disclosure
+// contract is "nothing lands before it is named", and the first thing that
+// lands is a managed file written inside the installer -- well before it runs
+// systemctl. Asserting order against the systemctl seam or the post-install
+// message therefore cannot catch a disclosure printed after the first write,
+// so the ordering test hooks the installer entry point instead.
+var evidenceAuditorInstall = installEvidenceCorpusAuditor
+
+// runEvidenceAuditorPhase decides and, unless skipped, performs the evidence
+// corpus auditor install for `pipelock init`. It is on Linux by default:
+// --no-auditor opts out, --dry-run installs nothing, and a host with no
+// usable systemd --user session is skipped with a printed notice rather than
+// failing init outright. The disclosure is printed before any install call so
+// nothing lands on the system unannounced.
+func runEvidenceAuditorPhase(cmd *cobra.Command, opts initOptions, cfg *config.Config, result *initResult, configPath string, w io.Writer) (*initAuditorResult, error) {
+	if opts.noAuditor {
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintln(w, "  Evidence corpus auditor: skipped (--no-auditor)")
+			_, _ = fmt.Fprintln(w)
+		}
+		return &initAuditorResult{Status: auditorStatusSkippedFlag}, nil
+	}
+
+	if opts.dryRun {
+		// Both surfaces must read as a plan, not as an action. The bare
+		// disclosure starts with "Installing", which is false under --dry-run
+		// and was previously handed to JSON consumers verbatim.
+		// The plan is conditional and must say so. Dry run deliberately runs no
+		// probe (so it starts nothing and writes nothing), which means it
+		// cannot know whether this host has a usable systemd --user session;
+		// claiming a flat "would install" told operators on a container or a
+		// recorder-less config that a real run would install something it
+		// would in fact skip.
+		planned := "Would install " + evidenceAuditorDisclosure[len("Installing "):]
+		planned += " A real run installs it only on Linux with a usable systemd --user session and a configured flight_recorder.dir, and names the skip reason otherwise."
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  %s\n\n", planned)
+		}
+		return &initAuditorResult{Status: auditorStatusSkippedDryRun, Detail: planned}, nil
+	}
+
+	if unavailable, reason := evidenceAuditorUserSystemdUnavailable(cmd.Context()); unavailable {
+		// The probe reports one boolean, so it cannot distinguish "this host
+		// has no user session" from "we were cancelled while asking". Only the
+		// context can. Without this check an interrupted init exits zero and
+		// reports a clean skip, which tells the operator the host lacks
+		// systemd when nothing of the sort was established.
+		if ctxErr := cmd.Context().Err(); ctxErr != nil {
+			return nil, fmt.Errorf("probing systemd --user: %w", ctxErr)
+		}
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  Evidence corpus auditor: skipped (%s)\n\n", reason)
+		}
+		return &initAuditorResult{Status: auditorStatusSkippedNoSystemd, Detail: reason}, nil
+	}
+
+	auditorRecorderDir := cfg.FlightRecorder.Dir
+	installAuditor := result.Setup.Written
+	skipStatus := auditorStatusSkippedNoRecorderDir
+	skipReason := "existing config configures no flight_recorder.dir to audit"
+	if result.Setup.SkippedExsting {
+		// Preserve init's historic no-op behavior for an arbitrary existing
+		// config. A previously generated, valid config is enough to repair a
+		// missing managed auditor on rerun without rewriting the config.
+		existing, loadErr := config.Load(configPath)
+		switch {
+		case loadErr != nil:
+			skipStatus = auditorStatusSkippedUnreadableConfig
+			skipReason = fmt.Sprintf("existing config could not be read: %v", loadErr)
+		case existing.FlightRecorder.Dir != "":
+			auditorRecorderDir = existing.FlightRecorder.Dir
+			installAuditor = true
+		}
+	}
+	if !installAuditor {
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  Evidence corpus auditor: skipped (%s)\n\n", skipReason)
+		}
+		return &initAuditorResult{Status: skipStatus, Detail: skipReason}, nil
+	}
+
+	// Disclose BEFORE installing: name the unit, what it does, and how to
+	// remove it, so an operator sees this before anything is enabled. Under
+	// --json the disclosure goes to stderr rather than being dropped: stdout
+	// stays a single valid JSON document for machine consumers, and the
+	// consent contract still holds for the operator watching the terminal.
+	// Suppressing it entirely meant --json enabled a timer having named it
+	// nowhere until after the unit was already running.
+	// The disclosure is the whole consent boundary, so a write that failed
+	// means the operator was never told. Discarding that error installed the
+	// timer anyway against a broken pipe or a rejecting writer, which is the
+	// one outcome this phase exists to prevent.
+	var disclosureErr error
+	if opts.jsonOutput {
+		_, disclosureErr = fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", evidenceAuditorDisclosure)
+	} else {
+		_, disclosureErr = fmt.Fprintf(w, "  %s\n", evidenceAuditorDisclosure)
+	}
+	if disclosureErr != nil {
+		return nil, fmt.Errorf("writing evidence auditor disclosure: %w", disclosureErr)
+	}
+
+	installed, err := evidenceAuditorInstall(cmd.Context(), auditorRecorderDir)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.jsonOutput {
+		_, _ = fmt.Fprintf(w, "  Evidence corpus auditor timer installed: %s\n\n", installed.TimerPath)
+	}
+	return &initAuditorResult{
+		Status:      auditorStatusInstalled,
+		ServicePath: installed.ServicePath,
+		TimerPath:   installed.TimerPath,
+		AlertPath:   installed.AlertPath,
+		MetricPath:  installed.MetricPath,
+	}, nil
+}
+
+func printDiscoverPhase(w io.Writer, report *discover.Report) {
+	if len(report.Clients) == 0 {
+		_, _ = fmt.Fprintln(w, "  No IDE or agent configs found.")
+		_, _ = fmt.Fprintln(w, "  Config will use standard defaults.")
+		_, _ = fmt.Fprintln(w)
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "  Found %d client(s), %d MCP server(s)\n",
+		report.Summary.TotalClients, report.Summary.TotalServers)
+
+	for _, c := range report.Clients {
+		if c.ParseError != "" {
+			_, _ = fmt.Fprintf(w, "    %-16s %s (parse error)\n", c.Client, c.ConfigPath)
+		} else {
+			_, _ = fmt.Fprintf(w, "    %-16s %s (%d servers)\n", c.Client, c.ConfigPath, c.ServerCount)
+		}
+	}
+
+	if report.Summary.Unprotected > 0 {
+		_, _ = fmt.Fprintf(w, "  %d server(s) are not wrapped through pipelock.\n", report.Summary.Unprotected)
+		_, _ = fmt.Fprintln(w, "  Run 'pipelock discover --generate' for wrapper suggestions.")
+	}
+	if report.Summary.Unconfirmed > 0 {
+		_, _ = fmt.Fprintf(w, "  %d server(s) have wrappers in checked files; actual client launches are unconfirmed.\n", report.Summary.Unconfirmed)
+	}
+	_, _ = fmt.Fprintln(w)
+}
+
+func buildConfig(preset string, report *discover.Report) (*config.Config, error) {
+	cfg, err := presets.Config(preset)
+	if err != nil {
+		return nil, err
+	}
+	return buildConfigFromPreset(cfg, report)
+}
+
+func buildConfigFromPreset(cfg *config.Config, report *discover.Report) (*config.Config, error) {
+	// Loaded policy is immutable and may already have a cached policy hash.
+	cfg = cfg.Clone()
+	// Enable MCP scanning if MCP servers were discovered.
+	if report != nil && report.Summary.TotalServers > 0 {
+		// Match the runtime's unconfigured-section convention. A nonempty
+		// action preserves configured scanning, including explicit disables.
+		if !cfg.MCPInputScanning.Enabled && cfg.MCPInputScanning.Action == "" {
+			cfg.MCPInputScanning.Enabled = true
+			cfg.MCPInputScanning.Action = config.ActionWarn
+		}
+		if !cfg.MCPToolScanning.Enabled && cfg.MCPToolScanning.Action == "" {
+			cfg.MCPToolScanning.Enabled = true
+			cfg.MCPToolScanning.Action = config.ActionWarn
+			cfg.MCPToolScanning.DetectDrift = true
+		}
+	}
+
+	return cfg, nil
+}
+
+func writeConfig(cfg *config.Config, configPath, preset string) error {
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("creating directory %s: %w", dir, err)
+	}
+
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	header := fmt.Sprintf("# Pipelock config (%s preset)\n# Generated by: pipelock init --preset %s\n# Docs: https://github.com/luckyPipewrench/pipelock/blob/main/docs/configuration.md\n\n", preset, preset)
+
+	if err := os.WriteFile(configPath, []byte(header+string(data)), 0o600); err != nil {
+		return fmt.Errorf("writing %s: %w", configPath, err)
+	}
+
+	return nil
+}
+
+// flightRecorderInitPaths returns the recorder directory and signing-key path
+// that `pipelock init` provisions next to the generated config. Both are
+// absolute so the generated config records regardless of the proxy's working
+// directory. Mirrors the layout used by `pipelock contain` (recorder dir +
+// keys/ subdir) for consistency across setup paths.
+func flightRecorderInitPaths(configPath string) (dir, keyPath string) {
+	configDir := filepath.Dir(configPath)
+	if abs, err := filepath.Abs(configDir); err == nil {
+		configDir = abs
+	}
+	return filepath.Join(configDir, "recorder"),
+		filepath.Join(configDir, "keys", "flight-recorder-signing.key")
+}
+
+// ensureFlightRecorderSigningKey creates the recorder directory and an Ed25519
+// signing key used to sign decision receipts. An existing key is reused, never
+// overwritten: the signing key anchors the receipt chain, so clobbering it would
+// orphan any receipts already on disk under the old key (they fail to resume and
+// emission bricks). Directories use 0o750 and the key file 0o600 (via
+// signing.SavePrivateKey) so the agent side cannot read pipelock's signing key.
+func ensureFlightRecorderSigningKey(keyPath, recorderDir string) error {
+	if err := os.MkdirAll(recorderDir, 0o750); err != nil {
+		return fmt.Errorf("creating recorder directory %s: %w", recorderDir, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0o750); err != nil {
+		return fmt.Errorf("creating signing key directory: %w", err)
+	}
+	switch _, statErr := os.Stat(keyPath); {
+	case statErr == nil:
+		// A key already exists. Distinguish two failure modes so we never clobber
+		// a still-valid key (which would orphan its receipt chain):
+		//   - cannot READ the file (permission drift, I/O, symlink/read failure):
+		//     abort. The bytes may be a perfectly good key we just can't read.
+		//   - readable but the bytes do not PARSE as a key (zero-byte, truncated,
+		//     wrong material): that file signed no valid chain, so regenerate
+		//     over it rather than leaving init pointing at an unusable key the
+		//     recorder would only fail to load later.
+		data, readErr := os.ReadFile(filepath.Clean(keyPath))
+		if readErr != nil {
+			return fmt.Errorf("reading existing signing key %s: %w", keyPath, readErr)
+		}
+		if priv, decodeErr := signing.DecodePrivateKey(string(data)); decodeErr == nil {
+			return writeFlightRecorderPublicKey(keyPath, priv) // reuse key, refresh public sidecar
+		}
+		// fall through: corrupt/unparseable key material -> regenerate.
+	case !errors.Is(statErr, os.ErrNotExist):
+		return fmt.Errorf("checking signing key %s: %w", keyPath, statErr)
+	}
+	_, priv, err := signing.GenerateKeyPair()
+	if err != nil {
+		return fmt.Errorf("generating signing key: %w", err)
+	}
+	if err := signing.SavePrivateKey(priv, keyPath); err != nil {
+		return fmt.Errorf("writing signing key %s: %w", keyPath, err)
+	}
+	return writeFlightRecorderPublicKey(keyPath, priv)
+}
+
+func writeFlightRecorderPublicKey(keyPath string, priv ed25519.PrivateKey) error {
+	pubPath := keyPath + ".pub"
+	if err := signing.SavePublicKeyHexFromPrivateKey(priv, pubPath, flightRecorderPublicKeyMode); err != nil {
+		return fmt.Errorf("writing public signing key %s: %w", pubPath, err)
+	}
+	return nil
+}
+
+func runInitVerify(cfg *config.Config) *initVerifyResult {
+	// Run basic config validation checks without requiring a running proxy.
+	var passed, failed int
+
+	// Check 1: config parses and validates.
+	if err := cfg.Validate(); err != nil {
+		return &initVerifyResult{
+			Passed: passed,
+			Failed: 1,
+			Detail: fmt.Sprintf("config validation failed: %v", err),
+		}
+	}
+	passed++
+
+	// Check 2: DLP patterns compile.
+	for _, p := range cfg.DLP.Patterns {
+		if p.Regex != "" {
+			passed++
+		}
+	}
+
+	// Check 3: response scanning patterns compile.
+	if cfg.ResponseScanning.Enabled {
+		passed++
+	}
+
+	// Check 4: mode is set.
+	switch cfg.Mode {
+	case config.ModeStrict, config.ModeBalanced, config.ModeAudit:
+		passed++
+	default:
+		failed++
+	}
+
+	detail := ""
+	if failed > 0 {
+		detail = "Config validation failed. Use the config-specific commands in Next steps."
+	}
+
+	return &initVerifyResult{
+		Passed: passed,
+		Failed: failed,
+		Detail: detail,
+	}
+}
+
+// initCanaryURL returns the synthetic DLP canary URL for cfg. It keeps the
+// historical github.com destination unless a strict allowlist would block it
+// before DLP runs, and then uses a destination the configured allowlist
+// itself accepts. The policy itself is never changed.
+func initCanaryURL(cfg *config.Config) string {
+	host := "github.com"
+	if cfg.Mode == config.ModeStrict && len(cfg.APIAllowlist) > 0 && !canaryHostAllowed(host, cfg.APIAllowlist) {
+		host = allowlistCanaryHost(cfg.APIAllowlist)
+	}
+	// RFC 3986 brackets every IPv6 literal, including IPv4-mapped forms such
+	// as ::ffff:192.0.2.1 whose To4 is non-nil. Config validation keeps a
+	// trailing dot that net.ParseIP rejects, so drop it from an IPv6 literal.
+	if bare := strings.TrimSuffix(host, "."); net.ParseIP(bare) != nil && strings.Contains(bare, ":") {
+		host = "[" + bare + "]"
+	}
+	u := url.URL{Scheme: "https", Host: host, Path: "/test", RawQuery: "key=" + canaryToken()}
+	return u.String()
+}
+
+// allowlistCanaryHost picks a hostname that the allowlist matcher accepts and
+// that is not an IP literal, which the core SSRF floor can block before DLP.
+// A leading wildcard pattern yields a name under it, since stripping the
+// wildcard can leave an address the pattern does not authorize. When no entry
+// yields such a name, the first entry is returned and the canary reports the
+// block honestly.
+func allowlistCanaryHost(allowlist []string) string {
+	for _, pattern := range allowlist {
+		host := pattern
+		if suffix, ok := strings.CutPrefix(pattern, "*."); ok {
+			host = "canary." + suffix
+		}
+		if scanner.ParseIPLiteral(host) == nil && canaryHostAllowed(host, allowlist) {
+			return host
+		}
+	}
+	return strings.TrimPrefix(allowlist[0], "*.")
+}
+
+func canaryHostAllowed(host string, allowlist []string) bool {
+	for _, pattern := range allowlist {
+		if scanner.MatchDomain(host, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func runInitCanary(cfg *config.Config) *initCanaryResult {
+	return scanCanaryResult(cfg, initCanaryURL(cfg))
+}
+
+func scanCanaryURL(cfg *config.Config, canaryURL string) bool {
+	return scanCanaryResult(cfg, canaryURL).Detected
+}
+
+func scanCanaryResult(cfg *config.Config, canaryURL string) *initCanaryResult {
+	sc, err := scanner.New(cfg)
+	if err != nil {
+		return &initCanaryResult{Detail: fmt.Sprintf("Canary was not detected: scanner initialization failed: %v", err)}
+	}
+	defer sc.Close()
+	result := sc.Scan(context.Background(), canaryURL)
+	// Assert the block came from DLP specifically, not an allowlist or other layer.
+	// Core DLP (immutable safety floor) also counts as DLP detection.
+	if !result.Allowed && (result.Scanner == scanner.ScannerDLP || result.Scanner == scanner.ScannerCoreDLP) {
+		return &initCanaryResult{Detected: true, Detail: "Synthetic canary detected in the local URL scanner; client routing was not tested."}
+	}
+	if !result.Allowed {
+		return &initCanaryResult{Detail: fmt.Sprintf("Synthetic canary was blocked before DLP by scanner %q; DLP detection was not verified.", result.Scanner)}
+	}
+	return &initCanaryResult{Detail: "Canary was not detected by DLP. Use the config-specific check command in Next steps."}
+}
+
+func printProof(w interface{ Write([]byte) (int, error) }, result *initResult, cfg *config.Config) {
+	_, _ = fmt.Fprintln(w, "[5/5] Summary")
+	_, _ = fmt.Fprintln(w, "=============")
+	_, _ = fmt.Fprintln(w)
+
+	// Discovery
+	_, _ = fmt.Fprintf(w, "  Clients found:      %d\n", result.Discover.ClientsFound)
+	_, _ = fmt.Fprintf(w, "  MCP servers found:  %d\n", result.Discover.ServersFound)
+	_, _ = fmt.Fprintf(w, "  Protected:          %d\n", result.Discover.Protected)
+	_, _ = fmt.Fprintf(w, "  Unprotected:        %d\n", result.Discover.Unprotected)
+	_, _ = fmt.Fprintf(w, "  Unconfirmed:        %d\n", result.Discover.Unconfirmed)
+	if result.Discover.Unknown > 0 {
+		_, _ = fmt.Fprintf(w, "  Unknown:            %d\n", result.Discover.Unknown)
+	}
+	_, _ = fmt.Fprintln(w)
+
+	// Setup
+	switch {
+	case result.Setup.Written:
+		_, _ = fmt.Fprintf(w, "  Config written to:  %s\n", result.Setup.ConfigPath)
+	case result.Setup.SkippedExsting:
+		_, _ = fmt.Fprintf(w, "  Config exists at:   %s (use --force to overwrite)\n", result.Setup.ConfigPath)
+	default:
+		_, _ = fmt.Fprintf(w, "  Config would be at: %s (dry run)\n", result.Setup.ConfigPath)
+	}
+	if result.Setup.SkippedExsting {
+		_, _ = fmt.Fprintln(w, "  Preset:             not applied (retained existing config)")
+	} else {
+		_, _ = fmt.Fprintf(w, "  Preset:             %s\n", result.Setup.Preset)
+	}
+	_, _ = fmt.Fprintln(w)
+
+	// Validate
+	if result.Verify != nil {
+		if result.Verify.Skipped {
+			_, _ = fmt.Fprintln(w, "  Validate:           skipped")
+		} else {
+			_, _ = fmt.Fprintf(w, "  Validate:           %d passed, %d failed\n",
+				result.Verify.Passed, result.Verify.Failed)
+		}
+	}
+
+	// Auditor
+	if result.Auditor != nil {
+		switch result.Auditor.Status {
+		case auditorStatusInstalled:
+			_, _ = fmt.Fprintf(w, "  Evidence auditor:   installed (%s)\n", result.Auditor.TimerPath)
+		case auditorStatusSkippedFlag:
+			_, _ = fmt.Fprintln(w, "  Evidence auditor:   skipped (--no-auditor)")
+		case auditorStatusSkippedDryRun:
+			_, _ = fmt.Fprintln(w, "  Evidence auditor:   skipped (dry run)")
+		case auditorStatusSkippedNoSystemd, auditorStatusSkippedNoRecorderDir, auditorStatusSkippedUnreadableConfig:
+			_, _ = fmt.Fprintf(w, "  Evidence auditor:   skipped (%s)\n", result.Auditor.Detail)
+		}
+	}
+
+	// Canary
+	if result.Canary != nil {
+		if result.Canary.Skipped {
+			_, _ = fmt.Fprintln(w, "  Canary:             skipped")
+		} else if result.Canary.Detected {
+			_, _ = fmt.Fprintln(w, "  Canary:             detected (synthetic local URL scan only)")
+		} else {
+			_, _ = fmt.Fprintln(w, "  Canary:             not detected (check config)")
+		}
+	}
+
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Next steps:")
+	if !result.Setup.Written && !result.Setup.SkippedExsting {
+		_, _ = fmt.Fprintln(w, "  Dry run checked the proposed config only. Save it before running these commands.")
+	}
+	if runtime.GOOS == "windows" {
+		_, _ = fmt.Fprintln(w, "  Commands below use PowerShell quoting.")
+	}
+	pathArg := initCommandQuote(result.Setup.ConfigPath, runtime.GOOS)
+	_, _ = fmt.Fprintf(w, "  pipelock check --config %s --url %s\n", pathArg, initCommandQuote(initCanaryURL(cfg), runtime.GOOS))
+	_, _ = fmt.Fprintf(w, "  pipelock doctor --config %s\n", pathArg)
+	_, _ = fmt.Fprintf(w, "  pipelock verify-install --config %s     # temporary-proxy synthetic checks\n", pathArg)
+	_, _ = fmt.Fprintf(w, "  pipelock run --config %s\n", pathArg)
+	_, _ = fmt.Fprintln(w, "  pipelock discover --generate     # wrap unprotected MCP servers")
+	_, _ = fmt.Fprintln(w, "  These checks do not prove a real client is routed through Pipelock. Verify the client's wrapper/proxy configuration and a request from that client.")
+	_, _ = fmt.Fprintln(w)
+}
+
+// canaryToken returns a synthetic AWS access key ID used for DLP detection testing.
+// Split to avoid triggering DLP scanners on the source file itself.
+func canaryToken() string {
+	var b strings.Builder
+	b.WriteString("AKIA")
+	for range 16 {
+		b.WriteByte('A')
+	}
+	return b.String()
+}
+
+// initCommandQuote renders copyable POSIX-shell or PowerShell arguments.
+func initCommandQuote(value, goos string) string {
+	if goos == "windows" {
+		return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+	}
+	return shellQuote(value)
+}

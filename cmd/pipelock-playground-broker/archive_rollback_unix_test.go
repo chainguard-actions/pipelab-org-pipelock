@@ -1,0 +1,178 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build unix
+
+package main
+
+import (
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
+	"testing"
+)
+
+// tinyFileSizeChildEnv marks the child process that runs a test body under a
+// lowered file-size limit. The limit applies to every file the process writes,
+// including the test framework's own log when test caching is on, so the limited
+// body runs in a child that writes no such log.
+const (
+	tinyFileSizeChildEnv     = "PIPELOCK_TEST_TINY_FSIZE_CHILD"
+	tinyFileSizeSkipProbeEnv = "PIPELOCK_TEST_TINY_FSIZE_SKIP_PROBE"
+)
+
+// runInTinyFileSizeChild re-runs the named test in a child process and fails
+// the parent when the child fails. It returns true in the child, where the
+// caller runs the limited body.
+func runInTinyFileSizeChild(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv(tinyFileSizeChildEnv) == "1" {
+		return true
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary: %v", err)
+	}
+	cmd := exec.CommandContext(t.Context(), exe, "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1", "-test.v") // #nosec G204 -- fixed self-test binary and test name.
+	cmd.Env = append(os.Environ(), tinyFileSizeChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("limited child test failed: %v\n%s", err, out)
+	}
+	if strings.Contains(string(out), "--- SKIP: "+t.Name()) {
+		t.Skipf("limited child skipped: %s", strings.TrimSpace(string(out)))
+	}
+	if !strings.Contains(string(out), "--- PASS: "+t.Name()) {
+		t.Fatalf("limited child test did not run:\n%s", out)
+	}
+	return false
+}
+
+// A file created and then failed mid-write is the case that separates "created"
+// from "written". It cannot be reached by passing a bad path, because an
+// exclusive create either succeeds or fails outright, so the write is forced to
+// fail with a file-size limit instead.
+//
+// SIGXFSZ has to be ignored first: its default action terminates the process,
+// and only once it is ignored does exceeding the limit surface as an EFBIG
+// error from write, which is the shape a real disk-full failure takes.
+func withTinyFileSizeLimit(t *testing.T, limit uint64) {
+	t.Helper()
+
+	signal.Ignore(syscall.SIGXFSZ)
+	var saved syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &saved); err != nil {
+		t.Skipf("cannot read RLIMIT_FSIZE: %v", err)
+	}
+	tiny := syscall.Rlimit{Cur: limit, Max: saved.Max}
+	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &tiny); err != nil {
+		t.Skipf("cannot lower RLIMIT_FSIZE: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Setrlimit(syscall.RLIMIT_FSIZE, &saved)
+		signal.Reset(syscall.SIGXFSZ)
+	})
+}
+
+func TestTinyFileSizeChildPropagatesSkip(t *testing.T) {
+	if os.Getenv(tinyFileSizeSkipProbeEnv) != "1" {
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.CommandContext(t.Context(), exe, "-test.run=^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1", "-test.v") // #nosec G204 -- fixed self-test binary and test name.
+		cmd.Env = append(os.Environ(), tinyFileSizeSkipProbeEnv+"=1")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("skip probe failed: %v\n%s", err, out)
+		}
+		if !strings.Contains(string(out), "--- SKIP: "+t.Name()) || !strings.Contains(string(out), "child cannot use this fixture") {
+			t.Fatalf("child skip was not propagated:\n%s", out)
+		}
+		return
+	}
+	if !runInTinyFileSizeChild(t) {
+		return
+	}
+	t.Skip("child cannot use this fixture")
+}
+
+// The regression: writeNewArchiveFile reported creation only when the write
+// succeeded, so a file it created and then failed to write was never recorded.
+// Rollback left that file on disk, and its presence then prevented the kit
+// directory from being removed, leaving exactly the half-published artifact set
+// the all-or-nothing publish exists to prevent.
+func TestPublishArchiveArtifacts_RollsBackAFileCreatedThenFailedMidWrite(t *testing.T) {
+	if !runInTinyFileSizeChild(t) {
+		return
+	}
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "replay-bundle.tar.gz")
+	kitDir := filepath.Join(dir, "kits")
+	f := &archiveReplayFlags{output: bundlePath, kitOutputDir: kitDir}
+
+	withTinyFileSizeLimit(t, 1)
+
+	// Larger than the limit, so the exclusive create succeeds and the write then
+	// fails.
+	bundle := []byte("this payload exceeds the file size limit")
+	kits := []archiveKit{{name: "kit.zip", data: []byte("kit")}}
+
+	err := publishArchiveArtifacts(f, bundle, kits)
+	if err == nil {
+		t.Fatal("a write that exceeded the file size limit was reported as success")
+	}
+	if !strings.Contains(err.Error(), "write output") && !strings.Contains(err.Error(), "close output") {
+		t.Fatalf("error = %v, want a write or close failure", err)
+	}
+	if _, statErr := os.Stat(bundlePath); !os.IsNotExist(statErr) {
+		t.Fatal("a file created and then failed mid-write survived rollback")
+	}
+	if _, statErr := os.Stat(kitDir); !os.IsNotExist(statErr) {
+		t.Fatal("the kit directory survived rollback")
+	}
+}
+
+// The bundle and the kits are tracked by separate branches, so a bundle-only
+// failure returns before the kit branch ever runs and leaves its tracking
+// untested. This drives the failure into the kit write instead, by sizing the
+// bundle to fit under the limit and the kit to exceed it. An untracked kit file
+// is the worse case of the two: besides surviving, it keeps the kit directory
+// non-empty so that cannot be removed either.
+func TestPublishArchiveArtifacts_RollsBackAKitCreatedThenFailedMidWrite(t *testing.T) {
+	if !runInTinyFileSizeChild(t) {
+		return
+	}
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, "replay-bundle.tar.gz")
+	kitDir := filepath.Join(dir, "kits")
+	f := &archiveReplayFlags{output: bundlePath, kitOutputDir: kitDir}
+
+	withTinyFileSizeLimit(t, 1)
+
+	// One byte fits the limit, so the bundle publishes and the kit directory is
+	// created; the kit then exceeds it and fails after its own create.
+	bundle := []byte("b")
+	kits := []archiveKit{{name: "kit.zip", data: []byte("this kit exceeds the file size limit")}}
+
+	err := publishArchiveArtifacts(f, bundle, kits)
+	if err == nil {
+		t.Fatal("a kit write that exceeded the file size limit was reported as success")
+	}
+	if !strings.Contains(err.Error(), "write output") && !strings.Contains(err.Error(), "close output") {
+		t.Fatalf("error = %v, want a write or close failure", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(kitDir, "kit.zip")); !os.IsNotExist(statErr) {
+		t.Fatal("a kit created and then failed mid-write survived rollback")
+	}
+	if _, statErr := os.Stat(kitDir); !os.IsNotExist(statErr) {
+		t.Fatal("the kit directory survived rollback, so an untracked kit was left inside it")
+	}
+	if _, statErr := os.Stat(bundlePath); !os.IsNotExist(statErr) {
+		t.Fatal("the successfully written bundle survived a failed publication")
+	}
+}

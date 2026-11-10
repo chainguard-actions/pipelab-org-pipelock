@@ -1,0 +1,871 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtimeconfig"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/commitmentkey"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
+	"github.com/luckyPipewrench/pipelock/internal/deferred"
+	"github.com/luckyPipewrench/pipelock/internal/emit"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
+	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+	"github.com/luckyPipewrench/pipelock/internal/verification"
+	"golang.org/x/time/rate"
+)
+
+// ServerOpts carries the CLI-flag surface and I/O bindings for a runtime
+// server. ModeChanged / ListenChanged distinguish "CLI override" from "use
+// config default", matching the cobra.Flag.Changed semantics RunCmd relied on
+// before the extraction.
+type ServerOpts struct {
+	// StartupVerification supplies cancellation and observed verification work
+	// during construction, before Start owns the listener lifecycle.
+	StartupVerification     verification.Options
+	ConfigFile              string
+	Mode                    string
+	Listen                  string
+	MCPListen               string
+	MCPUpstream             string
+	MCPServerName           string
+	MCPAuthTokenFile        string
+	MCPAllowedOrigins       []string
+	MCPAllowUnauthenticated bool
+	ReverseProxy            bool
+	ReverseUpstream         string
+	ReverseListen           string
+	CaptureOutput           string
+	CaptureDuration         time.Duration
+	CaptureEscrowKey        string
+
+	// ModeChanged is set when the --mode flag was supplied on the command
+	// line (cobra.Flag.Changed("mode")). Only then does Mode override the
+	// loaded config's mode.
+	ModeChanged bool
+	// ListenChanged mirrors ModeChanged for --listen.
+	ListenChanged bool
+
+	// allowEphemeralListenersForTesting permits :0 only in package-owned test
+	// harnesses. It is unexported so CLI/operator input cannot enable it.
+	allowEphemeralListenersForTesting bool
+
+	// listenerShutdownTimeout overrides auxiliary receipt-listener grace periods in tests.
+	listenerShutdownTimeout time.Duration
+
+	// expireForTesting overrides the retention pass. Unexported and threaded
+	// through opts rather than a package-level variable so parallel tests do
+	// not share mutable state.
+	expireForTesting expireFunc
+
+	// AgentArgs is the command+args that followed "--" on the CLI, or nil
+	// when "--" was absent. Used only for the Phase 2 "Agent: ..." note
+	// emitted during startup.
+	AgentArgs []string
+
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+// Server owns the runtime lifecycle for `pipelock run`. NewServer loads and
+// validates the config, builds every runtime component (scanner, metrics,
+// kill switch, proxy, flight recorder, receipt/envelope emitters, capture
+// writer), but binds no listeners. Start performs the listener bind + serve
+// loop and blocks until ctx is cancelled. Reload drives a single
+// hot-reload cycle against newCfg. Shutdown cancels the internal context
+// so Start unblocks.
+// liveCredentialAckSet pairs an acknowledgment set with the configuration it
+// was built from.
+type liveCredentialAckSet struct {
+	cfg *config.Config
+	set *tools.CredentialAckSet
+}
+
+type Server struct {
+	opts ServerOpts
+
+	// ackKeyRevokedFor is the running configuration whose acknowledgment key
+	// was found unavailable or changed after a failed reload. Its
+	// acknowledgments refuse; a successfully reloaded configuration is a
+	// different value and is unaffected.
+	ackKeyRevokedFor atomic.Pointer[config.Config]
+	// liveAckSet is the acknowledgment set the MCP listener built for its
+	// current configuration. Every tool configuration copy shares it, including
+	// one an in-flight response already holds, so revoking it reaches them all
+	// at once.
+	liveAckSet atomic.Pointer[liveCredentialAckSet]
+	// agentDrainIncomplete records that agent listeners were unbound outside
+	// shutdown (license expiry, CRL fail-closed, license-revoking reload) and
+	// did not drain. Their handlers may have lost receipts, so the run must
+	// not be sealed as complete even if the final shutdown drains cleanly.
+	agentDrainIncomplete atomic.Bool
+
+	runtimeMode        config.RuntimeMode
+	hasMCPListen       bool
+	apiOnSeparatePort  bool
+	hasApprover        bool
+	containmentManaged bool
+	metricsDisabled    bool
+	// containmentMetricsDenied is set when a containment reload presents an
+	// invalid metrics listener or policy. The bound listener stays up, but its handler
+	// denies every request until a valid policy is reloaded.
+	containmentMetricsDenied atomic.Bool
+	// containmentMetricsDenyLog bounds attacker-driven audit volume from the
+	// unauthenticated observability listener.
+	containmentMetricsDenyLog *rate.Limiter
+	// sdStartupReady is closed once startup readiness has been reported to
+	// systemd. A SIGHUP that lands before that point must not send the
+	// notify-reload envelope: its READY=1 would make systemd consider the start
+	// job finished while listeners are still being bound. The reload consumer
+	// waits on this rather than testing a flag when it handles an event, so a
+	// signal that arrives during startup is held and then handled with its
+	// envelope, instead of being handled envelope-less while systemd waits.
+	sdStartupReady     chan struct{}
+	sdStartupReadyOnce sync.Once
+
+	cfg          *config.Config
+	bundleResult *rules.LoadResult
+
+	sentry                 *plsentry.Client
+	logger                 *audit.Logger
+	emitter                *emit.Emitter
+	emitSinks              []emit.Sink
+	scanner                *scanner.Scanner
+	scannerConstructor     func(*config.Config) (*scanner.Scanner, error)
+	metrics                *metrics.Metrics
+	killswitch             *killswitch.Controller
+	ksAPI                  *killswitch.APIHandler
+	proxy                  *proxy.Proxy
+	receiptEmitter         *receipt.Emitter
+	receiptShardSet        *receipt.ReceiptShardSet
+	receiptGroupFailure    atomic.Pointer[error]
+	envelopeEmitter        *envelope.Emitter
+	captureWriter          *capture.Writer
+	mcpListenerBearerToken string
+	recorder               *recorder.Recorder
+	commitmentKeyring      *commitmentkey.Keyring
+	// conductorApply holds *applycache.Cache in the enterprise build (nil
+	// in the core build). Stored as any so server.go has no compile-time
+	// dependency on the enterprise conductor packages; the build-tagged
+	// ApplyConductorPolicyBundle type-asserts back to the concrete type.
+	conductorApply any
+	// conductorAuditQueue holds *auditbatcher.Queue in the enterprise
+	// build. The producer setup that runs after the flight recorder is
+	// constructed needs this handle; stash it on the server so the two
+	// build-tagged init methods can share state without touching server.go.
+	conductorAuditQueue any
+	// conductorStatusReporter holds *conductorPolicyStatusReporter in the
+	// enterprise build. It is created with the bundle poller but also feeds the
+	// audit producer's signed applied-state provider (built in a later init
+	// phase), so it is stashed here as any for the two build-tagged methods to
+	// share, same pattern as conductorAuditQueue.
+	conductorStatusReporter any
+	conductorAudit          conductorRunner
+	conductorRemoteKill     conductorRunner
+	conductorBundle         conductorRunner
+	// conductorRollback holds *policysync.RollbackPoller in the enterprise build.
+	// It polls the leader for a signed rollback authorization matching the
+	// follower's active->prior bundle pair and drives the existing apply boundary
+	// (with AllowRollback) to restore the prior bundle.
+	conductorRollback conductorRunner
+	// conductorStale holds *applycache.StaleEnforcer in the enterprise build.
+	// It engages the kill switch's conductor_stale source when the active
+	// policy bundle ages past its grace window, failing closed.
+	conductorStale conductorRunner
+	// conductorStaleStrictDeny is set true at enforcer init when the follower's
+	// stale policy is strict_deny_all. teardownConductor reads it to fail closed:
+	// once the fleet entitlement is permanently gone, the stale enforcer's ticker
+	// is cancelled and can never re-engage, so a strict follower whose bundle
+	// later ages past grace would otherwise serve stale config forever. Engaging
+	// conductor_stale AT teardown closes that window. Independent of the build
+	// tag (the field lives here so the untagged teardown path can read it).
+	conductorStaleStrictDeny atomic.Bool
+	conductorProducer        conductorCloser
+
+	// conductorLifeMu guards conductorCancel and conductorWait.
+	// teardownConductor may be invoked concurrently from the runtime CRL watcher
+	// and the config reload path, so lifecycle handles are published and read
+	// under the lock.
+	conductorLifeMu sync.Mutex
+	conductorCancel context.CancelFunc
+	conductorWait   func()
+	// conductorDown is set by teardownConductor when a runtime fleet-license
+	// revocation, expiry, or downgrade stops the follower-side Conductor
+	// runtime. It gates ApplyConductorPolicyBundle (no further policy bundles
+	// apply once down) and makes teardown idempotent. Losing the paid fleet
+	// entitlement stops Conductor but never the proxy/detection path.
+	// Conductor stays down until process restart, matching the restart-only
+	// conductor invariant (a reload cannot re-activate it).
+	conductorDown atomic.Bool
+
+	approver *hitl.Approver
+
+	// lastReloadHash / lastReloadAt dedup fsnotify + SIGHUP stacking
+	// inside Reload. Two stacked Changes() events with the same hash
+	// within 2s skip silently; a single no-op SIGHUP still logs.
+	lastReloadHash string
+	lastReloadAt   time.Time
+
+	// cancelMu guards internalCancel against the Start-writes /
+	// Shutdown-reads race. Start publishes the cancel func under the
+	// lock; Shutdown reads and invokes it outside the lock so the
+	// cancel itself does not synchronously deadlock on Start's defers.
+	cancelMu       sync.Mutex
+	internalCancel context.CancelFunc
+	// Set before cancellation for multi-chain key-file rotation. Start returns
+	// a distinct error after its normal listener drain and group close.
+	receiptRotationRequested atomic.Bool
+
+	// conductorApplyMu serializes ApplyConductorPolicyBundle so the
+	// stage -> reload -> activate sequence is atomic. Concurrent applies
+	// would otherwise be able to interleave such that one bundle wins the
+	// Reload while another wins Activate, leaving the durable last-known-good
+	// pointer out of sync with the running config.
+	conductorApplyMu sync.Mutex
+
+	// reloadMu serializes the whole hot-reload activation boundary: old-state
+	// snapshot, bundle downgrade gates, proxy publication, and runtime mirror
+	// refresh. proxy.Reload has its own lock, but that only covers lower-level
+	// pointer publication; the server-level gates also depend on s.stateMu-backed
+	// mirrors such as mcpToolExtraPoison.
+	reloadMu             sync.Mutex
+	reloadOutcome        proxy.ReloadOutcome // guarded by reloadMu
+	reloadDurablePending bool                // Conductor owns final success until durable activation
+
+	stateMu            sync.RWMutex
+	toolPolicyCfg      *policy.Config
+	mcpChainMatcher    *chains.Matcher
+	mcpCEE             *mcp.CEEDeps
+	mcpToolExtraPoison []*tools.ExtraPoisonPattern
+	mcpDoW             *mcpDoWRuntime
+}
+
+func (s *Server) constructScanner(cfg *config.Config) (*scanner.Scanner, error) {
+	if s.scannerConstructor != nil {
+		return s.scannerConstructor(cfg)
+	}
+	return scanner.New(cfg)
+}
+
+// stderrSyncWriter wraps the operator-facing stderr writer with a mutex so
+// concurrent producers (Reload's warning emitter and the MCP listener
+// startup log path) cannot interleave or race a shared bytes.Buffer when
+// tests substitute one.
+type stderrSyncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *stderrSyncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// NewServer validates opts, loads config, applies CLI overrides, and builds
+// every runtime component. No ports are bound; that is Start's job. On any
+// construction failure NewServer closes whatever was partially built and
+// returns the error.
+func NewServer(opts ServerOpts) (*Server, error) {
+	if opts.Stderr == nil {
+		opts.Stderr = io.Discard
+	}
+	opts.Stderr = &stderrSyncWriter{w: opts.Stderr}
+	startupVerification, stopStartupProgress := startupVerificationOptions(opts)
+	defer stopStartupProgress()
+	if opts.Stdout == nil {
+		opts.Stdout = io.Discard
+	}
+
+	hasMCPListen := opts.MCPListen != ""
+	hasMCPUpstream := opts.MCPUpstream != ""
+	if hasMCPListen && !hasMCPUpstream {
+		return nil, errors.New("--mcp-listen requires --mcp-upstream")
+	}
+	if hasMCPUpstream && !hasMCPListen {
+		return nil, errors.New("--mcp-upstream requires --mcp-listen")
+	}
+	if hasMCPUpstream {
+		u, uErr := url.Parse(opts.MCPUpstream)
+		if uErr != nil || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
+			return nil, fmt.Errorf("invalid --mcp-upstream %q: must be http:// or https:// with a host", opts.MCPUpstream)
+		}
+	}
+	if !hasMCPListen && (opts.MCPAuthTokenFile != "" || len(opts.MCPAllowedOrigins) > 0 || opts.MCPAllowUnauthenticated) {
+		return nil, errors.New("MCP listener authentication flags require --mcp-listen")
+	}
+	if err := validateMCPListenerOrigins(opts.MCPAllowedOrigins); err != nil {
+		return nil, err
+	}
+	mcpAuthToken, mcpAuthErr := readMCPListenerTokenFile(opts.MCPAuthTokenFile)
+	if mcpAuthErr != nil {
+		return nil, mcpAuthErr
+	}
+	if err := validateMCPListenerBoundary(opts.MCPListen, mcpAuthToken, opts.MCPAllowUnauthenticated); err != nil {
+		return nil, err
+	}
+
+	if opts.ReverseProxy && opts.ReverseUpstream == "" {
+		return nil, errors.New("--reverse-proxy requires --reverse-upstream")
+	}
+	if opts.ReverseUpstream != "" && !opts.ReverseProxy {
+		return nil, errors.New("--reverse-upstream requires --reverse-proxy")
+	}
+	if opts.ReverseProxy {
+		u, uErr := url.Parse(opts.ReverseUpstream)
+		if uErr != nil || (u.Scheme != schemeHTTP && u.Scheme != schemeHTTPS) || u.Host == "" {
+			return nil, fmt.Errorf("invalid --reverse-upstream %q: must be http:// or https:// with a host", opts.ReverseUpstream)
+		}
+		if opts.ReverseListen == "" {
+			opts.ReverseListen = ":8890"
+		}
+	}
+
+	var cfg *config.Config
+	var err error
+	if opts.ConfigFile != "" {
+		cfg, err = config.LoadForRuntime(opts.ConfigFile)
+		if err != nil {
+			return nil, fmt.Errorf("loading config: %w", err)
+		}
+	} else {
+		cfg = config.Defaults()
+	}
+	if opts.allowEphemeralListenersForTesting {
+		cfg.AllowEphemeralListenersForTesting()
+	}
+
+	if opts.ModeChanged {
+		cfg.Mode = opts.Mode
+	}
+	if opts.ListenChanged {
+		cfg.FetchProxy.Listen = opts.Listen
+	}
+	if opts.ReverseProxy {
+		cfg.ReverseProxy.Enabled = true
+		cfg.ReverseProxy.Listen = opts.ReverseListen
+		cfg.ReverseProxy.Upstream = opts.ReverseUpstream
+	}
+
+	cfg.ApplyDefaults()
+	warnings, err := cfg.ValidateWithWarnings()
+	for _, wn := range warnings {
+		_, _ = fmt.Fprintf(opts.Stderr, "WARNING: %s: %s\n", wn.Field, wn.Message)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	// An expired containment grant is dropped from the effective set rather
+	// than refusing to start, so a lapsed entry can never take the proxy, and
+	// every contained agent's egress, down with it.
+	if _, err := cfg.LapseExpiredScannerExceptions(time.Now()); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	if _, err := cfg.LapseExpiredContainmentGrants(time.Now()); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	s := &Server{
+		opts:                      opts,
+		hasMCPListen:              hasMCPListen,
+		containmentManaged:        containmentManagedRuntime(),
+		containmentMetricsDenyLog: rate.NewLimiter(rate.Every(time.Second), 5),
+		scannerConstructor:        scanner.New,
+	}
+	s.mcpListenerBearerToken = mcpAuthToken
+	if cfg.EvidenceProvenance.CommitmentKeyringPath != "" {
+		keyring, loadErr := commitmentkey.Load(cfg.EvidenceProvenance.CommitmentKeyringPath)
+		if loadErr != nil {
+			return nil, fmt.Errorf("loading evidence_provenance.commitment_keyring_path: %w", loadErr)
+		}
+		s.commitmentKeyring = keyring
+	}
+
+	sentryClient, sentryErr := plsentry.Init(cfg, cliutil.Version)
+	if sentryErr != nil {
+		_, _ = fmt.Fprintf(opts.Stderr, "warning: sentry init failed: %v\n", sentryErr)
+	}
+	s.sentry = sentryClient
+
+	logger, err := audit.New(
+		cfg.Logging.Format,
+		cfg.Logging.Output,
+		cfg.Logging.File,
+		cfg.Logging.IncludeAllowed,
+		cfg.Logging.IncludeBlocked,
+	)
+	if err != nil {
+		s.cleanup()
+		return nil, fmt.Errorf("creating audit logger: %w", err)
+	}
+	s.logger = logger
+
+	m := metrics.New()
+	s.metrics = m
+	emitter, emitSinks, emitErr := startAuditEmitter(cfg, logger, m, opts.ConfigFile, opts.Stderr)
+	if emitErr != nil {
+		s.cleanup()
+		return nil, emitErr
+	}
+	s.emitter = emitter
+	s.emitSinks = append([]emit.Sink(nil), emitSinks...)
+	if s.containmentManaged {
+		if containmentErr := validateContainmentMetricsConfig(cfg); containmentErr != nil {
+			s.metricsDisabled = true
+			s.reportContainmentMetricsDrift(cfg, "startup", containmentErr)
+		}
+	}
+	s.reportLapsedContainmentGrants(cfg, "startup")
+	runtimeMode := config.RuntimeForward
+	if hasMCPListen {
+		runtimeMode = config.RuntimeForwardWithMCPListener
+	}
+	s.runtimeMode = runtimeMode
+
+	var bundleResult *rules.LoadResult
+	cfg, resolveInfo := runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
+		Mode: runtimeMode,
+		MergeBundles: func(c *config.Config) {
+			bundleResult = rules.MergeIntoConfig(c, cliutil.Version)
+		},
+		DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
+	}, nil, "listener")
+	runtimeconfig.EmitResolveInfoLogs(opts.Stderr, resolveInfo, "listener")
+	if err := s.reportStartupRuleBundleResult(cfg, bundleResult); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	if hasMCPListen {
+		if err := validateMCPDeferSurface(deferred.SurfaceMCPHTTPListener, cfg); err != nil {
+			return nil, err
+		}
+	}
+
+	sc, err := s.constructScanner(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create scanner: %w", err)
+	}
+	s.scanner = sc
+	// License gate for the follower-side Conductor runtime. When
+	// conductor.enabled is true the operator has explicitly opted into
+	// central governance (remote kill, audit ingest, policy distribution);
+	// fail-closed if the license does not grant the fleet feature, so the
+	// process does not silently start a half-wired follower the operator
+	// expects to be participating.
+	if cfg.Conductor.Enabled {
+		lic, err := license.VerifyFleetWithOptions(license.FleetVerifyInputs{
+			LicenseKey:       cfg.LicenseKey,
+			PublicKeyHex:     cfg.LicensePublicKey,
+			CRLFile:          cfg.LicenseCRLFile,
+			IntermediateFile: cfg.LicenseIntermediateFile,
+			IntermediateCert: cfg.LicenseIntermediateCert,
+			RequireSet:       true,
+			Require:          cfg.LicenseRequireIntermediateResolved,
+			MaxAge:           cfg.LicenseCRLMaxAgeResolved,
+		})
+		if err != nil {
+			s.cleanup()
+			return nil, err
+		}
+		cfg.LicenseID = lic.ID
+		cfg.LicenseIssuedAt = lic.IssuedAt
+		cfg.LicenseExpiresAt = lic.ExpiresAt
+		cfg.LicenseTier = lic.Tier
+	}
+	emitLicenseExpiryWarning(cfg, logger, sentryClient, opts.Stderr)
+	if err := s.initConductorApplyAndAudit(cfg, m); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	sc.SetDLPWarnHook(func(ctx context.Context, patternName, severity string) {
+		emitDLPWarn(s.logger, s.metrics, s.liveReceiptEmitter(), ctx, patternName, severity)
+	})
+	wirePromptInjectionAudit(sc, logger)
+	logPromptInjectionPolicy(cfg, logger)
+
+	ks := killswitch.New(cfg)
+	m.RegisterKillSwitchState(ks.Sources)
+	m.RegisterInfo(cliutil.Version)
+	s.killswitch = ks
+
+	ksAPI := killswitch.NewAPIHandler(ks)
+	s.ksAPI = ksAPI
+	if err := s.initConductorRemoteKill(cfg, ks, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	if err := s.initConductorBundlePoller(cfg, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	if err := s.initConductorRollbackPoller(cfg, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	if err := s.initConductorStaleEnforcer(cfg, ks, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+
+	var proxyOpts []proxy.Option
+	s.hasApprover = needsHITLApprover(cfg)
+	if s.hasApprover {
+		approver := newRuntimeApprover(cfg)
+		s.approver = approver
+		proxyOpts = append(proxyOpts, proxy.WithApprover(approver))
+	}
+	proxyOpts = append(proxyOpts, proxy.WithKillSwitch(ks))
+
+	s.apiOnSeparatePort = cfg.KillSwitch.APIListen != ""
+	if !s.apiOnSeparatePort {
+		proxyOpts = append(proxyOpts, proxy.WithKillSwitchAPI(ksAPI))
+	} else {
+		ks.SetSeparateAPIPort(true)
+	}
+
+	if opts.CaptureOutput != "" {
+		// Redaction parity with the MCP proxy: DLP-scrub captured payloads
+		// before they hit disk unless flight_recorder.redact is disabled.
+		// Previously the HTTP --capture-output path passed no RedactFn, so
+		// tool args / bodies were written un-redacted regardless of the
+		// redact knob; buildCaptureWriter now honors it on both surfaces.
+		var captureRedactFn recorder.RedactFunc
+		if cfg.FlightRecorder.Redact {
+			captureRedactFn = sc.ScanTextForDLP
+		}
+		cw, cwErr := buildCaptureWriter(opts.CaptureOutput, opts.CaptureEscrowKey, cfg.FlightRecorder.FileMode, captureRedactFn, m)
+		if cwErr != nil {
+			s.cleanup()
+			return nil, fmt.Errorf("creating capture writer: %w", cwErr)
+		}
+		s.captureWriter = cw
+		proxyOpts = append(proxyOpts, proxy.WithCaptureObserver(cw))
+	}
+
+	// Flight recorder: create a tamper-evident evidence recorder when
+	// enabled in YAML config. The --capture-output CLI flag uses a
+	// separate code path (capture.Writer above). This path wires the
+	// YAML-config-driven recorder into the proxy so enforcement decisions
+	// are hash-chained to disk.
+	var recPrivKey ed25519.PrivateKey
+	if cfg.FlightRecorder.Enabled && cfg.FlightRecorder.Dir != "" {
+		recCfg := recorder.Config{
+			Enabled:            cfg.FlightRecorder.Enabled,
+			Dir:                cfg.FlightRecorder.Dir,
+			CheckpointInterval: cfg.FlightRecorder.CheckpointInterval,
+			RetentionDays:      cfg.FlightRecorder.RetentionDays,
+			Redact:             cfg.FlightRecorder.Redact,
+			SignCheckpoints:    cfg.FlightRecorder.SignCheckpoints,
+			MaxEntriesPerFile:  cfg.FlightRecorder.MaxEntriesPerFile,
+			FileMode:           cfg.FlightRecorder.FileMode,
+			RawEscrow:          cfg.FlightRecorder.RawEscrow,
+			EscrowPublicKey:    cfg.FlightRecorder.EscrowPublicKey,
+			Metrics:            m,
+		}
+
+		if cfg.FlightRecorder.SigningKeyPath != "" {
+			k, kErr := signing.LoadPrivateKeyFile(cfg.FlightRecorder.SigningKeyPath)
+			if kErr != nil {
+				s.cleanup()
+				return nil, fmt.Errorf("loading flight recorder signing key: %w", kErr)
+			}
+			recPrivKey = k
+		}
+
+		rec, recErr := recorder.NewWithScanner(recCfg, sc, recPrivKey)
+		if recErr != nil {
+			s.cleanup()
+			return nil, fmt.Errorf("creating flight recorder: %w", recErr)
+		}
+		runFlightRecorderExpiryOnce(rec, opts.Stderr, opts.expiry())
+		s.recorder = rec
+		var runSession string
+		if cfg.FlightRecorder.ReceiptChainCount() == 1 {
+			var sessErr error
+			runSession, sessErr = acquireRunSession(rec)
+			if sessErr != nil {
+				s.cleanup()
+				return nil, sessErr
+			}
+		}
+		proxyOpts = append(proxyOpts, proxy.WithRecorder(rec))
+		postureResult, bindErr := posturebinding.LoadRuntimeForReceipts(posturebinding.RuntimeReceiptOptions{
+			ReceiptSigningEnabled:      cfg.FlightRecorder.SigningKeyPath != "",
+			RequireContainmentEvidence: cfg.FlightRecorder.RequireContainmentEvidence,
+			PinnedPostureSignerKey:     cfg.FlightRecorder.PostureSignerPublicKey,
+			Stderr:                     opts.Stderr,
+		})
+		if bindErr != nil {
+			s.cleanup()
+			return nil, fmt.Errorf("loading posture binding: %w", bindErr)
+		}
+
+		if cfg.FlightRecorder.ReceiptChainCount() > 1 {
+			if len(recPrivKey) == 0 {
+				s.cleanup()
+				return nil, errors.New("multiple receipt chains require a signing key")
+			}
+			shards, groupOpts, groupErr := buildServerReceiptShardGroup(receipt.EmitterConfig{
+				StartupVerification: startupVerification,
+				Recorder:            rec, PrivKey: recPrivKey, ConfigHash: cfg.Hash(),
+				Principal: "local", Actor: "pipelock", Metrics: m,
+				PriorSignerKeys:     cfg.FlightRecorder.ReceiptGroupPriorSignerKeys,
+				PostureBinding:      postureResult.Binding,
+				PostureAvailability: string(postureResult.Availability),
+				HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+			}, cfg.FlightRecorder.ReceiptChainCount(), cfg.FlightRecorder.SigningKeyPath, false, s.failRequiredReceiptGroup)
+			if groupErr != nil {
+				s.cleanup()
+				return nil, fmt.Errorf("opening receipt shard group: %w", groupErr)
+			}
+			s.receiptShardSet = shards
+			s.receiptEmitter = shards.ProcessEmitter()
+			opening, _ := shards.Opening()
+			proxyOpts = append(proxyOpts, groupOpts...)
+			_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: %d signed chains opened\n", opening.ShardCount)
+		} else {
+			proxyOpts = append(proxyOpts, proxy.WithSession(runSession))
+			// Action receipt emitter: ConfigHash uses cfg.Hash() (raw YAML
+			// bytes) because the receipt is a point-in-time audit
+			// fingerprint of the loaded configuration file. Two deployments
+			// that happened to produce the same effective policy through
+			// different YAML should still be distinguishable in a forensic
+			// trail. Envelope attestation (below) uses the policy-semantic
+			// hash because its contract is the opposite - identical
+			// effective policy should produce identical envelope ph
+			// regardless of YAML formatting.
+			s.receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
+				Recorder:            rec,
+				PrivKey:             recPrivKey,
+				ConfigHash:          cfg.Hash(),
+				Principal:           "local",
+				Actor:               "pipelock",
+				Metrics:             m,
+				PostureBinding:      postureResult.Binding,
+				PostureAvailability: string(postureResult.Availability),
+				HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+				Session:             runSession,
+			})
+			if s.receiptEmitter != nil {
+				// Loud, one-time startup signal when the chain could not be
+				// resumed. Without this an init failure was only an error log on
+				// each Emit (to a formerly root-only file), silent to operators.
+				// A non-nil InitError means every Emit will fail until resolved,
+				// so name the cause and the remediation here.
+				if initErr := s.receiptEmitter.InitError(); errors.Is(initErr, receipt.ErrRetainedContent) {
+					// A configuration refusal, not a chain-resume fault: name
+					// the field and pattern and refuse to start.
+					s.cleanup()
+					return nil, fmt.Errorf("flight_recorder: %w", initErr)
+				} else if initErr != nil {
+					_, _ = io.WriteString(opts.Stderr, receiptResumeFailureNotice(initErr))
+				} else {
+					if openErr := emitStartupSessionOpen(s.receiptEmitter); openErr != nil {
+						if cfg.FlightRecorder.RequireReceipts {
+							s.cleanup()
+							return nil, fmt.Errorf("flight_recorder.require_receipts is enabled but session_open receipt could not be emitted: %w", openErr)
+						}
+						_, _ = fmt.Fprintf(opts.Stderr,
+							"  Receipts: ERROR - session_open could not be emitted: %v\n"+
+								"            Receipt emission for this run is UNVERIFIED until resolved.\n",
+							openErr)
+					}
+					proxyOpts = append(proxyOpts, proxy.WithReceiptEmitter(s.receiptEmitter))
+					if cfg.FlightRecorder.SigningKeyPath != "" {
+						proxyOpts = append(proxyOpts, proxy.WithReceiptKeyPath(cfg.FlightRecorder.SigningKeyPath))
+					}
+					_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: enabled (action receipts signed)\n")
+				}
+
+				// v2 proxy_decision emitter: dual-emitted alongside the v1 action
+				// receipt on every proxy decision, signed with the same key and
+				// gated on the same receipt intent (no separate flag). Sanitizes
+				// targets with the recorder's redactor (#676) before signing.
+				if v2Emitter := proxydecision.NewEmitter(proxydecision.EmitterConfig{
+					Recorder:  rec,
+					Signer:    proxydecision.NewKeyedSigner(recPrivKey),
+					Sanitize:  proxydecision.SanitizeFromRedactor(rec.ReceiptRedactor()),
+					Principal: "local",
+					Actor:     "pipelock",
+					Session:   runSession,
+				}); v2Emitter != nil {
+					proxyOpts = append(proxyOpts, proxy.WithV2ReceiptEmitter(v2Emitter))
+					_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: v2 proxy_decision dual-emit enabled\n")
+				}
+			}
+		}
+
+		_, _ = fmt.Fprintf(opts.Stderr, "  Recorder: %s (flight recorder enabled)\n", cfg.FlightRecorder.Dir)
+		printFlightRecorderEvidenceWarning(opts.Stderr, cfg.FlightRecorder.Dir, cfg.FlightRecorder.RetentionDays)
+	} else if cfg.FlightRecorder.Enabled {
+		// Flight recorder is on by default, but no dir is configured, so no
+		// recorder is built and no receipts are written. Surface this once so an
+		// operator who expects "verify the boundary" out of the box knows why the
+		// evidence directory is empty. `pipelock init` generates a dir + signing
+		// key and writes them into the config; setting flight_recorder.dir (and a
+		// signing_key_path) makes receipts live.
+		_, _ = fmt.Fprintf(opts.Stderr,
+			"  Recorder: enabled but inert - no flight_recorder.dir configured; "+
+				"no receipts will be written. Run 'pipelock init' or set flight_recorder.dir + signing_key_path.\n")
+	}
+	// require_receipts escalates a missing receipt to a block. With no live
+	// signed emitter (no recorder dir or no signing key) EVERY request would
+	// fail closed with receipt_emission_failed - a silent, total egress
+	// black-hole. Refuse to start so the misconfiguration surfaces here
+	// instead of as an all-403 outage at runtime. (Restart-only recorder
+	// fields are preserved across reload, so a live emitter built here stays
+	// live; this check intentionally lives at build time, not in Validate.)
+	if cfg.FlightRecorder.RequireReceipts && !receiptEmitterReady(s.receiptEmitter) {
+		s.cleanup()
+		return nil, fmt.Errorf("flight_recorder.require_receipts is enabled but no healthy signed receipt emitter is active: set flight_recorder.enabled, flight_recorder.dir, and flight_recorder.signing_key_path (run 'pipelock init'), fix any receipt-chain resume error, or disable require_receipts")
+	}
+	if err := s.initConductorProducer(cfg, m, recPrivKey, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+	if err := s.initConductorEnrollment(cfg, recPrivKey, opts.Stderr); err != nil {
+		s.cleanup()
+		return nil, err
+	}
+
+	if cfg.MediationEnvelope.Enabled {
+		s.envelopeEmitter = envelope.NewEmitter(envelope.EmitterConfig{
+			ConfigHash:  cfg.CanonicalPolicyHash(),
+			ActorFormat: cfg.MediationEnvelope.ActorFormat,
+			TrustDomain: cfg.MediationEnvelope.TrustDomain,
+		})
+		proxyOpts = append(proxyOpts, proxy.WithEnvelopeEmitter(s.envelopeEmitter))
+		_, _ = fmt.Fprintf(opts.Stderr, "  Envelope: enabled (mediation envelopes injected)\n")
+	}
+
+	p, pErr := proxy.New(cfg, logger, sc, m, proxyOpts...)
+	if pErr != nil {
+		s.cleanup()
+		return nil, fmt.Errorf("creating proxy: %w", pErr)
+	}
+	s.proxy = p
+	s.initReloadIdentity()
+	if api := p.SessionAPI(); api != nil {
+		api.SetConfigControl(s.ReloadStatus, s.ReloadFile)
+	}
+
+	if err := p.LoadCertCache(cfg); err != nil {
+		if sentryClient != nil {
+			sentryClient.CaptureError(err)
+		}
+		s.cleanup()
+		return nil, err
+	}
+
+	s.refreshRuntimeState(nil, cfg, bundleResult, sc)
+	if err := s.recoverActiveConductorPolicy(); err != nil {
+		s.cleanup()
+		return nil, fmt.Errorf("recovering active conductor policy bundle: %w", err)
+	}
+	// Bundle resolution and cached-policy recovery can add DLP inputs after
+	// Sentry's first initialization. Bind the startup client to the final
+	// policy before serving, so restarting actually reconciles scrubber drift.
+	if s.sentry.ScrubberNeedsRestart(s.liveConfig()) {
+		s.sentry.Close()
+		s.sentry, sentryErr = plsentry.Init(s.liveConfig(), cliutil.Version)
+		if sentryErr != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "warning: sentry init failed: %v\n", sentryErr)
+		}
+		s.reloadOutcome.RestartRequiredFields = slices.DeleteFunc(s.reloadOutcome.RestartRequiredFields, func(field string) bool {
+			return field == reloadSentryScrubberField
+		})
+		s.reloadOutcome.PendingRestart = len(s.reloadOutcome.RestartRequiredFields) != 0
+		if s.reloadOutcome.Verdict == proxy.ReloadRestartRequired && !s.reloadOutcome.PendingRestart {
+			s.reloadOutcome.Verdict = proxy.ReloadAccepted
+			s.reloadOutcome.Reason = ""
+		}
+	}
+
+	return s, nil
+}
+
+// Shutdown cancels Start's internal context so the serve loop unblocks.
+// Safe to call before Start has begun (it is a no-op in that case).
+// Cleanup of owned resources happens inside Start's deferred cleanup.
+func (s *Server) Shutdown(_ context.Context) error {
+	s.cancelMu.Lock()
+	cancel := s.internalCancel
+	s.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
+}
+
+func (s *Server) failRequiredReceiptGroup(err error) {
+	if err == nil {
+		return
+	}
+	live := s.currentConfig()
+	if live == nil || !live.FlightRecorder.RequireReceipts {
+		return
+	}
+	if s.receiptGroupFailure.CompareAndSwap(nil, &err) {
+		if s.logger != nil {
+			s.logger.LogError(audit.NewMethodLogContext("RECEIPT"), fmt.Errorf("required receipt group failed: %w", err))
+		}
+	}
+	_ = s.Shutdown(context.Background())
+}
+
+func (s *Server) requiredReceiptGroupError() error {
+	if failure := s.receiptGroupFailure.Load(); failure != nil {
+		return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt group emission failed: %w", *failure)
+	}
+	return nil
+}
+
+// expiry returns the retention pass to run: the test override when set,
+// otherwise the real one.
+func (o ServerOpts) expiry() expireFunc {
+	if o.expireForTesting != nil {
+		return o.expireForTesting
+	}
+	return defaultExpire
+}
+
+// receiptResumeFailureNotice is the startup message for a receipt chain that
+// could not be resumed. Each run begins a new recorder session, so the cause is
+// a corrupt, tampered, or foreign-key evidence tail or an evidence read error,
+// never a routine key change, and restarting is what begins a clean session.
+func receiptResumeFailureNotice(err error) string {
+	return fmt.Sprintf("  Receipts: ERROR - chain could not be resumed: %v\n"+
+		"            Receipt emission is DISABLED until resolved. A corrupt, tampered, or\n"+
+		"            foreign-key evidence tail fails closed. Inspect the evidence directory\n"+
+		"            and the configured signing_key_path, then restart to begin a new session.\n", err)
+}

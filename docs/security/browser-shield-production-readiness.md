@@ -1,0 +1,156 @@
+# Browser Shield production readiness
+
+Browser Shield is a defensive response-sanitization layer for HTML and SVG. It
+removes hidden agent traps and active SVG content from responses returned
+through Pipelock. It doesn't edit existing JavaScript. It isn't an anti-bot
+bypass system, and it doesn't promise access to websites that deliberately deny
+automation or proxy traffic.
+
+Browser Shield is opt-in. `browser_shield.enabled` defaults to `false`; the
+strictness, size, oversize, exempt-domain, and rewrite toggles have safe
+defaults for operators that explicitly enable it.
+
+## Current enforcement boundary
+
+Browser Shield runs after Pipelock has fetched a response and before the agent
+or browser receives the body. It only rewrites content that the local pipeline
+can classify as shieldable:
+
+- HTML and XHTML, excluding existing script elements
+- SVG active content, including complete script elements
+
+JavaScript media types still receive normal response scanning, but Browser
+Shield returns their bytes unchanged. This includes historical JavaScript media
+type aliases.
+
+SVG is the one active image format, so it is delivered only after Shield
+validates the complete body and the rewritten body it will send. A document
+with active content is refused rather than partially cleaned, and SVG is
+refused whenever Shield is disabled, exempt for the host, or cannot see the
+complete body (a partial `206`, an oversized body, or an undecodable
+encoding). See `docs/configuration.md`, "SVG active content hardening".
+
+Binary media, PDFs, JSON, and unknown specific content types bypass the shield.
+This avoids treating large legitimate media responses as shield failures.
+
+## Production invariants
+
+- Shield rewrites are response-local. They never grant outbound network access.
+- Shield rewrites are additive to scanning. Response injection scanning still
+  runs after shield rewriting on applicable transports.
+- Oversized shieldable responses fail according to `oversize_action`.
+  `scan_head` is the default: it rewrites only the configured prefix and records
+  the intervention as partial. `block` fails closed. `warn` returns the body
+  unchanged and should stay limited to short diagnostics.
+- Common developer documentation and browser IDE hosts skip Shield rewriting by default to reduce false positives on large rendered reference pages. The exemption does not bypass the full-response policy: forward, TLS-intercepted, and reverse traffic still refuses every `206` and `304`.
+- Signed action receipts include a `shield` summary whenever Browser Shield
+  rewrites a response and receipt emission is enabled.
+- Rewritten responses carry `X-Pipelock-Shield-Rewrite`, so a client can tell
+  an altered 200 response from an untouched one. The value contains non-zero
+  categories in fixed `extension`, `tracking`, `trap` order (for example,
+  `extension=1,tracking=1,trap=2`). `extension` includes an injected extension
+  defense shim; `trap` includes hidden traps and SVG active-content removals.
+  Clean responses omit the header. Fetch also includes the same value as
+  `shield_rewrite` in its JSON envelope. The header is emitted on buffered
+  fetch, forward-proxy, TLS-intercepted CONNECT, and reverse-proxy responses;
+  streaming responses are never rewritten, so they have no marker.
+- Adaptive enforcement records a low-weight `SignalShieldRewrite` signal for
+  repeated shield interventions. The signal is capped at one signal per
+  response body, worth 0.25 points, so one noisy page cannot immediately
+  escalate a session.
+
+## Receipt fields
+
+The optional `shield` block in ActionReceipt v1 records:
+
+- pipeline: `html`, `javascript`, or `svg`; `javascript` identifies partial
+  coverage records and never means that Browser Shield changed script bytes
+- total rewrite count
+- extension probe rewrites
+- tracking image and prefetch rewrites, reported through the compatibility
+  field `tracking_beacons`
+- hidden agent-trap and whole SVG script removals
+- fingerprint shim injection
+- SVG active-content rewrite counts
+- body size, scanned size, and whether the rewrite was partial
+- adaptive signal count recorded for that response
+
+Existing verifiers that ignore unknown optional fields remain compatible.
+
+## Receipt volume
+
+Each response that Browser Shield rewrites emits one shield receipt when
+receipt emission is configured. Operators should size receipt storage for
+browser-heavy workflows and treat future aggregation or rate limits as an
+evidence-retention policy decision, not as a transport safety requirement.
+
+Shield receipt targets, like every other receipt target, keep only the URL
+scheme, host and port. Userinfo, path, query strings, and fragments are removed
+before signing, so a credential-bearing path no longer reaches a shareable
+receipt store even when no pattern recognizes it. Correlate a shield receipt
+with the request through its request ID.
+
+## HUMAN and PerimeterX class systems
+
+Commercial browser-integrity systems such as HUMAN and PerimeterX combine
+server-side reputation, client-side telemetry, challenges, behavioral scoring,
+and encrypted JavaScript signals. Browser Shield does not try to defeat those
+systems. Treating that as a product goal would blur Pipelock's security
+boundary and create brittle site-specific behavior.
+
+The defensive scope is narrower:
+
+- remove browser-extension URLs outside scripts and optionally inject an HTML
+  shim that blocks extension-scheme requests
+- remove 1x1 tracking images and prefetch links outside scripts
+- remove hidden prompt traps and concealed instructions
+- record when Pipelock changed content so operators can audit the intervention
+
+The optional fingerprint shim can suppress `sendBeacon` at runtime. Browser
+Shield doesn't rewrite static beacon calls in standalone or inline JavaScript.
+
+## Explicit non-goals
+
+- solving CAPTCHAs or challenges
+- bypassing commercial bot-management access decisions
+- forging browser-integrity telemetry
+- impersonating a specific human browser profile
+- patching every obfuscated anti-automation script
+
+If a page depends on a commercial browser-integrity system for access, the
+operator should either configure an allowed human/browser workflow outside the
+agent path or treat the target as unsupported for automated access.
+
+## Review checklist
+
+Before changing Browser Shield behavior:
+
+1. Prove transport parity across fetch, forward, intercept, and reverse paths
+   when the path buffers a response body.
+2. Keep non-shieldable binary/media responses outside the oversize block path.
+3. Clear body validators (`ETag`, `Digest`, `Content-MD5`) when a rewrite
+   changes response bytes.
+4. Keep shield receipts shareable: strip URL query strings and fragments from
+   receipt targets, and link shield intervention receipts to the request action
+   with `parent_action_id` when a request action exists.
+5. Cap adaptive Browser Shield rewrite scoring at one low-weight signal per
+   response body so ordinary ad-supported pages do not escalate from tracker
+   volume alone.
+6. Add adversarial tests for padding, encoded active content, and mixed
+   extension/tracking/trap payloads.
+7. Keep public copy defensive. Do not describe the feature as anti-bot evasion.
+
+## Production soak profile
+
+Use a staged rollout rather than turning Browser Shield on fleet-wide at the
+standard fail-closed posture.
+
+1. Build and verify the release candidate locally.
+2. Run the synthetic transport canary across fetch, forward, intercept, and
+   reverse paths with receipt signing enabled.
+3. Enable Browser Shield on a small opt-in agent group with
+   `strictness: minimal` and the default `oversize_action: scan_head`.
+4. Monitor shield receipts, validator-clearing behavior, adaptive score
+   movement, response scanner deltas, and page breakage.
+5. Move to `strictness: standard`, then consider `oversize_action: block` only
+   after the soak shows stable browsing behavior and no unexpected escalation.

@@ -1,0 +1,1405 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// Golden-file canonical-hash stability fixtures. These pin the current
+// CanonicalPolicyHash output against fixed-input Configs so that a
+// mechanical refactor of internal/config (TD-2b) cannot silently shift
+// ph and invalidate every signed receipt and mediation envelope that
+// already attests the v2.2.0 policy surface.
+//
+// If one of these hashes drifts, the change broke canonical hash
+// stability. That is admission-grade: every receipt emitted since
+// v2.2.0 carries ph derived from CanonicalPolicyHash, and every
+// cross-implementation verifier (the Python reference, any third-party
+// consumer) expects the same hash for the same effective policy.
+//
+// If you INTENTIONALLY change canonical-hash semantics - a new policy
+// field added to policySemanticView, a set-like slice graduated to
+// behavioral ordering, the default pattern corpus expanded - update
+// the constant to match the new value and note the bump in the PR
+// body. Do not silently regenerate: the whole point of this test is to
+// make the drift visible in review.
+
+const (
+	// goldenHashDefaults pins CanonicalPolicyHash for a freshly
+	// constructed Defaults() config, post-ApplyDefaults + Validate.
+	// This is the "out of the box" hash a user gets from `pipelock
+	// run` with no --config flag.
+	// Bumped for the contract-compile observation pipeline schema:
+	// Defaults() now includes the Learn top-level block (enabled=false,
+	// privacy.public_allowlist_default=true). New policy surface → ph
+	// must shift so verifiers detect the schema change.
+	// Re-bumped on the inference-engine wiring PR: Learn now carries an
+	// inference.floors substruct (min_sessions/min_events/min_windows).
+	// Floors are detection-relevant (they decide stable vs
+	// never_confirmed at compile time), so they must flow into ph so
+	// verifiers detect deployments that loosen the exposure gates.
+	// Re-bumped on the path-normalization wiring PR: Learn now also
+	// carries an inference.normalization substruct (algorithm,
+	// min_events, min_distinct_values, entropy_threshold_bits,
+	// reserved_segments_extra, cardinality_cap_per_host,
+	// tail_promotion_block_pct). Normalization knobs are
+	// policy-relevant because they decide which path segments collapse
+	// to wildcards at compile time. An operator who lowers the entropy
+	// threshold or raises the cardinality cap silently widens the
+	// wildcard surface of every emitted contract; the verifier must
+	// observe the schema change through ph.
+	// Re-bumped on the same PR after policySemanticView started
+	// resolving zero-valued floors and normalization fields to their
+	// effective defaults before hashing. The change closes a verifier-
+	// drift hole: a YAML omitting learn.inference.floors and a YAML
+	// setting them explicitly to 5/20/3 now hash identically because
+	// they describe the same effective policy.
+	// Re-bumped for federation plumbing: mediation_envelope now carries
+	// actor_format/trust_domain and inbound verify/replay settings.
+	// These change the attested envelope trust contract, so ph must move.
+	// Re-bumped for federation hardening: mediation_envelope now carries
+	// signature_expires (operator-tunable signer lifetime, paired with
+	// the inbound replay window), and verify_inbound.trust_list[].
+	// trust_domains (per-key actor binding so a compromised partner key
+	// cannot impersonate another peer's trust domain). Both change the
+	// attested envelope trust contract.
+	// Re-bumped for route-scoped redaction non-JSON exceptions:
+	// redaction.allowlist_unparseable_routes is new policy surface that
+	// constrains which opaque request formats may skip JSON rewriting.
+	// Re-bumped to close documented skill-poisoning vector gaps:
+	// Memory Persistence Directive, Credential Solicitation, and Covert
+	// Action Directive each widened their alternation to catch three
+	// vectors that escaped the prior pattern set (memory persistence
+	// using "future sessions"/"for all future", credential solicitation
+	// of plural ".aws/credentials" files, covert exfil verbs including
+	// exfiltrate/leak/stream/transmit/relay/forward/smuggle). See
+	// TestSkillPoisoningCorpus for the six-vector regression suite.
+	// Re-bumped for production-readiness tuning: Browser Shield
+	// oversize handling now defaults to scan_head, TLS passthrough has a
+	// googlevideo baseline, Browser Shield has a small large-site exempt
+	// baseline, and adaptive enforcement defaults to downweighting
+	// cooperative tool burst anomalies.
+	// Re-bumped to include the effective session-profiling defaults in
+	// Defaults() itself, so programmatic enablement gets the same domain
+	// burst/window/volume baselines as YAML-loaded configs.
+	// Re-bumped for signed MCP binary-integrity manifests:
+	// mcp_binary_integrity now carries signature trust settings that can
+	// make runtime launch fail closed before any MCP traffic is handled.
+	// Re-bumped for Spanish prompt-injection coverage: the default
+	// response-scanning corpus now includes Spanish instruction override
+	// and system-prompt disclosure patterns.
+	// Re-bumped for cross-lingual prompt-injection coverage: the default
+	// response-scanning corpus now includes mixed English/Spanish instruction
+	// override and system-prompt disclosure patterns.
+	// 2026-05-21: rotated for ToolChainDetection.SensitivityLabels (v2.6
+	// lethal-trifecta detection). Adds a policy-semantic field to the
+	// canonical hash surface.
+	// Re-bumped on the Databricks PAT pattern tightening: the default DLP
+	// regex moves from `dapi[a-z0-9]{30,}` to `dapi[0-9a-f]{32,}`. This
+	// matches the documented 32-char hex Databricks token format and removes
+	// a false-positive surface that fired on random base64 image payloads.
+	// Re-bumped for DLP false-positive sprint hardening: high-risk
+	// short-prefix provider patterns were narrowed to bounded documented
+	// shapes, and package-host path entropy exclusions were added.
+	// Re-bumped for DLP false-positive hardening pass 2: Vault, Supabase,
+	// Linear, and Sentry provider-token patterns were tightened to
+	// documented shapes and leading/trailing token boundaries.
+	// Re-bumped again after the Supabase right edge was adjusted to keep
+	// matching valid base64url checksums that end in '-'.
+	// Re-bumped for the dns.host_overrides addition: dns is policy-relevant
+	// (it changes the destination IPs the SSRF check evaluates) and so it
+	// participates in the canonical view; the field is present but empty
+	// in Defaults().
+	// Re-bumped for file_sentry.action: adding the warn/block enforcement
+	// enum to FileSentry is a policy-semantics change. The default "warn"
+	// preserves current behavior; "block" causes the consumer to cancel
+	// the proxy ctx on agent-attributed findings, which is observably
+	// different enforcement.
+	// Re-bumped for the request_policy section: adding the request_policy
+	// operation-rails config (allow-by-default deny/warn rules over outbound
+	// API operations) is a policy-semantics change. The field is present but
+	// empty (disabled, no rules) in Defaults(), so it shifts the baseline hash.
+	// Re-bumped for request_policy fail-closed parse/opaque-operation actions:
+	// these control whether unreadable GraphQL operations block, warn, or pass.
+	// Bumped for the request_policy.batch section (JSON batch endpoint
+	// recursion): adding the policy-affecting field changes the canonical hash.
+	// Bumped for fetch_proxy.monitoring.query_entropy_exclusions: per-host
+	// bypass for the query parameter entropy gate is a policy-semantic
+	// change. Empty by default but the field is part of the canonical view.
+	// Re-bumped for the file_sentry max_file_bytes field: see note above.
+	// Bumped when mcp_tool_policy.quarantine_dir was removed from the
+	// canonical view: its default is derived from os.TempDir(), which made
+	// this hash depend on the ambient TMPDIR. Excluding the operational path
+	// makes the hash environment-independent (identical policy -> identical
+	// hash), which is the admission-grade contract.
+	// Re-bumped for the Twilio + Mailgun DLP pattern boundary tightening
+	// (defaults.go DLP set): SK[a-f0-9]{32} -> \bSK[a-f0-9]{32}\b and
+	// key-[a-zA-Z0-9]{32} -> \bkey-[a-zA-Z0-9]{32}\b.
+	// Re-bumped for the secret-pattern expansion (defaults.go DLP set,
+	// 48 -> 62): added DB connection-string patterns (postgres/mysql/mongodb/
+	// redis with embedded creds), the remaining GitLab token families
+	// (gldt-/glrt-/glcbt-/glptt-/gloas-/glsoat-/grouped service tokens), and
+	// cloud SA key patterns (GCP private_key_id, Azure storage account key,
+	// Azure SAS signature). The GCP service_account marker is core DLP, not a
+	// default pattern.
+	// Re-bumped again: the "Private Key Header" pattern now also matches PGP
+	// armor and the trailing BLOCK keyword, aligning DLP detection with the
+	// ssh-private-key redaction class.
+	// Re-bumped for A2A Agent Card signature verification: a2a_scanning gained
+	// the require_signed_agent_cards and trusted_agent_card_keys policy fields,
+	// which are enforcement-relevant and so belong in the canonical policy hash.
+	// Re-bumped for response_scanning.size_exempt_domains: trusted per-host
+	// oversize response passthrough changes response-size enforcement.
+	// Re-bumped for git_protection.allowed_push_repos. The field is
+	// policy-semantic because it changes whether visible git-receive-pack
+	// pushes are allowed at the proxy.
+	// Re-bumped for DLP precision: the "Environment Variable Secret" and
+	// "Credential in URL" default patterns now require a secret-plausible
+	// leading value character so the whitespace-collapsed DLP view cannot
+	// over-match benign shell env-var references; the "Credential in URL"
+	// value tail additionally excludes ';' so a semicolon-separated param
+	// does not bleed into the captured credential. Detection-relevant change.
+	// Re-bumped for flight_recorder.require_receipts: the default is false,
+	// but explicit true changes enforcement by blocking otherwise-allowed
+	// requests when a required receipt cannot be emitted.
+	// Re-bumped for response-injection precision: the "Hidden Instruction"
+	// default pattern now matches the directive-marker form
+	// (hidden instruction:) instead of the bare noun, and "Credential
+	// Solicitation" narrows the "include" verb to direct include-your-secret
+	// requests while rehoming include-secret-path forms to "Credential Path
+	// Directive", so security-standards/docs prose that DESCRIBES these attacks
+	// no longer over-matches while imperative credential asks still block.
+	// Detection-relevant change.
+	// Re-bumped for "Credential Solicitation" direction-anchoring: the default
+	// (and immutable core floor) now require a hand-over verb + credential noun
+	// to co-occur with an explicit "send it back to the requester" cue within
+	// one sentence, instead of the prior verb-near-noun .{0,80} rule that
+	// hard-blocked ordinary credential setup documentation ("provide your API
+	// key in config"). Imperative solicitations to the requester still block.
+	// Detection-relevant change.
+	// Re-bumped for defer.max_cascade_depth. The bound changes held-action
+	// admission decisions, so it participates in the signed policy hash.
+	// Re-bumped for removal of vestigial DeferConfig.ResolutionTriggers
+	// field. The field had zero runtime consumers (only validated/defaulted)
+	// and was dropped in v2.8 before any release shipped it.
+	// Re-bumped for mcp_input_scanning.response_timeout_seconds field
+	// (v2.8 stress-followup Finding 12). New policy-semantic field that
+	// changes upstream response timeout behavior. Zero default = disabled.
+	// Re-bumped for response_scanning.mcp_servers: per-server MCP response
+	// trust classes change response-injection enforcement from the fail-closed
+	// untrusted block default to explicit reasoning/warn.
+	// Re-bumped for provider-key DLP precision: short `sk-*` suffix floors
+	// moved from 10 to 20 chars, provider-bound URL exemptions were added to
+	// the matching DLP patterns, and default suppress entries now exempt
+	// provider-bound request bodies/headers while preserving blocks to other
+	// destinations. Detection/enforcement-relevant change.
+	// Re-bumped for the second provider-key DLP expansion: five additional
+	// distinctively-prefixed AI provider-key shapes were added with provider
+	// host exemptions and default suppress entries. Detection/enforcement-
+	// relevant change.
+	// Re-bumped for dropping the FP-prone "Voice AI" (sk_car_) and "Neural
+	// Search" (jina_) default DLP patterns plus their suppress entries: their
+	// key formats are undisclosed so the prefixes false-positive on common
+	// identifiers. Detection/enforcement-relevant change.
+	// Re-bumped for the LLM Router (sk-or-v1-) DLP suffix tightening: the suffix
+	// charset dropped "-"/"_" (was matching hyphenated prose), a policy-semantic
+	// pattern change, so the hash shifts.
+	// Re-bumped again for the LLM Router suffix narrowing from alphanumeric to
+	// hex-only, matching the documented key shape and preventing long ordinary
+	// words after "sk-or-v1-" from false-positive matching.
+	// Re-bumped for dropping the leading \b from 16 provider-key DLP patterns:
+	// the anchor prevented detection when a key was glued to a preceding alnum
+	// run (credential-exfil bypass). Only the leading anchor was removed;
+	// trailing \b is retained.
+	// Re-bumped for removing Slack/Discord/Telegram from generated default
+	// api_allowlist. Messaging platforms are common exfiltration channels and
+	// should be explicit operator choices, not out-of-box policy.
+	// Re-bumped for MCP binary-integrity fail-closed defaults:
+	// enabled mcp_binary_integrity with no explicit action now defaults to
+	// block, so missing manifests and hash failures stop MCP subprocess spawn
+	// unless an operator deliberately sets action: warn.
+	// Re-bumped for the dotted-token DLP false-positive fix: the "Discord Bot
+	// Token", "SendGrid API Key", and "JWT Token" default patterns now pin
+	// their structural prefix anchors case-sensitively ((?-i:[MN]), (?-i:SG.),
+	// (?-i:eyJ/eyA/ew*)) so the scanner's forced (?i) prefix plus
+	// whitespace-normalized DLP view can no longer collapse natural-language
+	// prose into a fake 3-part dotted token. Detection-relevant: real tokens
+	// still match (and Discord now also matches the "mfa." token form). Review
+	// polish widened the JWT header/payload segments to narrow case-sensitive
+	// JSON-object encodings (`eyA`, `ew[o/k/0]`, `e30`, `e30=`), so compact
+	// JWTs with whitespace or empty claims are not dropped. See
+	// TestTextDLP_DottedTokenPatterns.
+	// Re-bumped for Markdown Link Credential Exfiltration, which extends the
+	// response-injection defaults from image-only markdown exfil to ordinary
+	// markdown links that solicit credentials.
+	// Re-bumped for tightening Markdown Link Credential Exfiltration with an
+	// exfiltration-direction cue, so ordinary credential setup docs with later
+	// links no longer match while credential-to-link exfil prompts still block.
+	// Re-bumped for removing generic navigation verbs from the markdown-link
+	// credential-exfil branch, so docs that say to visit/click setup links stay
+	// clean unless an actual exfiltration verb is present.
+	// Re-bumped for markdown-link credential-exfil intent anchoring: the
+	// destination cue now has to bind directly to the markdown/angle link, so
+	// credential setup docs that later open guide links stay clean while
+	// credential-to-link transfer prompts still block.
+	// Re-bumped for markdown-link credential-exfil bypass coverage: short
+	// destination nouns between the cue and link, whitespace-split credential
+	// nouns, and link-first submit/paste-there phrasing now still block.
+	// Re-bumped for same-class destination cue coverage: "in [form]" and
+	// "at [portal]" now block like "into [form]" and "to [portal]".
+	// Re-bumped for link-first markdown credential exfiltration coverage:
+	// "[link] to send/paste/append/put credential" now blocks when terminal
+	// or pointing here/there, while setup docs that paste into a local app stay clean.
+	// Re-bumped for bounded size-exempt response scanning: the per-response
+	// and per-proxy-instance scan ceilings plus the explicit unscannable passthrough
+	// allowlist change response-size enforcement.
+	// Re-bumped for Credential Path Directive partitioning + bare-tier hardening
+	// + newline termination (merged from origin/main).
+	// Bumped for fetch_proxy.monitoring.query_entropy_param_exclusions: exact
+	// endpoint+parameter query-value entropy exemptions are policy-semantic.
+	// Advisory metadata is excluded, but the effective tuple is included in
+	// sorted order.
+	// Re-bumped for the Markdown Link Credential Exfiltration and Auth
+	// Material Requirement precision fixes: verb<->noun gaps are now
+	// clause-aware (no bare DOTALL '.') so a benign two-clause sentence no
+	// longer bridges an unrelated transfer verb to a credential noun, the
+	// "collect/copy/include NOUN, then VERB ... link" branch requires the
+	// verb's object to be the credential itself, and Auth Material
+	// Requirement now requires an explicit hand-over request in the same
+	// clause as the stated requirement instead of firing on a bare
+	// precondition statement. See
+	// TestCore_MarkdownLinkCredentialExfiltrationIntentAnchor and
+	// TestScanResponse_AuthMaterialRequirementIntentAnchor.
+	// Re-bumped for adversarial regression coverage on those same patterns:
+	// Auth Material Requirement now catches immediate sentence-split
+	// requirement-plus-handover forms, and the default/core floor adds a
+	// narrow Markdown Link Credential Value Exfiltration sibling for
+	// "copy credential, then submit the value to [link]" without changing the
+	// preset YAML regex bytes.
+	// Re-bumped to close an indirect markdown-link exfiltration gap: the
+	// default/core floor adds a new "Markdown Link Credential Follow
+	// Exfiltration" sibling pattern for "collect credential, then
+	// open/follow/visit this link to sync/upload/send: [...](...)",
+	// a shape the existing transmit-verb-anchored patterns above do not
+	// cover because the link is never the direct object of a send/upload/
+	// submit verb. See TestCore_MarkdownLinkCredentialFollowExfiltrationIntentAnchor.
+	// Re-bumped for the Markdown Link Credential Exfiltration verb-to-noun
+	// separator: ordinary direct gaps are short again, while comma-set-off
+	// parenthetical padding still blocks. This catches padded single-clause
+	// exfiltration without bridging coordinated objects like "send your invoice
+	// and include your account token ... [billing]". See
+	// TestCore_MarkdownLinkCredentialExfiltrationIntentAnchor.
+	// Re-bumped for request_body_scanning.disable_patterns and pattern_actions:
+	// these per-pattern body/header DLP tuning knobs change enforcement and
+	// must flow into signed policy hashes, even when empty in defaults.
+	// Re-bumped for adaptive-enforcement recovery and severity-weighting knobs:
+	// level timers, clean-request de-escalation, and severity-weighted signal
+	// handling change adaptive policy semantics when configured.
+	// Re-bumped because Defaults().Internal now exposes the enforced Azure WireServer and IPv6 unspecified SSRF floor.
+	// Re-bumped for Safety Reclassification Directive response pattern coverage.
+	// Re-bumped for rules.trust_embedded_keys: the rules signing trust roots are
+	// policy semantics, so removing the compiled official keyring must change ph.
+	// Re-bumped for request body/WebSocket content entropy warn-by-default
+	// posture in ApplyDefaults.
+	// Re-bumped for the policy-semantic forward_proxy.sni_require_tls field.
+	// Re-bumped for sentence-bounded external-data-transfer directives,
+	// sensitive query-key variants, and command-body transfer coverage.
+	// Re-bumped for cookie query keys plus curl/wget upload-form coverage.
+	// Re-bumped for URL-first curl and wget upload-command coverage.
+	// Re-bumped for shell-boundary handling, dotted paths, and additional
+	// sensitive query-key aliases in external data-transfer directives.
+	// Re-bumped for natural-language password and private-key transfers.
+	// Re-bumped for airlock.triggers.anomaly_window_minutes default 0:
+	// the reserved window is now rejected when nonzero, so the default
+	// cannot stay at the previous inert 5.
+	// Re-bumped for New Instructions authority/action context narrowing.
+	// Re-bumped again for the New Instructions proximity form: the narrowing
+	// above required a literal ":" or "-" between the phrase and its context,
+	// so a period, newline, comma, or em-dash evaded it. Proximity keeps the
+	// context requirement without depending on one punctuation mark.
+	// Re-bumped to require an authority label or concrete override action;
+	// ordinary publication and developer-guide prose must remain clean.
+	// Re-bumped for singular directive nouns, authority-after-phrase forms,
+	// and hard-separator action anchoring that excludes ordinary run guidance.
+	// Re-bumped so authority-qualified directives remain detectable across
+	// period, comma, em-dash, and newline separators.
+	// Re-bumped for action-anchored connective forms such as "rules say to"
+	// and "instructions are to" without broadening ordinary task prose.
+	// Re-bumped for the reverse-proxy scan admission budget: ReverseProxy
+	// now carries max_inflight_scan_bytes, which decides whether a request
+	// is scanned or refused with 413 under load. That is an enforcement
+	// outcome rather than plumbing, so it belongs in the policy view and
+	// must shift ph. Listen and Upstream on the same struct stay excluded,
+	// which the ops-field invariance test confirms by landing on this same
+	// hash.
+	// Re-bumped for provider-key left-boundary precision. The change prevents
+	// ordinary prose from being redacted or blocked, while deliberately losing
+	// detection for a key glued to a preceding token-alphabet character.
+	// Re-bumped for response_scanning.authenticated_artifacts: the canonical
+	// view now carries the exact signed-artifact allowlist. It is
+	// policy-relevant because an entry lets the proxy release a verified
+	// official rules bundle with response injection matching skipped, so
+	// verifiers must observe the schema change through ph.
+	// Re-bumped for request_body_scanning.content_entropy_warn_routes. The
+	// exact route exception changes an entropy block to a visible warning, so
+	// mixed versions must not report the same policy identity.
+	// Re-bumped for request_body_scanning.sigv4_credential_routes. The exact
+	// route grant changes whether a request body may carry a structurally valid
+	// presigned URL and therefore belongs in the policy identity.
+	// Re-bumped for issuer-backed GitHub stateless-token and decoded Azure SAS
+	// coverage in the default DLP pattern set.
+	// Re-bumped for fetch_proxy.monitoring.scan_nested_urls: nested query
+	// destinations are an enforcement floor, so mixed versions must not
+	// report the same policy identity.
+	// Re-bumped when host-set hashing adopted runtime-equivalent case,
+	// duplicate, and trailing-dot normalization.
+	// Re-bumped for Credential in URL grammar: line-start assignments require
+	// adjacency around '=', while delimiter-led query parameters retain
+	// whitespace tolerance. This detection-relevant default changes policy.
+	// Re-bumped for cross_request_detection.fragment_reassembly.max_sessions:
+	// this fail-closed evidence-capacity field changes whether cross-request
+	// detection can retain and inspect a new fragment stream, so mixed versions
+	// must not report the same policy identity.
+	// Re-bumped again when that field became a pointer so validation can tell an
+	// omitted value from an explicit one. This bump is a REPRESENTATION change
+	// rather than a semantics change, and it moves only the DISABLED default:
+	// while cross-request detection is off the field cannot affect a decision,
+	// so the canonical view now drops it instead of asserting a bound nothing
+	// consults. Where the feature IS enabled the view resolves the pointer to
+	// its effective value, so a config that omits the field and a config that
+	// sets it to the default keep one identity, and the three enabled goldens
+	// below did not move.
+	// Re-bumped for path_entropy_exclusions: the Monitoring struct gained a
+	// new policy field, so the canonical view emits it and ph shifts even for
+	// a config that never sets it. These structs carry no json tags, so
+	// json.Marshal has no omitempty to suppress an unset slice; any added
+	// policy field moves this hash. Intentional and visible in review, per
+	// the contract above. Governance fields on the new type (reason, owner,
+	// expires) are dropped by canonicalPathEntropyExclusions, so editing a
+	// reason does NOT move ph. The rich fixtures here do NOT configure this
+	// field and prove nothing about it; the focused tests in
+	// path_entropy_canonical_test.go do, including the positive control that
+	// a changed route DOES move the hash.
+	// Re-bumped for DLPPattern.CredentialAudienceHosts. The field is
+	// compiled-in and yaml:"-", so strict decode REJECTS an operator that
+	// tries to set it; the canonical view still emits it because these
+	// structs carry no json tags and nothing suppresses an unset slice.
+	// That is the right outcome rather than an accident: the built-in set
+	// decides which destinations a credential pattern is enforced against,
+	// so two binaries shipping different built-ins genuinely enforce
+	// differently and must not report one policy identity. This hash now
+	// moves with the BINARY, not with operator configuration.
+	// Re-bumped when the Discord bot-token audience gained gateway.discord.gg.
+	// The Gateway is a different domain from discord.com, so without it a bot
+	// token in an outbound frame stayed a DLP match and blocked a legitimate
+	// connection. Adding a host changes which destinations that credential is
+	// enforced against, which is a policy-semantics change.
+	// Re-bumped when the inert session_profiling.volume_spike_ratio field was
+	// removed. It had no consumer, but SessionProfiling is part of the policy
+	// view, so dropping the field changes the canonical JSON shape and shifts
+	// the hash. Effective enforcement is unchanged.
+	// Re-bumped 2026-09-11 for the shipped document-sharing route exclusions,
+	// and again the same day when the Slides route was corrected to Google's
+	// published singular /presentation/d/ (the plural was an invented value).
+	// Defaults() now carries five path_entropy_exclusions entries, which IS a
+	// policy-semantics change: every deployment's reported policy identity moves
+	// on upgrade, and a conductor strict-mode reload will see it. That
+	// visibility is the intended behavior, not a side effect - an operator's
+	// detection posture changed and the hash is what says so.
+	// Re-bumped for directive-intent response patterns. The narrowed detector
+	// bytes change response enforcement and therefore the canonical policy.
+	// Re-bumped for polite and list-prefixed disclosure directives and for
+	// sentence-bounded persistence lead-ins.
+	// Re-bumped for clause-level response-directive coverage.
+	// Re-bumped for transition-prefixed response directives.
+	// Re-bumped for polite and recipient-first directive coverage.
+	// Re-bumped for explicitly marked directive transitions.
+	// Re-bumped for response_scanning.core_observe_exceptions: a declared
+	// per-host observe entry withholds a block on the immutable response
+	// floor, so two deployments differing only in their exceptions have
+	// genuinely different enforcement and their receipts must say so.
+	// Re-bumped when the Slack bot/user and app-level tokens gained the compiled
+	// audience slack.com and the immutable core floor learned to honor a compiled
+	// audience at a credential's own issuing authority. Slack Token is a core
+	// pattern, so this narrows where that credential is enforced (allowed at its
+	// exact encrypted Slack authorities, blocked everywhere else); the identity
+	// moves with the binary's built-in set, not with operator YAML.
+	// Re-bumped when Slack's hosted MCP authority was added to the Slack Token
+	// audience. The extra exact host changes where that built-in credential is
+	// enforced, so the binary's reported policy identity must move with it.
+	// Re-bumped when the built-in Google OAuth Token pattern gained the compiled
+	// audience *.googleapis.com, restricted to Bearer Authorization headers.
+	// Other carriers still block, and the binary policy identity moves.
+	// Re-bumped when GitHub and GitLab token classes gained compiled audiences
+	// (GitHub Token, Fine-Grained PAT, GitLab PAT, CI job token) and the DLP
+	// section gained the declared enterprise host lists.
+	// Re-bumped when shipped path-entropy routes began merging beside operator
+	// entries instead of being replaced by them.
+	// Re-bumped when the built-in DAN jailbreak token began requiring word
+	// context, which changes a shipped response pattern.
+	// Re-bumped when issuer-bound session cookies became a request-body
+	// scanning default.
+	// Re-bumped when GitLab's native Private-Token and Job-Token headers joined
+	// the default sensitive headers.
+	// Re-bumped when the built-in JWT Token pattern gained a compiled URL-query
+	// audience for GitHub's release download storage host.
+	// Re-bumped when the built-in Azure SAS Token pattern gained a compiled
+	// ReleaseGrantSAS audience for the same release-asset host, so the shipped
+	// GitHub release redirect's Azure SAS can be admitted alongside its JWT
+	// grant instead of blocking on its own.
+	// Re-bumped when GitHub package registries gained a compiled Basic
+	// audience, RubyGems gained Bearer, and the container-registry JWT
+	// gained a bearer audience for ghcr.io.
+	// Re-bumped for the RFC 9110 section 4.1 default URI size (8000 octets).
+	// Bound to compiled API endpoint carriers and the Api-Key sensitive header.
+	// Re-bumped when the Anthropic audience admitted its documented Bearer carrier.
+	// Re-bumped for the structured Discord Gateway carrier and the publisher SDK Together host.
+	// Re-bumped when the built-in Anthropic API Key pattern's credential
+	// audience added platform.claude.com and mcp-proxy.anthropic.com
+	// (Claude Code first-party credential endpoints). The default
+	// pattern corpus is part of the canonical policy view.
+	// Re-bumped for the compiled sign-in bearer carrier on the JWT pattern.
+	goldenHashDefaults = "aaa69c20b466da8e99b1af8c1ee67aa10167abe9248941de90df64e23ebc42b4"
+
+	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
+	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
+	// representative policy-semantic fixture with emphasis on the
+	// sections most likely to drift during TD-2b.
+	// Bumped for the contract-compile observation pipeline schema:
+	// the rich fixture now carries a Learn block with enabled=false +
+	// privacy.public_allowlist_default=true defaults, so ph must shift
+	// in lockstep with the Defaults() bump above.
+	// Re-bumped on the inference-engine wiring PR: see goldenHashDefaults
+	// note above. Floors decode as zero in the rich fixture (which does
+	// not set them) and Resolved() supplies defaults at runtime, so the
+	// rich-config hash shifts in lockstep with Defaults().
+	// Re-bumped on the path-normalization wiring PR: see goldenHashDefaults
+	// note above. Normalization knobs decode as zero in the rich fixture
+	// (which does not set them) and Resolved() supplies defaults at
+	// runtime, so the rich-config hash shifts in lockstep with Defaults().
+	// Re-bumped on the same PR after policySemanticView started
+	// resolving zero-valued floors and normalization fields to their
+	// effective defaults before hashing. See goldenHashDefaults note
+	// above. The rich fixture omits the inference substruct, so
+	// resolved-default values flow into ph identically to Defaults().
+	// Re-bumped for federation plumbing: see goldenHashDefaults note.
+	// Re-bumped for federation hardening: see goldenHashDefaults note.
+	// Re-bumped for route-scoped redaction non-JSON exceptions: see
+	// goldenHashDefaults note.
+	// Re-bumped for skill-poisoning pattern broadening: see
+	// goldenHashDefaults note. The rich fixture inherits the response
+	// scanning pattern set from Defaults(), so the hash shifts in
+	// lockstep.
+	// Re-bumped for production-readiness tuning: see
+	// goldenHashDefaults note.
+	// Re-bumped for signed MCP binary-integrity manifests: see
+	// goldenHashDefaults note above.
+	// Re-bumped for Spanish prompt-injection coverage: see
+	// goldenHashDefaults note above.
+	// Re-bumped for cross-lingual prompt-injection coverage: see
+	// goldenHashDefaults note above.
+	// 2026-05-21: rotated for ToolChainDetection.SensitivityLabels
+	// (v2.6 lethal-trifecta detection). The new field participates in
+	// policy semantics: operator-provided sensitivity overrides change
+	// which tools classify into untrusted_source / sensitive_source /
+	// external_sink, which changes which sequences emit the lethal-
+	// trifecta verdict.
+	// Re-bumped for the Databricks PAT pattern tightening from
+	// `dapi[a-z0-9]{30,}` to `dapi[0-9a-f]{32,}` (defaults.go DLP set), which
+	// closes a false-positive surface in random base64 image payloads while
+	// still matching the documented 32-char hex Databricks token format.
+	// Re-bumped for DLP false-positive sprint hardening: see
+	// goldenHashDefaults note. The rich fixture inherits the default DLP
+	// pattern and entropy-exclusion defaults, so the hash shifts in
+	// lockstep.
+	// Re-bumped for DLP false-positive hardening pass 2: see
+	// goldenHashDefaults note above. The rich fixture inherits the default
+	// DLP pattern set, so the hash shifts in lockstep.
+	// Re-bumped again for the Supabase base64url checksum right-edge fix:
+	// see goldenHashDefaults note above.
+	// Re-bumped for the dns.host_overrides addition: see goldenHashDefaults
+	// note. The rich fixture omits dns:, so the field is empty but still
+	// part of the canonical view.
+	// Re-bumped for file_sentry.action: same rationale as goldenHashDefaults.
+	// Re-bumped for the request_policy section: same rationale as
+	// goldenHashDefaults. The rich fixture omits request_policy, so the field
+	// is empty but still part of the canonical view; the hash shifts in lockstep.
+	// Re-bumped for request_policy fail-closed parse/opaque-operation actions:
+	// see goldenHashDefaults note above.
+	// Bumped for the request_policy.batch section (see goldenHashDefaults).
+	// Bumped for fetch_proxy.monitoring.query_entropy_exclusions: see the
+	// goldenHashDefaults note above.
+	// Re-bumped for the file_sentry max_file_bytes field: see goldenHashDefaults note.
+	// Re-bumped for A2A Agent Card signature verification fields: see
+	// goldenHashDefaults note above.
+	// Re-bumped for the Twilio + Mailgun DLP boundary tightening and again for
+	// the secret-pattern expansion: see goldenHashDefaults note above. The rich
+	// fixture inherits the default DLP pattern set, so the hash shifts in lockstep.
+	// Re-bumped for response_scanning.size_exempt_domains: see the
+	// goldenHashDefaults note above.
+	// Re-bumped for git_protection.allowed_push_repos: see goldenHashDefaults
+	// note above. The rich fixture omits the field, but the empty allowlist is
+	// still part of the canonical policy view.
+	// Re-bumped for DLP precision on the env-var-secret / credential-in-URL
+	// patterns: see goldenHashDefaults note above.
+	// Re-bumped for flight_recorder.require_receipts: see goldenHashDefaults
+	// note above.
+	// Re-bumped for "Credential Solicitation" direction-anchoring: see
+	// goldenHashDefaults note above. The rich fixture inherits the default
+	// response-scanning pattern set, so the hash shifts in lockstep.
+	// Re-bumped for the defer section: held-action timeout and capacity
+	// bounds are policy semantics for action enforcement.
+	// Re-bumped for mcp_input_scanning.response_timeout_seconds: see
+	// goldenHashDefaults note above.
+	// Re-bumped for response_scanning.mcp_servers: see goldenHashDefaults note
+	// above. The rich fixture omits the list, but the empty policy field is
+	// still part of the canonical view.
+	// Re-bumped for provider-key DLP precision: see goldenHashDefaults note
+	// above. The rich fixture inherits the default DLP pattern and suppress
+	// sets, so the hash shifts in lockstep.
+	// Re-bumped for dropping the FP-prone "Voice AI" (sk_car_) and "Neural
+	// Search" (jina_) default DLP patterns + their suppress entries.
+	// Re-bumped for the LLM Router hex-only suffix narrowing: see
+	// goldenHashDefaults note above.
+	// Re-bumped for dropping leading \b from 16 provider-key DLP patterns:
+	// see goldenHashDefaults note above.
+	// Re-bumped for the dotted-token DLP false-positive fix plus JWT
+	// header/payload edge-case polish: see goldenHashDefaults note above. The
+	// rich fixture inherits the default DLP pattern set (include_defaults: true),
+	// so the hash shifts in lockstep.
+	// Re-bumped for MCP tool-policy structural argument validators. New
+	// ToolPolicyRule fields are policy-semantic even when zero-valued because
+	// non-zero values change tool-call decisions.
+	// Re-bumped for defer.max_cascade_depth: see goldenHashDefaults note above.
+	// Re-bumped for Markdown Link Credential Exfiltration: see goldenHashDefaults
+	// note above; the rich fixture inherits the default response-scanning pattern
+	// set, so the hash shifts in lockstep.
+	// Re-bumped for the generic-navigation false-positive tightening: see
+	// goldenHashDefaults note above.
+	// Re-bumped for markdown-link credential-exfil intent anchoring: see
+	// goldenHashDefaults note above.
+	// Re-bumped for markdown-link credential-exfil bypass coverage: see
+	// goldenHashDefaults note above.
+	// Re-bumped for same-class destination cue coverage: see goldenHashDefaults
+	// note above.
+	// Re-bumped for link-first send/paste/append/put coverage: see
+	// goldenHashDefaults note above.
+	// Re-bumped for bounded size-exempt response scanning: see
+	// goldenHashDefaults note above.
+	// Re-bumped for Credential Path Directive changes (merged from origin/main)
+	// and for fetch_proxy.monitoring.query_entropy_param_exclusions: see
+	// goldenHashDefaults note above.
+	// Re-bumped for the Markdown Link Credential Exfiltration and Auth
+	// Material Requirement precision fixes: see goldenHashDefaults note above;
+	// the rich fixture inherits the default response-scanning pattern set, so
+	// the hash shifts in lockstep.
+	// Re-bumped for the new Markdown Link Credential Follow Exfiltration
+	// sibling pattern: see goldenHashDefaults note above; the rich fixture
+	// inherits the default response-scanning pattern set, so the hash
+	// shifts in lockstep.
+	// Re-bumped for the Markdown Link Credential Exfiltration verb-to-noun
+	// separator. See goldenHashDefaults note above.
+	// Re-bumped for adaptive-enforcement recovery and severity-weighting knobs:
+	// see goldenHashDefaults note above.
+	// Re-bumped for Safety Reclassification Directive: see goldenHashDefaults
+	// note above.
+	// Re-bumped for rules.trust_embedded_keys: see goldenHashDefaults note above.
+	// Re-bumped for request body/WebSocket content entropy warn-by-default
+	// posture in ApplyDefaults: see goldenHashDefaults note above.
+	// Re-bumped for forward_proxy.sni_require_tls; the rich fixture omits the
+	// field, whose compatibility default is false.
+	// Re-bumped for the external-data-transfer directive precision changes;
+	// the rich fixture inherits the default response-scanning pattern set.
+	// Re-bumped for cookie query keys plus curl/wget upload-form coverage.
+	// Re-bumped for URL-first curl and wget upload-command coverage.
+	// Re-bumped for natural-language password and private-key transfers.
+	// Re-bumped for New Instructions authority/action context narrowing.
+	// Re-bumped again for the New Instructions proximity form; see the
+	// goldenHashDefaults note. Both invariance tests compare against this
+	// constant and produced this same hash, so ops-field and allowlist-order
+	// invariance are intact and only the shared baseline moved.
+	// Re-bumped for the authority-label/action narrowing above.
+	// Re-bumped for the singular and hard-separator refinement above.
+	// Re-bumped for the authority-label separator expansion above.
+	// Re-bumped for the hard-separated directive expansion above.
+	// Re-bumped for the reverse-proxy scan admission budget: ReverseProxy
+	// now carries max_inflight_scan_bytes, which decides whether a request
+	// is scanned or refused with 413 under load. That is an enforcement
+	// outcome rather than plumbing, so it belongs in the policy view and
+	// must shift ph. Listen and Upstream on the same struct stay excluded,
+	// which the ops-field invariance test confirms by landing on this same
+	// hash.
+	// Re-bumped for provider-key left-boundary precision; see goldenHashDefaults.
+	// Re-bumped for response_scanning.authenticated_artifacts: see
+	// goldenHashDefaults note above. The rich fixture omits the field, so the
+	// nil allowlist flows into ph identically to Defaults() and the hash
+	// shifts in lockstep.
+	// Re-bumped for route-scoped entropy warnings: see goldenHashDefaults.
+	// Re-bumped for route-scoped SigV4 body credentials: see goldenHashDefaults.
+	// Re-bumped for issuer-backed GitHub stateless-token and decoded Azure SAS
+	// coverage: the rich fixture inherits the default DLP pattern set.
+	// Re-bumped for fetch_proxy.monitoring.scan_nested_urls: see
+	// goldenHashDefaults. The rich fixture omits the field, so nil (enabled)
+	// flows into ph identically to Defaults().
+	// Re-bumped for runtime-equivalent host-set normalization; see
+	// goldenHashDefaults above.
+	// Re-bumped for the Credential in URL grammar change above; the rich
+	// fixture inherits the built-in DLP patterns.
+	// Re-bumped for fragment_reassembly.max_sessions: see goldenHashDefaults.
+	// The rich fixture sets cross-request detection, so a changed evidence
+	// capacity must produce a distinct policy identity here as well.
+	// Re-bumped for path_entropy_exclusions alongside goldenHashDefaults.
+	// Re-bumped for DLPPattern.CredentialAudienceHosts. The field is
+	// compiled-in and yaml:"-", so strict decode REJECTS an operator that
+	// tries to set it; the canonical view still emits it because these
+	// structs carry no json tags and nothing suppresses an unset slice.
+	// That is the right outcome rather than an accident: the built-in set
+	// decides which destinations a credential pattern is enforced against,
+	// so two binaries shipping different built-ins genuinely enforce
+	// differently and must not report one policy identity. This hash now
+	// moves with the BINARY, not with operator configuration.
+	// Re-bumped when the Discord bot-token audience gained gateway.discord.gg.
+	// The Gateway is a different domain from discord.com, so without it a bot
+	// token in an outbound frame stayed a DLP match and blocked a legitimate
+	// connection. Adding a host changes which destinations that credential is
+	// enforced against, which is a policy-semantics change.
+	// Re-bumped again when a customized pattern stopped inheriting a built-in
+	// audience. The rich fixture carries a pattern that reuses a built-in name
+	// with different content; it previously kept the built-in audience hosts
+	// and could earn an allow at that vendor. It no longer does, which is a
+	// fail-closed policy change. The defaults hash is unaffected because the
+	// default set has no customized pattern.
+	// Re-bumped for the session_profiling.volume_spike_ratio removal: see
+	// goldenHashDefaults note above. The rich fixture inherits SessionProfiling
+	// defaults, so the hash shifts in lockstep.
+	// Re-bumped 2026-09-11 alongside goldenHashDefaults. This one moving is the
+	// POINT rather than a side effect: the rich fixture is YAML-backed, and it
+	// only inherits the shipped document-sharing routes because ApplyDefaults
+	// now materializes them. Before that fix the defaults hash moved and this
+	// one did not, which is exactly the shape of a default that reaches the
+	// no-config CLI path and no real deployment.
+	// Re-bumped alongside goldenHashDefaults for directive-intent response patterns.
+	// Re-bumped alongside goldenHashDefaults for the directive-boundary fixes.
+	// Re-bumped alongside goldenHashDefaults for clause-level response directives.
+	// Re-bumped alongside goldenHashDefaults for transition-prefixed directives.
+	// Re-bumped alongside goldenHashDefaults for polite and recipient-first directives.
+	// Re-bumped alongside goldenHashDefaults for explicitly marked transitions.
+	// Re-bumped for response_scanning.core_observe_exceptions: a declared
+	// per-host observe entry withholds a block on the immutable response
+	// floor, so two deployments differing only in their exceptions have
+	// genuinely different enforcement and their receipts must say so.
+	// Re-bumped alongside goldenHashDefaults for the Slack compiled audience and
+	// the core-floor audience change; the rich fixture carries the built-in DLP
+	// patterns, so its policy identity moves the same way.
+	// Re-bumped for Slack's hosted MCP authority; see goldenHashDefaults above.
+	// Re-bumped for the Google OAuth Token compiled audience; see goldenHashDefaults above.
+	// Re-bumped for the GitLab native token headers in the default sensitive
+	// headers; see goldenHashDefaults above.
+	// Re-bumped for the JWT Token URL-query audience; see goldenHashDefaults above.
+	// Re-bumped for the Azure SAS Token ReleaseGrantSAS audience; see
+	// goldenHashDefaults above. The rich fixture inherits the default DLP
+	// pattern set, so the hash shifts in lockstep.
+	// Bound to the narrowed compiled credential audiences and carriers.
+	// Re-bumped with goldenHashDefaults for compiled credential-audience metadata.
+	// Re-bumped when the built-in Anthropic API Key pattern's credential
+	// audience added platform.claude.com and mcp-proxy.anthropic.com
+	// (Claude Code first-party credential endpoints). The default
+	// pattern corpus is part of the canonical policy view.
+	// Re-bumped with goldenHashDefaults for the sign-in bearer carrier.
+	goldenHashRichConfig = "941a0679fef814e2030e8736d32983fbd6ec5674d3ebd6021cf1bfa17de6a595"
+)
+
+// goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
+// exercises a representative policy-semantic cross-section: the API
+// allowlist, SSRF internal CIDRs, trusted domains, fetch/forward/
+// websocket/reverse proxy enforcement-relevant fields (NOT listen /
+// upstream addresses, which are noise), DLP patterns including the
+// include_defaults toggle, response scanning with exempt_domains, MCP
+// input/tool scanning, MCP session binding, MCP tool policy with
+// rules and patterns, kill switch with an API token, cross-request
+// detection with entropy + fragment trackers, scan API auth + kinds,
+// taint with protected paths + trust overrides, and mediation envelope
+// with signed_components.
+//
+// Fixture 3 (invariant-under-allowlist-order) reverses the set-like
+// slices that policySemanticView explicitly canonicalises today
+// (api_allowlist, internal, trusted_domains) to verify sortedCopy
+// still collapses the two onto the same hash. Fixture 4
+// (invariant-under-ops-fields) swaps representative noise-only fields
+// (listen addresses, logging, emit destinations, sentry, license,
+// envelope key path, flight recorder dir, agents map) to verify those
+// are zeroed by policySemanticView.
+const goldenRichYAML = `version: 1
+mode: balanced
+enforce: true
+
+api_allowlist:
+  - api.anthropic.com
+  - api.openai.com
+  - api.example.internal
+
+internal:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+
+trusted_domains:
+  - trusted.example.com
+  - internal.example.com
+
+fetch_proxy:
+  listen: "127.0.0.1:8888"
+  timeout_seconds: 30
+  max_response_mb: 10
+  user_agent: "Pipelock/test"
+  monitoring:
+    max_url_length: 2048
+    entropy_threshold: 4.5
+    subdomain_entropy_threshold: 4.0
+    max_requests_per_minute: 60
+    blocklist:
+      - "*.pastebin.com"
+      - "*.hastebin.com"
+
+forward_proxy:
+  enabled: true
+  max_tunnel_seconds: 300
+  idle_timeout_seconds: 120
+  sni_verification: true
+
+websocket_proxy:
+  enabled: false
+
+reverse_proxy:
+  enabled: false
+
+dlp:
+  include_defaults: true
+  patterns:
+    - name: "Custom Secret"
+      regex: "CUSTOM-[A-Z0-9]{16}"
+      severity: "high"
+
+response_scanning:
+  enabled: true
+  action: "warn"
+  exempt_domains:
+    - allowlisted.example.com
+
+mcp_input_scanning:
+  enabled: true
+  action: "block"
+  on_parse_error: "block"
+
+mcp_tool_scanning:
+  enabled: true
+  action: "warn"
+  detect_drift: true
+
+mcp_session_binding:
+  enabled: true
+  unknown_tool_action: "block"
+  no_baseline_action: "warn"
+
+mcp_tool_policy:
+  enabled: true
+  action: "warn"
+  rules:
+    - name: "block-dangerous-writes"
+      tool_pattern: "^write_.*$"
+      arg_pattern: "^/etc/.*"
+      action: "block"
+
+kill_switch:
+  enabled: true
+  api_token: "test-token-XXXX"
+
+metrics_listen: "127.0.0.1:19090"
+
+cross_request_detection:
+  enabled: true
+  entropy_budget:
+    enabled: true
+    bits_per_window: 256
+    window_minutes: 60
+  fragment_reassembly:
+    enabled: true
+    max_buffer_bytes: 4096
+    window_minutes: 5
+
+scan_api:
+  listen: "127.0.0.1:19091"
+  auth:
+    bearer_tokens:
+      - "scan-api-token-1"
+  kinds:
+    url: true
+    dlp: true
+    prompt_injection: true
+    tool_call: true
+  rate_limit:
+    requests_per_minute: 60
+    burst: 10
+  max_body_bytes: 65536
+  timeouts:
+    read: "2s"
+    write: "2s"
+    scan: "1s"
+
+taint:
+  enabled: true
+  policy: "balanced"
+  protected_paths:
+    - "/etc/**"
+    - "/root/**"
+  elevated_paths:
+    - "/home/**"
+  trust_overrides:
+    - scope: "action"
+      action_match: "read"
+      expires_at: 2030-01-01T00:00:00Z
+      granted_by: "operator@example.com"
+      reason: "routine telemetry read"
+
+mediation_envelope:
+  enabled: true
+  sign: false
+  signed_components:
+    - "@method"
+    - "@target-uri"
+    - "@authority"
+
+logging:
+  format: "json"
+  output: "stdout"
+  include_allowed: false
+  include_blocked: true
+`
+
+// goldenRichYAMLReversedSlices is goldenRichYAML with the set-like
+// slices that policySemanticView currently canonicalises
+// (api_allowlist, internal, trusted_domains) reversed.
+// sortedCopy must collapse these onto the same hash as goldenRichYAML.
+const goldenRichYAMLReversedSlices = `version: 1
+mode: balanced
+enforce: true
+
+api_allowlist:
+  - api.example.internal
+  - api.openai.com
+  - api.anthropic.com
+
+internal:
+  - 192.168.0.0/16
+  - 172.16.0.0/12
+  - 10.0.0.0/8
+
+trusted_domains:
+  - internal.example.com
+  - trusted.example.com
+
+fetch_proxy:
+  listen: "127.0.0.1:8888"
+  timeout_seconds: 30
+  max_response_mb: 10
+  user_agent: "Pipelock/test"
+  monitoring:
+    max_url_length: 2048
+    entropy_threshold: 4.5
+    subdomain_entropy_threshold: 4.0
+    max_requests_per_minute: 60
+    blocklist:
+      - "*.pastebin.com"
+      - "*.hastebin.com"
+
+forward_proxy:
+  enabled: true
+  max_tunnel_seconds: 300
+  idle_timeout_seconds: 120
+  sni_verification: true
+
+websocket_proxy:
+  enabled: false
+
+reverse_proxy:
+  enabled: false
+
+dlp:
+  include_defaults: true
+  patterns:
+    - name: "Custom Secret"
+      regex: "CUSTOM-[A-Z0-9]{16}"
+      severity: "high"
+
+response_scanning:
+  enabled: true
+  action: "warn"
+  exempt_domains:
+    - allowlisted.example.com
+
+mcp_input_scanning:
+  enabled: true
+  action: "block"
+  on_parse_error: "block"
+
+mcp_tool_scanning:
+  enabled: true
+  action: "warn"
+  detect_drift: true
+
+mcp_session_binding:
+  enabled: true
+  unknown_tool_action: "block"
+  no_baseline_action: "warn"
+
+mcp_tool_policy:
+  enabled: true
+  action: "warn"
+  rules:
+    - name: "block-dangerous-writes"
+      tool_pattern: "^write_.*$"
+      arg_pattern: "^/etc/.*"
+      action: "block"
+
+kill_switch:
+  enabled: true
+  api_token: "test-token-XXXX"
+
+metrics_listen: "127.0.0.1:19090"
+
+cross_request_detection:
+  enabled: true
+  entropy_budget:
+    enabled: true
+    bits_per_window: 256
+    window_minutes: 60
+  fragment_reassembly:
+    enabled: true
+    max_buffer_bytes: 4096
+    window_minutes: 5
+
+scan_api:
+  listen: "127.0.0.1:19091"
+  auth:
+    bearer_tokens:
+      - "scan-api-token-1"
+  kinds:
+    url: true
+    dlp: true
+    prompt_injection: true
+    tool_call: true
+  rate_limit:
+    requests_per_minute: 60
+    burst: 10
+  max_body_bytes: 65536
+  timeouts:
+    read: "2s"
+    write: "2s"
+    scan: "1s"
+
+taint:
+  enabled: true
+  policy: "balanced"
+  protected_paths:
+    - "/etc/**"
+    - "/root/**"
+  elevated_paths:
+    - "/home/**"
+  trust_overrides:
+    - scope: "action"
+      action_match: "read"
+      expires_at: 2030-01-01T00:00:00Z
+      granted_by: "operator@example.com"
+      reason: "routine telemetry read"
+
+mediation_envelope:
+  enabled: true
+  sign: false
+  signed_components:
+    - "@method"
+    - "@target-uri"
+    - "@authority"
+
+logging:
+  format: "json"
+  output: "stdout"
+  include_allowed: false
+  include_blocked: true
+`
+
+// goldenRichYAMLWithOpsFieldsChanged is goldenRichYAML with
+// representative noise-only fields swapped. policySemanticView must
+// zero these so the hash stays equal to goldenHashRichConfig:
+//
+//   - fetch_proxy.listen (different port)
+//   - reverse_proxy.listen and reverse_proxy.upstream
+//   - metrics_listen (different port)
+//   - logging.output, logging.format, logging.file, logging.include_allowed
+//   - emit.webhook.url and severity routing
+//   - sentry.dsn, environment, and debug flag
+//   - flight_recorder.dir (operational path)
+//   - mediation_envelope.signing_key_path (different path)
+//   - license_key (not in policy surface)
+//   - agents map (resolved per-agent, not in the global view)
+//
+// If any of these flip the hash, policySemanticView is under-zeroing.
+const goldenRichYAMLWithOpsFieldsChanged = `version: 1
+mode: balanced
+enforce: true
+
+api_allowlist:
+  - api.anthropic.com
+  - api.openai.com
+  - api.example.internal
+
+internal:
+  - 10.0.0.0/8
+  - 172.16.0.0/12
+  - 192.168.0.0/16
+
+trusted_domains:
+  - trusted.example.com
+  - internal.example.com
+
+fetch_proxy:
+  listen: "127.0.0.1:28888"
+  timeout_seconds: 30
+  max_response_mb: 10
+  user_agent: "Pipelock/test"
+  monitoring:
+    max_url_length: 2048
+    entropy_threshold: 4.5
+    subdomain_entropy_threshold: 4.0
+    max_requests_per_minute: 60
+    blocklist:
+      - "*.pastebin.com"
+      - "*.hastebin.com"
+
+forward_proxy:
+  enabled: true
+  max_tunnel_seconds: 300
+  idle_timeout_seconds: 120
+  sni_verification: true
+
+websocket_proxy:
+  enabled: false
+
+reverse_proxy:
+  enabled: false
+  listen: "127.0.0.1:28990"
+  upstream: "http://127.0.0.1:28991"
+
+dlp:
+  include_defaults: true
+  patterns:
+    - name: "Custom Secret"
+      regex: "CUSTOM-[A-Z0-9]{16}"
+      severity: "high"
+
+response_scanning:
+  enabled: true
+  action: "warn"
+  exempt_domains:
+    - allowlisted.example.com
+
+mcp_input_scanning:
+  enabled: true
+  action: "block"
+  on_parse_error: "block"
+
+mcp_tool_scanning:
+  enabled: true
+  action: "warn"
+  detect_drift: true
+
+mcp_session_binding:
+  enabled: true
+  unknown_tool_action: "block"
+  no_baseline_action: "warn"
+
+mcp_tool_policy:
+  enabled: true
+  action: "warn"
+  rules:
+    - name: "block-dangerous-writes"
+      tool_pattern: "^write_.*$"
+      arg_pattern: "^/etc/.*"
+      action: "block"
+
+kill_switch:
+  enabled: true
+  api_token: "test-token-XXXX"
+
+metrics_listen: "127.0.0.1:39090"
+
+cross_request_detection:
+  enabled: true
+  entropy_budget:
+    enabled: true
+    bits_per_window: 256
+    window_minutes: 60
+  fragment_reassembly:
+    enabled: true
+    max_buffer_bytes: 4096
+    window_minutes: 5
+
+scan_api:
+  listen: "127.0.0.1:19091"
+  auth:
+    bearer_tokens:
+      - "scan-api-token-1"
+  kinds:
+    url: true
+    dlp: true
+    prompt_injection: true
+    tool_call: true
+  rate_limit:
+    requests_per_minute: 60
+    burst: 10
+  max_body_bytes: 65536
+  timeouts:
+    read: "2s"
+    write: "2s"
+    scan: "1s"
+
+taint:
+  enabled: true
+  policy: "balanced"
+  protected_paths:
+    - "/etc/**"
+    - "/root/**"
+  elevated_paths:
+    - "/home/**"
+  trust_overrides:
+    - scope: "action"
+      action_match: "read"
+      expires_at: 2030-01-01T00:00:00Z
+      granted_by: "operator@example.com"
+      reason: "routine telemetry read"
+
+mediation_envelope:
+  enabled: true
+  sign: false
+  signed_components:
+    - "@method"
+    - "@target-uri"
+    - "@authority"
+  signing_key_path: "/etc/pipelock/envelope.key"
+
+logging:
+  format: "text"
+  output: "file"
+  file: "/var/log/pipelock/test.log"
+  include_allowed: true
+  include_blocked: true
+
+emit:
+  webhook:
+    url: "https://events.example.com/pipelock"
+    min_severity: "critical"
+
+sentry:
+  dsn: "https://public@example.com/1"
+  environment: "staging"
+  debug: true
+
+flight_recorder:
+  enabled: false
+  dir: "/var/lib/pipelock/fr"
+
+license_key: "test-license-key-XXXX"
+
+agents:
+  reviewer:
+    mode: "strict"
+`
+
+// loadGoldenConfig writes yamlSrc to a temp file, loads it through the
+// full Load pipeline, and returns the resulting Config. Load already
+// parses, applies defaults, validates, and warms the canonical hash
+// cache before returning; these tests call computeCanonicalPolicyHash
+// explicitly so they exercise the uncached value on that loaded
+// snapshot. Failure here means the fixture itself is invalid, not a
+// hash drift - treat it as a test-infra bug, not a production
+// regression.
+func loadGoldenConfig(t *testing.T, yamlSrc string) *Config {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "golden.yaml")
+	if err := os.WriteFile(path, []byte(yamlSrc), 0o600); err != nil {
+		t.Fatalf("write golden yaml: %v", err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load golden yaml: %v", err)
+	}
+	return cfg
+}
+
+// TestCanonicalPolicyHash_GoldenDefaults pins the canonical hash of
+// the out-of-the-box Defaults() config. Any drift in this value after
+// a refactor means Defaults() or a component of policySemanticView
+// shifted. For the TD-2b mechanical split this MUST stay byte-stable.
+func TestCanonicalPolicyHash_GoldenDefaults(t *testing.T) {
+	t.Parallel()
+	cfg := Defaults()
+	cfg.ApplyDefaults()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Defaults() must validate: %v", err)
+	}
+	got := cfg.computeCanonicalPolicyHash()
+	if got != goldenHashDefaults {
+		t.Errorf("Defaults() canonical hash drifted.\n  want %s\n  got  %s\n\nIf this is an intentional policy-semantics change, update goldenHashDefaults and document the bump in the PR body.", goldenHashDefaults, got)
+	}
+}
+
+// TestCanonicalPolicyHash_GoldenRichConfig pins the hash for the rich
+// YAML fixture. This is the hash any mechanical refactor of the
+// config package MUST preserve.
+func TestCanonicalPolicyHash_GoldenRichConfig(t *testing.T) {
+	t.Parallel()
+	cfg := loadGoldenConfig(t, goldenRichYAML)
+	got := cfg.computeCanonicalPolicyHash()
+	if got != goldenHashRichConfig {
+		t.Errorf("rich-config canonical hash drifted.\n  want %s\n  got  %s\n\nIf this is an intentional policy-semantics change, update goldenHashRichConfig and document the bump in the PR body.", goldenHashRichConfig, got)
+	}
+}
+
+// TestCanonicalPolicyHash_NewToolAdmissionVocabularyGolden pins the legacy
+// JSON key and warn|block representation used for the renamed
+// new_tool_admission operator vocabulary. Alias-equality tests alone cannot
+// catch a coordinated mapping change, so these fixed digests pin both values.
+func TestCanonicalPolicyHash_NewToolAdmissionVocabularyGolden(t *testing.T) {
+	tests := []struct {
+		name      string
+		admission string
+		wantHash  string
+	}{
+		// These fixtures inherit the default credential audiences and sensitive
+		// headers, including Api-Key. The hashes include the structured Discord
+		// Gateway carrier, the publisher SDK Together host and the JWT sign-in
+		// bearer carrier, matching the default and rich-config goldens above.
+		// They inherit the RFC 9110 default URI limit of 8000 octets.
+		{name: "admit remains warn", admission: NewToolAdmit, wantHash: "ba2cd65c3708db0faa29ce29a9c82015e0b6a7cb499849d26b6f2b24f1394f67"},
+		{name: "withhold remains block", admission: NewToolWithhold, wantHash: "4679f249c6c0852349f58617b5773094ca364da0a67a3637499f0c4f17d94f0d"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := loadGoldenConfig(t, "mcp_tool_scanning:\n  enabled: true\n  action: warn\n  detect_drift: true\n  new_tool_admission: "+tt.admission+"\n")
+			if got := cfg.computeCanonicalPolicyHash(); got != tt.wantHash {
+				t.Errorf("new-tool admission canonical hash drifted: want %s, got %s", tt.wantHash, got)
+			}
+		})
+	}
+}
+
+// TestCanonicalPolicyHash_GoldenInvariantUnderAllowlistOrder verifies
+// that reversing every set-like slice (api_allowlist, internal,
+// trusted_domains) in the rich fixture produces the SAME hash. Proves
+// sortedCopy canonicalisation inside policySemanticView is still
+// running after the TD-2b split.
+func TestCanonicalPolicyHash_GoldenInvariantUnderAllowlistOrder(t *testing.T) {
+	t.Parallel()
+	cfg := loadGoldenConfig(t, goldenRichYAMLReversedSlices)
+	got := cfg.computeCanonicalPolicyHash()
+	if got != goldenHashRichConfig {
+		t.Errorf("allowlist-order invariance broken.\n  want %s (rich-config golden)\n  got  %s\n\nEither sortedCopy is not being invoked on one of api_allowlist/internal/trusted_domains, or the slice was re-classified as behavioral ordering.", goldenHashRichConfig, got)
+	}
+}
+
+// TestCanonicalPolicyHash_GoldenInvariantUnderOpsFields verifies that
+// swapping every "noise-only" field in the rich fixture produces the
+// SAME hash. Proves policySemanticView is still zeroing operational
+// plumbing (listen addresses, logging, license, envelope key path,
+// flight recorder dir, agents map).
+//
+// If this test drifts, policySemanticView is under-zeroing - a noise
+// field is leaking into ph, and every deployment that touches that
+// field would emit receipts with a different hash despite having
+// identical effective policy.
+func TestCanonicalPolicyHash_GoldenInvariantUnderOpsFields(t *testing.T) {
+	t.Parallel()
+	cfg := loadGoldenConfig(t, goldenRichYAMLWithOpsFieldsChanged)
+	got := cfg.computeCanonicalPolicyHash()
+	if got != goldenHashRichConfig {
+		t.Errorf("ops-field invariance broken.\n  want %s (rich-config golden)\n  got  %s\n\nA field in policySemanticView is not being zeroed. Check the field list in canonical.go:policySemanticView against the ops-field swap set in goldenRichYAMLWithOpsFieldsChanged.", goldenHashRichConfig, got)
+	}
+}
+
+func TestCanonicalPolicyHash_ListenerDriftResetFileIsOperational(t *testing.T) {
+	base := Defaults()
+	withResetFile := Defaults()
+	withResetFile.MCPToolScanning.ListenerDriftResetFile = "/run/pipelock/mcp-tool-drift.reset"
+
+	if got, want := withResetFile.computeCanonicalPolicyHash(), base.computeCanonicalPolicyHash(); got != want {
+		t.Fatalf("listener drift reset file changed canonical policy hash: got %s, want %s", got, want)
+	}
+}
+
+// TestCanonicalPolicyHash_UnscannablePassthrough exercises the canonical
+// serialization + sort of unscannable_passthrough entries (so the policy hash
+// binds them) and the deep-copy clone path. Entries are supplied unsorted and
+// differ in each sort key so the canonical comparator branches all run.
+func TestCanonicalPolicyHash_UnscannablePassthrough(t *testing.T) {
+	// Read the clock ONCE and derive the second date from the first. Two
+	// independent calls can straddle a UTC midnight and return the same day,
+	// which silently removes the distinct Expires value this sort test exists
+	// to exercise.
+	expires := temporaryExpiryDate(MaxUnscannablePassthroughHorizon)
+	expiresAt, err := time.Parse(time.DateOnly, expires)
+	if err != nil {
+		t.Fatalf("parse generated expiry %q: %v", expires, err)
+	}
+	laterExpires := expiresAt.AddDate(0, 0, -1).Format(time.DateOnly)
+	if laterExpires == expires {
+		t.Fatalf("derived expiry %q equals %q; the sort test needs two distinct values", laterExpires, expires)
+	}
+	entries := []UnscannablePassthroughEntry{
+		{Host: "b.example.com", Paths: []string{"/z.bin"}, ContentTypes: []string{"application/octet-stream"}, Reason: "r2", Added: "2026-02-01", Expires: expires},
+		{Host: "a.example.com", Paths: []string{"/x.bin"}, ContentTypes: []string{"application/octet-stream"}, Reason: "r1", Added: "2026-01-01", Expires: expires},
+		{Host: "a.example.com", Paths: []string{"/y.bin"}, ContentTypes: []string{"application/octet-stream"}, Reason: "r1", Added: "2026-01-01", Expires: expires},
+		{Host: "a.example.com", Paths: []string{"/x.bin"}, ContentTypes: []string{"application/zip"}, Reason: "r1", Added: "2026-01-01", Expires: expires},
+		{Host: "a.example.com", Paths: []string{"/x.bin"}, ContentTypes: []string{"application/octet-stream"}, Reason: "r3", Added: "2026-01-01", Expires: expires},
+		{Host: "a.example.com", Paths: []string{"/x.bin"}, ContentTypes: []string{"application/octet-stream"}, Reason: "r1", Added: "2026-03-01", Expires: expires},
+		{Host: "a.example.com", Paths: []string{"/x.bin"}, ContentTypes: []string{"application/octet-stream"}, Reason: "r1", Added: "2026-01-01", Expires: laterExpires},
+	}
+
+	withPT := Defaults()
+	withPT.ResponseScanning.UnscannablePassthrough = append([]UnscannablePassthroughEntry(nil), entries...)
+	hWith := withPT.CanonicalPolicyHash()
+
+	base := Defaults()
+	hBase := base.CanonicalPolicyHash()
+	if hWith == hBase {
+		t.Fatal("unscannable_passthrough entries must change the canonical policy hash")
+	}
+
+	// Order invariance: the same entries in a different input order must
+	// canonicalize to the same hash.
+	shuffled := Defaults()
+	rev := make([]UnscannablePassthroughEntry, len(entries))
+	for i, e := range entries {
+		rev[len(entries)-1-i] = e
+	}
+	shuffled.ResponseScanning.UnscannablePassthrough = rev
+	if got := shuffled.CanonicalPolicyHash(); got != hWith {
+		t.Fatalf("passthrough hash is order-sensitive: %s vs %s", got, hWith)
+	}
+
+	// Clone must deep-copy the passthrough slice (and its nested slices) so a
+	// runtime caller cannot alias back into the loaded config.
+	clone := withPT.Clone()
+	if len(clone.ResponseScanning.UnscannablePassthrough) != len(entries) {
+		t.Fatalf("clone dropped passthrough entries: got %d want %d", len(clone.ResponseScanning.UnscannablePassthrough), len(entries))
+	}
+	clone.ResponseScanning.UnscannablePassthrough[0].Paths[0] = "/mutated"
+	clone.ResponseScanning.UnscannablePassthrough[0].Host = "mutated.example.com"
+	if withPT.CanonicalPolicyHash() != hWith {
+		t.Fatal("mutating the clone aliased back into the source config")
+	}
+}

@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+# Copyright 2026 Pipelock contributors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Structural tests for the advisory example and installation verification."""
+
+import ast
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github" / "workflows" / "example-verification.yaml"
+RUNNER = ROOT / "scripts" / "verify-examples.sh"
+
+
+def event_paths(workflow: str, event: str) -> list[str]:
+    marker = f"  {event}:\n"
+    start = workflow.index(marker) + len(marker)
+    next_event = re.search(r"(?m)^  [a-z_]+:\n", workflow[start:])
+    block = workflow[start:] if next_event is None else workflow[start : start + next_event.start()]
+    paths_start = block.index("    paths:\n") + len("    paths:\n")
+    paths = []
+    for line in block[paths_start:].splitlines():
+        if not line.startswith("      - "):
+            break
+        paths.append(line.removeprefix("      - ").strip("'"))
+    return paths
+
+
+class ExampleVerificationWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.runner = RUNNER.read_text(encoding="utf-8")
+
+    def test_every_shipped_verifier_is_in_the_runner_contract(self):
+        example_scripts = sorted(ROOT.glob("examples/*/verify.sh"))
+        self.assertEqual(len(example_scripts), 18)
+        self.assertIn("find \"$ROOT_DIR/examples\"", self.runner)
+        self.assertIn("-name verify.sh", self.runner)
+        for path in sorted((ROOT / "scripts" / "e2e").glob("*-install.sh")):
+            self.assertIn(f'run_case "{path.relative_to(ROOT)}"', self.runner)
+        for path in sorted((ROOT / "scripts" / "e2e").glob("*-mcp-runtime.py")):
+            self.assertIn(f'run_case "{path.relative_to(ROOT)}"', self.runner)
+
+    def test_make_target_is_the_workflow_entrypoint(self):
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        self.assertIn("verify-examples: build\n", makefile)
+        self.assertIn("scripts.test_e2e_hermetic scripts.test_example_verification_workflow", makefile)
+        self.assertIn('./scripts/verify-examples.sh', makefile)
+        self.assertIn("run: make verify-examples", self.workflow)
+
+    def test_browser_regressions_reuse_the_existing_runtime_and_fail_visibly(self):
+        start = self.workflow.index("      - name: Browser reproduction regressions against the built candidate\n")
+        end = self.workflow.index("      - name: Report verification result\n", start)
+        block = self.workflow[start:end]
+        self.assertLess(self.workflow.index("      - name: Set up Node.js\n"), start)
+        self.assertLess(self.workflow.index("run: make verify-examples"), start)
+        self.assertIn("node-version: '24'", self.workflow[:start])
+        self.assertIn("set -euo pipefail", block)
+        self.assertIn('PIPELOCK_BROWSER_TEST_BIN="$PWD/pipelock"', block)
+        self.assertIn("python3 -m unittest discover -s scripts/e2e/browser_repro -p 'test_*.py'", block)
+        self.assertIn("node --check scripts/e2e/browser_repro/driver.mjs", block)
+        self.assertIn("node --test scripts/e2e/browser_repro/test_contracts.mjs", block)
+        self.assertNotIn("continue-on-error", block)
+        self.assertNotIn("uses:", block)
+        self.assertNotIn("secrets.", block)
+        self.assertNotIn("make build", block)
+        self.assertNotIn("go build", block)
+
+    def test_push_and_pull_request_filters_match(self):
+        push_paths = event_paths(self.workflow, "push")
+        pull_request_paths = event_paths(self.workflow, "pull_request")
+        self.assertEqual(push_paths, pull_request_paths)
+        self.assertIn("examples/**", push_paths)
+        self.assertIn("scripts/e2e/**", push_paths)
+        self.assertIn("scripts/ci_process_supervisor.py", push_paths)
+        self.assertIn("internal/**", push_paths)
+        self.assertIn("scripts/test_e2e_hermetic.py", push_paths)
+        self.assertIn("scripts/test_example_verification_workflow.py", push_paths)
+        self.assertNotIn("docs/**", push_paths)
+
+    def test_verification_failure_is_visible_and_job_does_not_claim_otherwise(self):
+        # The job fails on purpose so failures are visible. Assert the durable
+        # intent rather than the exact warning prose: the failure must surface,
+        # and the job must not describe itself as something that cannot fail,
+        # because a name promising one thing while the step does another is how
+        # a check ends up in branch protection by mistake.
+        verify_job = self.workflow[self.workflow.index("  verify:\n") :]
+        self.assertEqual(verify_job.count("continue-on-error: true"), 1)
+        self.assertIn("id: verification", verify_job)
+        self.assertIn("VERIFICATION_OUTCOME: ${{ steps.verification.outcome }}", verify_job)
+        self.assertIn("must not be added to branch protection", verify_job)
+        self.assertIn("exit 1", verify_job)
+        job_name = next(
+            line for line in verify_job.splitlines() if line.strip().startswith("name:")
+        )
+        self.assertNotIn("report-only", job_name.lower())
+
+    def test_skips_are_counted_separately_from_passes(self):
+        self.assertIn("/^SKIP: [0-9]+$/", self.runner)
+        self.assertIn('RESULT: SKIP', self.runner)
+        self.assertIn("Skipped checks (not covered by this run)", self.runner)
+        for path in (
+            ROOT / "scripts" / "e2e" / "cline-mcp-runtime.py",
+            ROOT / "scripts" / "e2e" / "opencode-mcp-runtime.py",
+            ROOT / "examples" / "docker-compose-proxy" / "verify.sh",
+        ):
+            body = path.read_text(encoding="utf-8")
+            self.assertIn('SKIP: ', body, path)
+
+    def test_missing_npx_is_an_explicit_runtime_skip(self):
+        env = os.environ.copy()
+        env["PATH"] = ""
+        env["PIPELOCK_E2E_LIVE_UPSTREAM"] = "1"
+        for path in sorted((ROOT / "scripts" / "e2e").glob("*-mcp-runtime.py")):
+            result = subprocess.run(
+                [sys.executable, str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(result.returncode, 0, (path, result.stderr))
+            self.assertIn("SKIP: runtime MCP E2E (npx is not available)", result.stdout)
+            self.assertRegex(result.stdout, r"(?m)^PASS: 0$")
+            self.assertRegex(result.stdout, r"(?m)^FAIL: 0$")
+            self.assertRegex(result.stdout, r"(?m)^SKIP: 1$")
+
+    def test_missing_npm_is_an_explicit_runtime_skip(self):
+        with tempfile.TemporaryDirectory() as bindir:
+            npx = Path(bindir) / "npx"
+            npx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            npx.chmod(0o700)
+            env = os.environ.copy()
+            env["PATH"] = bindir
+            env["PIPELOCK_E2E_LIVE_UPSTREAM"] = "1"
+            for path in sorted((ROOT / "scripts" / "e2e").glob("*-mcp-runtime.py")):
+                result = subprocess.run(
+                    [sys.executable, str(path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, (path, result.stderr))
+                self.assertIn("SKIP: runtime MCP E2E (npm is not available)", result.stdout)
+                self.assertRegex(result.stdout, r"(?m)^PASS: 0$")
+                self.assertRegex(result.stdout, r"(?m)^FAIL: 0$")
+                self.assertRegex(result.stdout, r"(?m)^SKIP: 1$")
+
+    def test_runtime_warmups_fetch_without_starting_the_mcp_server(self):
+        for path in sorted((ROOT / "scripts" / "e2e").glob("*-mcp-runtime.py")):
+            body = path.read_text(encoding="utf-8")
+            tree = ast.parse(body)
+            warm_node = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "warm_upstream_package"
+            )
+            main_node = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "main"
+            )
+            warm_body = ast.get_source_segment(body, warm_node)
+            main_body = ast.get_source_segment(body, main_node)
+            self.assertIsNotNone(warm_body, path)
+            self.assertIsNotNone(main_body, path)
+            self.assertIn('"npm", "exec", "--yes"', warm_body, path)
+            self.assertIn('f"--package={EVERYTHING_PACKAGE}"', warm_body, path)
+            self.assertIn('"--", "node", "--version"', warm_body, path)
+            self.assertNotIn('EVERYTHING_PACKAGE, "--version"', warm_body, path)
+            self.assertIn("timeout=60", warm_body, path)
+            self.assertIn("check=True", warm_body, path)
+            self.assertIn('print("SKIP: 1")', warm_body, path)
+            self.assertIn("return False", warm_body, path)
+            sequence = (
+                main_body.index("run_install("),
+                main_body.index("if not warm_upstream_package(runtime_env):"),
+                main_body.index("proc = subprocess.Popen("),
+            )
+            self.assertEqual(
+                sequence,
+                tuple(sorted(sequence)),
+                path,
+            )
+
+    def test_quickstart_runs_the_binary_built_from_this_tree(self):
+        self.assertIn('local go_binary="${PIPELOCK_VERIFY_GO:-go}"', self.runner)
+        self.assertIn('CGO_ENABLED=0 "$go_binary" build -trimpath', self.runner)
+        self.assertIn("internal/cliutil.GitCommit=$expected_commit", self.runner)
+        self.assertEqual(self.runner.count('"%s:/pipelock:ro,Z"'), 2)
+        self.assertIn("PIPELOCK_VERIFY_COMMIT", self.runner)
+        quickstart = (ROOT / "examples" / "quickstart" / "verify.sh").read_text(encoding="utf-8")
+        self.assertIn('grep -Fq "git commit: $PIPELOCK_VERIFY_COMMIT"', quickstart)
+
+    def test_actions_are_pinned_and_checkout_drops_credentials(self):
+        actions = re.findall(r"uses:\s+([^@\s]+)@([^\s]+)", self.workflow)
+        self.assertTrue(actions)
+        for action, revision in actions:
+            self.assertRegex(revision, r"^[0-9a-f]{40}$", action)
+        self.assertEqual(
+            self.workflow.count("persist-credentials: false"),
+            self.workflow.count("uses: actions/checkout@"),
+        )
+
+    def test_docker_preflight_does_not_bypass_verifier_skip_reporting(self):
+        self.assertNotIn("command -v docker", self.workflow)
+        self.assertNotIn("docker compose version", self.workflow)
+
+    def test_docker_hub_pulls_use_a_mirror_before_the_verifiers_run(self):
+        mirror_step = self.workflow.index("name: Pull Docker Hub images through a public mirror")
+        verifiers = self.workflow.index("name: Run shipped verification scripts")
+        self.assertLess(mirror_step, verifiers)
+        step = self.workflow[mirror_step:verifiers]
+        self.assertIn("https://mirror.gcr.io", step)
+        # Existing daemon settings are merged, not replaced, and a runner
+        # without Docker keeps the verifiers' own skip reporting.
+        self.assertIn('."registry-mirrors" // []', step)
+        self.assertIn("systemctl is-active --quiet docker", step)
+        self.assertIn("exit 0", step)
+        self.assertNotIn("continue-on-error", step)
+
+    def test_quickstart_blocks_require_status_and_named_reason(self):
+        # BusyBox wget hides headers on a 4xx, so the quickstart reads the raw
+        # response. Only a 403 header naming the expected check passes.
+        source = (ROOT / "examples" / "quickstart" / "verify.sh").read_text(encoding="utf-8")
+        function = re.search(r"^fetch_block\(\) \{.*?^\}$", source, re.M | re.S).group()
+        checks = source[source.index("# -- Test 3") : source.index("# -- Test 5")]
+        stub = (
+            "set -eu\nPIPELOCK_HOST=pipelock\nPIPELOCK_PORT=8888\n"
+            "ATTACKER=http://attacker:9999\n"
+            "pass() { echo PASS; }\nfail() { echo FAIL; }\nstep() { :; }\n"
+            "sleep() { :; }\nnc() { printf '%b' \"$CANNED\"; }\n"
+        )
+        head = "HTTP/1.1 403 Forbidden\\r\\n"
+        cases = {
+            "dlp": (head + "X-Pipelock-Block-Reason: dlp_match\\r\\n"
+                    "X-Pipelock-Block-Reason-Layer: core_dlp\\r\\n\\r\\n{}", "PASS FAIL"),
+            "injection": (head + "X-Pipelock-Block-Reason: prompt_injection\\r\\n\\r\\n{}",
+                          "FAIL PASS"),
+            "unrelated 403": (head + "X-Pipelock-Block-Reason: parse_error\\r\\n\\r\\n{}",
+                              "FAIL FAIL"),
+            "near-miss reason": (head + "X-Pipelock-Block-Reason: dlp_match_extra\\r\\n\\r\\n",
+                                 "FAIL FAIL"),
+            "reason only in body": (head + "\\r\\nX-Pipelock-Block-Reason: dlp_match\\r\\n",
+                                    "FAIL FAIL"),
+            "allowed": ("HTTP/1.1 200 OK\\r\\nX-Pipelock-Block-Reason: dlp_match\\r\\n\\r\\n",
+                        "FAIL FAIL"),
+            "no response": ("", "FAIL FAIL"),
+            "truncated headers": (head + "X-Pipelock-Block-Reason: dlp_match\\r\\n",
+                                  "FAIL FAIL"),
+            "invalid status code": ("HTTP/1.1 4030 Invalid\\r\\n"
+                                    "X-Pipelock-Block-Reason: dlp_match\\r\\n\\r\\n",
+                                    "FAIL FAIL"),
+        }
+        for name, (canned, want) in cases.items():
+            with self.subTest(case=name):
+                result = subprocess.run(
+                    ["sh", "-c", stub + function + "\n" + checks],
+                    capture_output=True, text=True, timeout=10, check=False,
+                    env={**os.environ, "CANNED": canned},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(" ".join(result.stdout.split()), want)
+
+
+if __name__ == "__main__":
+    unittest.main()

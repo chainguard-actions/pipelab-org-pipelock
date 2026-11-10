@@ -1,0 +1,309 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package cli
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/proxyhealth"
+)
+
+type statusReport struct {
+	ConfigurationSource string                 `json:"configuration_source,omitempty"`
+	Identity            *proxyhealth.Identity  `json:"identity,omitempty"`
+	ConfigFile          string                 `json:"config_file"`
+	Version             string                 `json:"version"`
+	Mode                string                 `json:"mode"`
+	Enforce             bool                   `json:"enforce"`
+	Listeners           []statusListener       `json:"listeners"`
+	Scanners            []statusScanner        `json:"scanners"`
+	License             statusLicense          `json:"license"`
+	KillSwitch          statusKillSwitchReport `json:"kill_switch"`
+}
+
+type statusListener struct {
+	Name    string `json:"name"`
+	Listen  string `json:"listen,omitempty"`
+	Enabled bool   `json:"enabled"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+type statusScanner struct {
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	Action  string `json:"action,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+type statusLicense struct {
+	State   string `json:"state"`
+	ID      string `json:"id,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+	Warning string `json:"warning,omitempty"`
+}
+
+type statusKillSwitchReport struct {
+	Active  bool            `json:"active"`
+	Sources map[string]bool `json:"sources"`
+	Detail  string          `json:"detail,omitempty"`
+}
+
+func statusCmd() *cobra.Command {
+	var configFile string
+	var jsonOutput bool
+	var identityURL, identityAgent string
+
+	cmd := &cobra.Command{
+		Use:   "status",
+		Short: "Print read-only effective Pipelock state",
+		Long: `Print a read-only summary of the effective local configuration: mode,
+listeners, scanner switches, license state, and kill-switch sources. This
+command loads config and stats any configured kill-switch sentinel file, but it
+does not mutate runtime state. By default it does not contact the proxy.
+--identity-url adds a live caller-only identity probe of that listener; all
+other fields describe the local configuration, not loaded runtime state.`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, cfgLabel, err := explainLoadConfig(configFile)
+			if err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+			}
+			if identityAgent != "" && identityURL == "" {
+				return errors.New("--identity-agent requires --identity-url")
+			}
+			report := buildStatusReport(cfg, cfgLabel)
+			if identityURL != "" {
+				ctx, cancel := context.WithTimeout(cmd.Context(), 3*time.Second)
+				defer cancel()
+				transport := http.DefaultTransport.(*http.Transport).Clone()
+				transport.Proxy = nil // Connect to the chosen listener itself, as exec readiness does.
+				defer transport.CloseIdleConnections()
+				client := &http.Client{Transport: transport, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+				identity, err := proxyhealth.GetIdentity(ctx, client, identityURL, identityAgent)
+				if err != nil {
+					return err
+				}
+				report.Identity = identity
+				report.ConfigurationSource = "local-configuration"
+			}
+			if jsonOutput {
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				if err := enc.Encode(report); err != nil {
+					return fmt.Errorf("encode status report JSON: %w", err)
+				}
+				return nil
+			}
+			printStatusReport(cmd.OutOrStdout(), report)
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path (default: built-in defaults)")
+	cmd.Flags().StringVar(&identityURL, "identity-url", "", "probe live caller identity at this HTTP(S) listener origin")
+	cmd.Flags().StringVar(&identityAgent, "identity-agent", "", "optional self-declared X-Pipelock-Agent header for the live probe")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output report as JSON")
+	return cmd
+}
+
+func buildStatusReport(cfg *config.Config, cfgLabel string) statusReport {
+	ks := killswitch.New(cfg)
+	sources := ks.Sources()
+	return statusReport{
+		ConfigFile: cfgLabel,
+		Version:    cliutil.Version,
+		Mode:       cfg.Mode,
+		Enforce:    cfg.EnforceEnabled(),
+		Listeners:  statusListeners(cfg),
+		Scanners:   statusScanners(cfg),
+		License:    statusLicenseState(cfg, time.Now()),
+		KillSwitch: statusKillSwitchReport{
+			Active:  anyKillSwitchSource(sources),
+			Sources: sources,
+			Detail:  killSwitchDetail(cfg),
+		},
+	}
+}
+
+func statusListeners(cfg *config.Config) []statusListener {
+	listeners := []statusListener{
+		{Name: "fetch_proxy", Listen: cfg.FetchProxy.Listen, Enabled: cfg.FetchProxy.Listen != ""},
+		{Name: "forward_proxy", Listen: cfg.FetchProxy.Listen, Enabled: cfg.ForwardProxy.Enabled},
+		{Name: "websocket_proxy", Listen: cfg.FetchProxy.Listen, Enabled: cfg.WebSocketProxy.Enabled},
+		{Name: "metrics", Listen: cfg.MetricsListen, Enabled: cfg.MetricsListen != ""},
+		{Name: "kill_switch_api", Listen: cfg.KillSwitch.APIListen, Enabled: cfg.KillSwitch.APIListen != ""},
+		{Name: "scan_api", Listen: cfg.ScanAPI.Listen, Enabled: cfg.ScanAPI.Listen != ""},
+	}
+	listeners = append(listeners, statusListener{
+		Name:    "reverse_proxy",
+		Listen:  cfg.ReverseProxy.Listen,
+		Enabled: cfg.ReverseProxy.Enabled,
+		Detail:  cfg.ReverseProxy.Profile,
+	})
+	return listeners
+}
+
+func statusScanners(cfg *config.Config) []statusScanner {
+	enabledSeed := cfg.SeedPhraseDetection.Enabled == nil || *cfg.SeedPhraseDetection.Enabled
+	scanners := []statusScanner{
+		{Name: "url_scanning", Enabled: true, Action: modeAction(cfg), Detail: "scheme, CRLF, path traversal, allowlist/blocklist, SSRF, DLP, entropy, rate, budget"},
+		{Name: "dlp", Enabled: true, Action: modeAction(cfg), Detail: fmt.Sprintf("%d patterns; scan_env=%t", len(cfg.DLP.Patterns), cfg.DLP.ScanEnv)},
+		{Name: "core_dlp", Enabled: true, Action: config.ActionBlock, Detail: "immutable floor"},
+		{Name: "ssrf", Enabled: cfg.Internal != nil, Action: modeAction(cfg)},
+		{Name: "core_ssrf", Enabled: true, Action: config.ActionBlock, Detail: "immutable literal-IP floor"},
+		{Name: "response_scanning", Enabled: cfg.ResponseScanning.Enabled, Action: cfg.ResponseScanning.Action},
+		{Name: "request_body_scanning", Enabled: cfg.RequestBodyScanning.Enabled, Action: cfg.RequestBodyScanning.Action},
+		{Name: "mcp_input_scanning", Enabled: cfg.MCPInputScanning.Enabled, Action: cfg.MCPInputScanning.Action},
+		{Name: "mcp_tool_scanning", Enabled: cfg.MCPToolScanning.Enabled, Action: cfg.MCPToolScanning.Action},
+		{Name: "mcp_tool_policy", Enabled: cfg.MCPToolPolicy.Enabled, Action: cfg.MCPToolPolicy.Action},
+		{Name: "mcp_session_binding", Enabled: cfg.MCPSessionBinding.Enabled, Action: cfg.MCPSessionBinding.UnknownToolAction},
+		{Name: "mcp_binary_integrity", Enabled: cfg.MCPBinaryIntegrity.Enabled, Action: cfg.MCPBinaryIntegrity.Action},
+		{Name: "mcp_tool_provenance", Enabled: cfg.MCPToolProvenance.Enabled, Action: cfg.MCPToolProvenance.Action},
+		{Name: "a2a_scanning", Enabled: cfg.A2AScanning.Enabled, Action: cfg.A2AScanning.Action},
+		{Name: "address_protection", Enabled: cfg.AddressProtection.Enabled, Action: cfg.AddressProtection.Action},
+		{Name: "browser_shield", Enabled: cfg.BrowserShield.Enabled, Action: cfg.BrowserShield.OversizeAction},
+		{Name: "media_policy", Enabled: cfg.MediaPolicy.IsEnabled(), Action: config.ActionBlock},
+		{Name: "seed_phrase_detection", Enabled: enabledSeed, Action: modeAction(cfg)},
+		{Name: "file_sentry", Enabled: cfg.FileSentry.Enabled, Action: cfg.FileSentry.Action},
+		{Name: "git_protection", Enabled: cfg.GitProtection.Enabled, Action: config.ActionBlock},
+	}
+	return scanners
+}
+
+// modeAction reports the action runtime takes on an ordinary finding. Blocking
+// follows enforce alone; mode: audit does not change it.
+func modeAction(cfg *config.Config) string {
+	if !cfg.EnforceEnabled() {
+		return config.ActionWarn
+	}
+	return config.ActionBlock
+}
+
+func statusLicenseState(cfg *config.Config, now time.Time) statusLicense {
+	warning := license.ExpiryStatus(license.License{
+		ID:        cfg.LicenseID,
+		IssuedAt:  cfg.LicenseIssuedAt,
+		ExpiresAt: cfg.LicenseExpiresAt,
+		Tier:      cfg.LicenseTier,
+	}, now).Message()
+	switch {
+	case cfg.LicenseKey == "":
+		return statusLicense{State: "not_configured", Detail: "no enterprise license configured"}
+	case cfg.LicenseRevoked:
+		return statusLicense{State: "revoked", ID: cfg.LicenseID, Detail: cfg.LicenseRevocationReason}
+	case cfg.LicenseExpiresAt > 0 && now.Unix() >= cfg.LicenseExpiresAt:
+		return statusLicense{State: "expired", ID: cfg.LicenseID, Detail: time.Unix(cfg.LicenseExpiresAt, 0).UTC().Format(time.DateOnly)}
+	case cfg.LicenseAgentsFeature:
+		return statusLicense{State: "active", ID: cfg.LicenseID, Detail: "agents feature enabled", Warning: warning}
+	case cfg.LicenseID != "":
+		return statusLicense{State: "configured", ID: cfg.LicenseID, Detail: "license token loaded", Warning: warning}
+	default:
+		return statusLicense{State: "configured", Detail: "license token configured; verification status unavailable in this build"}
+	}
+}
+
+func anyKillSwitchSource(sources map[string]bool) bool {
+	for _, active := range sources {
+		if active {
+			return true
+		}
+	}
+	return false
+}
+
+func killSwitchDetail(cfg *config.Config) string {
+	parts := []string{
+		fmt.Sprintf("sentinel_file=%t", cfg.KillSwitch.SentinelFile != ""),
+		fmt.Sprintf("api_listen=%t", cfg.KillSwitch.APIListen != ""),
+		fmt.Sprintf("allowlist_ips=%d", len(cfg.KillSwitch.AllowlistIPs)),
+	}
+	return strings.Join(parts, ", ")
+}
+
+func printStatusReport(w io.Writer, report statusReport) {
+	_, _ = fmt.Fprintln(w, "Pipelock Status")
+	if report.Identity != nil {
+		id := report.Identity
+		_, _ = fmt.Fprintf(w, "Identity (loaded runtime; this request): grade=%s trusted=%t issuer_id_evidence_eligible=%t\n", id.ActorAuth, id.TrustedForIdentity, id.IssuerIDEvidenceEligible)
+		_, _ = fmt.Fprintf(w, "  default_identity_configured=%t bind_default_agent_identity=%t\n", id.DefaultIdentityConfigured, id.BindDefaultAgentIdentity)
+		_, _ = fmt.Fprintf(w, "  tls_interception_enabled=%t request_body_scan_enabled=%t scan_headers=%t issuer_bound_session_cookies=%t\n", id.TLSInterceptionEnabled, id.RequestBodyScanEnabled, id.ScanHeaders, id.IssuerBoundSessionCookies)
+		_, _ = fmt.Fprintln(w, "Local configured state (does not prove loaded runtime):")
+	}
+	_, _ = fmt.Fprintln(w, "===============")
+	_, _ = fmt.Fprintf(w, "Config:  %s\n", terminalDisplay(report.ConfigFile))
+	_, _ = fmt.Fprintf(w, "Mode:    %s\n", terminalDisplay(report.Mode))
+	_, _ = fmt.Fprintf(w, "Enforce: %t\n", report.Enforce)
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Listeners:")
+	for _, l := range report.Listeners {
+		_, _ = fmt.Fprintf(w, "  %-18s %-8s %s", terminalDisplay(l.Name), onOff(l.Enabled), terminalDisplay(l.Listen))
+		if l.Detail != "" {
+			_, _ = fmt.Fprintf(w, " (%s)", terminalDisplay(l.Detail))
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintln(w, "Scanners:")
+	for _, s := range report.Scanners {
+		_, _ = fmt.Fprintf(w, "  %-22s %-8s", terminalDisplay(s.Name), onOff(s.Enabled))
+		if s.Action != "" {
+			_, _ = fmt.Fprintf(w, " action=%s", terminalDisplay(s.Action))
+		}
+		if s.Detail != "" {
+			_, _ = fmt.Fprintf(w, " (%s)", terminalDisplay(s.Detail))
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+	_, _ = fmt.Fprintln(w)
+	_, _ = fmt.Fprintf(w, "License: %s", terminalDisplay(report.License.State))
+	if report.License.ID != "" {
+		_, _ = fmt.Fprintf(w, " (%s)", terminalDisplay(report.License.ID))
+	}
+	if report.License.Detail != "" {
+		_, _ = fmt.Fprintf(w, " - %s", terminalDisplay(report.License.Detail))
+	}
+	_, _ = fmt.Fprintln(w)
+	if report.License.Warning != "" {
+		_, _ = fmt.Fprintf(w, "License warning: %s\n", terminalDisplay(report.License.Warning))
+	}
+	_, _ = fmt.Fprintf(w, "Kill switch: active=%t", report.KillSwitch.Active)
+	if report.KillSwitch.Detail != "" {
+		_, _ = fmt.Fprintf(w, " (%s)", terminalDisplay(report.KillSwitch.Detail))
+	}
+	_, _ = fmt.Fprintln(w)
+	for _, name := range sortedSourceNames(report.KillSwitch.Sources) {
+		_, _ = fmt.Fprintf(w, "  %-18s %t\n", terminalDisplay(name), report.KillSwitch.Sources[name])
+	}
+}
+
+func sortedSourceNames(sources map[string]bool) []string {
+	names := make([]string, 0, len(sources))
+	for name := range sources {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func onOff(enabled bool) string {
+	if enabled {
+		return "enabled"
+	}
+	return "disabled"
+}

@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+# Copyright 2026 Pipelock contributors
+# SPDX-License-Identifier: Apache-2.0
+
+set -euo pipefail
+
+chart="charts/pipelock"
+render_dir="$(mktemp -d)"
+trap 'rm -rf "$render_dir"' EXIT
+
+helm lint "$chart"
+
+helm template pipelock "$chart" >"$render_dir/default.yaml"
+
+for values in "$chart"/examples/*.yaml; do
+  name="$(basename "$values" .yaml)"
+  helm lint "$chart" -f "$values"
+  helm template pipelock "$chart" -f "$values" >"$render_dir/$name.yaml"
+done
+
+# Existing manual state homes replace the default wiring, without duplicate
+# environment names, mount paths, or volume names. Reuse the default volume name
+# here to ensure the default volume is omitted as well as its mount.
+cat >"$render_dir/custom-state-values.yaml" <<'EOF'
+extraEnv:
+  - name: XDG_STATE_HOME
+    value: /custom/state
+extraVolumes:
+  - name: pipelock-state
+    persistentVolumeClaim:
+      claimName: existing-state
+extraVolumeMounts:
+  - name: pipelock-state
+    mountPath: /custom/state
+extraEnvFrom:
+  - configMapRef:
+      name: state-from-envfrom
+  - secretRef:
+      name: state-from-secret
+EOF
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" >"$render_dir/custom-state.yaml"
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+  --set-json 'extraEnv=[{"name":"XDG_STATE_HOME","valueFrom":{"configMapKeyRef":{"name":"state-home","key":"path"}}}]' \
+  >"$render_dir/custom-state-valuefrom.yaml"
+# HOME is the lower-priority selector; explicit HOME also owns its storage.
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+  --set-json 'extraEnv=[{"name":"HOME","value":"/custom/home"}]' \
+  --set-json 'extraVolumeMounts=[{"name":"pipelock-state","mountPath":"/custom/home/.local/state"}]' \
+  >"$render_dir/custom-state-home.yaml"
+helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+  --set-json 'extraEnv=[{"name":"HOME","valueFrom":{"configMapKeyRef":{"name":"state-home","key":"path"}}}]' \
+  --set-json 'extraVolumeMounts=[{"name":"pipelock-state","mountPath":"/custom/home/.local/state"}]' \
+  >"$render_dir/custom-state-home-valuefrom.yaml"
+for selector in XDG_STATE_HOME HOME; do
+  name=custom-state-secret-valuefrom
+  state_path=/custom/state
+  if [[ "$selector" == HOME ]]; then
+    name=custom-state-home-secret-valuefrom
+    state_path=/custom/home/.local/state
+  fi
+  helm template pipelock "$chart" -f "$render_dir/custom-state-values.yaml" \
+    --set-json "extraEnv=[{\"name\":\"$selector\",\"valueFrom\":{\"secretKeyRef\":{\"name\":\"state-home\",\"key\":\"path\"}}}]" \
+    --set-json "extraVolumeMounts=[{\"name\":\"pipelock-state\",\"mountPath\":\"$state_path\"}]" \
+    >"$render_dir/$name.yaml"
+done
+# A default envFrom source must precede operator ConfigMaps and Secrets.
+# Keep existing operator storage even though the harmless default remains.
+helm template pipelock "$chart" \
+  --set-json 'extraEnvFrom=[{"configMapRef":{"name":"state-from-envfrom"}},{"secretRef":{"name":"state-from-secret"}}]' \
+  --set-json 'extraVolumes=[{"name":"operator-state","persistentVolumeClaim":{"claimName":"operator-state"}}]' \
+  --set-json 'extraVolumeMounts=[{"name":"operator-state","mountPath":"/operator/state"}]' \
+  >"$render_dir/envfrom-state.yaml"
+helm template pipelock "$chart" \
+  --set-json 'extraEnvFrom=[{"configMapRef":{"name":"unrelated-env"}}]' \
+  >"$render_dir/unrelated-envfrom.yaml"
+# A follower without persistence still configures durable state paths under
+# /var/lib/pipelock. The default state mount must not make them writable.
+helm template pipelock "$chart" \
+  --set conductorFollower.enabled=true \
+  --set conductorFollower.conductorURL=https://conductor.example:8895 \
+  --set conductorFollower.serverCASecretRef.name=ca \
+  --set conductorFollower.clientSecretRef.name=client \
+  --set conductorFollower.trustRosterSecretRef.name=roster \
+  --set conductorFollower.auditQueueKeyringSecretRef.name=keyring \
+  >"$render_dir/follower-nopersist.yaml"
+# Helm's own YAML decoder checks actual producer output. The Helm-only CI job
+# needs neither a Go toolchain nor an additional YAML package.
+state_args=()
+for manifest in "$render_dir/default.yaml" "$render_dir"/values-*.yaml \
+  "$render_dir/custom-state.yaml" "$render_dir/custom-state-valuefrom.yaml" \
+  "$render_dir/custom-state-home.yaml" "$render_dir/custom-state-home-valuefrom.yaml" \
+  "$render_dir/custom-state-secret-valuefrom.yaml" "$render_dir/custom-state-home-secret-valuefrom.yaml" \
+  "$render_dir/envfrom-state.yaml" "$render_dir/unrelated-envfrom.yaml" \
+  "$render_dir/follower-nopersist.yaml"; do
+  state_args+=(--set-file "manifests.$(basename "$manifest" .yaml)=$manifest")
+done
+helm template state-check scripts/helmstate "${state_args[@]}" >"$render_dir/state-check.out"
+# A checker that renders nothing exits 0, so require its pass marker.
+grep -q -- "decoded Helm proxy state checks passed" "$render_dir/state-check.out"
+
+expect_template_error() {
+  local want="$1"
+  shift
+  local out="$render_dir/negative.out"
+  if helm template pipelock "$chart" "$@" >"$out" 2>&1; then
+    echo "helm template unexpectedly succeeded for negative case: $want" >&2
+    exit 1
+  fi
+  if ! grep -q "$want" "$out"; then
+    echo "helm template negative case did not include expected error: $want" >&2
+    cat "$out" >&2
+    exit 1
+  fi
+}
+
+expect_template_error "extraVolumes name pipelock-state conflicts" \
+  --set-json 'extraVolumes=[{"name":"pipelock-state","emptyDir":{}}]'
+expect_template_error "extraVolumeMounts conflicts" \
+  --set-json 'extraVolumeMounts=[{"name":"pipelock-state","mountPath":"/other"}]'
+expect_template_error "extraVolumeMounts conflicts" \
+  --set-json 'extraVolumeMounts=[{"name":"other","mountPath":"/var/lib/pipelock/home"}]'
+
+expect_template_error "/image/tag" \
+  --set image.tag="@sha256:e8e249d2dd1b579f995f0f5a75cfab13fb8505a8ffc33c2cec7a6418290d9098"
+
+expect_template_error "/image/tag" \
+  --set image.tag="sha256:e8e249d2dd1b579f995f0f5a75cfab13fb8505a8ffc33c2cec7a6418290d9098"
+
+expect_template_error "/image/digest" \
+  --set image.digest="not-a-digest"
+
+expect_template_error "/image/digest" \
+  --set image.digest="sha256:e8e249d2dd1b579f995f0f5a75cfab13fb8505a8ffc33c2cec7a6418290d909Z"
+
+expect_template_error "conductorFollower.conductorURL is required" \
+  --set conductorFollower.enabled=true
+
+expect_template_error "conductorFollower.auditQueueKeyringSecretRef.name is required" \
+  -f "$chart/examples/values-enterprise-follower.yaml" \
+  --set conductorFollower.auditQueueKeyringSecretRef.name=
+
+expect_template_error "conductorFollower.auditQueueKeyringSecretRef.key is required" \
+  -f "$chart/examples/values-enterprise-follower.yaml" \
+  --set conductorFollower.auditQueueKeyringSecretRef.key=
+
+expect_template_error "conductorFollower.auditQueueKeyringSecretRef.mountPath is required" \
+  -f "$chart/examples/values-enterprise-follower.yaml" \
+  --set conductorFollower.auditQueueKeyringSecretRef.mountPath=
+
+for overlapping_keyring_mount in \
+  /var/lib/pipelock/conductor/audit-queue \
+  /var/lib/pipelock/conductor/audit-queue/keys; do
+  expect_template_error "conductorFollower.auditQueueKeyringSecretRef.mountPath must be outside" \
+    -f "$chart/examples/values-enterprise-follower.yaml" \
+    --set "conductorFollower.auditQueueKeyringSecretRef.mountPath=${overlapping_keyring_mount}"
+done
+
+expect_template_error "enterprise modes require explicit networkPolicy.ingress and networkPolicy.egress rules" \
+	--set mode=conductor \
+	--set networkPolicy.enabled=true \
+	--set networkPolicy.ingress=null \
+	--set networkPolicy.egress=null
+
+expect_template_error "conductor.orgID is required in conductor mode" \
+	-f "$chart/examples/values-enterprise-conductor.yaml" \
+	--set conductor.orgID=
+
+expect_template_error "conductor.replicaCount must be 1 when conductor.persistence.accessModes includes ReadWriteOnce" \
+  -f "$chart/examples/values-enterprise-conductor.yaml" \
+  --set conductor.replicaCount=2
+
+expect_template_error "fleetSink.replicaCount must be 1 when fleetSink.persistence.accessModes includes ReadWriteOnce" \
+  -f "$chart/examples/values-enterprise-devfleet.yaml" \
+  --set fleetSink.replicaCount=2
+
+expect_template_error "/mcp/allowUnauthenticated" \
+  --set mcp.allowUnauthenticated=not-a-boolean
+
+expect_template_error "/mcp/allowedOrigins" \
+  --set mcp.allowedOrigins=not-an-array
+
+expect_template_error "mcp.listen must end with the same port configured by service.mcpPort" \
+  --set mcp.enabled=true \
+  --set mcp.upstream=http://mcp.vendor.example \
+  --set mcp.listen=0.0.0.0:9999 \
+  --set mcp.allowUnauthenticated=true \
+  --set networkPolicy.enabled=true
+
+for deceptive_loopback in 127.evil 127.0.0.1.example.com 127.0.0.999; do
+  expect_template_error "mcp.listen is non-loopback" \
+    --set mcp.enabled=true \
+    --set mcp.upstream=http://mcp.vendor.example \
+    --set "mcp.listen=${deceptive_loopback}:8889"
+done
+
+# Syntactically valid IPv4 and IPv6 loopback literals remain valid without an
+# auth token because they are not reachable through the Service network path.
+helm template pipelock "$chart" \
+  --set mcp.enabled=true \
+  --set mcp.upstream=http://mcp.vendor.example \
+  --set mcp.listen=127.0.0.42:8889 >"$render_dir/mcp-loopback-ipv4.yaml"
+helm template pipelock "$chart" \
+  --set mcp.enabled=true \
+  --set mcp.upstream=http://mcp.vendor.example \
+  --set 'mcp.listen=[::1]:8889' >"$render_dir/mcp-loopback-ipv6.yaml"
+
+grep -q -- "- run" "$render_dir/default.yaml"
+# The proxy pod states its stop budget rather than inheriting Kubernetes' 30 s,
+# which a receipt-group close on a small CPU limit can outlast.
+grep -q -- "terminationGracePeriodSeconds: 600" "$render_dir/default.yaml"
+helm template pipelock "$chart" --set terminationGracePeriodSeconds=1200 | grep -q -- "terminationGracePeriodSeconds: 1200"
+expect_template_error "/terminationGracePeriodSeconds" --set terminationGracePeriodSeconds=-1
+helm template pipelock "$chart" --set terminationGracePeriodSeconds=0 | grep -q -- "terminationGracePeriodSeconds: 0"
+# Null must leave the Kubernetes default, never render a zero-second budget.
+# Render to a file first so a failed render cannot pass as an absent field.
+helm template pipelock "$chart" --set-json terminationGracePeriodSeconds=null >"$render_dir/null-grace.yaml"
+grep -q -- "kind: Deployment" "$render_dir/null-grace.yaml"
+if grep -q -- "terminationGracePeriodSeconds" "$render_dir/null-grace.yaml"; then
+  echo "null terminationGracePeriodSeconds rendered a value instead of leaving the Kubernetes default" >&2
+  exit 1
+fi
+grep -q -- "conductor:" "$render_dir/values-enterprise-follower.yaml"
+grep -q -- "pipelock-follower-bundles" "$render_dir/values-enterprise-follower.yaml"
+grep -q -- "pipelock-follower-audit-queue" "$render_dir/values-enterprise-follower.yaml"
+grep -q -- 'secretName: "follower-audit-queue-keyring"' "$render_dir/values-enterprise-follower.yaml"
+grep -q -- 'key: "audit-queue-keyring.json"' "$render_dir/values-enterprise-follower.yaml"
+grep -q -- 'mountPath: "/etc/pipelock/conductor/audit-queue-key"' "$render_dir/values-enterprise-follower.yaml"
+keyring_mount_block=$(grep -A2 -- 'name: conductor-audit-queue-keyring' "$render_dir/values-enterprise-follower.yaml" || true)
+[[ "$keyring_mount_block" == *"readOnly: true"* ]]
+grep -q -- 'durable_audit_queue_keyring: /etc/pipelock/conductor/audit-queue-key/audit-queue-keyring.json' "$render_dir/values-enterprise-follower.yaml"
+
+grep -q -- "- conductor" "$render_dir/values-enterprise-conductor.yaml"
+grep -q -- "- serve" "$render_dir/values-enterprise-conductor.yaml"
+grep -q -- "--probe-listen" "$render_dir/values-enterprise-conductor.yaml"
+grep -q -- "--publisher-token-file" "$render_dir/values-enterprise-conductor.yaml"
+for scope_flag in publisher-org auditor-org admin-org; do
+	grep -A1 -- "- --${scope_flag}" "$render_dir/values-enterprise-conductor.yaml" | grep -q -- 'org-prod'
+done
+for scope_flag in publisher-fleet auditor-fleet admin-fleet; do
+	grep -A1 -- "- --${scope_flag}" "$render_dir/values-enterprise-conductor.yaml" | grep -q -- 'fleet-prod'
+done
+grep -q -- "pipelock-conductor-probes" "$render_dir/values-enterprise-conductor.yaml"
+
+helm template pipelock "$chart" \
+	-f "$chart/examples/values-enterprise-conductor.yaml" \
+	--set conductor.fleetID= >"$render_dir/values-enterprise-conductor-org-wide.yaml"
+if grep -q -- '--publisher-fleet\|--auditor-fleet\|--admin-fleet' "$render_dir/values-enterprise-conductor-org-wide.yaml"; then
+	echo "org-wide conductor scope must not render fleet-scoped bearer flags" >&2
+	exit 1
+fi
+
+grep -q -- "- fleet-sink" "$render_dir/values-enterprise-devfleet.yaml"
+grep -q -- "--probe-listen" "$render_dir/values-enterprise-devfleet.yaml"
+grep -q -- "--reader-token-file" "$render_dir/values-enterprise-devfleet.yaml"
+grep -q -- "pipelock-fleet-sink-probes" "$render_dir/values-enterprise-devfleet.yaml"
+grep -q -- "pipelock-fleet-sink-storage" "$render_dir/values-enterprise-devfleet.yaml"
+
+if grep -R "publisher.token:" "$render_dir" >/dev/null; then
+  echo "rendered manifests must not contain inline publisher token values" >&2
+  exit 1
+fi
+
+# Every rendered image reference must be either repo:tag or repo@sha256:...,
+# never a malformed combination. This guards UX-001 (a digest concatenated as a
+# tag produced ":@sha256:") and the related empty-tag / double-separator shapes.
+image_refs="$(grep -RhE '^[[:space:]]*image:[[:space:]]' "$render_dir" | grep -vE '^[[:space:]]*imagePull(Secrets|Policy):' || true)"
+if [ -z "$image_refs" ]; then
+  echo "no image references found in rendered manifests" >&2
+  exit 1
+fi
+if printf '%s\n' "$image_refs" | grep -E ':@sha256:|@@|: *"[^"]*:" *$|:" *$' >/dev/null; then
+  echo "rendered manifests contain a malformed image reference:" >&2
+  printf '%s\n' "$image_refs" | grep -E ':@sha256:|@@|: *"[^"]*:" *$|:" *$' >&2
+  exit 1
+fi
+
+# Digest-pinned examples must render repository@sha256:..., not a tag.
+# The repository is the chart's own default (release.yaml re-stamps that single
+# line with the releasing namespace at package time), so an example that
+# overrides image.repository, or a second namespace, fails here.
+default_repository="$(awk '/^image:/ { in_image = 1; next } in_image && /^  repository:/ { print $2; exit }' "$chart/values.yaml")"
+if ! printf '%s' "$default_repository" | grep -qE '^ghcr\.io/[a-z0-9-]+/pipelock$'; then
+  echo "charts/pipelock/values.yaml image.repository is not a ghcr.io/<owner>/pipelock default: '$default_repository'" >&2
+  exit 1
+fi
+for name in values-enterprise-conductor values-enterprise-follower; do
+  if ! grep -qF -- "image: \"${default_repository}@sha256:" "$render_dir/$name.yaml"; then
+    echo "$name should render a digest-pinned image (repository@sha256:...)" >&2
+    grep -- 'image:' "$render_dir/$name.yaml" >&2
+    exit 1
+  fi
+done
+
+echo "helm chart checks passed"

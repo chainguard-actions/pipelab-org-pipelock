@@ -1,0 +1,2175 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package runtime
+
+import (
+	"bufio"
+	"context"
+	"crypto/ed25519"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unicode"
+
+	"github.com/spf13/cobra"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtimeconfig"
+	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
+	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
+	"github.com/luckyPipewrench/pipelock/internal/deferred"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/identity"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
+	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/sandbox"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/secperm"
+	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
+	session "github.com/luckyPipewrench/pipelock/internal/session"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+)
+
+// reservedTransportHeaders are header names operators must not override via
+// --header. The MCP HTTP transport manages framing (Content-Type, Accept,
+// Content-Length, Transfer-Encoding), session correlation (Mcp-Session-Id),
+// and host routing (Host). Letting --header clobber any of these would
+// either break the transport contract or - for Mcp-Session-Id specifically -
+// let an attacker pin the upstream's session correlation to a value of their
+// choice on the very first request, before HTTPClient has a session ID to
+// overwrite with. Lookup is canonical (textproto) so case variants like
+// "mcp-session-id" or "MCP-SESSION-ID" are also rejected.
+var reservedTransportHeaders = map[string]struct{}{
+	http.CanonicalHeaderKey("Content-Type"):      {},
+	http.CanonicalHeaderKey("Accept"):            {},
+	http.CanonicalHeaderKey("Mcp-Session-Id"):    {},
+	http.CanonicalHeaderKey("Content-Length"):    {},
+	http.CanonicalHeaderKey("Transfer-Encoding"): {},
+	http.CanonicalHeaderKey("Host"):              {},
+	// Mcp-Method and Mcp-Name describe the individual call a request carries,
+	// so no single value can be correct for a whole session. Pinning one is
+	// startup-valid but bricks the listener: the pinned value replaces the
+	// client's before the body is parsed, and every request whose method or
+	// tool name differs from the pin is then refused as a routing-header
+	// disagreement. Rejecting the pin outright is clearer than shipping a
+	// configuration whose only correct value is the one method a deployment
+	// happens to use.
+	http.CanonicalHeaderKey("Mcp-Method"): {},
+	http.CanonicalHeaderKey("Mcp-Name"):   {},
+}
+
+type mcpAuditLoggerFactory func(
+	format, output, filePath string,
+	includeAllowed, includeBlocked bool,
+	stream io.Writer,
+) (*audit.Logger, error)
+
+// singletonUpstreamHeaders carry credentials or negotiated service policy.
+// Multiple ordinary HTTP header values are legitimate and remain supported,
+// but these values must have exactly one operator meaning before the listener
+// applies precedence and protocol validation.
+var singletonUpstreamHeaders = map[string]struct{}{
+	http.CanonicalHeaderKey("Authorization"):        {},
+	http.CanonicalHeaderKey("Mcp-Protocol-Version"): {},
+	http.CanonicalHeaderKey("A2A-Version"):          {},
+	http.CanonicalHeaderKey("A2A-Extensions"):       {},
+}
+
+// parseHeaderFlags converts repeatable --header "Key: Value" entries into an
+// http.Header. Returns nil for an empty input so callers can pass the result
+// straight to transports that interpret nil as "no extras". Both an empty
+// key and a missing colon are rejected with a descriptive error so a typo
+// (e.g. "Authorization Bearer xyz") can't silently drop the auth header.
+//
+// Reserved transport-managed headers are rejected with a descriptive error
+// so an operator does not accidentally poison transport framing or - in the
+// Mcp-Session-Id case - force the upstream onto an attacker-chosen session
+// correlation token on the first request. The transport also strips these
+// defensively (defense-in-depth), but rejecting at parse time gives a
+// clearer error than silent removal would.
+func parseHeaderFlags(raw []string) (http.Header, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	h := make(http.Header, len(raw))
+	for _, entry := range raw {
+		key, value, ok := strings.Cut(entry, ":")
+		if !ok {
+			return nil, errors.New("--header: expected 'Key: Value' format")
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, errors.New("--header: key is empty")
+		}
+		if !validHeaderName(key) {
+			return nil, errors.New("--header: key contains invalid characters")
+		}
+		// Validate the raw value before trimming so leading/trailing CRLF,
+		// control chars, or unicode whitespace are rejected rather than
+		// silently stripped by TrimSpace and then accepted.
+		if !validHeaderValue(value) {
+			return nil, errors.New("--header: value contains invalid characters")
+		}
+		// Trim ASCII space/tab only after validation; full TrimSpace would
+		// strip unicode whitespace that the validator just rejected, leaving
+		// the bypass available through the header value's edges.
+		value = strings.Trim(value, " \t")
+		if _, reserved := reservedTransportHeaders[http.CanonicalHeaderKey(key)]; reserved {
+			return nil, fmt.Errorf("--header: %q is managed by the MCP HTTP transport and cannot be overridden via --header", key)
+		}
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if _, exists := h[canonicalKey]; exists {
+			if _, singleton := singletonUpstreamHeaders[canonicalKey]; !singleton {
+				h.Add(canonicalKey, value)
+				continue
+			}
+			return nil, fmt.Errorf("--header: duplicate header %q is ambiguous", canonicalKey)
+		}
+		h.Add(canonicalKey, value)
+	}
+	return h, nil
+}
+
+// readHeaderFile reads "Key: Value" entries from a sidecar file with strict
+// permissions. Empty path returns nil. Lines starting with '#' and blank
+// lines are skipped. The file must be regular and its permission bits must
+// be 0o600 or 0o640 (group-read allowed for k8s fsGroup parity with
+// signing.LoadPrivateKeyFile). Values are not validated here; the caller
+// hands the returned lines to parseHeaderFlags which applies the same
+// validation as --header.
+func readHeaderFile(path string) ([]string, error) {
+	if path == "" {
+		return nil, nil
+	}
+	clean := filepath.Clean(path)
+	info, err := os.Stat(clean)
+	if err != nil {
+		return nil, fmt.Errorf("--header-file %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("--header-file %q: not a regular file (mode=%s)", path, info.Mode())
+	}
+	// Unix-only gate: secperm.TooPermissive returns false on Windows, where Go
+	// reports the mode from the read-only attribute rather than the NTFS ACL.
+	// On Windows, restrict access with file ACLs instead; this check does not
+	// fire there, so the chmod-style message below is only ever seen on Unix.
+	if secperm.TooPermissive(info.Mode().Perm(), 0o037) {
+		return nil, fmt.Errorf("--header-file %q: permissions %04o reveal the header values to other users; restrict to 0600 or 0640 (Unix); on Windows restrict with file ACLs", path, info.Mode().Perm())
+	}
+	data, err := os.ReadFile(clean) //nolint:gosec // path is operator-supplied and cleaned + perm-gated above
+	if err != nil {
+		return nil, fmt.Errorf("--header-file %q: %w", path, err)
+	}
+	var lines []string
+	for _, raw := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		lines = append(lines, raw)
+	}
+	return lines, nil
+}
+
+func validHeaderName(key string) bool {
+	if key == "" {
+		return false
+	}
+	// HTTP header names are ASCII tokens (RFC 7230 §3.2.6); iterate by byte
+	// so any non-ASCII byte is rejected by isHTTPTokenChar.
+	for i := 0; i < len(key); i++ {
+		if !isHTTPTokenChar(key[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHTTPTokenChar(c byte) bool {
+	switch {
+	case c >= 'a' && c <= 'z':
+		return true
+	case c >= 'A' && c <= 'Z':
+		return true
+	case c >= '0' && c <= '9':
+		return true
+	}
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	default:
+		return false
+	}
+}
+
+func validHeaderValue(value string) bool {
+	for _, r := range value {
+		if r == '\t' || r == ' ' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+		if r > 127 && unicode.IsSpace(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// handleProxyError classifies MCP proxy errors: subprocess exits get a
+// user-facing message and a specific exit code; other errors are reported
+// to Sentry (if available) and returned as-is.
+func handleProxyError(err error, logW io.Writer, sentryClient *plsentry.Client) error {
+	if errors.Is(err, mcp.ErrSubprocessExit) {
+		_, _ = fmt.Fprintf(logW, "pipelock: %v\n", err)
+		return cliutil.ExitCodeError(cliutil.ExitSubprocess, err)
+	}
+	if sentryClient != nil {
+		sentryClient.CaptureError(err)
+	}
+	return err
+}
+
+func applyMCPA2AOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, baseline *mcp.CardBaseline, cardURL string) {
+	if cfg != nil {
+		a2a := cfg.A2AScanning
+		opts.A2ACfg = &a2a
+	}
+	opts.CardBaseline = baseline
+	if cardURL != "" {
+		opts.A2ACardURL = cardURL
+	}
+}
+
+// applyMCPResponseSuppressOpts applies a resolved identity to the proxy
+// options. Audit, receipts, adaptive state and acknowledgment lookup use the
+// resolution's Name; the suppress target, core-observe target and the trust,
+// taint and action lookups use only its ArmingName, so a name that was never
+// proven arms nothing.
+func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, res identity.Resolution) {
+	opts.ServerName = res.Name
+	opts.PolicyServerName = res.ArmingName
+	opts.ServerBindingMode = res.BindingMode
+	opts.ServerRevision = res.Revision
+	trust := config.ResponseTrustUntrusted
+	taintTrusted := false
+	if cfg != nil {
+		opts.Suppress = cfg.Suppress
+		if configuredTrust, ok := cfg.MCPResponseTrustForServer(res.ArmingName); ok {
+			trust = configuredTrust
+		}
+		taintTrusted = cfg.TaintTrustsMCPServer(res.ArmingName)
+	}
+	opts.ResponseTrustClass = trust
+	opts.ResponseActionOverride = cfg.MCPResponseActionForServer(res.ArmingName)
+	opts.TaintTrustedSource = taintTrusted
+}
+
+func mcpResponseLogFields(opts mcp.MCPProxyOpts) (action, trust, server string) {
+	trust = opts.ResponseTrustClass
+	if trust == "" {
+		trust = config.ResponseTrustUntrusted
+	}
+	action = opts.ResponseActionOverride
+	if action == "" {
+		action = config.MCPResponseActionForTrust(trust)
+	}
+	server = opts.ServerName
+	if server == "" {
+		server = "(unnamed)"
+	}
+	return action, trust, server
+}
+
+func mcpReceiptParityOpts(
+	opts mcp.MCPProxyOpts,
+	receiptEmitter *receipt.Emitter,
+	v2ReceiptEmitter *proxydecision.Emitter,
+	policyHash string,
+	requireReceipts bool,
+) mcp.MCPProxyOpts {
+	opts.ReceiptEmitter = receiptEmitter
+	opts.V2ReceiptEmitter = v2ReceiptEmitter
+	opts.PolicyHash = policyHash
+	opts.RequireReceipts = requireReceipts
+	return opts
+}
+
+func buildDeferManager(cfg *config.Config, warningWriter io.Writer) *deferred.Manager {
+	if cfg == nil || !cfg.Defer.Enabled {
+		return nil
+	}
+	var warningf func(format string, args ...any)
+	if warningWriter != nil {
+		warningf = func(format string, args ...any) {
+			_, _ = fmt.Fprintf(warningWriter, format, args...)
+		}
+	}
+	return deferred.NewManager(deferred.Config{
+		Enabled:              cfg.Defer.Enabled,
+		Timeout:              time.Duration(cfg.Defer.TimeoutSeconds) * time.Second,
+		MaxPending:           cfg.Defer.MaxPending,
+		MaxPendingPerSession: cfg.Defer.MaxPendingPerSession,
+		MaxPendingBytes:      cfg.Defer.MaxPendingBytes,
+		MaxCascadeDepth:      cfg.Defer.MaxCascadeDepth,
+		JournalPath:          deferJournalPath(cfg),
+		JournalWriteGuard: func(write func() error) error {
+			return recorder.WithEvidenceWriterCeremonyLock(cfg.FlightRecorder.Dir, write)
+		},
+		Warningf: warningf,
+	})
+}
+
+func deferJournalPath(cfg *config.Config) string {
+	if cfg == nil || cfg.FlightRecorder.Dir == "" {
+		return ""
+	}
+	return filepath.Join(cfg.FlightRecorder.Dir, "deferred-actions.jsonl")
+}
+
+// startDeferredOperatorAPI starts the operator-only admin listener that exposes
+// the deferred (held-action) control surface for `pipelock mcp proxy`. It binds
+// kill_switch.api_listen on a dedicated port and serves ONLY the deferred
+// routes, wired to the live deferManager that admitted the holds, so an
+// operator can list, approve, and deny held actions out of band.
+//
+// This dedicated listener IS the confused-deputy boundary: the deferred routes
+// are reachable ONLY here, never on the MCP data listener (--listen) nor the
+// child's stdio, so a proxied agent cannot approve its own held actions. When
+// api_listen is unset (or defer is disabled / no live manager) the surface is
+// simply not exposed - deferred control is unavailable, NOT silently mounted on
+// an agent-facing port - and the returned stop is a no-op.
+//
+// A bind failure is fatal to the proxy: an operator who configured api_listen
+// but cannot reach the steering wheel should fail closed, matching the
+// api_listen fail-fast in `pipelock run`.
+func startDeferredOperatorAPI(
+	ctx context.Context,
+	cfg *config.Config,
+	deferManager *deferred.Manager,
+	logger *audit.Logger,
+	stderr io.Writer,
+) (func(), error) {
+	if cfg == nil || cfg.KillSwitch.APIListen == "" || deferManager == nil || !deferManager.Enabled() {
+		return func() {}, nil
+	}
+	apiToken := cfg.EffectiveKillSwitchAPIToken()
+	if apiToken == "" {
+		return func() {}, fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token, api_token_file or %s to be set", killswitch.EnvAPIToken)
+	}
+	sessionAPI := proxy.NewSessionAPIHandler(proxy.SessionAPIOptions{
+		Logger:   logger,
+		Deferred: deferManager,
+		APIToken: apiToken,
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/deferred", sessionAPI.HandleDeferredList)
+	mux.HandleFunc("/api/v1/deferred/", sessionAPI.HandleDeferredAction)
+
+	ln, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.KillSwitch.APIListen)
+	if lnErr != nil {
+		return func() {}, wrapBindError("kill_switch.api_listen", cfg.KillSwitch.APIListen, lnErr)
+	}
+	srv := newHTTPServer(mux)
+	go func() {
+		if serveErr := srv.Serve(ln); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			_, _ = fmt.Fprintf(stderr, "pipelock: deferred operator API stopped: %v\n", serveErr)
+		}
+	}()
+	_, _ = fmt.Fprintf(stderr, "pipelock: deferred operator API on %s (routes: /api/v1/deferred, /api/v1/deferred/{id}/{approve,deny})\n",
+		cfg.KillSwitch.APIListen)
+	stop := func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+	}
+	return stop, nil
+}
+
+func startDeferredOperatorAPIOrReport(
+	ctx context.Context,
+	cfg *config.Config,
+	deferManager *deferred.Manager,
+	logger *audit.Logger,
+	stderr io.Writer,
+	sentryClient *plsentry.Client,
+) (func(), error) {
+	stop, err := startDeferredOperatorAPI(ctx, cfg, deferManager, logger, stderr)
+	if err != nil {
+		if sentryClient != nil {
+			sentryClient.CaptureError(err)
+		}
+		return nil, err
+	}
+	return stop, nil
+}
+
+func resolvedMCPDoWAgentName(requested, resolved string, found bool) string {
+	if found || resolved == "" {
+		return requested
+	}
+	return resolved
+}
+
+func recoverDeferredActions(
+	manager *deferred.Manager,
+	journalPath string,
+	opts mcp.MCPProxyOpts,
+	logW io.Writer,
+) error {
+	if journalPath == "" && manager != nil {
+		journalPath = manager.JournalPath()
+	}
+	if journalPath == "" {
+		return nil
+	}
+	pending, err := deferred.PendingJournal(journalPath)
+	if err != nil {
+		return fmt.Errorf("reading deferred action journal: %w", err)
+	}
+	// Validate every saved selection before closing any hold. A restart must
+	// not assign an unresolved action to a different receipt shard.
+	if opts.ReceiptGroup != nil && opts.ReceiptGroup.Shards != nil {
+		for _, held := range pending {
+			if !held.ShardSelected {
+				return fmt.Errorf("deferred restart recovery %q has no recorded receipt shard; start once with flight_recorder.receipt_chains set to 1 to close it, and preserve journal %q and its receipt evidence: %w", held.DeferID, journalPath, mcp.ErrReceiptRequired)
+			}
+			if held.ShardIndex < 0 {
+				return fmt.Errorf("deferred restart recovery %q has invalid saved receipt shard %d; preserve journal %q and its receipt evidence for recovery: %w", held.DeferID, held.ShardIndex, journalPath, mcp.ErrReceiptRequired)
+			}
+			if held.ShardIndex >= opts.ReceiptGroup.Shards.ShardCount() {
+				return fmt.Errorf("deferred restart recovery %q needs saved receipt shard %d, unavailable in the configured group of %d; set flight_recorder.receipt_chains to at least %d and preserve journal %q: %w", held.DeferID, held.ShardIndex, opts.ReceiptGroup.Shards.ShardCount(), held.ShardIndex+1, journalPath, mcp.ErrReceiptRequired)
+			}
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool {
+		if pending[i].CascadeDepth != pending[j].CascadeDepth {
+			return pending[i].CascadeDepth < pending[j].CascadeDepth
+		}
+		return pending[i].DeferID < pending[j].DeferID
+	})
+	for _, held := range pending {
+		opts.RequireReceipts = true
+		opts.Transport = held.Surface
+		if err := mcp.EmitDeferredResolutionReceipt(opts, logW, deferred.Resolution{
+			DeferID:          held.DeferID,
+			ParentActionID:   held.ActionID,
+			ShardIndex:       held.ShardIndex,
+			ShardSelected:    held.ShardSelected,
+			FinalDecision:    config.ActionBlock,
+			ResolutionSource: deferred.SourceRestartRecovery,
+			Authority:        held.Authority,
+			ParentDeferID:    held.ParentDeferID,
+			CascadeDepth:     held.CascadeDepth,
+			Linkage:          held.Linkage,
+			Policy:           held.Policy,
+			Target:           held.Target,
+			Method:           held.Method,
+			Reason:           held.Reason,
+		}); err != nil {
+			return fmt.Errorf("emitting deferred restart recovery receipt %q: %w", held.DeferID, err)
+		}
+		if manager != nil {
+			err = manager.RecordRestartRecovery(held)
+		} else {
+			err = deferred.RecordRestartRecoveryJournal(journalPath, held)
+		}
+		if err != nil {
+			return fmt.Errorf("recording deferred restart recovery %q: %w", held.DeferID, err)
+		}
+	}
+	return nil
+}
+
+func mcpToolPolicyUsesDefer(cfg config.MCPToolPolicy) bool {
+	if cfg.Action == config.ActionDefer {
+		return true
+	}
+	for _, rule := range cfg.Rules {
+		if rule.Action == config.ActionDefer {
+			return true
+		}
+	}
+	return false
+}
+
+func validateMCPDeferSurface(surface string, cfg *config.Config) error {
+	if cfg == nil || !mcpToolPolicyUsesDefer(cfg.MCPToolPolicy) {
+		return nil
+	}
+	return deferred.ValidateAction(surface, config.ActionDefer)
+}
+
+// ErrMCPResponseSecurityFinding is returned when pipelock mcp scan detects an
+// MCP response security finding.
+var ErrMCPResponseSecurityFinding = errors.New("MCP response security finding detected")
+
+// ErrInjectionDetected is kept for compatibility. Deprecated: use
+// ErrMCPResponseSecurityFinding.
+var ErrInjectionDetected = ErrMCPResponseSecurityFinding
+
+// ErrMCPScanMalformedInput is returned when pipelock mcp scan could not fully
+// inspect a line. It carries the exit code this binary reserves for bad input
+// rather than the security-finding code, because "this could not be scanned"
+// and "this was scanned and something was found" are different answers for a
+// caller.
+var ErrMCPScanMalformedInput = cliutil.ExitCodeError(
+	cliutil.ExitConfig,
+	errors.New("malformed MCP input: one or more lines could not be fully inspected and were not verified clean"),
+)
+
+// safeWriter wraps an io.Writer with a mutex for concurrent use.
+// Used to synchronize file sentry goroutines and RunProxy stderr output.
+type safeWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (sw *safeWriter) Write(p []byte) (int, error) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
+// URL scheme constants used for upstream validation.
+const (
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
+)
+
+// buildRedirectRT derives a RedirectRuntime from config for built-in redirect
+// handlers. Always returns a non-nil runtime so quarantine-write works even
+// when fetch_proxy is not configured. FetchEndpoint is only populated when the
+// fetch proxy listen address is valid; fetch-proxy redirect handlers fail
+// closed ("no fetch_endpoint") when it is empty.
+func buildRedirectRT(cfg *config.Config) *mcp.RedirectRuntime {
+	rt := &mcp.RedirectRuntime{
+		QuarantineDir: cfg.MCPToolPolicy.QuarantineDir,
+	}
+	if cfg.FetchProxy.Listen != "" {
+		host, port, err := net.SplitHostPort(cfg.FetchProxy.Listen)
+		if err == nil {
+			switch host {
+			case "", "0.0.0.0":
+				host = "127.0.0.1"
+			case "::":
+				host = "::1"
+			}
+			rt.FetchEndpoint = "http://" + net.JoinHostPort(host, port) + "/fetch"
+		}
+	}
+	return rt
+}
+
+// McpCmd returns the mcp cobra command.
+func McpCmd() *cobra.Command {
+	return mcpCmdWithAuditLoggerFactory(audit.NewWithStream)
+}
+
+func mcpCmdWithAuditLoggerFactory(newAuditLogger mcpAuditLoggerFactory) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "mcp",
+		Short: "MCP (Model Context Protocol) security scanning",
+		Long: `Scan MCP JSON-RPC 2.0 responses for prompt injection and inbound generic credentials before they reach the agent.
+
+Examples:
+  mcp-server | pipelock mcp scan
+  mcp-server | pipelock mcp scan --json --config pipelock.yaml`,
+	}
+
+	cmd.AddCommand(mcpScanCmd())
+	cmd.AddCommand(mcpProxyCmdWithAuditLoggerFactory(newAuditLogger))
+	cmd.AddCommand(mcpIntegrityCmd())
+	cmd.AddCommand(mcpIdentityCmd())
+	return cmd
+}
+
+func mcpScanCmd() *cobra.Command {
+	var configFile string
+	var jsonOutput bool
+
+	cmd := &cobra.Command{
+		Use:   "scan",
+		Short: "Scan MCP responses from stdin for prompt injection and inbound credentials",
+		Long: `Reads newline-delimited MCP JSON-RPC 2.0 responses from stdin and scans
+text content blocks for response prompt-injection patterns and generic inbound
+credential findings.
+
+Inbound DLP scanning intentionally skips agent-owned environment and file-secret
+values: receiving those values in an MCP response is not an exfiltration event.
+For bidirectional MCP protection, use pipelock mcp proxy: responses are scanned
+before forwarding, and requests are scanned for DLP leaks and injection in tool
+arguments.
+
+Exit code 0 only if every response was scanned and all were clean, 1 if any
+response security finding (prompt injection, generic inbound credential, or
+tool-definition poisoning/drift) is detected, and 2 if any line could not be
+fully inspected and was therefore not verified clean - including a tools/list
+response scanned while mcp_tool_scanning is explicitly disabled by config; a
+verdict never reports clean:true over content it did not inspect. A finding
+outranks an inspection failure. A strict-mode rule-bundle integrity refusal
+also exits with code 1 before stdin is read and produces no response verdict.
+Scanning covers response injection, inbound
+DLP, and (auto-enabled by default, like the proxy) tool-definition scanning
+for tools/list responses. It does not include tool call policy or request-side
+input scanning, because scan only ever sees one side of the conversation: the
+response stream on stdin, never the paired request. Numeric JSON leaves are
+kept out of prompt-injection and pattern-DLP matching; they are compared only
+against registered canary tokens (as a plain number or decimal character
+codes) and configured environment or file secrets spelled as decimal character
+codes. Use pipelock mcp proxy for full bidirectional protection.
+In text mode, findings and input-inspection errors are printed. In JSON mode,
+each line that can be read produces a verdict.
+
+Examples:
+  mcp-server | pipelock mcp scan
+  pipelock mcp scan --json --config pipelock.yaml < responses.jsonl`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := cliutil.LoadConfigOrDefault(configFile)
+			if err != nil {
+				return err
+			}
+
+			// Resolve effective policy for scan mode: response-scanning
+			// fallback, tool-scanning auto-enable, and bundle merge on a
+			// cloned config. RuntimeMCPScan auto-enables tool scanning (it
+			// is response-side, unlike input scanning / tool policy, which
+			// stay off because scan never sees a request).
+			var bundleResult *rules.LoadResult
+			cfg, _ = runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
+				Mode: config.RuntimeMCPScan,
+				MergeBundles: func(c *config.Config) {
+					bundleResult = rules.MergeIntoConfig(c, cliutil.Version)
+				},
+			}, cmd.ErrOrStderr(), "scan")
+			for _, e := range bundleResult.Errors {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
+			for _, w := range bundleResult.Warnings {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
+			}
+			if err := strictRuleBundleIntegrityError(cfg, bundleResult); err != nil {
+				return err
+			}
+			if bundleResult.Degraded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
+			}
+			sc, err := scanner.New(cfg)
+			if err != nil {
+				return fmt.Errorf("create scanner: %w", err)
+			}
+			defer sc.Close()
+			announcePromptInjectionPolicy(cfg, nil, cmd.ErrOrStderr())
+			wirePromptInjectionStderr(sc, cmd.ErrOrStderr())
+
+			// A nil toolCfg tells ScanStreamResult the operator explicitly
+			// disabled mcp_tool_scanning (RuntimeMCPScan auto-enables it
+			// above when left unconfigured, matching mcp proxy's default),
+			// so a tools/list response reports Unscanned instead of a false
+			// clean:true. Baseline is fresh per invocation: scan is a
+			// one-shot stdin stream, not a long-lived session, so drift
+			// detection is scoped to definitions repeated within this run.
+			var toolCfg *tools.ToolScanConfig
+			if cfg.MCPToolScanning.Enabled {
+				// ack-exempt: the offline scan has no configured server or
+				// transport binding, so no acknowledgment can apply to it.
+				toolCfg = &tools.ToolScanConfig{
+					Baseline:         tools.NewToolBaseline(),
+					Action:           cfg.MCPToolScanning.Action,
+					DetectDrift:      cfg.MCPToolScanning.DetectDrift,
+					NewToolAdmission: cfg.MCPToolScanning.NewToolAdmission,
+					ExtraPoison:      rules.ConvertToolPoison(bundleResult.ToolPoison),
+				}
+			}
+
+			found, malformed, err := mcp.ScanStreamResult(cmd.InOrStdin(), cmd.OutOrStdout(), sc, jsonOutput, toolCfg)
+			if err != nil && !errors.Is(err, bufio.ErrTooLong) {
+				return err
+			}
+			if found {
+				return ErrMCPResponseSecurityFinding
+			}
+			// A line that could not be fully inspected was not verified clean, so
+			// it must not share an exit code with verified-clean input. A caller
+			// gating CI on process status would otherwise read incomplete scanning
+			// as safe.
+			// Exit 2 is the code this binary already reserves for bad input, and
+			// `pipelock explain mcp-response` already returns it for the same
+			// input, so this makes the two agree rather than inventing a scheme.
+			if malformed {
+				return ErrMCPScanMalformedInput
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
+	cmd.Flags().BoolVar(&jsonOutput, "json", false, "output results as JSON (one object per line)")
+	return cmd
+}
+
+func mcpProxyCmd() *cobra.Command {
+	return mcpProxyCmdWithAuditLoggerFactory(audit.NewWithStream)
+}
+
+func mcpProxyCmdWithAuditLoggerFactory(newAuditLogger mcpAuditLoggerFactory) *cobra.Command {
+	return mcpProxyCmdWithListenerTimeout(newAuditLogger, 0)
+}
+
+func mcpProxyCmdWithListenerTimeout(newAuditLogger mcpAuditLoggerFactory, listenerShutdownTimeout time.Duration) *cobra.Command {
+	var configFile string
+	var upstreamURL string
+	var listenAddr string
+	var envVars []string
+	var envCarriers []string
+	var envUnset []string
+	var envFileCarrier string
+	var rawHeaders []string
+	var headerCarriers []string
+	var headerFile string
+	var agentName string
+	var serverName string
+	var adaptiveResetFile string
+	var adaptiveResetAuthorityPublicKeyFile string
+	var adaptiveResetTarget string
+	var sandboxEnabled bool
+	var sandboxStrict bool
+	var sandboxBestEffort bool
+	var sandboxBestEffortReason string
+	var sandboxBestEffortExpiry string
+	var sandboxWorkspace string
+	var captureOutput string
+	var captureEscrowKey string
+	var listenerAuthTokenFile string
+	var listenerAllowedOrigins []string
+	var listenerAllowUnauthenticated bool
+
+	cmd := &cobra.Command{
+		Use:   "proxy [flags] [-- COMMAND [ARGS...]]",
+		Short: "Proxy an MCP server, scanning responses for prompt injection",
+		Long: `Launches an MCP server subprocess and proxies its stdio transport with
+bidirectional scanning:
+
+  - Responses (server->client) are scanned for prompt injection before forwarding.
+  - Requests (client->server) are scanned for DLP leaks and injection in tool arguments.
+
+Response action is controlled by response_scanning.action (warn/block/strip/ask).
+Request action is controlled by mcp_input_scanning.action (warn/block).
+
+Input scanning is auto-enabled unless explicitly configured in your config file.
+Use this as a drop-in wrapper in your MCP client configuration.
+
+Subprocess (stdio) mode:
+  pipelock mcp proxy -- npx @modelcontextprotocol/server-filesystem /tmp
+  pipelock mcp proxy --config pipelock.yaml -- python my_server.py
+
+HTTP transport mode (stdio client, HTTP upstream):
+  pipelock mcp proxy --upstream http://localhost:8080/mcp
+  pipelock mcp proxy --upstream https://mcp.example.com/v1 --config pipelock.yaml
+
+HTTP reverse proxy mode (HTTP listener, HTTP upstream):
+  pipelock mcp proxy --listen 0.0.0.0:8889 --upstream http://localhost:3000/mcp
+  pipelock mcp proxy --listen :8889 --upstream http://web:3000/mcp --config pipelock.yaml
+
+Claude Desktop config (local subprocess):
+  {
+    "mcpServers": {
+      "filesystem": {
+        "command": "pipelock",
+        "args": ["mcp", "proxy", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      }
+    }
+  }
+
+Claude Desktop config (remote server):
+  {
+    "mcpServers": {
+      "remote": {
+        "command": "pipelock",
+        "args": ["mcp", "proxy", "--upstream", "http://host.docker.internal:8080/mcp"]
+      }
+    }
+  }
+
+Environment passthrough (subprocess mode only):
+  pipelock mcp proxy --env BRAIN_DIR --env API_URL=http://localhost:8081 -- node server.js
+
+  By default, pipelock strips the child process environment to prevent secret leakage.
+  Use --env KEY to pass through a variable from the current environment, or
+  --env KEY=VALUE to set it explicitly.
+
+When flight_recorder.enabled is true in config, pipelock writes tamper-evident
+MCP evidence. If flight_recorder.signing_key_path is also set, pipelock emits
+signed action receipts for MCP decisions.
+
+Key-free evidence capture:
+  pipelock mcp proxy --capture-output ./evidence -- node server.js
+
+  --capture-output writes scan verdicts (DLP, injection, tool policy, CEE) as
+  evidence-*.jsonl without requiring a signing key, mirroring
+  'pipelock run --capture-output'. Captured tool arguments are DLP-redacted
+  unless flight_recorder.redact is set to false.`,
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
+			dashIdx := cmd.ArgsLenAtDash()
+			hasSubprocess := dashIdx >= 0 && dashIdx < len(args)
+			hasUpstream := upstreamURL != ""
+			hasListen := listenAddr != ""
+			if serverName != "" {
+				if err := config.ValidateMCPServerName(serverName, "--server-name"); err != nil {
+					return err
+				}
+			}
+			carrierEntries, err := resolveHeaderCarrierEntries(headerCarriers)
+			if err != nil {
+				return err
+			}
+			resolvedEnv, err := resolveChildEnvironment(envFileCarrier, envCarriers, envUnset)
+			if err != nil {
+				return err
+			}
+
+			// Mutual exclusion validation.
+			if hasUpstream && hasSubprocess {
+				return errors.New("--upstream and subprocess command (--) are mutually exclusive")
+			}
+			if hasListen && hasSubprocess {
+				return errors.New("--listen and subprocess command (--) are mutually exclusive")
+			}
+			if hasListen && !hasUpstream {
+				return errors.New("--listen requires --upstream")
+			}
+			if !hasUpstream && !hasSubprocess {
+				return errors.New("specify --upstream URL or -- COMMAND [ARGS...]")
+			}
+			// Headers and child-environment overrides are resolved once here and
+			// reused by the transport, so the server binding covers exactly
+			// what is sent.
+			var upstreamHeaders http.Header
+			var launchHeaders []identity.Header
+			var extraEnv []string
+			bindingInputs := mcpBindingInputs{}
+			if hasUpstream {
+				fileHeaders, fileErr := readHeaderFile(headerFile)
+				if fileErr != nil {
+					return fileErr
+				}
+				var headerErr error
+				upstreamHeaders, headerErr = parseHeaderFlags(mergeHeaderLines(fileHeaders, rawHeaders, carrierEntries))
+				if headerErr != nil {
+					return headerErr
+				}
+				launchHeaders, headerErr = identityHeaders(fileHeaders, rawHeaders, carrierEntries)
+				if headerErr != nil {
+					return headerErr
+				}
+				bindingInputs = mcpUpstreamBindingInputs(upstreamURL, upstreamHeaders)
+			} else {
+				var envErr error
+				extraEnv, envErr = buildChildExtraEnv(resolvedEnv, envVars, os.LookupEnv)
+				if envErr != nil {
+					return envErr
+				}
+				bindingInputs.Command = args[dashIdx:]
+				bindingInputs.ChildEnv = extraEnv
+			}
+			if adaptiveResetFile != "" && (hasUpstream || hasListen) {
+				return errors.New("--adaptive-reset-file is only supported with local subprocess MCP servers")
+			}
+			// Any sandbox flag is sandbox intent. Checking here, before the
+			// remote-mode branches, means a best-effort flag on --upstream or
+			// --listen is refused instead of silently ignored.
+			sandboxIntent := sandboxEnabled || sandboxStrict || sandboxBestEffort ||
+				cmd.Flags().Changed("sandbox-best-effort-reason") || cmd.Flags().Changed("sandbox-best-effort-expiry")
+			if sandboxIntent && hasListen {
+				return errors.New("--sandbox cannot be used with --listen (cannot sandbox a remote server)")
+			}
+			if sandboxIntent && hasUpstream {
+				return errors.New("--sandbox cannot be used with --upstream (cannot sandbox a remote server)")
+			}
+			if adaptiveResetFile == "" && (adaptiveResetAuthorityPublicKeyFile != "" || adaptiveResetTarget != "") {
+				return errors.New("--adaptive-reset-authority-public-key-file and --adaptive-reset-target require --adaptive-reset-file")
+			}
+			if !hasListen && (listenerAuthTokenFile != "" || len(listenerAllowedOrigins) > 0 || listenerAllowUnauthenticated) {
+				return errors.New("MCP listener authentication flags require --listen")
+			}
+			if err := validateMCPListenerOrigins(listenerAllowedOrigins); err != nil {
+				return err
+			}
+			listenerAuthToken, err := readMCPListenerTokenFile(listenerAuthTokenFile)
+			if err != nil {
+				return err
+			}
+			if err := validateMCPListenerBoundary(listenAddr, listenerAuthToken, listenerAllowUnauthenticated); err != nil {
+				return err
+			}
+			// Reject sandbox CLI flag with remote modes.
+			if sandboxEnabled {
+				if hasUpstream {
+					return errors.New("--sandbox cannot be used with --upstream (cannot sandbox a remote server)")
+				}
+				if hasListen {
+					return errors.New("--sandbox cannot be used with --listen (cannot sandbox a remote server)")
+				}
+			}
+
+			// Validate upstream URL scheme.
+			var isWSUpstream bool
+			if hasUpstream {
+				u, err := url.Parse(upstreamURL)
+				if err != nil || u.Host == "" {
+					return fmt.Errorf("invalid upstream URL %q: must include a scheme and host", RedactEndpoint(upstreamURL))
+				}
+				switch u.Scheme {
+				case schemeHTTP, schemeHTTPS:
+					// HTTP transport.
+				case "ws", "wss":
+					isWSUpstream = true
+				default:
+					return fmt.Errorf("invalid upstream URL %q: scheme must be http, https, ws, or wss", RedactEndpoint(upstreamURL))
+				}
+			}
+
+			cfg, err := cliutil.LoadConfigOrDefault(configFile)
+			if err != nil {
+				return err
+			}
+			if err := cfg.ResolveRuntimeCredentials(); err != nil {
+				return err
+			}
+
+			// Build edition so _default fallback works the same as HTTP proxy.
+			// Bootstrap scanner is used only for edition init; closed before
+			// rebuilding with the resolved config.
+			bootSC, err := scanner.New(cfg)
+			if err != nil {
+				return fmt.Errorf("create edition scanner: %w", err)
+			}
+			ed, edErr := edition.NewEditionFunc(cfg, bootSC)
+			if edErr != nil {
+				bootSC.Close()
+				return fmt.Errorf("edition init: %w", edErr)
+			}
+			defer ed.Close()
+
+			// Resolve agent: known name -> that profile, unknown -> error, empty -> _default.
+			resolved, found := ed.LookupProfile(agentName)
+			if agentName != "" && !found {
+				// Distinguish truly unknown from known-but-expired.
+				if known := ed.KnownProfiles(); known[agentName] {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "WARNING: agent profile %q exists but license has expired; using default profile\n", agentName)
+				} else {
+					bootSC.Close()
+					return fmt.Errorf("unknown agent profile %q", agentName)
+				}
+			}
+			dowAgentName := resolvedMCPDoWAgentName(agentName, resolved.Name, found)
+			cfg = resolved.Config
+			bootSC.Close() // done with bootstrap scanner
+			if err := ackKeyWithheldFromChild(cfg.MCPToolScanning.AcknowledgmentKey, extraEnv); err != nil {
+				return err
+			}
+
+			// Set up Sentry error reporting
+			sentryClient, sentryErr := plsentry.Init(cfg, cliutil.Version)
+			if sentryErr != nil {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "warning: sentry init failed: %v\n", sentryErr)
+			}
+			if sentryClient != nil {
+				defer sentryClient.Close()
+			}
+
+			// Resolve effective runtime policy on a clone. The MCP proxy
+			// mode response-scanning fallback, MCP scanning auto-enable,
+			// and bundle merges all run inside ResolveRuntime so the
+			// loaded cfg is never mutated and the clone's CanonicalPolicyHash
+			// reflects the effective policy every downstream emitter,
+			// scanner, and receipt stamp consumes.
+			var bundleResult *rules.LoadResult
+			cfg, _ = runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
+				Mode: config.RuntimeMCPProxy,
+				MergeBundles: func(c *config.Config) {
+					bundleResult = rules.MergeIntoConfig(c, cliutil.Version)
+				},
+				DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
+			}, cmd.ErrOrStderr(), "proxy")
+			for _, e := range bundleResult.Errors {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
+			for _, w := range bundleResult.Warnings {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
+			}
+			// Fail closed in strict mode on installed-bundle integrity loss,
+			// matching the main proxy server's startup path. Without this a
+			// strict `mcp proxy` would silently boot on core patterns only when
+			// a tampered bundle failed verification.
+			if err := strictRuleBundleIntegrityError(cfg, bundleResult); err != nil {
+				return err
+			}
+			if bundleResult.Degraded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
+			}
+			extraPoison := rules.ConvertToolPoison(bundleResult.ToolPoison)
+
+			// Resolve the launch identity once, from the final config and before
+			// the acknowledgment binding is computed: a registered verified local
+			// service is bound by the session digest, everything else by the
+			// transport digest.
+			launchTransport := identity.Transport{
+				Kind:     identity.KindSubprocess,
+				Command:  bindingInputs.Command,
+				ChildEnv: bindingInputs.ChildEnv,
+			}
+			if hasUpstream {
+				launchTransport = identity.Transport{
+					Kind:        upstreamTransportKind(isWSUpstream),
+					UpstreamURL: upstreamURL,
+					Headers:     launchHeaders,
+				}
+			}
+			launchIdentity, err := resolveLaunchIdentity(cfg, serverName, launchTransport, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			serverBinding, err := launchBinding(launchIdentity, launchTransport, bindingInputs)
+			if err != nil {
+				return err
+			}
+
+			// Rebuild scanner with the (possibly modified) resolved config.
+			sc, err := scanner.New(cfg)
+			if err != nil {
+				return fmt.Errorf("create scanner: %w", err)
+			}
+			defer sc.Close()
+			auditLogger, err := newAuditLogger(
+				cfg.Logging.Format,
+				cfg.Logging.Output,
+				cfg.Logging.File,
+				cfg.Logging.IncludeAllowed,
+				cfg.Logging.IncludeBlocked,
+				cmd.ErrOrStderr(),
+			)
+			if err != nil {
+				return fmt.Errorf("create MCP audit logger: %w", err)
+			}
+			defer auditLogger.Close()
+			wirePromptInjectionAudit(sc, auditLogger)
+			announcePromptInjectionPolicy(cfg, auditLogger, cmd.ErrOrStderr())
+			upstreamDialContext := verifiedDialContext(
+				mcp.NewMetadataSafeDialContext(func() *scanner.Scanner { return sc }),
+				launchIdentity,
+				cmd.ErrOrStderr(),
+			)
+
+			ks := killswitch.New(cfg)
+
+			var approver *hitl.Approver
+			if needsHITLApprover(cfg) {
+				approver = newRuntimeApprover(cfg)
+				defer approver.Close()
+			}
+
+			inputCfg := &mcp.InputScanConfig{
+				Enabled:                cfg.MCPInputScanning.Enabled,
+				Action:                 cfg.MCPInputScanning.Action,
+				OnParseError:           cfg.MCPInputScanning.OnParseError,
+				ResponseTimeoutSeconds: cfg.MCPInputScanning.ResponseTimeoutSeconds,
+			}
+
+			var mcpRedactMatcher *redact.Matcher
+			if cfg.Redaction.Enabled {
+				var redactErr error
+				mcpRedactMatcher, redactErr = cfg.Redaction.BuildMatcher(cfg.Redaction.DefaultProfile)
+				if redactErr != nil {
+					return fmt.Errorf("build MCP redaction matcher: %w", redactErr)
+				}
+			}
+
+			var toolCfg *tools.ToolScanConfig
+			if cfg.MCPToolScanning.Enabled {
+				toolCfg = &tools.ToolScanConfig{
+					Action:                 cfg.MCPToolScanning.Action,
+					DetectDrift:            cfg.MCPToolScanning.DetectDrift,
+					NewToolAdmission:       cfg.MCPToolScanning.NewToolAdmission,
+					ListenerDriftResetFile: cfg.MCPToolScanning.ListenerDriftResetFile,
+					ExtraPoison:            extraPoison,
+					CredentialAcks:         tools.NewCredentialAckSet(cfg.MCPToolScanning.AcknowledgedFindings, cfg.MCPToolScanning.AcknowledgmentKeyBytes),
+				}
+				resetTarget := cfg.MCPToolScanning.ListenerDriftResetTarget
+				if cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile != "" &&
+					len(cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKey) != 0 && resetTarget != "" {
+					toolCfg.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKey...)
+					toolCfg.ListenerDriftResetTarget = resetTarget
+				}
+				// Wire session binding into tool scanning when enabled.
+				if cfg.MCPSessionBinding.Enabled {
+					toolCfg.BindingUnknownAction = cfg.MCPSessionBinding.UnknownToolAction
+					toolCfg.BindingNoBaselineAction = cfg.MCPSessionBinding.NoBaselineAction
+				}
+			}
+
+			var adaptiveResetAuthority *mcp.ResetAuthority
+			var adaptiveResetEpoch atomic.Uint64
+			if adaptiveResetFile != "" {
+				if adaptiveResetAuthorityPublicKeyFile == "" || adaptiveResetTarget == "" {
+					return errors.New("--adaptive-reset-file requires --adaptive-reset-authority-public-key-file and --adaptive-reset-target")
+				}
+				publicKey, err := signing.LoadPublicKey(adaptiveResetAuthorityPublicKeyFile)
+				if err != nil {
+					return fmt.Errorf("load adaptive reset authority public key: %w", err)
+				}
+				adaptiveResetAuthority, err = mcp.NewResetAuthority(publicKey, adaptiveResetTarget)
+				if err != nil {
+					return fmt.Errorf("create adaptive reset authority: %w", err)
+				}
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: MCP reset authority target=%q instance=%q epoch=0\n", adaptiveResetAuthority.Target(), adaptiveResetAuthority.InstanceID())
+			}
+
+			var policyCfg *policy.Config
+			if cfg.MCPToolPolicy.Enabled {
+				policyCfg = policy.New(cfg.MCPToolPolicy)
+				// A subprocess server shares this host's filesystem, so a submitted
+				// path is also matched by the file it resolves to here. A remote
+				// upstream resolves paths on its own host, which Pipelock cannot see.
+				// A server commonly resolves relative names against the directories
+				// it was given, so those join the working directory as bases.
+				if hasSubprocess && !hasUpstream {
+					cwd, _ := os.Getwd()
+					policyCfg.EnableLocalPathIdentity(localPathBasesFromArgs(cwd, args[dashIdx+1:])...)
+				}
+			}
+
+			// Initialize chain matcher if tool chain detection is configured.
+			var chainMatcher *chains.Matcher
+			if cfg.ToolChainDetection.Enabled {
+				chainMatcher = chains.New(&cfg.ToolChainDetection)
+			}
+
+			// Create the MCP metrics registry independently of session profiling so
+			// transport, CEE, and denial-of-wallet counters share the served registry.
+			mcpMetrics := metrics.New()
+
+			// Deliver audit events to the sinks configured under emit, exactly
+			// as pipelock run does. Without this, a wrapper's emit section was
+			// parsed and then ignored. Activation failure aborts startup so a
+			// configured audit destination cannot be bypassed. The deferred
+			// Close runs before auditLogger.Close (LIFO), draining queued events.
+			mcpEmitter, _, emitErr := startAuditEmitter(cfg, auditLogger, mcpMetrics, configFile, cmd.ErrOrStderr())
+			if emitErr != nil {
+				return emitErr
+			}
+			defer func() { _ = mcpEmitter.Close() }()
+
+			// Build CEE deps when cross-request detection is enabled.
+			var cee *mcp.CEEDeps
+			if cfg.CrossRequestDetection.Enabled {
+				cee = mcp.NewCEEDeps(cfg.CrossRequestDetection, mcpMetrics)
+			}
+
+			// The session store remains optional.
+			var store session.Store
+			var baselineChecker session.BaselineChecker
+			var adaptiveCfg *config.AdaptiveEnforcement
+			if cfg.AdaptiveEnforcement.Enabled {
+				adaptiveCfg = &cfg.AdaptiveEnforcement
+			}
+			if cfg.SessionProfiling.Enabled {
+				// Reuse the registry created above rather than replacing it: the
+				// denial-of-wallet and transport counters are already wired to
+				// that instance, and a second registry here would drop them.
+				smOpts := mcpSessionManagerOptions(cfg, auditLogger)
+				sm := proxy.NewSessionManager(&cfg.SessionProfiling, adaptiveCfg, mcpMetrics, smOpts)
+				if cfg.BehavioralBaseline.Enabled {
+					if err := sm.EnableBaseline(&cfg.BehavioralBaseline); err != nil {
+						return fmt.Errorf("behavioral baseline: %w", err)
+					}
+				}
+				defer sm.Close()
+				store = sm.AsStore()
+				baselineChecker = sm
+			}
+			// Denial-of-wallet tracking: _default budget is free tier (always
+			// available). Named agent budgets are safe to read from cfg.Agents
+			// because EnforceLicenseGate (called during Load) already stripped
+			// named agents when the license is missing/invalid. In enterprise
+			// builds the gate preserves _default and removes the rest; in OSS
+			// builds the gate func is nil so only _default survives if no
+			// named agents are configured.
+			dowWiring := buildMCPDoWWiring(cfg, dowAgentName)
+
+			var receiptEmitter *receipt.Emitter
+			var v2ReceiptEmitter *proxydecision.Emitter
+			var receiptGroup *mcp.MCPReceiptGroup
+			if cfg.FlightRecorder.Enabled {
+				recCfg := recorder.Config{
+					Enabled:            cfg.FlightRecorder.Enabled,
+					Dir:                cfg.FlightRecorder.Dir,
+					CheckpointInterval: cfg.FlightRecorder.CheckpointInterval,
+					RetentionDays:      cfg.FlightRecorder.RetentionDays,
+					Redact:             cfg.FlightRecorder.Redact,
+					SignCheckpoints:    cfg.FlightRecorder.SignCheckpoints,
+					MaxEntriesPerFile:  cfg.FlightRecorder.MaxEntriesPerFile,
+					FileMode:           cfg.FlightRecorder.FileMode,
+					RawEscrow:          cfg.FlightRecorder.RawEscrow,
+					EscrowPublicKey:    cfg.FlightRecorder.EscrowPublicKey,
+				}
+
+				var recPrivKey ed25519.PrivateKey
+				if cfg.FlightRecorder.SigningKeyPath != "" {
+					k, kErr := signing.LoadPrivateKeyFile(cfg.FlightRecorder.SigningKeyPath)
+					if kErr != nil {
+						return fmt.Errorf("loading flight recorder signing key: %w", kErr)
+					}
+					recPrivKey = k
+				}
+
+				// The recorder owns this scanner generation as its receipt
+				// detector for its whole lifetime (see recorder.NewWithScanner).
+				rec, recErr := recorder.NewWithScanner(recCfg, sc, recPrivKey)
+				if recErr != nil {
+					return fmt.Errorf("creating flight recorder: %w", recErr)
+				}
+				runFlightRecorderExpiryOnce(rec, cmd.ErrOrStderr(), defaultExpire)
+				defer func() { _ = rec.Close() }()
+				var runSession string
+				if cfg.FlightRecorder.ReceiptChainCount() == 1 {
+					var sessErr error
+					runSession, sessErr = acquireRunSession(rec)
+					if sessErr != nil {
+						return sessErr
+					}
+				}
+				retentionCtx, retentionCancel := context.WithCancel(cmd.Context())
+				var retentionWG sync.WaitGroup
+				startFlightRecorderRetention(retentionCtx, &retentionWG, rec, cmd.ErrOrStderr(), defaultFlightRecorderRetentionInterval, defaultExpire)
+				defer func() {
+					retentionCancel()
+					retentionWG.Wait()
+				}()
+				postureResult, bindErr := posturebinding.LoadRuntimeForReceipts(posturebinding.RuntimeReceiptOptions{
+					ReceiptSigningEnabled:      cfg.FlightRecorder.SigningKeyPath != "",
+					RequireContainmentEvidence: cfg.FlightRecorder.RequireContainmentEvidence,
+					PinnedPostureSignerKey:     cfg.FlightRecorder.PostureSignerPublicKey,
+					Stderr:                     cmd.ErrOrStderr(),
+				})
+				if bindErr != nil {
+					return fmt.Errorf("loading posture binding: %w", bindErr)
+				}
+
+				// ConfigHash here uses cfg.Hash() (raw YAML bytes) - the
+				// receipt is a point-in-time audit fingerprint of the
+				// loaded configuration file. The envelope emitter below
+				// uses cfg.CanonicalPolicyHash() because its contract is
+				// about effective policy equivalence, not file identity.
+				// Intentional split, preserved across the runtime-resolve
+				// refactor: the resolved cfg carries the original rawBytes
+				// so Hash() still reflects the on-disk YAML even after
+				// bundle merge and auto-enable.
+				// The shared MCP registry also captures receipt emission failures.
+				template := receipt.EmitterConfig{
+					Recorder:            rec,
+					PrivKey:             recPrivKey,
+					ConfigHash:          cfg.Hash(),
+					Principal:           "local",
+					Actor:               "pipelock",
+					Metrics:             mcpMetrics,
+					PriorSignerKeys:     cfg.FlightRecorder.ReceiptGroupPriorSignerKeys,
+					PostureBinding:      postureResult.Binding,
+					PostureAvailability: string(postureResult.Availability),
+					HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+					Session:             runSession,
+				}
+				cmd.PrintErrf("  Recorder: %s (flight recorder enabled)\n", cfg.FlightRecorder.Dir)
+				printFlightRecorderEvidenceWarning(cmd.ErrOrStderr(), cfg.FlightRecorder.Dir, cfg.FlightRecorder.RetentionDays)
+				if cfg.FlightRecorder.ReceiptChainCount() > 1 {
+					var groupErr error
+					receiptGroup, groupErr = buildMCPReceiptGroup(template, cfg.FlightRecorder.ReceiptChainCount())
+					if groupErr != nil {
+						return groupErr
+					}
+					opening, _ := receiptGroup.Shards.Opening()
+					receiptEmitter = receiptGroup.Shards.ProcessEmitter()
+					v2ReceiptEmitter = receiptGroup.V2[opening.ProcessShardIndex]
+					cmd.PrintErrf("  Receipts: %d signed chains enabled\n", opening.ShardCount)
+				} else {
+					receiptEmitter = receipt.NewEmitter(template)
+
+					// Loud, one-time startup signal when the chain could not be
+					// resumed (a corrupt, tampered, or foreign-key tail, or an
+					// evidence read error). Each run mints a new session, so a key
+					// changed between runs starts a fresh chain and never lands here.
+					if initErr := receiptEmitter.InitError(); errors.Is(initErr, receipt.ErrRetainedContent) {
+						// A configuration refusal, not a chain-resume fault.
+						return fmt.Errorf("flight_recorder: %w", initErr)
+					} else if initErr != nil {
+						cmd.PrintErrf("  Receipts: ERROR - chain could not be resumed: %v\n"+
+							"            Receipt emission is DISABLED until resolved. Inspect the evidence\n"+
+							"            directory and flight_recorder.signing_key_path.\n", initErr)
+					} else if len(recPrivKey) > 0 {
+						if openErr := emitStartupSessionOpen(receiptEmitter); openErr != nil {
+							if cfg.FlightRecorder.RequireReceipts {
+								return fmt.Errorf("flight_recorder.require_receipts is enabled but session_open receipt could not be emitted: %w", openErr)
+							}
+							cmd.PrintErrf("  Receipts: ERROR - session_open could not be emitted: %v\n"+
+								"            Receipt emission for this run is UNVERIFIED until resolved.\n", openErr)
+						}
+						cmd.PrintErrf("  Receipts: enabled (action receipts signed)\n")
+						v2ReceiptEmitter = proxydecision.NewEmitter(proxydecision.EmitterConfig{
+							Recorder:  rec,
+							Signer:    proxydecision.NewKeyedSigner(recPrivKey),
+							Sanitize:  proxydecision.SanitizeFromRedactor(rec.ReceiptRedactor()),
+							Principal: "local",
+							Actor:     "pipelock",
+							Session:   runSession,
+						})
+						if v2ReceiptEmitter != nil {
+							cmd.PrintErrf("  Receipts: v2 proxy_decision dual-emit enabled\n")
+						}
+					} else {
+						// receipt.NewEmitter returns nil when no signing key is
+						// configured. Receipts must be signed - there is no
+						// "unsigned receipt" mode - so report the operator-facing
+						// status by signing-key presence, not by emitter identity.
+						cmd.PrintErrf("  Receipts: disabled — set flight_recorder.signing_key_path to enable signed action receipts\n")
+					}
+				}
+			}
+			// require_receipts escalates a missing receipt to a block. With no
+			// live signed emitter (recorder disabled, no dir, or no signing
+			// key) every tools/call would fail closed with
+			// receipt_emission_failed - a silent, total block. Refuse to start
+			// so the misconfiguration surfaces here, not as an all-blocked
+			// proxy at runtime.
+			if cfg.FlightRecorder.RequireReceipts && !receiptEmitterReady(receiptEmitter) {
+				return fmt.Errorf("flight_recorder.require_receipts is enabled but no healthy signed receipt emitter is active: set flight_recorder.enabled, flight_recorder.dir, and flight_recorder.signing_key_path (run 'pipelock init'), fix any receipt-chain resume error, or disable require_receipts")
+			}
+			heartbeatCtx, heartbeatCancel := context.WithCancel(cmd.Context())
+			defer heartbeatCancel()
+			var mcpLn net.Listener
+			if hasListen {
+				mcpLn, err = (&net.ListenConfig{}).Listen(heartbeatCtx, "tcp", listenAddr)
+				if err != nil {
+					bindErr := fmt.Errorf("MCP listener bind %s: %w", listenAddr, err)
+					if sentryClient != nil {
+						sentryClient.CaptureError(bindErr)
+					}
+					return bindErr
+				}
+				defer func() { _ = mcpLn.Close() }()
+			}
+			stopMetrics, metricsBoundAddr, metricsErr := startDedicatedMetricsServer(heartbeatCtx, cfg.MetricsListen, mcpMetrics, cmd.ErrOrStderr())
+			if metricsErr != nil {
+				if hasListen {
+					return fmt.Errorf("start metrics listener after reserving MCP --listen %q: %w", listenAddr, metricsErr)
+				}
+				return metricsErr
+			}
+			defer stopMetrics()
+			var heartbeatErrMu sync.Mutex
+			var heartbeatErr error
+			var groupFailureErr error
+			setRequiredHeartbeatErr := func(err error) {
+				if err == nil {
+					return
+				}
+				heartbeatErrMu.Lock()
+				if heartbeatErr == nil {
+					heartbeatErr = err
+				}
+				heartbeatErrMu.Unlock()
+				heartbeatCancel()
+			}
+			requiredHeartbeatErr := func() error {
+				heartbeatErrMu.Lock()
+				defer heartbeatErrMu.Unlock()
+				if groupFailureErr != nil {
+					return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt group emission failed: %w", groupFailureErr)
+				}
+				if heartbeatErr == nil {
+					return nil
+				}
+				return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt heartbeat emission failed: %w", heartbeatErr)
+			}
+			if receiptGroup != nil {
+				receiptGroup.OnRequiredFailure = func(err error) {
+					heartbeatErrMu.Lock()
+					if groupFailureErr == nil {
+						groupFailureErr = err
+					}
+					heartbeatErrMu.Unlock()
+					heartbeatCancel()
+				}
+			}
+			// Standalone MCP does not have the proxy server's drain-then-seal
+			// WaitGroup. Tie heartbeat to the command lifetime instead: the
+			// deferred stop cancels and joins heartbeats before writing
+			// session_close + transcript_root, so no heartbeat appends after
+			// the close even though each transport has its own run loop.
+			var stopReceiptLifecycle func(error)
+			if receiptGroup != nil {
+				stopReceiptLifecycle = startStandaloneReceiptGroupLifecycle(
+					heartbeatCtx, cfg.FlightRecorder.HeartbeatIntervalDuration(),
+					receiptGroup.Shards, cmd.ErrOrStderr(), cfg.FlightRecorder.RequireReceipts,
+					setRequiredHeartbeatErr,
+				)
+			} else {
+				stopReceiptLifecycle = startStandaloneReceiptLifecycle(
+					heartbeatCtx, cfg.FlightRecorder.HeartbeatIntervalDuration(),
+					receiptEmitter, cmd.ErrOrStderr(), cfg.FlightRecorder.RequireReceipts,
+					setRequiredHeartbeatErr,
+				)
+			}
+			defer func() {
+				stopReceiptLifecycle(runErr)
+				if failure := requiredHeartbeatErr(); failure != nil {
+					runErr = errors.Join(runErr, failure)
+				}
+			}()
+			sc.SetDLPWarnHook(func(ctx context.Context, patternName, severity string) {
+				emitDLPWarn(auditLogger, nil, receiptEmitter, ctx, patternName, severity)
+			})
+
+			// Envelope emitter: create when mediation_envelope.enabled=true.
+			var envEmitter *envelope.Emitter
+			if cfg.MediationEnvelope.Enabled {
+				envEmitter = envelope.NewEmitter(envelope.EmitterConfig{
+					ConfigHash:  cfg.CanonicalPolicyHash(),
+					ActorFormat: cfg.MediationEnvelope.ActorFormat,
+					TrustDomain: cfg.MediationEnvelope.TrustDomain,
+				})
+			}
+			captureConfigHash := cfg.CanonicalPolicyHash()
+			captureProfile := resolved.Name
+			if captureProfile == "" {
+				captureProfile = edition.ProfileDefault
+			}
+			contractLoader, contractLoaderErr := mcp.NewContractLoaderFromConfig(cfg)
+			if contractLoaderErr != nil {
+				return fmt.Errorf("building MCP contract loader: %w", contractLoaderErr)
+			}
+			defer startMCPContractWatch(heartbeatCtx, contractLoader, auditLogger)()
+			contractAgent := agentName
+			if contractAgent == "" {
+				contractAgent = captureProfile
+			}
+
+			// Key-free evidence capture (--capture-output): wire a
+			// capture.Writer as the CaptureObserver so DLP, injection,
+			// tool-policy, and CEE verdicts are written as evidence-*.jsonl
+			// without a signing key, mirroring `pipelock run --capture-output`.
+			// The signed receipt emitter above and this observer are
+			// independent evidence streams (different sinks), so both can run
+			// together. Built ONCE here; every transport's MCPProxyOpts is a
+			// value copy, so setting CaptureObs on each block below propagates
+			// it to stdio, sandbox-stdio, streamable-HTTP, HTTP-reverse, and WS.
+			if captureEscrowKey != "" && captureOutput == "" {
+				return fmt.Errorf("--capture-escrow-public-key requires --capture-output")
+			}
+			var captureObs capture.CaptureObserver
+			if captureOutput != "" {
+				var captureRedactFn recorder.RedactFunc
+				if cfg.FlightRecorder.Redact {
+					captureRedactFn = sc.ScanTextForDLP
+				}
+				cw, cwErr := buildCaptureWriter(captureOutput, captureEscrowKey, cfg.FlightRecorder.FileMode, captureRedactFn, mcpMetrics)
+				if cwErr != nil {
+					return fmt.Errorf("creating capture writer: %w", cwErr)
+				}
+				// capture.Writer is async and only drains its bounded queue on
+				// Close. Standalone MCP has no Server.cleanup(), so without this
+				// defer buffered evidence is dropped on normal return. Close is
+				// idempotent (sync.Once).
+				defer func() { _ = cw.Close() }()
+				captureObs = cw
+				cmd.PrintErrf("  Capture: %s (key-free evidence)\n", captureOutput)
+			}
+
+			inputAction := "disabled"
+			if inputCfg.Enabled {
+				inputAction = inputCfg.Action
+			}
+			toolAction := "disabled"
+			if toolCfg != nil {
+				toolAction = toolCfg.Action
+			}
+			policyAction := "disabled"
+			if policyCfg != nil {
+				policyAction = policyCfg.Action
+			}
+			a2aCardBaseline := mcp.NewCardBaseline(1000)
+			deferManager := buildDeferManager(cfg, cmd.ErrOrStderr())
+			if err := recoverDeferredActions(deferManager, deferJournalPath(cfg), mcp.MCPProxyOpts{
+				Scanner: sc, ReceiptEmitter: receiptEmitter, V2ReceiptEmitter: v2ReceiptEmitter,
+				ReceiptGroup: receiptGroup, PolicyHash: captureConfigHash,
+			}, cmd.ErrOrStderr()); err != nil {
+				return err
+			}
+			if hasUpstream {
+				if len(envVars) > 0 {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: --env is ignored in HTTP transport mode (no child process)")
+				}
+
+				extraHeaders := upstreamHeaders
+				if len(extraHeaders) > 0 && isWSUpstream {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: --header is only honored for HTTP upstreams; ignored for ws/wss upstreams")
+				}
+
+				ctx, cancel := signal.NotifyContext(heartbeatCtx, syscall.SIGINT, syscall.SIGTERM)
+				defer cancel()
+
+				// HTTP reverse proxy mode: --listen + --upstream.
+				if hasListen && isWSUpstream {
+					err := fmt.Errorf("--listen with WebSocket upstream (ws/wss) is not yet supported; use stdio mode: pipelock mcp proxy --upstream %s", RedactEndpoint(upstreamURL))
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
+				}
+				if hasListen {
+					if err := validateMCPDeferSurface(deferred.SurfaceMCPHTTPListener, cfg); err != nil {
+						return err
+					}
+					// Wrap static adaptiveCfg in a function to satisfy the
+					// AdaptiveConfigFunc signature. Short-lived: no hot-reload concern.
+					adaptiveFn := mcp.AdaptiveConfigFunc(func() *config.AdaptiveEnforcement {
+						return adaptiveCfg
+					})
+					listenerOpts := mcp.MCPProxyOpts{
+						ListenerBearerToken:          listenerAuthToken,
+						ListenerAllowedOrigins:       listenerAllowedOrigins,
+						ListenerAllowUnauthenticated: listenerAllowUnauthenticated,
+						ListenerStateTokenRequiredFn: func() *bool {
+							return cfg.MCPSessionBinding.ListenerRequireStateToken
+						},
+						UpstreamHeaders: extraHeaders,
+						Scanner:         sc, Approver: approver,
+						AuditLogger: auditLogger, CorrelationHeader: cfg.Emit.CorrelationHeader,
+						InputCfg: inputCfg, RequestBodyCfg: &cfg.RequestBodyScanning,
+						ToolCfg: toolCfg, PolicyCfg: policyCfg,
+						KillSwitch: ks, ChainMatcher: chainMatcher,
+						CEE: cee, Store: store, Baseline: baselineChecker, AdaptiveCfgFn: adaptiveFn, AirlockCfg: &cfg.Airlock, Metrics: mcpMetrics,
+						ConfigHash: captureConfigHash, Profile: captureProfile,
+						AddressProtectionAgent: captureProfile,
+						RedirectRT:             buildRedirectRT(cfg),
+						ProvenanceCfg:          &cfg.MCPToolProvenance,
+						EnvelopeEmitter:        envEmitter,
+						CaptureObs:             captureObs,
+						MediaPolicy:            &cfg.MediaPolicy,
+						RedactMatcher:          mcpRedactMatcher,
+						RedactLimits:           cfg.Redaction.Limits.ToLimits(),
+						RedactProfile:          cfg.Redaction.DefaultProfile,
+						TaintCfg:               &cfg.Taint,
+						ContractLoader:         contractLoader,
+						ContractAgent:          contractAgent,
+						DialContext:            upstreamDialContext,
+					}
+					applyMCPDoWOpts(&listenerOpts, dowWiring, true)
+					if listenerAuthTokenFile != "" {
+						listenerOpts.ListenerBearerTokenFn = func() (string, error) {
+							return readMCPListenerTokenFile(listenerAuthTokenFile)
+						}
+					}
+					applyMCPA2AOpts(&listenerOpts, cfg, a2aCardBaseline, upstreamURL)
+					applyMCPResponseSuppressOpts(&listenerOpts, cfg, launchIdentity)
+					listenerOpts.ServerBinding = serverBinding
+					listenerOpts.ServerIdentityHeadersFn = listenerIdentityHeadersFn(launchIdentity, launchTransport, func() mcp.ServerIdentity {
+						return mcp.ServerIdentity{Name: launchIdentity.Name, PolicyName: launchIdentity.ArmingName, Binding: serverBinding, BindingMode: launchIdentity.BindingMode, Revision: launchIdentity.Revision}
+					})
+					listenerOpts = mcpReceiptParityOpts(listenerOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+					listenerOpts.ReceiptGroup = receiptGroup
+					respAction, respTrust, respServer := mcpResponseLogFields(listenerOpts)
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: MCP reverse proxy %s -> %s (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
+						listenAddr, RedactEndpoint(upstreamURL), respAction, respTrust, respServer, inputAction, toolAction, policyAction)
+					listenerOpts.ListenerShutdownTimeout = listenerShutdownTimeout
+					if err := mcp.RunHTTPListenerProxy(ctx, mcpLn, upstreamURL, cmd.ErrOrStderr(), listenerOpts); err != nil {
+						if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+							return errors.Join(err, heartbeatErr)
+						}
+						if sentryClient != nil {
+							sentryClient.CaptureError(err)
+						}
+						return err
+					}
+					if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+						return heartbeatErr
+					}
+					return nil
+				}
+
+				// Stdio-to-WebSocket mode: --upstream ws:// or wss://.
+				if isWSUpstream {
+					if err := validateMCPDeferSurface(deferred.SurfaceMCPWS, cfg); err != nil {
+						return err
+					}
+					wsOpts := mcp.MCPProxyOpts{
+						Scanner: sc, Approver: approver,
+						AuditLogger: auditLogger,
+						InputCfg:    inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+						KillSwitch: ks, ChainMatcher: chainMatcher,
+						CEE: cee, Store: store, Baseline: baselineChecker,
+						AdaptiveCfg:            adaptiveCfg,
+						AirlockCfg:             &cfg.Airlock,
+						ConfigHash:             captureConfigHash,
+						Profile:                captureProfile,
+						AddressProtectionAgent: captureProfile,
+						Metrics:                mcpMetrics,
+						CaptureObs:             captureObs,
+						RedirectRT:             buildRedirectRT(cfg),
+						EnvelopeEmitter:        envEmitter,
+						MediaPolicy:            &cfg.MediaPolicy,
+						RedactMatcher:          mcpRedactMatcher,
+						RedactLimits:           cfg.Redaction.Limits.ToLimits(),
+						RedactProfile:          cfg.Redaction.DefaultProfile,
+						TaintCfg:               &cfg.Taint,
+						ContractLoader:         contractLoader,
+						ContractAgent:          contractAgent,
+						DialContext:            upstreamDialContext,
+					}
+					applyMCPDoWOpts(&wsOpts, dowWiring, false)
+					applyMCPA2AOpts(&wsOpts, cfg, a2aCardBaseline, upstreamURL)
+					applyMCPResponseSuppressOpts(&wsOpts, cfg, launchIdentity)
+					wsOpts.ServerBinding = serverBinding
+					wsOpts = mcpReceiptParityOpts(wsOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+					wsOpts.ReceiptGroup = receiptGroup
+					respAction, respTrust, respServer := mcpResponseLogFields(wsOpts)
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying WS upstream %s (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
+						RedactEndpoint(upstreamURL), respAction, respTrust, respServer, inputAction, toolAction, policyAction)
+					if err := mcp.RunWSProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), upstreamURL, wsOpts); err != nil {
+						if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+							return heartbeatErr
+						}
+						if sentryClient != nil {
+							sentryClient.CaptureError(err)
+						}
+						return err
+					}
+					if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+						return heartbeatErr
+					}
+					return nil
+				}
+
+				// Stdio-to-HTTP mode: --upstream only.
+				if err := validateMCPDeferSurface(deferred.SurfaceMCPHTTPUpstream, cfg); err != nil {
+					return err
+				}
+				stopDeferAPI, deferAPIErr := startDeferredOperatorAPIOrReport(ctx, cfg, deferManager, auditLogger, cmd.ErrOrStderr(), sentryClient)
+				if deferAPIErr != nil {
+					return deferAPIErr
+				}
+				defer stopDeferAPI()
+				httpOpts := mcp.MCPProxyOpts{
+					Scanner: sc, Approver: approver,
+					AuditLogger: auditLogger,
+					InputCfg:    inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+					KillSwitch: ks, ChainMatcher: chainMatcher,
+					CEE: cee, Store: store, Baseline: baselineChecker,
+					AdaptiveCfg: adaptiveCfg, AirlockCfg: &cfg.Airlock, Metrics: mcpMetrics,
+					ConfigHash: captureConfigHash, Profile: captureProfile,
+					AddressProtectionAgent: captureProfile,
+					RedirectRT:             buildRedirectRT(cfg),
+					EnvelopeEmitter:        envEmitter,
+					CaptureObs:             captureObs,
+					IntegrityCfg:           &cfg.MCPBinaryIntegrity,
+					ProvenanceCfg:          &cfg.MCPToolProvenance,
+					MediaPolicy:            &cfg.MediaPolicy,
+					RedactMatcher:          mcpRedactMatcher,
+					RedactLimits:           cfg.Redaction.Limits.ToLimits(),
+					RedactProfile:          cfg.Redaction.DefaultProfile,
+					TaintCfg:               &cfg.Taint,
+					ContractLoader:         contractLoader,
+					ContractAgent:          contractAgent,
+					DeferManager:           deferManager,
+					DialContext:            upstreamDialContext,
+				}
+				applyMCPDoWOpts(&httpOpts, dowWiring, false)
+				applyMCPA2AOpts(&httpOpts, cfg, a2aCardBaseline, upstreamURL)
+				applyMCPResponseSuppressOpts(&httpOpts, cfg, launchIdentity)
+				httpOpts.ServerBinding = serverBinding
+				httpOpts = mcpReceiptParityOpts(httpOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+				httpOpts.ReceiptGroup = receiptGroup
+				respAction, respTrust, respServer := mcpResponseLogFields(httpOpts)
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying upstream %s (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
+					RedactEndpoint(upstreamURL), respAction, respTrust, respServer, inputAction, toolAction, policyAction)
+				if err := mcp.RunHTTPProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), upstreamURL, extraHeaders, httpOpts); err != nil {
+					if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+						return heartbeatErr
+					}
+					if sentryClient != nil {
+						sentryClient.CaptureError(err)
+					}
+					return err
+				}
+				if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+					return heartbeatErr
+				}
+				return nil
+			}
+
+			// extraEnv was resolved once above, with the server binding.
+			if len(extraEnv) > 0 {
+				keys := make([]string, 0, len(extraEnv))
+				for _, e := range extraEnv {
+					k, _, _ := strings.Cut(e, "=")
+					keys = append(keys, k)
+				}
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: passing %d env var(s) to child process: %s\n",
+					len(keys), strings.Join(keys, ", "))
+			}
+
+			// Subprocess mode.
+			serverCmd := args[dashIdx:]
+			// --sandbox-strict and --sandbox-best-effort imply --sandbox.
+			if sandboxStrict || sandboxBestEffort {
+				sandboxEnabled = true
+			}
+			useSandbox := sandboxEnabled || cfg.Sandbox.Enabled
+
+			// Reject sandbox with remote modes.
+			if useSandbox && (hasUpstream || hasListen) {
+				return errors.New("sandbox cannot be used with --upstream or --listen (cannot sandbox a remote server)")
+			}
+
+			// Sandboxed MCP proxy: child in isolated namespace.
+			if useSandbox {
+				if err := validateMCPDeferSurface(deferred.SurfaceMCPStdio, cfg); err != nil {
+					return err
+				}
+				// File sentry is not yet integrated with sandbox mode.
+				// Warn explicitly so users don't lose coverage silently.
+				if cfg.FileSentry.Enabled {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(),
+						"pipelock: WARNING: file_sentry is not yet supported with --sandbox; file write DLP scanning is disabled for this session")
+				}
+				workspace := sandboxWorkspace
+				if workspace == "" {
+					workspace = cfg.Sandbox.Workspace
+				}
+				if workspace == "" {
+					workspace, _ = os.Getwd()
+				}
+				workspace, _ = filepath.Abs(workspace)
+				// The sandboxed child runs in the workspace, so relative names it
+				// receives, including its own directory arguments, resolve there.
+				policyCfg.AddLocalPathBases(append([]string{workspace}, localPathBasesFromArgs(workspace, serverCmd[1:])...)...)
+
+				ctx, cancel := signal.NotifyContext(heartbeatCtx, syscall.SIGINT, syscall.SIGTERM)
+				defer cancel()
+
+				stopDeferAPI, deferAPIErr := startDeferredOperatorAPIOrReport(ctx, cfg, deferManager, auditLogger, cmd.ErrOrStderr(), sentryClient)
+				if deferAPIErr != nil {
+					return deferAPIErr
+				}
+				defer stopDeferAPI()
+
+				mcpStrict := sandboxStrict || cfg.Sandbox.Strict
+				if mcpStrict && (sandboxBestEffort || cfg.Sandbox.BestEffort) {
+					return errors.New("--sandbox-strict and --sandbox-best-effort are mutually exclusive")
+				}
+				mcpBestEffort, mcpBestEffortReason, mcpBestEffortExpiry, err := resolveBestEffortOverride(
+					sandboxBestEffort,
+					sandboxBestEffortReason,
+					sandboxBestEffortExpiry,
+					cmd.Flags().Changed("sandbox-best-effort-reason"),
+					cmd.Flags().Changed("sandbox-best-effort-expiry"),
+					cfg.Sandbox.BestEffort,
+					cfg.Sandbox.BestEffortReason,
+					cfg.Sandbox.BestEffortExpiry,
+				)
+				if err != nil {
+					return err
+				}
+				if mcpBestEffort {
+					mcpBestEffortExpiry, err = anchorBestEffortExpiry(mcpBestEffortReason, mcpBestEffortExpiry)
+					if err != nil {
+						return err
+					}
+				}
+
+				launchCfg := sandbox.LaunchConfig{
+					Ctx:              ctx,
+					Command:          serverCmd,
+					Workspace:        workspace,
+					Strict:           mcpStrict,
+					BestEffort:       mcpBestEffort,
+					BestEffortReason: mcpBestEffortReason,
+					BestEffortExpiry: mcpBestEffortExpiry,
+					ExtraEnv:         extraEnv,
+					GateTargetStart:  true,
+
+					BridgeIdleTimeout: sandboxBridgeIdleTimeout(cfg),
+				}
+				if cfg.Sandbox.FS != nil {
+					p := sandbox.DefaultPolicy(workspace)
+					// Merge custom paths into defaults (don't replace).
+					p.AllowReadDirs = append(p.AllowReadDirs, cfg.Sandbox.FS.AllowRead...)
+					p.AllowRWDirs = append(p.AllowRWDirs, cfg.Sandbox.FS.AllowWrite...)
+					launchCfg.Policy = &p
+				}
+
+				// Binary integrity: verify before sandbox wraps the command.
+				// The sandbox re-execs pipelock as the parent, so checking
+				// after PrepareSandboxCmd would verify pipelock itself, not
+				// the MCP server binary. Pass workspace so relative script
+				// arguments resolve the same way the sandbox child resolves
+				// them after chdir(workspace).
+				if cfg.MCPBinaryIntegrity.Enabled {
+					if err := mcp.VerifyBinaryIntegrity(serverCmd, &cfg.MCPBinaryIntegrity, cmd.ErrOrStderr(), workspace); err != nil {
+						return err
+					}
+				}
+				if mcpBestEffort {
+					reportBestEffortAdmission(cmd.ErrOrStderr())
+				}
+
+				closeBridge, bridgeErr := setupMCPSandboxBridge(mcpSandboxBridgeSetupOptions{
+					Context:          ctx,
+					Cancel:           cancel,
+					GOOS:             runtime.GOOS,
+					Config:           cfg,
+					KillSwitch:       ks,
+					AuditLogger:      auditLogger,
+					Metrics:          mcpMetrics,
+					MetricsBoundAddr: metricsBoundAddr,
+					ReceiptEmitter:   receiptEmitter,
+					V2ReceiptEmitter: v2ReceiptEmitter,
+					ReceiptGroup:     receiptGroup,
+					EnvelopeEmitter:  envEmitter,
+					Stderr:           cmd.ErrOrStderr(),
+					LaunchConfig:     &launchCfg,
+					StartBridge:      startMCPSandboxBridge,
+				})
+				if bridgeErr != nil {
+					return bridgeErr
+				}
+				defer closeBridge()
+
+				sandboxLaunch, sErr := sandbox.PrepareSandboxLaunch(launchCfg)
+				if sErr != nil {
+					return fmt.Errorf("sandbox prepare: %w", sErr)
+				}
+				sandboxLaunch.Cmd.Stderr = cmd.ErrOrStderr()
+
+				proxyOpts := mcp.MCPProxyOpts{
+					Scanner: sc, Approver: approver,
+					AuditLogger: auditLogger,
+					InputCfg:    inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+					KillSwitch: ks, ChainMatcher: chainMatcher,
+					CEE: cee, Store: store, Baseline: baselineChecker,
+					AdaptiveCfg: adaptiveCfg, AirlockCfg: &cfg.Airlock, Metrics: mcpMetrics,
+					ConfigHash: captureConfigHash, Profile: captureProfile,
+					AddressProtectionAgent: captureProfile,
+					RedirectRT:             buildRedirectRT(cfg),
+					EnvelopeEmitter:        envEmitter,
+					CaptureObs:             captureObs,
+					IntegrityCfg:           &cfg.MCPBinaryIntegrity,
+					ProvenanceCfg:          &cfg.MCPToolProvenance,
+					MediaPolicy:            &cfg.MediaPolicy,
+					RedactMatcher:          mcpRedactMatcher,
+					RedactLimits:           cfg.Redaction.Limits.ToLimits(),
+					RedactProfile:          cfg.Redaction.DefaultProfile,
+					TaintCfg:               &cfg.Taint,
+					ContractLoader:         contractLoader,
+					ContractAgent:          contractAgent,
+					AdaptiveResetFile:      adaptiveResetFile,
+					AdaptiveResetAuthority: adaptiveResetAuthority,
+					AdaptiveResetEpoch:     &adaptiveResetEpoch,
+					DeferManager:           deferManager,
+				}
+				applyMCPDoWOpts(&proxyOpts, dowWiring, false)
+				applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
+				applyMCPResponseSuppressOpts(&proxyOpts, cfg, launchIdentity)
+				proxyOpts.ServerBinding = serverBinding
+				proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+				proxyOpts.ReceiptGroup = receiptGroup
+				respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
+					"pipelock: proxying MCP server %v [SANDBOXED] (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s, workspace=%s)\n",
+					serverCmd, respAction, respTrust, respServer, inputAction, toolAction, policyAction, workspace)
+				// Report orphan-cleanup availability once, before the server
+				// launches, so the operator learns it up front. The proxy path
+				// still runs the authoritative strict refusal against the same
+				// probe result, so this report cannot bypass a strict launch.
+				mcp.ReportCleanupCapability(cmd.ErrOrStderr(), !mcpStrict)
+				proxyOpts.StartupCleanupReported = true
+				if err := mcp.RunProxyWithSandboxLaunch(ctx, sandboxLaunch, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), proxyOpts, mcpStrict); err != nil {
+					if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+						return heartbeatErr
+					}
+					return handleProxyError(err, cmd.ErrOrStderr(), sentryClient)
+				}
+				if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+					return heartbeatErr
+				}
+				return nil
+			}
+
+			// Normal (unsandboxed) subprocess mode.
+			if err := validateMCPDeferSurface(deferred.SurfaceMCPStdio, cfg); err != nil {
+				return err
+			}
+			ctx, cancel := signal.NotifyContext(heartbeatCtx, syscall.SIGINT, syscall.SIGTERM)
+			defer cancel()
+
+			stopDeferAPI, deferAPIErr := startDeferredOperatorAPIOrReport(ctx, cfg, deferManager, auditLogger, cmd.ErrOrStderr(), sentryClient)
+			if deferAPIErr != nil {
+				return deferAPIErr
+			}
+			defer stopDeferAPI()
+
+			// Wrap stderr in a mutex so file sentry goroutines and RunProxy
+			// (which wraps logW in its own syncWriter) don't interleave.
+			logW := &safeWriter{w: cmd.ErrOrStderr()}
+
+			// File sentry: watch agent working directories for secret writes.
+			// Watches are installed synchronously (Arm) before the child starts
+			// to prevent early writes from being missed.
+			var lin filesentry.Lineage
+			var onChildReady func()
+			stopFileSentry := func() error { return nil }
+			if cfg.FileSentry.Enabled {
+				lin = filesentry.NewLineage()
+				// Error handler for non-fatal runtime errors (e.g. failing to watch new dirs).
+				onErr := func(err error) {
+					_, _ = fmt.Fprintf(logW, "pipelock: [file_sentry] %v\n", err)
+				}
+				watcher, watchErr := newFileSentryWatcher(&cfg.FileSentry, sc, lin, onErr)
+				if watchErr != nil {
+					return fmt.Errorf("file sentry init failed (feature is enabled): %w", watchErr)
+				}
+				// Arm synchronously before child launch.
+				if watcher != nil {
+					if armErr := watcher.Arm(); armErr != nil {
+						// Capture the watch failure count before closing the watcher.
+						degraded := watcher.DegradedPathCount()
+						_ = watcher.Close()
+						if cfg.FileSentry.BestEffort && !fileSentryArmErrorMustFailClosed(armErr) {
+							_, _ = fmt.Fprintf(logW, "pipelock: file sentry failed to arm watches (best_effort: continuing without file monitoring): %v\n", armErr)
+							watcher = nil
+						} else {
+							return fileSentryArmFailure(armErr, degraded)
+						}
+					}
+				}
+
+				if watcher != nil {
+					// Consume findings: log to stderr, record metrics, and
+					// (in block action mode) cancel the proxy ctx on the
+					// first agent-attributed finding so the MCP child fails
+					// closed after a detected leak. See filesentry.ConsumeFindings
+					// for the full enforcement matrix.
+					var findingHook filesentry.FindingHook
+					if mcpMetrics != nil {
+						findingHook = mcpMetrics.RecordFileSentryFinding
+					}
+					waitConsumer := filesentry.ConsumeFindings(filesentry.ConsumerOpts{
+						Watcher:   watcher,
+						Action:    cfg.FileSentry.Action,
+						Log:       logW,
+						OnFinding: findingHook,
+						Cancel:    cancel,
+					})
+					var failure fileSentryRuntimeFailure
+					var watcherWG sync.WaitGroup
+					var watcherStartOnce sync.Once
+					var stopOnce sync.Once
+					var stopErr error
+					stopFileSentry = func() error {
+						stopOnce.Do(func() {
+							_ = watcher.Close()
+							watcherWG.Wait()
+							waitConsumer()
+							if err := failure.get(); err != nil {
+								stopErr = fmt.Errorf("file sentry runtime failed: %w", err)
+							}
+						})
+						return stopErr
+					}
+					defer func() { _ = stopFileSentry() }()
+					reportFileSentryCoverage(logW, len(cfg.FileSentry.WatchPaths), cfg.FileSentry.Action, watcher.DegradedPathCount())
+
+					// onChildReady: called by RunProxy after cmd.Start() + TrackPID.
+					// Starts the file sentry event loop AFTER the child PID is registered,
+					// so attribution is ready before classifying any writes.
+					onChildReady = func() {
+						watcherStartOnce.Do(func() {
+							watcherWG.Add(1)
+							go func() {
+								defer watcherWG.Done()
+								if startErr := watcher.Start(ctx); startErr != nil {
+									_, _ = fmt.Fprintf(logW, "pipelock: file sentry fatal: %v — cancelling proxy\n", startErr)
+									failure.set(startErr)
+									cancel()
+								}
+							}()
+						})
+					}
+				} // watcher != nil
+			}
+
+			proxyOpts := mcp.MCPProxyOpts{
+				Scanner: sc, Approver: approver,
+				AuditLogger: auditLogger,
+				InputCfg:    inputCfg, ToolCfg: toolCfg, PolicyCfg: policyCfg,
+				KillSwitch: ks, ChainMatcher: chainMatcher,
+				CEE: cee, Store: store, Baseline: baselineChecker,
+				AdaptiveCfg: adaptiveCfg, AirlockCfg: &cfg.Airlock, Metrics: mcpMetrics,
+				ConfigHash: captureConfigHash, Profile: captureProfile,
+				AddressProtectionAgent: captureProfile,
+				RedirectRT:             buildRedirectRT(cfg),
+				EnvelopeEmitter:        envEmitter,
+				CaptureObs:             captureObs,
+				IntegrityCfg:           &cfg.MCPBinaryIntegrity,
+				ProvenanceCfg:          &cfg.MCPToolProvenance,
+				MediaPolicy:            &cfg.MediaPolicy,
+				RedactMatcher:          mcpRedactMatcher,
+				RedactLimits:           cfg.Redaction.Limits.ToLimits(),
+				RedactProfile:          cfg.Redaction.DefaultProfile,
+				TaintCfg:               &cfg.Taint,
+				Lineage:                lin, OnChildReady: onChildReady,
+				ContractLoader:         contractLoader,
+				ContractAgent:          contractAgent,
+				AdaptiveResetFile:      adaptiveResetFile,
+				AdaptiveResetAuthority: adaptiveResetAuthority,
+				AdaptiveResetEpoch:     &adaptiveResetEpoch,
+				DeferManager:           deferManager,
+			}
+			applyMCPDoWOpts(&proxyOpts, dowWiring, false)
+			applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
+			applyMCPResponseSuppressOpts(&proxyOpts, cfg, launchIdentity)
+			proxyOpts.ServerBinding = serverBinding
+			proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+			proxyOpts.ReceiptGroup = receiptGroup
+			// The unsandboxed path has no UID/GID map setup. Harden before
+			// RunProxy can start its wrapped command.
+			if err := mcp.HardenProxyProcess(); err != nil {
+				return fmt.Errorf("harden MCP proxy process: %w", err)
+			}
+			respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying MCP server %v (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
+				serverCmd, respAction, respTrust, respServer, inputAction, toolAction, policyAction)
+			// Report orphan-cleanup availability once, before the server
+			// launches. The plain stdio path has no strict mode, so this is
+			// informational, with no strict-mode remedy hint.
+			mcp.ReportCleanupCapability(logW, false)
+			proxyOpts.StartupCleanupReported = true
+			if err := mcp.RunProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), logW, serverCmd, proxyOpts, extraEnv...); err != nil {
+				if fileSentryErr := stopFileSentry(); fileSentryErr != nil {
+					return fileSentryErr
+				}
+				if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+					return heartbeatErr
+				}
+				// signal.NotifyContext terminates the wrapped child during an
+				// ordinary parent cancellation. That resulting process status is
+				// teardown noise, not a proxy failure. File-sentry and required
+				// heartbeat failures are checked above so they still fail closed.
+				if ctx.Err() != nil {
+					return nil
+				}
+				return handleProxyError(err, logW, sentryClient)
+			}
+			if fileSentryErr := stopFileSentry(); fileSentryErr != nil {
+				return fileSentryErr
+			}
+			if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
+				return heartbeatErr
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path")
+	cmd.Flags().StringVar(&upstreamURL, "upstream", "", "upstream MCP server URL (Streamable HTTP transport)")
+	cmd.Flags().StringVar(&listenAddr, "listen", "", "listen address for HTTP reverse proxy mode (e.g. 0.0.0.0:8889)")
+	cmd.Flags().StringVar(&listenerAuthTokenFile, "listener-auth-token-file", "", "secure file containing the HTTP listener bearer token")
+	cmd.Flags().StringArrayVar(&listenerAllowedOrigins, "listener-allowed-origin", nil, "browser Origin allowed to call the HTTP listener (repeatable, exact serialized origin)")
+	cmd.Flags().BoolVar(&listenerAllowUnauthenticated, "listener-allow-unauthenticated", false, "explicitly allow a non-loopback listener without authentication (network-policy-isolated deployments only)")
+	cmd.Flags().StringArrayVar(&envVars, "env", nil, "pass environment variable to child process (KEY or KEY=VALUE, repeatable)")
+	cmd.Flags().StringArrayVar(&envCarriers, "env-carrier", nil, "map a host-resolved carrier into the child environment (TARGET=CARRIER, repeatable)")
+	cmd.Flags().StringArrayVar(&envUnset, "env-unset", nil, "remove an environment variable from the child environment (repeatable)")
+	cmd.Flags().StringVar(&envFileCarrier, "env-file-carrier", "", "host-resolved carrier containing a VS Code envFile path")
+	cmd.Flags().StringArrayVar(&rawHeaders, "header", nil, "extra HTTP header for upstream MCP server in --upstream HTTP mode (repeatable, format: 'Key: Value')")
+	cmd.Flags().StringArrayVar(&headerCarriers, "header-carrier", nil, "map a host-resolved carrier into an upstream header (HEADER=CARRIER, repeatable)")
+	cmd.Flags().StringVar(&headerFile, "header-file", "", "path to a headers file (one 'Key: Value' per line, '#' comments) merged with --header; on Unix it must be mode 0o600 or 0o640, on Windows restrict access with file ACLs")
+	cmd.Flags().StringVar(&agentName, "agent", "", "agent profile name (resolves to config profile for policy/scanner)")
+	cmd.Flags().StringVar(&serverName, "server-name", "", "operator label for an unregistered MCP server; enables per-server response suppression via target 'mcp://<name>/response' (tools/list tool-definition findings are not suppressed by it; control them with mcp_tool_scanning). A server registered in mcp_identities supplies its own verified name; an explicit name equal to a registered identity must match the registration this launch's upstream resolves to")
+	cmd.Flags().StringVar(&adaptiveResetFile, "adaptive-reset-file", "", "signed adaptive reset delegation control file")
+	cmd.Flags().StringVar(&adaptiveResetAuthorityPublicKeyFile, "adaptive-reset-authority-public-key-file", "", "exported mcp-reset-authority public key for --adaptive-reset-file")
+	cmd.Flags().StringVar(&adaptiveResetTarget, "adaptive-reset-target", "", "stable target identity for --adaptive-reset-file delegations")
+	cmd.Flags().StringVar(&captureOutput, "capture-output", "", "directory for key-free evidence capture (evidence-*.jsonl); mirrors 'pipelock run --capture-output'")
+	cmd.Flags().StringVar(&captureEscrowKey, "capture-escrow-public-key", "", "X25519 public key (64 hex chars) to encrypt captured payload sidecars; requires --capture-output")
+	cmd.Flags().BoolVar(&sandboxEnabled, "sandbox", false, "run child in sandbox (Landlock + network namespace on Linux, plus seccomp on linux/amd64)")
+	cmd.Flags().BoolVar(&sandboxStrict, "sandbox-strict", false, "strict sandbox: error on missing layers, private /dev/shm, block clone3 (implies --sandbox)")
+	cmd.Flags().BoolVar(&sandboxBestEffort, "sandbox-best-effort", false, "degrade gracefully when namespace isolation is unavailable (implies --sandbox)")
+	cmd.Flags().StringVar(&sandboxBestEffortReason, "sandbox-best-effort-reason", "", "reason for a command-line best-effort override (must be supplied with --sandbox-best-effort)")
+	cmd.Flags().StringVar(&sandboxBestEffortExpiry, "sandbox-best-effort-expiry", "", "admission-time duration or RFC3339 expiry for a command-line best-effort override; does not stop a running child; later launches require re-authorization")
+	cmd.Flags().StringVar(&sandboxWorkspace, "workspace", "", "sandbox workspace directory (default: current directory)")
+	return cmd
+}
+
+// mcpSessionManagerOptions builds the session-manager options for the
+// single-load standalone `pipelock mcp proxy` runtime. The command does not
+// reload configuration; it attaches airlock state only when enabled at startup.
+func mcpSessionManagerOptions(cfg *config.Config, auditLogger *audit.Logger) proxy.SessionManagerOptions {
+	opts := proxy.SessionManagerOptions{Logger: auditLogger}
+	if cfg != nil && cfg.Airlock.Enabled {
+		opts.AirlockCfg = &cfg.Airlock
+	}
+	return opts
+}
+
+// startMCPContractWatch keeps a promoted Learn and Lock manifest live for the
+// MCP proxy: the watcher swaps the loader's active set in place, and every
+// transport reads it through the one loader. A rejected or unreadable promote
+// keeps the last accepted set and is logged. The returned stop function
+// cancels the watcher and waits for it to exit; it is never nil.
+func startMCPContractWatch(ctx context.Context, loader *contractruntime.Loader, logger *audit.Logger) func() {
+	if loader == nil {
+		return func() {}
+	}
+	logWatchErr := func(err error) {
+		if logger != nil {
+			logger.LogError(audit.NewMethodLogContext("CONTRACT_WATCH"), err)
+		}
+	}
+	stop, err := loader.StartWatch(ctx, logWatchErr)
+	if err != nil {
+		logWatchErr(fmt.Errorf("active manifest watcher not running, keeping last accepted contract: %w", err))
+		return func() {}
+	}
+	return stop
+}

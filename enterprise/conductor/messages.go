@@ -1,0 +1,2265 @@
+//go:build enterprise
+
+// Copyright 2026 Pipelock contributors
+// SPDX-License-Identifier: Elastic-2.0
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+// Package conductor defines Conductor signed message bodies.
+package conductor
+
+import (
+	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"slices"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/contract"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	SchemaVersion               = 1
+	SignatureAlgorithmEd25519   = "ed25519"
+	SignaturePrefixEd25519      = "ed25519:"
+	RequiredStandardSigners     = 1
+	RequiredCatastrophicSigners = 2
+	MaxAuditPayloadBytes        = 1024 * 1024
+	MaxConfigYAMLBytes          = 256 * 1024
+	MaxReasonBytes              = 4 * 1024
+	DefaultAuditMaxSkew         = 60 * time.Second
+	MaxAllowedAuditSkew         = 300 * time.Second
+	// MessageNotBeforeSkew bounds the clock skew tolerated on the not_before
+	// check for conductor control messages (policy bundles, remote-kill,
+	// rollback, stream-switch). These carry a not_before stamped on the
+	// OPERATOR's clock and are validated on the CONDUCTOR's and FOLLOWER's
+	// clocks, which differ on a real multi-machine fleet. With zero tolerance an
+	// operator clock even slightly ahead of the validator makes every kill /
+	// rollback "not yet valid" so the control fails on prod (reproduced cross-
+	// machine 2026-06-22; same-machine tests never surfaced it). Mirrors the
+	// audit path's DefaultAuditMaxSkew. Applied to not_before ONLY — expiry stays
+	// strict so a message's validity window is never extended past its stated end
+	// (no replay / revocation-evasion widening).
+	MessageNotBeforeSkew   = 60 * time.Second
+	MaxIDBytes             = 128
+	MaxLabelKeyBytes       = 128
+	MaxLabelValueBytes     = 256
+	MaxDropReasons         = 32
+	MaxDropReasonBytes     = 128
+	MaxCapabilityThreshold = 7
+
+	// AuditEnvelopeSchemaVersion is the highest audit-batch envelope schema a
+	// follower in this build can emit. It is DISTINCT from the top-level
+	// SchemaVersion (control-message schema, still 1): it governs which optional
+	// audit-batch fields (e.g. AppliedState) a follower may put on the wire, and
+	// is negotiated against the conductor's advertised AuditBatch SchemaRange.
+	// v1 = original signed audit batch; v2 = adds the signed applied_state
+	// statement. A follower emits at min(this, server AuditBatch.Max) so a new
+	// follower talking to an old (v1-only) conductor omits applied_state and
+	// stays wire-identical to v1.
+	AuditEnvelopeSchemaVersion = 2
+	// AppliedStateHeartbeatSchemaVersion is advertised through the existing
+	// audit-batch capability range rather than a new top-level capability field.
+	// Older followers strictly reject unknown JSON fields, but safely cap a
+	// larger known range at their local v2 maximum during rolling upgrades.
+	AppliedStateHeartbeatSchemaVersion = 3
+
+	// MaxRuntimeStringBytes bounds each short applied-state / runtime-status
+	// string field (versions, bundle ids, error code). MaxApplyErrorMessageRunes
+	// bounds the free-form apply error message. Both live here so the signed
+	// applied-state validation (this package) and the unsigned runtime-status
+	// normalization (controlplane) share one source of truth for the caps.
+	MaxRuntimeStringBytes     = 256
+	MaxApplyErrorMessageRunes = 512
+
+	// DefaultStreamSwitchMaxValidity bounds a stream-switch authorization
+	// window, mirroring DefaultRollbackMaxValidity (controlplane), so a
+	// compromised operator CLI cannot mint a long-lived cross-stream retarget
+	// capability that a follower would honor.
+	DefaultStreamSwitchMaxValidity = 24 * time.Hour
+)
+
+// acceptedSchemaVersions mirrors internal/recorder/entry.go's v1+v2 coexistence
+// pattern. New writes use SchemaVersion; verifiers accept anything in the set so
+// rolling fleet upgrades survive a schema bump. Extend by adding the new version
+// key when the schema changes - never remove old keys without a release-note
+// gate on rollout.
+var acceptedSchemaVersions = map[int]bool{1: true}
+
+var (
+	ErrUnsupportedSchemaVersion      = errors.New("unsupported conductor schema_version")
+	ErrMissingField                  = errors.New("missing required conductor field")
+	ErrInvalidAudience               = errors.New("invalid conductor audience")
+	ErrAudienceMismatch              = errors.New("conductor audience does not match follower")
+	ErrInvalidHash                   = errors.New("invalid conductor hash")
+	ErrInvalidSignature              = errors.New("invalid conductor signature")
+	ErrWrongKeyPurpose               = errors.New("conductor signature key_purpose mismatch")
+	ErrThresholdRequired             = errors.New("conductor signature threshold not met")
+	ErrForbiddenLicenseField         = errors.New("policy bundle contains forbidden license field")
+	ErrForbiddenBundleSection        = errors.New("policy bundle contains a config section not permitted in a signed bundle")
+	ErrForbiddenBundleCompanionField = errors.New("policy bundle contains a local companion-file field")
+	ErrInvalidValidityWindow         = errors.New("invalid conductor validity window")
+	ErrInvalidSequenceRange          = errors.New("invalid conductor sequence range")
+	ErrInvalidState                  = errors.New("invalid conductor state")
+	ErrInvalidRollback               = errors.New("invalid conductor rollback authorization")
+	ErrStreamSwitchWindowTooLong     = errors.New("conductor stream switch authorization validity window exceeds maximum")
+	ErrNotYetValid                   = errors.New("conductor message not yet valid (not_before in future)")
+	ErrExpired                       = errors.New("conductor message expired")
+	ErrSkewExceeded                  = errors.New("conductor message exceeds allowed clock skew")
+	ErrInvalidMinVersion             = errors.New("invalid min_pipelock_version")
+	ErrHashMismatch                  = errors.New("conductor hash mismatch")
+	ErrPayloadTooLarge               = errors.New("conductor payload exceeds size cap")
+	ErrInvalidAudienceWildcard       = errors.New("conductor audience cannot mix wildcard with explicit instance_ids")
+	ErrInvalidAudienceSelectors      = errors.New("conductor audience cannot mix instance_ids with labels")
+	ErrInvalidReason                 = errors.New("invalid conductor reason")
+	ErrInvalidIdentifier             = errors.New("invalid conductor identifier")
+	ErrInvalidControlIntent          = errors.New("invalid conductor control intent")
+	ErrSignatureVerification         = errors.New("conductor signature verification failed")
+	ErrInvalidDroppedAccounting      = errors.New("invalid conductor dropped accounting")
+	ErrInvalidAppliedState           = errors.New("invalid conductor follower applied state")
+)
+
+// allowedPolicyBundleSections is the default-deny allowlist of top-level config
+// sections a signed policy bundle may carry in its config_yaml. It contains ONLY
+// enforcement-policy surfaces - what pipelock decides about a scanned request.
+//
+// Everything not listed is rejected so a signed bundle cannot reconfigure
+// operational/infrastructure surfaces remotely: listeners, telemetry/emit,
+// logging, sentry, kill switch, flight recorder, the conductor control plane
+// itself, license, or mediation-envelope signing. It also rejects sections that
+// mix enforcement with a local trust boundary, identity, certificate, routing,
+// or OS-isolation concern - `internal`/`ssrf`/`dns`/`trusted_domains` (SSRF and
+// DNS trust), `agents` (per-agent identity/credentials), `tls_interception`
+// (MITM certs/passthrough), and `sandbox` (OS isolation) - until those are split
+// into narrower policy-only surfaces. Keeping them operator-local means a bundle
+// cannot loosen SSRF, add a trusted domain, retarget DNS, push agent identity,
+// change TLS interception, or weaken sandboxing.
+//
+// Default-deny is deliberate: a config section added in a future release is
+// automatically rejected from bundles until it is consciously added here.
+var allowedPolicyBundleSections = map[string]struct{}{
+	"version":                 {}, // schema/version metadata; harmless
+	"mode":                    {},
+	"enforce":                 {},
+	"explain_blocks":          {},
+	"api_allowlist":           {},
+	"suppress":                {},
+	"dlp":                     {},
+	"canary_tokens":           {},
+	"response_scanning":       {},
+	"mcp_input_scanning":      {},
+	"mcp_tool_scanning":       {},
+	"mcp_tool_policy":         {},
+	"git_protection":          {},
+	"session_profiling":       {},
+	"adaptive_enforcement":    {},
+	"mcp_session_binding":     {},
+	"request_body_scanning":   {},
+	"request_policy":          {},
+	"tool_chain_detection":    {},
+	"cross_request_detection": {},
+	"address_protection":      {},
+	"seed_phrase_detection":   {},
+	"rules":                   {},
+	"mcp_binary_integrity":    {},
+	"mcp_tool_provenance":     {},
+	"behavioral_baseline":     {},
+	"airlock":                 {},
+	"browser_shield":          {},
+	"media_policy":            {},
+	"taint":                   {},
+	"redaction":               {},
+	"learn":                   {},
+	"learn_lock":              {},
+}
+
+var forbiddenLicenseFields = map[string]struct{}{
+	"license_key":               {},
+	"license_file":              {},
+	"license_crl_file":          {},
+	"license_intermediate_file": {},
+	"license_public_key":        {},
+	"license_expires_at":        {},
+	"license_id":                {},
+	"license_crl_expires_at":    {},
+	"license_crl_sha256":        {},
+	"license_revoked":           {},
+	"license_revocation_reason": {},
+}
+
+var forbiddenPolicyBundleCompanionFields = map[string]struct{}{
+	"dlp.secrets_file":                    {},
+	"learn.privacy.salt_source":           {},
+	"mcp_binary_integrity.manifest_path":  {},
+	"mcp_binary_integrity.signature_path": {},
+	"mcp_binary_integrity.keystore":       {},
+	"behavioral_baseline.profile_dir":     {},
+	"learn_lock.store_dir":                {},
+	"learn_lock.roster_path":              {},
+}
+
+// SignatureKey carries the verification material plus the lifecycle metadata
+// the spec mandates ("key_id, purpose, created_at, not_before, not_after,
+// revoked_at"). The roster must populate NotBefore/NotAfter for every key; an
+// unset NotAfter is treated as never-expires. RevokedAt set to a non-nil
+// timestamp causes verification to reject regardless of the other windows.
+type SignatureKey struct {
+	PublicKey  ed25519.PublicKey
+	KeyPurpose signing.KeyPurpose
+	NotBefore  time.Time
+	NotAfter   time.Time
+	RevokedAt  *time.Time
+}
+
+// SignatureKeyResolver maps a signer key ID to its roster entry. Today the
+// verifier calls the resolver serially per signature, so simple map-based
+// resolvers without locks are safe. Implementations must remain safe under
+// concurrent invocation: future parallel-verify paths cannot break a resolver
+// that today assumes single-threaded calls.
+type SignatureKeyResolver func(signerKeyID string) (SignatureKey, error)
+
+type SignatureProof struct {
+	SignerKeyID string             `json:"signer_key_id"`
+	KeyPurpose  signing.KeyPurpose `json:"key_purpose"`
+	Algorithm   string             `json:"algorithm"`
+	Signature   string             `json:"signature"`
+}
+
+type Audience struct {
+	InstanceIDs []string          `json:"instance_ids,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+}
+
+type DroppedReason struct {
+	Reason string `json:"reason"`
+	Count  uint64 `json:"count"`
+}
+
+type DroppedAccounting struct {
+	Count   uint64          `json:"count"`
+	Reasons []DroppedReason `json:"reasons,omitempty"`
+}
+
+type RuleBundleRef struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	SHA256  string `json:"sha256"`
+}
+
+type PolicyBundlePayload struct {
+	ConfigYAML  string          `json:"config_yaml"`
+	RuleBundles []RuleBundleRef `json:"rule_bundles,omitempty"`
+}
+
+func (p PolicyBundlePayload) PayloadHash() (string, error) {
+	return canonicalValueHash(p, "policy_bundle_payload")
+}
+
+func (p PolicyBundlePayload) PolicyHash() (string, error) {
+	if err := rejectLicenseFields(p.ConfigYAML); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalidHash, err)
+	}
+	if err := rejectPolicyBundleCompanionFields(p.ConfigYAML); err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalidHash, err)
+	}
+	cfg, err := config.LoadPolicyBundleBytes([]byte(p.ConfigYAML))
+	if err != nil {
+		return "", fmt.Errorf("%w: load policy bundle config_yaml: %w", ErrInvalidHash, err)
+	}
+	configPolicyHash := cfg.CanonicalPolicyHash()
+	if len(p.RuleBundles) == 0 {
+		return configPolicyHash, nil
+	}
+	return canonicalValueHash(struct {
+		ConfigPolicyHash string          `json:"config_policy_hash"`
+		RuleBundles      []RuleBundleRef `json:"rule_bundles"`
+	}{
+		ConfigPolicyHash: configPolicyHash,
+		RuleBundles:      p.RuleBundles,
+	}, "policy_bundle_policy")
+}
+
+// LegacyPolicyHash returns the policy_hash scheme used before policy bundles
+// were hashed over config.LoadPolicyBundleBytes(). It is retained only for
+// rolling upgrades of already-signed bundles that were published by older
+// conductors; new publishers should use PolicyHash.
+func (p PolicyBundlePayload) LegacyPolicyHash() (string, error) {
+	var cfg any
+	decoder := yaml.NewDecoder(strings.NewReader(p.ConfigYAML))
+	if err := decoder.Decode(&cfg); err != nil && !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("parse legacy policy bundle config_yaml for policy hash: %w", err)
+	}
+	var extra yaml.Node
+	if err := decoder.Decode(&extra); err == nil {
+		if !isEmptyYAMLDocument(extra) {
+			return "", fmt.Errorf("%w: config_yaml has multiple YAML documents", ErrInvalidHash)
+		}
+	} else if !errors.Is(err, io.EOF) {
+		return "", fmt.Errorf("parse legacy policy bundle config_yaml trailing document: %w", err)
+	}
+	view := struct {
+		ConfigYAML  any             `json:"config_yaml"`
+		RuleBundles []RuleBundleRef `json:"rule_bundles,omitempty"`
+	}{
+		ConfigYAML:  cfg,
+		RuleBundles: p.RuleBundles,
+	}
+	return canonicalValueHash(view, "legacy_policy_bundle_policy")
+}
+
+type PolicyBundle struct {
+	SchemaVersion             int                        `json:"schema_version"`
+	BundleID                  string                     `json:"bundle_id"`
+	OrgID                     string                     `json:"org_id"`
+	FleetID                   string                     `json:"fleet_id"`
+	Environment               string                     `json:"environment"`
+	Audience                  Audience                   `json:"audience"`
+	Version                   uint64                     `json:"version"`
+	PreviousBundleHash        string                     `json:"previous_bundle_hash,omitempty"`
+	StreamSwitchAuthorization *StreamSwitchAuthorization `json:"stream_switch_authorization,omitempty"`
+	CreatedAt                 time.Time                  `json:"created_at"`
+	NotBefore                 time.Time                  `json:"not_before"`
+	ExpiresAt                 time.Time                  `json:"expires_at"`
+	MinPipelockVersion        string                     `json:"min_pipelock_version"`
+	PolicyHash                string                     `json:"policy_hash"`
+	PayloadSHA256             string                     `json:"payload_sha256"`
+	Payload                   PolicyBundlePayload        `json:"payload"`
+	Signatures                []SignatureProof           `json:"signatures,omitempty"`
+}
+
+type KillSwitchState string
+
+const (
+	KillSwitchInactive KillSwitchState = "inactive"
+	KillSwitchActive   KillSwitchState = "active"
+)
+
+type ControlIntent string
+
+const (
+	ControlIntentApply  ControlIntent = "apply"
+	ControlIntentReplay ControlIntent = "replay"
+)
+
+type RemoteKillMessage struct {
+	SchemaVersion int              `json:"schema_version"`
+	MessageID     string           `json:"message_id"`
+	OrgID         string           `json:"org_id"`
+	FleetID       string           `json:"fleet_id"`
+	Audience      Audience         `json:"audience"`
+	Intent        ControlIntent    `json:"intent,omitempty"`
+	State         KillSwitchState  `json:"state"`
+	Counter       uint64           `json:"counter"`
+	Reason        string           `json:"reason"`
+	CreatedAt     time.Time        `json:"created_at"`
+	NotBefore     time.Time        `json:"not_before"`
+	ExpiresAt     time.Time        `json:"expires_at"`
+	Signatures    []SignatureProof `json:"signatures,omitempty"`
+}
+
+type RollbackAuthorization struct {
+	SchemaVersion   int              `json:"schema_version"`
+	AuthorizationID string           `json:"authorization_id"`
+	OrgID           string           `json:"org_id"`
+	FleetID         string           `json:"fleet_id"`
+	Audience        Audience         `json:"audience"`
+	Intent          ControlIntent    `json:"intent,omitempty"`
+	CurrentBundleID string           `json:"current_bundle_id"`
+	CurrentVersion  uint64           `json:"current_version"`
+	TargetBundleID  string           `json:"target_bundle_id"`
+	TargetVersion   uint64           `json:"target_version"`
+	Counter         uint64           `json:"counter"`
+	Reason          string           `json:"reason"`
+	CreatedAt       time.Time        `json:"created_at"`
+	ExpiresAt       time.Time        `json:"expires_at"`
+	Signatures      []SignatureProof `json:"signatures,omitempty"`
+}
+
+type StreamSwitchAuthorization struct {
+	SchemaVersion     int              `json:"schema_version"`
+	AuthorizationID   string           `json:"authorization_id"`
+	OrgID             string           `json:"org_id"`
+	FleetID           string           `json:"fleet_id"`
+	Environment       string           `json:"environment"`
+	CurrentAudience   Audience         `json:"current_audience"`
+	CurrentBundleID   string           `json:"current_bundle_id"`
+	CurrentVersion    uint64           `json:"current_version"`
+	CurrentBundleHash string           `json:"current_bundle_hash"`
+	TargetAudience    Audience         `json:"target_audience"`
+	TargetBundleID    string           `json:"target_bundle_id"`
+	TargetVersion     uint64           `json:"target_version"`
+	TargetBundleHash  string           `json:"target_bundle_hash"`
+	Reason            string           `json:"reason"`
+	CreatedAt         time.Time        `json:"created_at"`
+	ExpiresAt         time.Time        `json:"expires_at"`
+	Signatures        []SignatureProof `json:"signatures,omitempty"`
+}
+
+type EvidenceChain struct {
+	EntryVersion           int    `json:"entry_version"`
+	SessionID              string `json:"session_id,omitempty"`
+	ChainKind              string `json:"chain_kind,omitempty"`
+	WriterInstanceID       string `json:"writer_instance_id,omitempty"`
+	SegmentID              string `json:"segment_id"`
+	SeqStart               uint64 `json:"seq_start"`
+	SeqEnd                 uint64 `json:"seq_end"`
+	PreviousSegmentTail    string `json:"previous_segment_tail,omitempty"`
+	SegmentHeadHash        string `json:"segment_head_hash"`
+	SegmentTailHash        string `json:"segment_tail_hash"`
+	CheckpointSeq          uint64 `json:"checkpoint_seq"`
+	CheckpointHash         string `json:"checkpoint_hash"`
+	CheckpointSignature    string `json:"checkpoint_signature"`
+	CheckpointSignerKeyID  string `json:"checkpoint_signer_key_id"`
+	FollowerRecorderKeyID  string `json:"follower_recorder_key_id"`
+	FollowerRecorderPubHex string `json:"follower_recorder_public_key_hex"`
+}
+
+// FollowerAppliedState is the follower's signed statement of what it is
+// actually running: the active policy bundle, the last apply outcome, and the
+// binary version. It rides inside the audit-batch envelope so it is covered by
+// the follower audit-batch signature (no side channel) and verified at ingest.
+// It is OPTIONAL (a v2 addition): a nil AppliedState pointer serializes to
+// nothing, keeping a v1 batch's canonical preimage byte-identical.
+//
+// Identity is NOT repeated here: the enclosing envelope's OrgID/FleetID/
+// InstanceID are the bound, verified identity. Adding a second identity inside
+// this struct would create a spoofable divergence, so callers read the
+// follower identity from the envelope, never from applied-state.
+type FollowerAppliedState struct {
+	ActiveBundleID                 string    `json:"active_bundle_id,omitempty"`
+	ActiveBundleVersion            uint64    `json:"active_bundle_version,omitempty"`
+	ActiveBundleHash               string    `json:"active_bundle_hash,omitempty"`
+	ActiveBundleMinPipelockVersion string    `json:"active_bundle_min_pipelock_version,omitempty"`
+	PipelockVersion                string    `json:"pipelock_version,omitempty"`
+	GitCommit                      string    `json:"git_commit,omitempty"`
+	BuildDate                      string    `json:"build_date,omitempty"`
+	LastPolicyPollAt               time.Time `json:"last_policy_poll_at,omitempty"`
+	LastSuccessfulApplyAt          time.Time `json:"last_successful_apply_at,omitempty"`
+	LastApplyErrorCode             string    `json:"last_apply_error_code,omitempty"`
+	LastApplyErrorMessage          string    `json:"last_apply_error_message,omitempty"`
+	ObservedAt                     time.Time `json:"observed_at"`
+	ProvenanceAt                   time.Time `json:"provenance_at,omitempty"`
+}
+
+// AppliedStateHeartbeat is a follower-signed, recorder-independent statement
+// of the policy and binary state the follower is currently running. It exists
+// so an idle follower can keep its verified fleet state fresh without
+// manufacturing recorder entries or weakening the fleet view to trust the
+// unsigned runtime-status channel.
+//
+// The enclosing identity is bound to the authenticated mTLS follower at
+// ingest. ObservedAt is also the monotonic replay key: a conductor accepts only
+// a statement newer than the verified state it already holds for that follower.
+type AppliedStateHeartbeat struct {
+	SchemaVersion int                  `json:"schema_version"`
+	HeartbeatID   string               `json:"heartbeat_id"`
+	OrgID         string               `json:"org_id"`
+	FleetID       string               `json:"fleet_id"`
+	InstanceID    string               `json:"instance_id"`
+	EmittedAt     time.Time            `json:"emitted_at"`
+	AppliedState  FollowerAppliedState `json:"applied_state"`
+	Signatures    []SignatureProof     `json:"signatures,omitempty"`
+}
+
+type AuditBatchEnvelope struct {
+	SchemaVersion      int                   `json:"schema_version"`
+	BatchID            string                `json:"batch_id"`
+	OrgID              string                `json:"org_id"`
+	FleetID            string                `json:"fleet_id"`
+	InstanceID         string                `json:"instance_id"`
+	AuditSchemaVersion int                   `json:"audit_schema_version"`
+	EmittedAt          time.Time             `json:"emitted_at"`
+	SeqStart           uint64                `json:"seq_start"`
+	SeqEnd             uint64                `json:"seq_end"`
+	EventCount         uint64                `json:"event_count"`
+	PayloadSHA256      string                `json:"payload_sha256"`
+	PayloadBytes       uint64                `json:"payload_bytes"`
+	Dropped            DroppedAccounting     `json:"dropped"`
+	Chain              EvidenceChain         `json:"chain"`
+	AppliedState       *FollowerAppliedState `json:"applied_state,omitempty"`
+	Signatures         []SignatureProof      `json:"signatures,omitempty"`
+}
+
+type SchemaRange struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+}
+
+type CapabilitiesResponse struct {
+	SchemaVersion          int         `json:"schema_version"`
+	ConductorID            string      `json:"conductor_id"`
+	RequiredMTLS           bool        `json:"required_mtls"`
+	ConductorBundle        SchemaRange `json:"conductor_bundle"`
+	RemoteKill             SchemaRange `json:"remote_kill"`
+	RollbackAuthorization  SchemaRange `json:"rollback_authorization"`
+	AuditBatch             SchemaRange `json:"audit_batch"`
+	ReceiptEntryVersions   []int       `json:"receipt_entry_versions"`
+	MaxCreatedSkewSeconds  int         `json:"max_created_skew_seconds"`
+	EmergencyStream        bool        `json:"emergency_stream"`
+	RemoteKillThreshold    int         `json:"remote_kill_threshold"`
+	RollbackThreshold      int         `json:"rollback_threshold"`
+	TrustRotationThreshold int         `json:"trust_rotation_threshold"`
+}
+
+func (p SignatureProof) Validate(required signing.KeyPurpose) error {
+	if strings.TrimSpace(p.SignerKeyID) == "" {
+		return fmt.Errorf("%w: signature.signer_key_id", ErrMissingField)
+	}
+	if err := validateIdentifier("signature.signer_key_id", p.SignerKeyID); err != nil {
+		return err
+	}
+	if p.Algorithm != SignatureAlgorithmEd25519 {
+		return fmt.Errorf("%w: algorithm=%q", ErrInvalidSignature, p.Algorithm)
+	}
+	if err := p.KeyPurpose.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidSignature, err)
+	}
+	if p.KeyPurpose != required {
+		return fmt.Errorf("%w: required=%q got=%q", ErrWrongKeyPurpose, required, p.KeyPurpose)
+	}
+	if err := validateEd25519SignatureString(p.Signature); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a Audience) Validate() error {
+	if len(a.InstanceIDs) == 0 && len(a.Labels) == 0 {
+		return fmt.Errorf("%w: empty audience", ErrInvalidAudience)
+	}
+	if len(a.InstanceIDs) > 0 && len(a.Labels) > 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidAudience, ErrInvalidAudienceSelectors)
+	}
+	wildcard := false
+	for _, id := range a.InstanceIDs {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("%w: empty instance_id", ErrInvalidAudience)
+		}
+		if id != "*" {
+			if err := validateIdentifier("audience.instance_ids", id); err != nil {
+				return fmt.Errorf("%w: %w", ErrInvalidAudience, err)
+			}
+		}
+		if id == "*" {
+			wildcard = true
+		}
+	}
+	if wildcard && len(a.InstanceIDs) > 1 {
+		// Mixing "*" with explicit IDs is always wildcard but the explicit
+		// entries imply scoped intent. Reject so operators don't ship a
+		// fleet-wide bundle thinking it was scoped.
+		return fmt.Errorf("%w: %w", ErrInvalidAudience, ErrInvalidAudienceWildcard)
+	}
+	for k, v := range a.Labels {
+		if strings.TrimSpace(k) == "" || strings.TrimSpace(v) == "" {
+			return fmt.Errorf("%w: empty label selector", ErrInvalidAudience)
+		}
+		if err := validateLabelSelector(k, v); err != nil {
+			return fmt.Errorf("%w: %w", ErrInvalidAudience, err)
+		}
+	}
+	return nil
+}
+
+func (d DroppedAccounting) Validate() error {
+	if d.Count == 0 {
+		if len(d.Reasons) != 0 {
+			return fmt.Errorf("%w: reasons present with zero count", ErrInvalidDroppedAccounting)
+		}
+		return nil
+	}
+	if len(d.Reasons) == 0 {
+		return fmt.Errorf("%w: count without reasons", ErrInvalidDroppedAccounting)
+	}
+	if len(d.Reasons) > MaxDropReasons {
+		return fmt.Errorf("%w: %d reasons > cap %d", ErrInvalidDroppedAccounting, len(d.Reasons), MaxDropReasons)
+	}
+	var total uint64
+	seen := make(map[string]struct{}, len(d.Reasons))
+	for _, r := range d.Reasons {
+		if err := r.Validate(); err != nil {
+			return err
+		}
+		if _, dup := seen[r.Reason]; dup {
+			return fmt.Errorf("%w: duplicate reason %q", ErrInvalidDroppedAccounting, r.Reason)
+		}
+		seen[r.Reason] = struct{}{}
+		// Detect overflow before accumulating. An attacker crafting a batch
+		// directly could otherwise pick Reason.Count values whose sum wraps
+		// uint64 to land back on d.Count, satisfying the equality check with
+		// an inconsistent payload.
+		if r.Count > math.MaxUint64-total {
+			return fmt.Errorf("%w: reason count sum overflows uint64", ErrInvalidDroppedAccounting)
+		}
+		total += r.Count
+	}
+	if total != d.Count {
+		return fmt.Errorf("%w: count=%d reason_total=%d", ErrInvalidDroppedAccounting, d.Count, total)
+	}
+	return nil
+}
+
+func (r DroppedReason) Validate() error {
+	if strings.TrimSpace(r.Reason) == "" {
+		return fmt.Errorf("%w: dropped.reason", ErrMissingField)
+	}
+	if len(r.Reason) > MaxDropReasonBytes {
+		return fmt.Errorf("%w: dropped.reason (%d bytes > cap %d)", ErrPayloadTooLarge, len(r.Reason), MaxDropReasonBytes)
+	}
+	if err := validateIdentifier("dropped.reason", r.Reason); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidDroppedAccounting, err)
+	}
+	if r.Count == 0 {
+		return fmt.Errorf("%w: dropped.reason.count", ErrMissingField)
+	}
+	return nil
+}
+
+func (a Audience) Matches(instanceID string, labels map[string]string) bool {
+	if slices.Contains(a.InstanceIDs, "*") || slices.Contains(a.InstanceIDs, instanceID) {
+		return true
+	}
+	if len(a.Labels) == 0 {
+		return false
+	}
+	for k, want := range a.Labels {
+		if labels[k] != want {
+			return false
+		}
+	}
+	return true
+}
+
+// AudiencesEqual reports whether two audiences address the identical policy
+// stream (order-insensitive on instance IDs, exact on labels). It is the single
+// source of truth for stream identity; the applycache cross-stream switch logic
+// depends on it, so it lives here rather than being duplicated per package.
+func AudiencesEqual(a, b Audience) bool {
+	aIDs := slices.Clone(a.InstanceIDs)
+	bIDs := slices.Clone(b.InstanceIDs)
+	slices.Sort(aIDs)
+	slices.Sort(bIDs)
+	if !slices.Equal(aIDs, bIDs) {
+		return false
+	}
+	if len(a.Labels) != len(b.Labels) {
+		return false
+	}
+	for key, aVal := range a.Labels {
+		if b.Labels[key] != aVal {
+			return false
+		}
+	}
+	return true
+}
+
+func (b PolicyBundle) SignablePreimage() ([]byte, error) {
+	unsigned := b
+	unsigned.Signatures = nil
+	// Force UTC + RFC3339Nano-compatible representation so two producers in
+	// different timezones canonicalize identically. Without this, the default
+	// time.Time JSON marshal embeds the source zone offset and breaks signature
+	// portability across regions / Conductor replicas.
+	unsigned.CreatedAt = unsigned.CreatedAt.UTC()
+	unsigned.NotBefore = unsigned.NotBefore.UTC()
+	unsigned.ExpiresAt = unsigned.ExpiresAt.UTC()
+	return canonicalPreimage(unsigned, "policy_bundle")
+}
+
+func (b PolicyBundle) CanonicalHash() (string, error) {
+	return canonicalHash(b.SignablePreimage)
+}
+
+func (b PolicyBundle) Validate() error {
+	return b.validate(false)
+}
+
+// ValidateAllowLegacyPolicyHash validates a bundle while tolerating a policy_hash
+// this build cannot reproduce. Network publish paths must use Validate.
+//
+// There are exactly two legitimate classes of caller, and a new call site that is
+// neither of them is a mistake:
+//
+//   - Reads of state on local disk the process already trusts: the leader's bundle
+//     store, the offline inspect and repair readers, and the follower's own
+//     verified cache. These never verified signatures and do not start now; the
+//     leader trusting its own disk is the documented design, and on that path the
+//     policy_hash recompute was a consistency check rather than a tamper gate,
+//     because anything able to rewrite the store rewrites the digests with it.
+//   - Apply paths that have ALREADY verified signatures against a pinned roster,
+//     which must use ValidateAtTimeAllowLegacyPolicyHash so the freshness window is
+//     checked too. There the publisher's signature covers policy_hash, so the value
+//     is attested even when this build cannot recompute it.
+//
+// Tolerated is not verified. Callers reporting to an operator must use
+// PolicyHashStatus and must not describe PolicyHashUnknownUnverified as a verified
+// digest of policy content.
+func (b PolicyBundle) ValidateAllowLegacyPolicyHash() error {
+	return b.validate(true)
+}
+
+func (b PolicyBundle) validate(allowLegacyPolicyHash bool) error {
+	if err := validateSchemaVersion(b.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("bundle_id", b.BundleID); err != nil {
+		return err
+	}
+	if err := validateOrgFleet(b.OrgID, b.FleetID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("environment", b.Environment); err != nil {
+		return err
+	}
+	if err := b.Audience.Validate(); err != nil {
+		return err
+	}
+	if b.Version == 0 {
+		return fmt.Errorf("%w: version", ErrMissingField)
+	}
+	if err := validateWindow(b.NotBefore, b.ExpiresAt); err != nil {
+		return err
+	}
+	if b.CreatedAt.IsZero() {
+		return fmt.Errorf("%w: created_at", ErrMissingField)
+	}
+	if err := validateHash("policy_hash", b.PolicyHash); err != nil {
+		return err
+	}
+	if err := validateHash("payload_sha256", b.PayloadSHA256); err != nil {
+		return err
+	}
+	if b.PreviousBundleHash != "" {
+		if err := validateHash("previous_bundle_hash", b.PreviousBundleHash); err != nil {
+			return err
+		}
+	}
+	if b.StreamSwitchAuthorization != nil {
+		if err := b.StreamSwitchAuthorization.Validate(); err != nil {
+			return err
+		}
+		if b.StreamSwitchAuthorization.OrgID != b.OrgID ||
+			b.StreamSwitchAuthorization.FleetID != b.FleetID ||
+			b.StreamSwitchAuthorization.Environment != b.Environment ||
+			b.StreamSwitchAuthorization.TargetBundleID != b.BundleID ||
+			b.StreamSwitchAuthorization.TargetVersion != b.Version ||
+			!AudiencesEqual(b.StreamSwitchAuthorization.TargetAudience, b.Audience) {
+			return fmt.Errorf("%w: stream switch authorization does not target bundle", ErrInvalidRollback)
+		}
+		detached := b
+		detached.Signatures = nil
+		detached.StreamSwitchAuthorization = nil
+		targetHash, err := detached.CanonicalHash()
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(b.StreamSwitchAuthorization.TargetBundleHash, targetHash) {
+			return fmt.Errorf("%w: stream switch target_bundle_hash", ErrHashMismatch)
+		}
+	}
+	if strings.TrimSpace(b.Payload.ConfigYAML) == "" {
+		return fmt.Errorf("%w: payload.config_yaml", ErrMissingField)
+	}
+	if len(b.Payload.ConfigYAML) > MaxConfigYAMLBytes {
+		return fmt.Errorf("%w: payload.config_yaml (%d bytes > cap %d)", ErrPayloadTooLarge, len(b.Payload.ConfigYAML), MaxConfigYAMLBytes)
+	}
+	if err := validateMinPipelockVersion(b.MinPipelockVersion); err != nil {
+		return err
+	}
+	if err := rejectLicenseFields(b.Payload.ConfigYAML); err != nil {
+		return err
+	}
+	if err := rejectPolicyBundleCompanionFields(b.Payload.ConfigYAML); err != nil {
+		return err
+	}
+	if err := rejectDisallowedBundleSections(b.Payload.ConfigYAML); err != nil {
+		return err
+	}
+	for _, rb := range b.Payload.RuleBundles {
+		if err := rb.Validate(); err != nil {
+			return err
+		}
+	}
+	if err := b.validateHashes(allowLegacyPolicyHash); err != nil {
+		return err
+	}
+	return validateSignatureThreshold(b.Signatures, signing.PurposePolicyBundleSigning, RequiredStandardSigners)
+}
+
+func (b PolicyBundle) validateHashes(allowLegacyPolicyHash bool) error {
+	if err := b.VerifyPayloadHash(); err != nil {
+		return err
+	}
+	policyHash, err := b.Payload.PolicyHash()
+	if err != nil {
+		// Computing the hash parses the bundle's config through the CURRENT
+		// schema, so this errors for a stored bundle whose config carries a field
+		// this release removed. That is the same upgrade case the tolerance below
+		// exists for, reached by a different door, and refusing here would put the
+		// leader back to not starting. It is exactly the shape this release
+		// produces, since it removes three budget fields a previously published
+		// bundle may well set.
+		//
+		// Publish keeps the hard failure: there the computing build is the build
+		// that produced the bundle, so an unparseable config is a real error. When
+		// reading stored state the hash is simply not reproducible by this build,
+		// which is what PolicyHashStatus already reports for this case, and the
+		// payload digest checked above still binds the raw payload.
+		if !allowLegacyPolicyHash {
+			return err
+		}
+		return nil
+	}
+	if !strings.EqualFold(b.PolicyHash, policyHash) {
+		if !allowLegacyPolicyHash {
+			return fmt.Errorf("%w: policy_hash", ErrHashMismatch)
+		}
+		legacyPolicyHash, legacyErr := b.Payload.LegacyPolicyHash()
+		if legacyErr != nil || !strings.EqualFold(b.PolicyHash, legacyPolicyHash) {
+			// Neither scheme this build can compute reproduces the stored value.
+			// That is the normal state for a bundle published before a release
+			// moved the canonical policy hash, and it is permanent: the value is
+			// derived from the whole config struct, so no amount of added schemes
+			// can reproduce a prior release's. Refusing here is what stopped the
+			// leader from booting after upgrade and what stopped followers from
+			// applying an in-flight bundle mid-rollout.
+			//
+			// This is deliberately NOT a tamper gate and was never one. On the
+			// leader nothing verifies signatures, so an attacker able to rewrite
+			// the store rewrites payload_sha256, policy_hash and the record hash
+			// together; strict recompute only catches corruption or a partial
+			// edit. On followers the cryptographic gate is VerifySignaturesAt,
+			// which callers MUST run before reaching here.
+			//
+			// What still holds for this bundle: payload_sha256 binds the raw
+			// payload and is schema-independent, the record's canonical hash
+			// pins it, expiry and chain checks apply, and the publisher's
+			// signature covers policy_hash itself. So the value is a signed
+			// opaque string. Callers surface it as
+			// PolicyHashUnknownUnverified and must never call it verified.
+			return nil
+		}
+	}
+	return nil
+}
+
+// VerifyPayloadHash checks the raw payload's cryptographic digest without
+// parsing ConfigYAML. Apply paths use it after signature verification and
+// before any semantic validation of the untrusted config payload.
+func (b PolicyBundle) VerifyPayloadHash() error {
+	payloadHash, err := b.Payload.PayloadHash()
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(b.PayloadSHA256, payloadHash) {
+		return fmt.Errorf("%w: payload_sha256", ErrHashMismatch)
+	}
+	return nil
+}
+
+// PolicyHashStatus describes which policy_hash scheme, if any, this build could
+// reproduce from a bundle's payload. A boolean cannot express the third case,
+// which is the one that matters on upgrade.
+type PolicyHashStatus string
+
+const (
+	// PolicyHashCurrent means the stored policy_hash matches what this build
+	// computes from the payload. The value is a verified digest of the policy.
+	PolicyHashCurrent PolicyHashStatus = "current"
+	// PolicyHashKnownLegacy means the stored policy_hash matches the
+	// pre-loaded-config scheme. Still a verified digest, under an older rule.
+	PolicyHashKnownLegacy PolicyHashStatus = "known_legacy"
+	// PolicyHashUnknownUnverified means the stored policy_hash matches no scheme
+	// this build can compute, so this build cannot say what policy content the
+	// value stands for.
+	//
+	// This is the NORMAL state for any bundle published before a release that
+	// moved the canonical policy hash, and it is not recoverable by adding more
+	// schemes: PolicyHash is derived from the whole config struct via
+	// config.CanonicalPolicyHash, so reproducing a prior release's value would
+	// require that release's entire config schema frozen in this binary. The
+	// pre-loaded-config scheme is the exception precisely because it hashes raw
+	// YAML and so is schema-independent.
+	//
+	// The value remains covered by the publisher's signature, so it is a signed
+	// opaque string. It must never be presented as verified or attested policy
+	// content.
+	PolicyHashUnknownUnverified PolicyHashStatus = "unknown_unverified"
+)
+
+// Reproducible reports whether this build could recompute the policy_hash and
+// found it correct. Only a reproducible status may be described to an operator
+// as a verified digest of the policy.
+func (s PolicyHashStatus) Reproducible() bool {
+	return s == PolicyHashCurrent || s == PolicyHashKnownLegacy
+}
+
+// PolicyHashStatus reports which scheme reproduces the bundle's policy_hash. It
+// is an upgrade and evidence signal for operators; it is not a trust decision
+// and must not replace signature verification.
+func (b PolicyBundle) PolicyHashStatus() PolicyHashStatus {
+	if policyHash, err := b.Payload.PolicyHash(); err == nil && strings.EqualFold(b.PolicyHash, policyHash) {
+		return PolicyHashCurrent
+	}
+	if legacyPolicyHash, err := b.Payload.LegacyPolicyHash(); err == nil && strings.EqualFold(b.PolicyHash, legacyPolicyHash) {
+		return PolicyHashKnownLegacy
+	}
+	return PolicyHashUnknownUnverified
+}
+
+// ValidateAtTime extends Validate with a freshness check: now must fall inside
+// [NotBefore, ExpiresAt]. Callers that apply the bundle must use this variant -
+// Validate alone passes a future-dated or already-expired bundle.
+func (b PolicyBundle) ValidateAtTime(now time.Time) error {
+	if err := b.Validate(); err != nil {
+		return err
+	}
+	return withinValidity(now, b.NotBefore, b.ExpiresAt)
+}
+
+// ValidateAtTimeAllowLegacyPolicyHash is ValidateAtTime for a bundle that is
+// already stored or already signature-verified, tolerating a policy_hash this
+// build cannot reproduce.
+//
+// CALLER CONTRACT: only use this AFTER VerifySignaturesAt has succeeded, or on a
+// record read from local storage the caller already trusts. The policy_hash
+// tolerance is not a tamper gate, so the cryptographic gate must come first.
+// Reaching this without verifying signatures would apply a bundle whose
+// provenance was never established.
+func (b PolicyBundle) ValidateAtTimeAllowLegacyPolicyHash(now time.Time) error {
+	if err := b.ValidateAllowLegacyPolicyHash(); err != nil {
+		return err
+	}
+	return withinValidity(now, b.NotBefore, b.ExpiresAt)
+}
+
+// VerifySignatures is shorthand for VerifySignaturesAt(time.Now(), resolve).
+// Callers that already have a logical clock (e.g. apply pipelines that took
+// "now" once at the top of the operation) should prefer VerifySignaturesAt so
+// roster lifecycle checks use the same instant as freshness checks.
+func (b PolicyBundle) VerifySignatures(resolve SignatureKeyResolver) error {
+	return b.VerifySignaturesAt(time.Now(), resolve)
+}
+
+func (b PolicyBundle) VerifySignaturesAt(now time.Time, resolve SignatureKeyResolver) error {
+	preimage, err := b.SignablePreimage()
+	if err != nil {
+		return err
+	}
+	return verifySignatureThreshold(now, preimage, b.Signatures, signing.PurposePolicyBundleSigning, RequiredStandardSigners, resolve)
+}
+
+func (b PolicyBundle) ValidateForFollower(orgID, fleetID, instanceID string, labels map[string]string) error {
+	if b.OrgID != orgID || b.FleetID != fleetID {
+		return fmt.Errorf("%w: org_id/fleet_id", ErrAudienceMismatch)
+	}
+	if !b.Audience.Matches(instanceID, labels) {
+		return fmt.Errorf("%w: instance_id=%q", ErrAudienceMismatch, instanceID)
+	}
+	return nil
+}
+
+func (r RuleBundleRef) Validate() error {
+	if err := validateIdentifier("rule_bundles.name", r.Name); err != nil {
+		return err
+	}
+	if err := requireNonEmpty("rule_bundles.version", r.Version); err != nil {
+		return err
+	}
+	return validateHash("rule_bundles.sha256", r.SHA256)
+}
+
+func (m RemoteKillMessage) SignablePreimage() ([]byte, error) {
+	unsigned := m
+	unsigned.Signatures = nil
+	unsigned.CreatedAt = unsigned.CreatedAt.UTC()
+	unsigned.NotBefore = unsigned.NotBefore.UTC()
+	unsigned.ExpiresAt = unsigned.ExpiresAt.UTC()
+	return canonicalPreimage(unsigned, "remote_kill")
+}
+
+func (m RemoteKillMessage) CanonicalHash() (string, error) {
+	return canonicalHash(m.SignablePreimage)
+}
+
+func (m RemoteKillMessage) ControlIntent() ControlIntent {
+	return effectiveControlIntent(m.Intent)
+}
+
+func (m RemoteKillMessage) Validate() error {
+	if err := validateSchemaVersion(m.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("message_id", m.MessageID); err != nil {
+		return err
+	}
+	if err := validateOrgFleet(m.OrgID, m.FleetID); err != nil {
+		return err
+	}
+	if err := m.Audience.Validate(); err != nil {
+		return err
+	}
+	if err := validateControlIntent(m.Intent); err != nil {
+		return err
+	}
+	if m.State != KillSwitchActive && m.State != KillSwitchInactive {
+		return fmt.Errorf("%w: state=%q", ErrInvalidState, m.State)
+	}
+	if m.Counter == 0 {
+		return fmt.Errorf("%w: counter", ErrMissingField)
+	}
+	if err := validateWindow(m.NotBefore, m.ExpiresAt); err != nil {
+		return err
+	}
+	if m.CreatedAt.IsZero() {
+		return fmt.Errorf("%w: created_at", ErrMissingField)
+	}
+	if err := validateReason("reason", m.Reason); err != nil {
+		return err
+	}
+	return validateSignatureThreshold(m.Signatures, signing.PurposeRemoteKillSigning, RequiredCatastrophicSigners)
+}
+
+// ValidateAtTime extends Validate with a freshness check. Remote kill messages
+// have tight TTLs by design; an expired remote-kill must be rejected even if
+// signature, threshold, and audience all pass.
+func (m RemoteKillMessage) ValidateAtTime(now time.Time) error {
+	if err := m.Validate(); err != nil {
+		return err
+	}
+	return withinValidity(now, m.NotBefore, m.ExpiresAt)
+}
+
+func (m RemoteKillMessage) VerifySignatures(resolve SignatureKeyResolver) error {
+	return m.VerifySignaturesAt(time.Now(), resolve)
+}
+
+func (m RemoteKillMessage) VerifySignaturesAt(now time.Time, resolve SignatureKeyResolver) error {
+	preimage, err := m.SignablePreimage()
+	if err != nil {
+		return err
+	}
+	return verifySignatureThreshold(now, preimage, m.Signatures, signing.PurposeRemoteKillSigning, RequiredCatastrophicSigners, resolve)
+}
+
+func (m RemoteKillMessage) ValidateForFollower(orgID, fleetID, instanceID string, labels map[string]string) error {
+	if m.OrgID != orgID || m.FleetID != fleetID {
+		return fmt.Errorf("%w: org_id/fleet_id", ErrAudienceMismatch)
+	}
+	if !m.Audience.Matches(instanceID, labels) {
+		return fmt.Errorf("%w: instance_id=%q", ErrAudienceMismatch, instanceID)
+	}
+	return nil
+}
+
+func (r RollbackAuthorization) SignablePreimage() ([]byte, error) {
+	unsigned := r
+	unsigned.Signatures = nil
+	unsigned.CreatedAt = unsigned.CreatedAt.UTC()
+	unsigned.ExpiresAt = unsigned.ExpiresAt.UTC()
+	return canonicalPreimage(unsigned, "rollback_authorization")
+}
+
+func (r RollbackAuthorization) CanonicalHash() (string, error) {
+	return canonicalHash(r.SignablePreimage)
+}
+
+func (r RollbackAuthorization) ControlIntent() ControlIntent {
+	return effectiveControlIntent(r.Intent)
+}
+
+func (r RollbackAuthorization) Validate() error {
+	if err := validateSchemaVersion(r.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("authorization_id", r.AuthorizationID); err != nil {
+		return err
+	}
+	if err := validateOrgFleet(r.OrgID, r.FleetID); err != nil {
+		return err
+	}
+	if err := validateControlIntent(r.Intent); err != nil {
+		return err
+	}
+	if err := validateIdentifier("current_bundle_id", r.CurrentBundleID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("target_bundle_id", r.TargetBundleID); err != nil {
+		return err
+	}
+	if r.CurrentVersion == 0 || r.TargetVersion == 0 || r.Counter == 0 {
+		return fmt.Errorf("%w: rollback counters", ErrMissingField)
+	}
+	if r.TargetVersion >= r.CurrentVersion {
+		return fmt.Errorf("%w: target_version must be lower than current_version", ErrInvalidRollback)
+	}
+	if r.CreatedAt.IsZero() || r.ExpiresAt.IsZero() || !r.ExpiresAt.After(r.CreatedAt) {
+		return fmt.Errorf("%w: rollback validity", ErrInvalidValidityWindow)
+	}
+	if err := validateReason("reason", r.Reason); err != nil {
+		return err
+	}
+	return validateSignatureThreshold(r.Signatures, signing.PurposePolicyBundleRollback, RequiredCatastrophicSigners)
+}
+
+// ValidateAtTime extends Validate with a freshness check. Rollback
+// authorizations are single-shot at publish/fetch time; recovery of a rollback
+// already accepted by the control plane can use Validate to avoid bricking
+// crash reconciliation after this wall-clock window expires.
+func (r RollbackAuthorization) ValidateAtTime(now time.Time) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	return withinValidity(now, r.CreatedAt, r.ExpiresAt)
+}
+
+func (r RollbackAuthorization) VerifySignatures(resolve SignatureKeyResolver) error {
+	return r.VerifySignaturesAt(time.Now(), resolve)
+}
+
+func (r RollbackAuthorization) VerifySignaturesAt(now time.Time, resolve SignatureKeyResolver) error {
+	preimage, err := r.SignablePreimage()
+	if err != nil {
+		return err
+	}
+	return verifySignatureThreshold(now, preimage, r.Signatures, signing.PurposePolicyBundleRollback, RequiredCatastrophicSigners, resolve)
+}
+
+func (a StreamSwitchAuthorization) SignablePreimage() ([]byte, error) {
+	unsigned := a
+	unsigned.Signatures = nil
+	unsigned.CreatedAt = unsigned.CreatedAt.UTC()
+	unsigned.ExpiresAt = unsigned.ExpiresAt.UTC()
+	return canonicalPreimage(unsigned, "stream_switch_authorization")
+}
+
+func (a StreamSwitchAuthorization) CanonicalHash() (string, error) {
+	return canonicalHash(a.SignablePreimage)
+}
+
+func (a StreamSwitchAuthorization) Validate() error {
+	if err := validateSchemaVersion(a.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("authorization_id", a.AuthorizationID); err != nil {
+		return err
+	}
+	if err := validateOrgFleet(a.OrgID, a.FleetID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("environment", a.Environment); err != nil {
+		return err
+	}
+	if err := a.CurrentAudience.Validate(); err != nil {
+		return err
+	}
+	if err := a.TargetAudience.Validate(); err != nil {
+		return err
+	}
+	if AudiencesEqual(a.CurrentAudience, a.TargetAudience) {
+		return fmt.Errorf("%w: stream switch target must differ from current audience", ErrInvalidRollback)
+	}
+	if err := validateIdentifier("current_bundle_id", a.CurrentBundleID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("target_bundle_id", a.TargetBundleID); err != nil {
+		return err
+	}
+	if a.CurrentVersion == 0 || a.TargetVersion == 0 {
+		return fmt.Errorf("%w: stream switch versions", ErrMissingField)
+	}
+	if err := validateHash("current_bundle_hash", a.CurrentBundleHash); err != nil {
+		return err
+	}
+	if err := validateHash("target_bundle_hash", a.TargetBundleHash); err != nil {
+		return err
+	}
+	if a.CreatedAt.IsZero() || a.ExpiresAt.IsZero() || !a.ExpiresAt.After(a.CreatedAt) {
+		return fmt.Errorf("%w: stream switch validity", ErrInvalidValidityWindow)
+	}
+	if err := validateReason("reason", a.Reason); err != nil {
+		return err
+	}
+	return validateSignatureThreshold(a.Signatures, signing.PurposePolicyBundleRollback, RequiredCatastrophicSigners)
+}
+
+func (a StreamSwitchAuthorization) ValidateAtTime(now time.Time) error {
+	if err := a.Validate(); err != nil {
+		return err
+	}
+	return withinValidity(now, a.CreatedAt, a.ExpiresAt)
+}
+
+// ValidateMaxValidity rejects a stream-switch authorization whose validity
+// window (ExpiresAt - CreatedAt) exceeds maxTTL. A non-positive or zero window
+// is already rejected by Validate (CreatedAt/ExpiresAt checks), so this method
+// only adds the upper-bound cap. Mirrors the controlplane's
+// validateMaxValidity for rollbacks, but lives on the message type so the
+// follower (applycache) can enforce it without importing the controlplane
+// package.
+func (a StreamSwitchAuthorization) ValidateMaxValidity(maxTTL time.Duration) error {
+	if maxTTL <= 0 {
+		return nil
+	}
+	window := a.ExpiresAt.Sub(a.CreatedAt)
+	if window > maxTTL {
+		return fmt.Errorf("%w: validity %s exceeds max %s", ErrStreamSwitchWindowTooLong, window, maxTTL)
+	}
+	return nil
+}
+
+func (a StreamSwitchAuthorization) VerifySignatures(resolve SignatureKeyResolver) error {
+	return a.VerifySignaturesAt(time.Now(), resolve)
+}
+
+func (a StreamSwitchAuthorization) VerifySignaturesAt(now time.Time, resolve SignatureKeyResolver) error {
+	preimage, err := a.SignablePreimage()
+	if err != nil {
+		return err
+	}
+	return verifySignatureThreshold(now, preimage, a.Signatures, signing.PurposePolicyBundleRollback, RequiredCatastrophicSigners, resolve)
+}
+
+func (a AuditBatchEnvelope) SignablePreimage() ([]byte, error) {
+	unsigned := a
+	unsigned.Signatures = nil
+	unsigned.EmittedAt = unsigned.EmittedAt.UTC()
+	// Force UTC on the applied-state timestamps too, mirroring the top-level
+	// EmittedAt normalization, so two producers in different timezones
+	// canonicalize identically. Copy the pointed-to struct first: `unsigned` is
+	// a shallow copy that still shares the AppliedState pointer, and mutating it
+	// through the pointer would rewrite the caller's applied-state.
+	if unsigned.AppliedState != nil {
+		applied := *unsigned.AppliedState
+		applied.LastPolicyPollAt = applied.LastPolicyPollAt.UTC()
+		applied.LastSuccessfulApplyAt = applied.LastSuccessfulApplyAt.UTC()
+		applied.ObservedAt = applied.ObservedAt.UTC()
+		applied.ProvenanceAt = applied.ProvenanceAt.UTC()
+		unsigned.AppliedState = &applied
+	}
+	return canonicalPreimage(unsigned, "audit_batch")
+}
+
+func (h AppliedStateHeartbeat) SignablePreimage() ([]byte, error) {
+	unsigned := h
+	unsigned.Signatures = nil
+	unsigned.EmittedAt = unsigned.EmittedAt.UTC()
+	unsigned.AppliedState.LastPolicyPollAt = unsigned.AppliedState.LastPolicyPollAt.UTC()
+	unsigned.AppliedState.LastSuccessfulApplyAt = unsigned.AppliedState.LastSuccessfulApplyAt.UTC()
+	unsigned.AppliedState.ObservedAt = unsigned.AppliedState.ObservedAt.UTC()
+	unsigned.AppliedState.ProvenanceAt = unsigned.AppliedState.ProvenanceAt.UTC()
+	return canonicalPreimage(unsigned, "applied_state_heartbeat")
+}
+
+func (h AppliedStateHeartbeat) CanonicalHash() (string, error) {
+	return canonicalHash(h.SignablePreimage)
+}
+
+func (h AppliedStateHeartbeat) Validate() error {
+	if err := validateSchemaVersion(h.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("heartbeat_id", h.HeartbeatID); err != nil {
+		return err
+	}
+	if err := validateOrgFleet(h.OrgID, h.FleetID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("instance_id", h.InstanceID); err != nil {
+		return err
+	}
+	if h.EmittedAt.IsZero() {
+		return fmt.Errorf("%w: emitted_at", ErrMissingField)
+	}
+	if err := h.AppliedState.Validate(); err != nil {
+		return err
+	}
+	if h.AppliedState.ProvenanceAt.IsZero() {
+		return fmt.Errorf("%w: applied_state.provenance_at", ErrMissingField)
+	}
+	return validateSignatureThreshold(h.Signatures, signing.PurposeAuditBatchSigning, RequiredStandardSigners)
+}
+
+func (h AppliedStateHeartbeat) ValidateForConductor(now time.Time, maxSkew time.Duration) error {
+	if err := h.Validate(); err != nil {
+		return err
+	}
+	if maxSkew <= 0 {
+		maxSkew = DefaultAuditMaxSkew
+	}
+	if maxSkew > MaxAllowedAuditSkew {
+		return fmt.Errorf("%w: max_skew %s exceeds ceiling %s", ErrSkewExceeded, maxSkew, MaxAllowedAuditSkew)
+	}
+	now = now.UTC()
+	minStamp := now.Add(-maxSkew)
+	maxStamp := now.Add(maxSkew)
+	for _, candidate := range []struct {
+		field string
+		stamp time.Time
+	}{
+		{field: "emitted_at", stamp: h.EmittedAt},
+		{field: "applied_state.observed_at", stamp: h.AppliedState.ObservedAt},
+		{field: "applied_state.provenance_at", stamp: h.AppliedState.ProvenanceAt},
+	} {
+		field, stamp := candidate.field, candidate.stamp.UTC()
+		if stamp.Before(minStamp) || stamp.After(maxStamp) {
+			return fmt.Errorf("%w: %s outside [%s,%s]", ErrSkewExceeded, field, minStamp.Format(time.RFC3339Nano), maxStamp.Format(time.RFC3339Nano))
+		}
+	}
+	return nil
+}
+
+func (h AppliedStateHeartbeat) VerifySignaturesAt(now time.Time, resolve SignatureKeyResolver) error {
+	preimage, err := h.SignablePreimage()
+	if err != nil {
+		return err
+	}
+	return verifySignatureThreshold(now, preimage, h.Signatures, signing.PurposeAuditBatchSigning, RequiredStandardSigners, resolve)
+}
+
+func (a AuditBatchEnvelope) CanonicalHash() (string, error) {
+	return canonicalHash(a.SignablePreimage)
+}
+
+func (a AuditBatchEnvelope) Validate() error {
+	if err := validateSchemaVersion(a.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("batch_id", a.BatchID); err != nil {
+		return err
+	}
+	if err := validateOrgFleet(a.OrgID, a.FleetID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("instance_id", a.InstanceID); err != nil {
+		return err
+	}
+	if a.AuditSchemaVersion <= 0 {
+		return fmt.Errorf("%w: audit_schema_version", ErrMissingField)
+	}
+	if a.EmittedAt.IsZero() {
+		return fmt.Errorf("%w: emitted_at", ErrMissingField)
+	}
+	if err := validateSeqRange(a.SeqStart, a.SeqEnd); err != nil {
+		return err
+	}
+	if a.EventCount == 0 {
+		return fmt.Errorf("%w: event_count", ErrMissingField)
+	}
+	if a.PayloadBytes == 0 {
+		return fmt.Errorf("%w: payload_bytes", ErrMissingField)
+	}
+	if a.PayloadBytes > MaxAuditPayloadBytes {
+		return fmt.Errorf("%w: payload_bytes=%d cap=%d", ErrPayloadTooLarge, a.PayloadBytes, MaxAuditPayloadBytes)
+	}
+	if err := validateHash("payload_sha256", a.PayloadSHA256); err != nil {
+		return err
+	}
+	if err := a.Dropped.Validate(); err != nil {
+		return err
+	}
+	if err := a.Chain.Validate(a.SeqStart, a.SeqEnd); err != nil {
+		return err
+	}
+	if a.AppliedState != nil {
+		if err := a.AppliedState.Validate(); err != nil {
+			return err
+		}
+	}
+	return validateSignatureThreshold(a.Signatures, signing.PurposeAuditBatchSigning, RequiredStandardSigners)
+}
+
+// Validate enforces the applied-state field bounds. It runs as part of
+// AuditBatchEnvelope.Validate (so it is checked at both sign time and ingest),
+// and because the whole struct is inside the signed preimage a malformed
+// applied-state fails the ENTIRE batch closed rather than being silently
+// dropped or stored unverified.
+func (s FollowerAppliedState) Validate() error {
+	if s.ObservedAt.IsZero() {
+		return fmt.Errorf("%w: observed_at", ErrMissingField)
+	}
+	for _, f := range []struct {
+		name  string
+		value string
+	}{
+		{"applied_state.active_bundle_id", s.ActiveBundleID},
+		{"applied_state.active_bundle_min_pipelock_version", s.ActiveBundleMinPipelockVersion},
+		{"applied_state.pipelock_version", s.PipelockVersion},
+		{"applied_state.git_commit", s.GitCommit},
+		{"applied_state.build_date", s.BuildDate},
+		{"applied_state.last_apply_error_code", s.LastApplyErrorCode},
+	} {
+		if err := validateAppliedStateString(f.name, f.value); err != nil {
+			return err
+		}
+	}
+	if err := validateAppliedStateMessage("applied_state.last_apply_error_message", s.LastApplyErrorMessage); err != nil {
+		return err
+	}
+	if s.ActiveBundleHash != "" {
+		if err := validateLowerHexHash("applied_state.active_bundle_hash", s.ActiveBundleHash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateForConductor extends Validate with skew enforcement against Conductor's clock.
+// maxSkew bounds |now - EmittedAt|; replay protection requires this be tight
+// (default DefaultAuditMaxSkew, ceiling MaxAllowedAuditSkew). Callers that
+// configure a higher skew must do so consciously and log a warning at config
+// load time. Validate alone does NOT enforce skew - a captured signed batch
+// could otherwise be replayed at any future time.
+func (a AuditBatchEnvelope) ValidateForConductor(now time.Time, maxSkew time.Duration) error {
+	if err := a.Validate(); err != nil {
+		return err
+	}
+	if maxSkew <= 0 {
+		maxSkew = DefaultAuditMaxSkew
+	}
+	if maxSkew > MaxAllowedAuditSkew {
+		return fmt.Errorf("%w: max_skew %s exceeds ceiling %s", ErrSkewExceeded, maxSkew, MaxAllowedAuditSkew)
+	}
+	delta := now.Sub(a.EmittedAt)
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > maxSkew {
+		return fmt.Errorf("%w: |now-emitted_at|=%s max_skew=%s", ErrSkewExceeded, delta, maxSkew)
+	}
+	if a.AppliedState != nil {
+		observedAt := a.AppliedState.ObservedAt.UTC()
+		latestAllowed := now.UTC().Add(maxSkew)
+		if observedAt.After(latestAllowed) {
+			return fmt.Errorf("%w: applied_state.observed_at=%s latest_allowed=%s", ErrSkewExceeded, observedAt.Format(time.RFC3339Nano), latestAllowed.Format(time.RFC3339Nano))
+		}
+	}
+	return nil
+}
+
+func (a AuditBatchEnvelope) ValidatePayload(payload []byte) error {
+	if uint64(len(payload)) != a.PayloadBytes {
+		return fmt.Errorf("%w: payload_bytes envelope=%d actual=%d", ErrHashMismatch, a.PayloadBytes, len(payload))
+	}
+	sum := sha256.Sum256(payload)
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), a.PayloadSHA256) {
+		return fmt.Errorf("%w: payload_sha256", ErrHashMismatch)
+	}
+	return nil
+}
+
+func (a AuditBatchEnvelope) ValidateForConductorWithPayload(now time.Time, maxSkew time.Duration, payload []byte) error {
+	if err := a.ValidateForConductor(now, maxSkew); err != nil {
+		return err
+	}
+	return a.ValidatePayload(payload)
+}
+
+func (a AuditBatchEnvelope) VerifySignatures(resolve SignatureKeyResolver) error {
+	return a.VerifySignaturesAt(time.Now(), resolve)
+}
+
+func (a AuditBatchEnvelope) VerifySignaturesAt(now time.Time, resolve SignatureKeyResolver) error {
+	preimage, err := a.SignablePreimage()
+	if err != nil {
+		return err
+	}
+	return verifySignatureThreshold(now, preimage, a.Signatures, signing.PurposeAuditBatchSigning, RequiredStandardSigners, resolve)
+}
+
+func (a AuditBatchEnvelope) ForksWith(other AuditBatchEnvelope) bool {
+	if a.OrgID != other.OrgID || a.FleetID != other.FleetID || a.InstanceID != other.InstanceID {
+		return false
+	}
+	if !auditChainIdentityEqual(a.Chain, other.Chain) {
+		return false
+	}
+	if a.SeqEnd < other.SeqStart || other.SeqEnd < a.SeqStart {
+		return false
+	}
+	return a.PayloadSHA256 != other.PayloadSHA256 || a.Chain.SegmentTailHash != other.Chain.SegmentTailHash
+}
+
+func auditChainIdentityEqual(a, b EvidenceChain) bool {
+	aNamespaced := recorder.EntryVersionHasNamespace(a.EntryVersion)
+	bNamespaced := recorder.EntryVersionHasNamespace(b.EntryVersion)
+	if aNamespaced != bNamespaced {
+		return false
+	}
+	if !aNamespaced {
+		return true
+	}
+	return a.EntryVersion == b.EntryVersion && a.SessionID == b.SessionID && a.ChainKind == b.ChainKind && a.WriterInstanceID == b.WriterInstanceID
+}
+
+// IsSupportedAuditEntryVersion reports whether audit transport accepts version.
+func IsSupportedAuditEntryVersion(version int) bool {
+	return version == 2 || recorder.EntryVersionHasNamespace(version)
+}
+
+// SupportedAuditEntryVersions returns the versions advertised to followers.
+func SupportedAuditEntryVersions() []int { return []int{2, 3} }
+
+func (c EvidenceChain) Validate(seqStart, seqEnd uint64) error {
+	if !IsSupportedAuditEntryVersion(c.EntryVersion) {
+		return fmt.Errorf("%w: entry_version=%d", ErrInvalidSequenceRange, c.EntryVersion)
+	}
+	if recorder.EntryVersionHasNamespace(c.EntryVersion) {
+		if err := validateIdentifier("chain.session_id", c.SessionID); err != nil {
+			return err
+		}
+		if err := validateIdentifier("chain.chain_kind", c.ChainKind); err != nil {
+			return err
+		}
+		if err := validateIdentifier("chain.writer_instance_id", c.WriterInstanceID); err != nil {
+			return err
+		}
+	}
+	if err := recorder.ValidateEntryNamespace(c.EntryVersion, c.ChainKind, c.WriterInstanceID); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidSequenceRange, err)
+	}
+	if err := validateIdentifier("chain.segment_id", c.SegmentID); err != nil {
+		return err
+	}
+	if c.SeqStart != seqStart || c.SeqEnd != seqEnd {
+		return fmt.Errorf("%w: chain seq range mismatch", ErrInvalidSequenceRange)
+	}
+	if err := validateSeqRange(c.SeqStart, c.SeqEnd); err != nil {
+		return err
+	}
+	for name, value := range map[string]string{
+		"chain.segment_head_hash": c.SegmentHeadHash,
+		"chain.segment_tail_hash": c.SegmentTailHash,
+		"chain.checkpoint_hash":   c.CheckpointHash,
+	} {
+		if err := validateHash(name, value); err != nil {
+			return err
+		}
+	}
+	if c.PreviousSegmentTail != "" {
+		if err := validateHash("chain.previous_segment_tail", c.PreviousSegmentTail); err != nil {
+			return err
+		}
+	}
+	if c.CheckpointSeq < c.SeqStart || c.CheckpointSeq > c.SeqEnd {
+		return fmt.Errorf("%w: checkpoint_seq", ErrInvalidSequenceRange)
+	}
+	if err := validateEd25519SignatureString(c.CheckpointSignature); err != nil {
+		return err
+	}
+	if err := validateIdentifier("chain.checkpoint_signer_key_id", c.CheckpointSignerKeyID); err != nil {
+		return err
+	}
+	if err := validateIdentifier("chain.follower_recorder_key_id", c.FollowerRecorderKeyID); err != nil {
+		return err
+	}
+	if err := validatePublicKeyHex("chain.follower_recorder_public_key_hex", c.FollowerRecorderPubHex); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c CapabilitiesResponse) Validate() error {
+	return c.ValidateWithLocalThresholdCap(MaxCapabilityThreshold)
+}
+
+func (c CapabilitiesResponse) ValidateWithLocalThresholdCap(maxThreshold int) error {
+	if err := validateSchemaVersion(c.SchemaVersion); err != nil {
+		return err
+	}
+	if err := validateIdentifier("conductor_id", c.ConductorID); err != nil {
+		return err
+	}
+	if !c.RequiredMTLS {
+		return fmt.Errorf("%w: required_mtls must be true", ErrInvalidState)
+	}
+	for name, r := range map[string]SchemaRange{
+		"conductor_bundle":       c.ConductorBundle,
+		"remote_kill":            c.RemoteKill,
+		"rollback_authorization": c.RollbackAuthorization,
+		"audit_batch":            c.AuditBatch,
+	} {
+		if err := r.Validate(name); err != nil {
+			return err
+		}
+	}
+	// Couple to the version the local recorder actively writes, not the latest
+	// version its readers accept. A reader-first bump must not strand older
+	// conductors during a rolling upgrade.
+	// Conductor must advertise that version or the follower can never produce
+	// ingestable batches.
+	if !slices.Contains(c.ReceiptEntryVersions, recorder.CurrentWriteEntryVersion) {
+		return fmt.Errorf("%w: receipt_entry_versions must include recorder write version %d", ErrInvalidState, recorder.CurrentWriteEntryVersion)
+	}
+	if c.MaxCreatedSkewSeconds <= 0 || c.MaxCreatedSkewSeconds > int(MaxAllowedAuditSkew/time.Second) {
+		return fmt.Errorf("%w: max_created_skew_seconds=%d", ErrSkewExceeded, c.MaxCreatedSkewSeconds)
+	}
+	for name, value := range map[string]int{
+		"remote_kill_threshold":    c.RemoteKillThreshold,
+		"rollback_threshold":       c.RollbackThreshold,
+		"trust_rotation_threshold": c.TrustRotationThreshold,
+	} {
+		if value < RequiredCatastrophicSigners {
+			return fmt.Errorf("%w: %s=%d", ErrThresholdRequired, name, value)
+		}
+		if maxThreshold > 0 && value > maxThreshold {
+			return fmt.Errorf("%w: %s=%d exceeds local cap %d", ErrThresholdRequired, name, value, maxThreshold)
+		}
+	}
+	return nil
+}
+
+func (r SchemaRange) Validate(name string) error {
+	if r.Min <= 0 || r.Max < r.Min {
+		return fmt.Errorf("%w: %s schema range", ErrInvalidState, name)
+	}
+	if SchemaVersion < r.Min || SchemaVersion > r.Max {
+		return fmt.Errorf("%w: %s must include schema_version %d", ErrInvalidState, name, SchemaVersion)
+	}
+	return nil
+}
+
+func validateSignatureThreshold(signatures []SignatureProof, required signing.KeyPurpose, minSigners int) error {
+	if len(signatures) == 0 {
+		return fmt.Errorf("%w: signatures", ErrThresholdRequired)
+	}
+	seen := make(map[string]struct{}, len(signatures))
+	for _, sig := range signatures {
+		if err := sig.Validate(required); err != nil {
+			return err
+		}
+		seen[sig.SignerKeyID] = struct{}{}
+	}
+	if len(seen) < minSigners {
+		return fmt.Errorf("%w: got %d distinct signer(s), want %d", ErrThresholdRequired, len(seen), minSigners)
+	}
+	return nil
+}
+
+func verifySignatureThreshold(
+	now time.Time,
+	preimage []byte,
+	signatures []SignatureProof,
+	required signing.KeyPurpose,
+	minSigners int,
+	resolve SignatureKeyResolver,
+) error {
+	if resolve == nil {
+		return fmt.Errorf("%w: nil key resolver", ErrSignatureVerification)
+	}
+	if len(signatures) == 0 {
+		return fmt.Errorf("%w: signatures", ErrThresholdRequired)
+	}
+	now = now.UTC()
+	seenIDs := make(map[string]struct{}, len(signatures))
+	seenKeys := make(map[string]struct{}, len(signatures))
+	for _, sig := range signatures {
+		if err := sig.Validate(required); err != nil {
+			return err
+		}
+		key, err := resolve(sig.SignerKeyID)
+		if err != nil {
+			return fmt.Errorf("%w: key_id=%q: %w", ErrSignatureVerification, sig.SignerKeyID, err)
+		}
+		if key.KeyPurpose != required {
+			return fmt.Errorf("%w: key_id=%q roster purpose=%q required=%q", ErrWrongKeyPurpose, sig.SignerKeyID, key.KeyPurpose, required)
+		}
+		if len(key.PublicKey) != ed25519.PublicKeySize {
+			return fmt.Errorf("%w: key_id=%q public key length=%d", ErrSignatureVerification, sig.SignerKeyID, len(key.PublicKey))
+		}
+		if err := key.checkLifecycle(now); err != nil {
+			return fmt.Errorf("%w: key_id=%q: %w", ErrSignatureVerification, sig.SignerKeyID, err)
+		}
+		sigBytes, err := parseEd25519SignatureString(sig.Signature)
+		if err != nil {
+			return err
+		}
+		if !contract.VerifyEd25519PureEdDSA(key.PublicKey, preimage, sigBytes) {
+			return fmt.Errorf("%w: key_id=%q", ErrSignatureVerification, sig.SignerKeyID)
+		}
+		seenIDs[sig.SignerKeyID] = struct{}{}
+		// Track distinct PUBLIC KEYS, not just distinct IDs. A roster that
+		// (maliciously or by misconfiguration) maps two IDs to the same
+		// public key would otherwise satisfy the threshold with one
+		// underlying signer.
+		seenKeys[hex.EncodeToString(key.PublicKey)] = struct{}{}
+	}
+	if len(seenIDs) < minSigners {
+		return fmt.Errorf("%w: got %d distinct signer id(s), want %d", ErrThresholdRequired, len(seenIDs), minSigners)
+	}
+	if len(seenKeys) < minSigners {
+		return fmt.Errorf("%w: got %d distinct verified public key(s) across %d signer id(s), want %d", ErrThresholdRequired, len(seenKeys), len(seenIDs), minSigners)
+	}
+	return nil
+}
+
+// checkLifecycle rejects a roster key whose validity window has not begun, has
+// ended, or that has been revoked. NotBefore zero is treated as "always valid
+// from epoch", NotAfter zero as "never expires". RevokedAt non-nil rejects
+// unconditionally - revocation overrides any window check.
+func (k SignatureKey) checkLifecycle(now time.Time) error {
+	if k.RevokedAt != nil {
+		return fmt.Errorf("%w: revoked_at=%s verification_time=%s", ErrSignatureVerification, k.RevokedAt.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	if !k.NotBefore.IsZero() && now.Before(k.NotBefore.UTC()) {
+		return fmt.Errorf("%w: not_before=%s verification_time=%s", ErrNotYetValid, k.NotBefore.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	if !k.NotAfter.IsZero() && now.After(k.NotAfter.UTC()) {
+		return fmt.Errorf("%w: not_after=%s verification_time=%s", ErrExpired, k.NotAfter.UTC().Format(time.RFC3339), now.Format(time.RFC3339))
+	}
+	return nil
+}
+
+func canonicalPreimage(v any, name string) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s: %w", name, err)
+	}
+	tree, err := contract.ParseJSONStrict(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse %s for canonicalization: %w", name, err)
+	}
+	return contract.Canonicalize(tree)
+}
+
+func canonicalHash(preimage func() ([]byte, error)) (string, error) {
+	data, err := preimage()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func canonicalValueHash(v any, name string) (string, error) {
+	data, err := canonicalPreimage(v, name)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func validateSchemaVersion(v int) error {
+	if !acceptedSchemaVersions[v] {
+		return fmt.Errorf("%w: got %d", ErrUnsupportedSchemaVersion, v)
+	}
+	return nil
+}
+
+func effectiveControlIntent(intent ControlIntent) ControlIntent {
+	if intent == "" {
+		return ControlIntentApply
+	}
+	return intent
+}
+
+func validateControlIntent(intent ControlIntent) error {
+	switch intent {
+	case "", ControlIntentApply, ControlIntentReplay:
+		return nil
+	default:
+		return fmt.Errorf("%w: %q", ErrInvalidControlIntent, intent)
+	}
+}
+
+// withinValidity reports whether now ∈ [notBefore, expiresAt]. notBefore and
+// expiresAt are presumed already shape-checked by validateWindow.
+// NotBeforeReached reports whether now has reached notBefore, tolerating the
+// bounded MessageNotBeforeSkew clock skew. Every conductor not_before gate -
+// message validation AND policy-bundle serving selection - must use this so the
+// skew tolerance is consistent and an operator clock slightly ahead of the
+// conductor/follower never makes a control message or bundle look "not yet
+// valid" on a multi-host fleet.
+func NotBeforeReached(now, notBefore time.Time) bool {
+	return !now.UTC().Add(MessageNotBeforeSkew).Before(notBefore.UTC())
+}
+
+func withinValidity(now, notBefore, expiresAt time.Time) error {
+	now = now.UTC()
+	// Tolerate bounded clock skew on not_before (see NotBeforeReached); expiry
+	// below stays strict so a validity window is never extended past its end.
+	if !NotBeforeReached(now, notBefore) {
+		return fmt.Errorf("%w: now=%s not_before=%s", ErrNotYetValid, now.Format(time.RFC3339), notBefore.UTC().Format(time.RFC3339))
+	}
+	if now.After(expiresAt.UTC()) {
+		return fmt.Errorf("%w: now=%s expires_at=%s", ErrExpired, now.Format(time.RFC3339), expiresAt.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+// validateMinPipelockVersion accepts a non-empty major.minor.patch semver-like
+// shape. Full SemVer 2.0.0 (pre-release / build metadata) is intentionally not
+// supported in MVP - bundles target release versions only. The follower-side
+// sanity window (max_min_version_major_skew / minor_skew per spec) is enforced
+// at apply time with the follower's runtime version on hand, not here.
+func validateMinPipelockVersion(v string) error {
+	if strings.TrimSpace(v) == "" {
+		return fmt.Errorf("%w: min_pipelock_version", ErrMissingField)
+	}
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return fmt.Errorf("%w: %q (want major.minor.patch)", ErrInvalidMinVersion, v)
+	}
+	for _, p := range parts {
+		if p == "" {
+			return fmt.Errorf("%w: %q (empty component)", ErrInvalidMinVersion, v)
+		}
+		if len(p) > 1 && p[0] == '0' {
+			return fmt.Errorf("%w: %q (leading zero component %q)", ErrInvalidMinVersion, v, p)
+		}
+		for _, r := range p {
+			if r < '0' || r > '9' {
+				return fmt.Errorf("%w: %q (non-numeric component %q)", ErrInvalidMinVersion, v, p)
+			}
+		}
+	}
+	return nil
+}
+
+// validateReason caps and constrains free-form reason strings used in
+// remote-kill / rollback messages. Empty is allowed, but control characters
+// are rejected at the signed-message boundary so downstream logs, terminals,
+// web UIs, and pager paths do not all need to rediscover the same sanitization
+// rule.
+func validateReason(field, reason string) error {
+	if len(reason) > MaxReasonBytes {
+		return fmt.Errorf("%w: %s (%d bytes > cap %d)", ErrPayloadTooLarge, field, len(reason), MaxReasonBytes)
+	}
+	if !utf8.ValidString(reason) {
+		return fmt.Errorf("%w: %s contains invalid utf-8", ErrInvalidReason, field)
+	}
+	for _, r := range reason {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: %s contains control character U+%04X", ErrInvalidReason, field, r)
+		}
+	}
+	return nil
+}
+
+// validateAppliedStateString bounds a short applied-state field. Empty is
+// allowed (optional field); non-empty must be valid UTF-8, free of control
+// characters, and within MaxRuntimeStringBytes. Rejecting rather than
+// sanitizing is required here: the value is inside the signed preimage, so
+// silently rewriting it would break signature verification.
+func validateAppliedStateString(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > MaxRuntimeStringBytes {
+		return fmt.Errorf("%w: %s (%d bytes > cap %d)", ErrPayloadTooLarge, field, len(value), MaxRuntimeStringBytes)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%w: %s contains invalid utf-8", ErrInvalidAppliedState, field)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: %s contains control character U+%04X", ErrInvalidAppliedState, field, r)
+		}
+	}
+	return nil
+}
+
+// validateAppliedStateMessage bounds the free-form apply error message by rune
+// count (MaxApplyErrorMessageRunes), with the same control-character and UTF-8
+// rejection as validateAppliedStateString.
+func validateAppliedStateMessage(field, value string) error {
+	if value == "" {
+		return nil
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%w: %s contains invalid utf-8", ErrInvalidAppliedState, field)
+	}
+	if n := utf8.RuneCountInString(value); n > MaxApplyErrorMessageRunes {
+		return fmt.Errorf("%w: %s (%d runes > cap %d)", ErrPayloadTooLarge, field, n, MaxApplyErrorMessageRunes)
+	}
+	for _, r := range value {
+		if unicode.IsControl(r) {
+			return fmt.Errorf("%w: %s contains control character U+%04X", ErrInvalidAppliedState, field, r)
+		}
+	}
+	return nil
+}
+
+// validateLowerHexHash requires a canonical lowercase 64-char hex SHA-256. The
+// applied-state producer lowercases the bundle hash, so an uppercase or
+// wrong-length value signals corruption/tampering and is rejected closed.
+func validateLowerHexHash(field, value string) error {
+	if len(value) != sha256.Size*2 {
+		return fmt.Errorf("%w: %s", ErrInvalidHash, field)
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return fmt.Errorf("%w: %s", ErrInvalidHash, field)
+		}
+	}
+	return nil
+}
+
+func validateOrgFleet(orgID, fleetID string) error {
+	if err := validateIdentifier("org_id", orgID); err != nil {
+		return err
+	}
+	return validateIdentifier("fleet_id", fleetID)
+}
+
+func requireNonEmpty(field, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%w: %s", ErrMissingField, field)
+	}
+	return nil
+}
+
+// ValidateIdentifier is the canonical conductor identifier check. Use it from
+// any package that receives operator- or transport-supplied identifiers
+// (org_id, fleet_id, instance_id, environment, bundle_id, ...). Diverging
+// identifier semantics between conductor base and conductor/controlplane risks
+// stream-key collisions when SPIFFE SANs unescape to bytes that the base layer
+// would reject (null bytes, slashes, control characters).
+func ValidateIdentifier(field, value string) error {
+	return validateIdentifier(field, value)
+}
+
+func validateIdentifier(field, value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%w: %s", ErrMissingField, field)
+	}
+	if len(value) > MaxIDBytes {
+		return fmt.Errorf("%w: %s (%d bytes > cap %d)", ErrInvalidIdentifier, field, len(value), MaxIDBytes)
+	}
+	if !isIdentifier(value) {
+		return fmt.Errorf("%w: %s=%q", ErrInvalidIdentifier, field, value)
+	}
+	return nil
+}
+
+func validateLabelSelector(key, value string) error {
+	if len(key) > MaxLabelKeyBytes {
+		return fmt.Errorf("%w: label key (%d bytes > cap %d)", ErrInvalidIdentifier, len(key), MaxLabelKeyBytes)
+	}
+	if len(value) > MaxLabelValueBytes {
+		return fmt.Errorf("%w: label value (%d bytes > cap %d)", ErrInvalidIdentifier, len(value), MaxLabelValueBytes)
+	}
+	if !isIdentifier(key) || !isIdentifier(value) {
+		return fmt.Errorf("%w: label %q=%q", ErrInvalidIdentifier, key, value)
+	}
+	return nil
+}
+
+func isIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		switch r {
+		case '_', '-', '.':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validateWindow(notBefore, expiresAt time.Time) error {
+	if notBefore.IsZero() || expiresAt.IsZero() || !expiresAt.After(notBefore) {
+		return ErrInvalidValidityWindow
+	}
+	return nil
+}
+
+func validateSeqRange(start, end uint64) error {
+	if end < start {
+		return fmt.Errorf("%w: start=%d end=%d", ErrInvalidSequenceRange, start, end)
+	}
+	return nil
+}
+
+func validateHash(field, value string) error {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != sha256.Size {
+		return fmt.Errorf("%w: %s", ErrInvalidHash, field)
+	}
+	return nil
+}
+
+func validatePublicKeyHex(field, value string) error {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != 32 {
+		return fmt.Errorf("%w: %s", ErrInvalidHash, field)
+	}
+	return nil
+}
+
+func validateEd25519SignatureString(value string) error {
+	_, err := parseEd25519SignatureString(value)
+	return err
+}
+
+func parseEd25519SignatureString(value string) ([]byte, error) {
+	if !strings.HasPrefix(value, SignaturePrefixEd25519) {
+		return nil, fmt.Errorf("%w: signature missing %q prefix", ErrInvalidSignature, SignaturePrefixEd25519)
+	}
+	hexPart := value[len(SignaturePrefixEd25519):]
+	decoded, err := hex.DecodeString(hexPart)
+	if err != nil || len(decoded) != 64 {
+		return nil, fmt.Errorf("%w: malformed ed25519 signature", ErrInvalidSignature)
+	}
+	return decoded, nil
+}
+
+func rejectLicenseFields(configYAML string) error {
+	dec := yaml.NewDecoder(bytes.NewReader([]byte(configYAML)))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		return fmt.Errorf("%w: parse config payload: %w", ErrForbiddenLicenseField, err)
+	}
+	if err := rejectExtraYAMLDocuments(dec); err != nil {
+		return err
+	}
+	if len(doc.Content) == 0 {
+		return nil
+	}
+	return walkRejectLicenseFields(doc.Content[0])
+}
+
+// walkRejectLicenseFields recurses through MappingNode / SequenceNode children
+// and rejects any key that matches forbiddenLicenseFields at any depth. The
+// shallow root-only check it replaces missed nested license fields under
+// agents.<name> and any other future submap. Path is reported so an operator
+// can see exactly which subpath tripped the rejection.
+func walkRejectLicenseFields(n *yaml.Node) error {
+	return walkRejectLicenseFieldsAt(n, "")
+}
+
+func walkRejectLicenseFieldsAt(n *yaml.Node, path string) error {
+	if n == nil {
+		return nil
+	}
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			if err := walkRejectLicenseFieldsAt(c, path); err != nil {
+				return err
+			}
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			key := n.Content[i]
+			val := n.Content[i+1]
+			childPath := path + "." + key.Value
+			if path == "" {
+				childPath = key.Value
+			}
+			if _, forbidden := forbiddenLicenseFields[key.Value]; forbidden {
+				return fmt.Errorf("%w: %s", ErrForbiddenLicenseField, childPath)
+			}
+			if err := walkRejectLicenseFieldsAt(val, childPath); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for i, c := range n.Content {
+			childPath := fmt.Sprintf("%s[%d]", path, i)
+			if err := walkRejectLicenseFieldsAt(c, childPath); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func rejectPolicyBundleCompanionFields(configYAML string) error {
+	dec := yaml.NewDecoder(bytes.NewReader([]byte(configYAML)))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		return fmt.Errorf("%w: parse config payload: %w", ErrForbiddenBundleCompanionField, err)
+	}
+	if err := rejectExtraYAMLDocuments(dec); err != nil {
+		return err
+	}
+	if len(doc.Content) == 0 {
+		return nil
+	}
+	return walkRejectPolicyBundleCompanionFieldsAt(doc.Content[0], "", make(map[*yaml.Node]bool))
+}
+
+func walkRejectPolicyBundleCompanionFieldsAt(n *yaml.Node, path string, seen map[*yaml.Node]bool) error {
+	if n == nil {
+		return nil
+	}
+	switch n.Kind {
+	case yaml.DocumentNode:
+		for _, c := range n.Content {
+			if err := walkRejectPolicyBundleCompanionFieldsAt(c, path, seen); err != nil {
+				return err
+			}
+		}
+	case yaml.AliasNode:
+		return walkRejectPolicyBundleCompanionFieldsAlias(n, path, seen)
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			key := n.Content[i]
+			val := n.Content[i+1]
+			if isYAMLMergeKey(key) {
+				if err := walkRejectPolicyBundleCompanionFieldsMerge(val, path, seen); err != nil {
+					return err
+				}
+				continue
+			}
+			childPath := path + "." + key.Value
+			if path == "" {
+				childPath = key.Value
+			}
+			if _, forbidden := forbiddenPolicyBundleCompanionFields[childPath]; forbidden && yamlNodeHasNonEmptyValue(val, seen) {
+				return fmt.Errorf("%w: %s", ErrForbiddenBundleCompanionField, childPath)
+			}
+			if err := walkRejectPolicyBundleCompanionFieldsAt(val, childPath, seen); err != nil {
+				return err
+			}
+		}
+	case yaml.SequenceNode:
+		for i, c := range n.Content {
+			childPath := fmt.Sprintf("%s[%d]", path, i)
+			if err := walkRejectPolicyBundleCompanionFieldsAt(c, childPath, seen); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func walkRejectPolicyBundleCompanionFieldsMerge(n *yaml.Node, path string, seen map[*yaml.Node]bool) error {
+	if n == nil {
+		return nil
+	}
+	if n.Kind == yaml.SequenceNode {
+		for _, c := range n.Content {
+			if err := walkRejectPolicyBundleCompanionFieldsAt(c, path, seen); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return walkRejectPolicyBundleCompanionFieldsAt(n, path, seen)
+}
+
+func walkRejectPolicyBundleCompanionFieldsAlias(n *yaml.Node, path string, seen map[*yaml.Node]bool) error {
+	if n.Alias == nil {
+		return nil
+	}
+	if seen[n.Alias] {
+		return fmt.Errorf("%w: YAML alias cycle at %s", ErrForbiddenBundleCompanionField, path)
+	}
+	seen[n.Alias] = true
+	defer delete(seen, n.Alias)
+	return walkRejectPolicyBundleCompanionFieldsAt(n.Alias, path, seen)
+}
+
+func isYAMLMergeKey(n *yaml.Node) bool {
+	return n != nil && n.Kind == yaml.ScalarNode && (n.Value == "<<" || n.Tag == "!!merge")
+}
+
+func yamlNodeHasNonEmptyValue(n *yaml.Node, seen map[*yaml.Node]bool) bool {
+	if n == nil {
+		return false
+	}
+	switch n.Kind {
+	case yaml.AliasNode:
+		if n.Alias == nil {
+			return false
+		}
+		if seen[n.Alias] {
+			return true
+		}
+		seen[n.Alias] = true
+		defer delete(seen, n.Alias)
+		return yamlNodeHasNonEmptyValue(n.Alias, seen)
+	case yaml.ScalarNode:
+		if n.Tag == "!!null" {
+			return false
+		}
+		return strings.TrimSpace(n.Value) != ""
+	default:
+		return true
+	}
+}
+
+// rejectDisallowedBundleSections enforces the default-deny
+// allowedPolicyBundleSections allowlist over the top-level keys of a policy
+// bundle's config_yaml. Any top-level section not in the allowlist is rejected.
+// Only the top level is checked: the allowlist governs which config SURFACES a
+// bundle may touch, not values within an allowed surface. An empty/blank
+// config_yaml is left to the caller's existing non-empty check.
+func rejectDisallowedBundleSections(configYAML string) error {
+	dec := yaml.NewDecoder(bytes.NewReader([]byte(configYAML)))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return fmt.Errorf("%w: parse config payload: %w", ErrForbiddenBundleSection, err)
+	}
+	if err := rejectExtraYAMLDocuments(dec); err != nil {
+		return err
+	}
+	if len(doc.Content) == 0 {
+		return nil
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		// A non-mapping top-level document carries no config sections; nothing
+		// to allow or reject here (other validators handle shape).
+		return nil
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		key := root.Content[i].Value
+		if _, ok := allowedPolicyBundleSections[key]; !ok {
+			return fmt.Errorf("%w: %q", ErrForbiddenBundleSection, key)
+		}
+	}
+	return nil
+}
+
+func rejectExtraYAMLDocuments(dec *yaml.Decoder) error {
+	var extra yaml.Node
+	err := dec.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: parse config payload: %w", ErrForbiddenLicenseField, err)
+	}
+	if !isEmptyYAMLDocument(extra) {
+		return fmt.Errorf("%w: multiple YAML documents", ErrForbiddenLicenseField)
+	}
+	return nil
+}
+
+func isEmptyYAMLDocument(n yaml.Node) bool {
+	if len(n.Content) == 0 {
+		return true
+	}
+	if n.Kind != yaml.DocumentNode || len(n.Content) != 1 {
+		return false
+	}
+	child := n.Content[0]
+	return child.Kind == yaml.ScalarNode && child.Tag == "!!null" && child.Value == ""
+}

@@ -1,0 +1,1385 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package normalize
+
+import (
+	"bytes"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"net/url"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+// ErrEvidenceProvenanceProcessingBudget reports that a recipe exhausted the
+// profile-wide cumulative processing allowance.
+var ErrEvidenceProvenanceProcessingBudget = errors.New("recipe: exceeds cumulative processing budget")
+
+// ErrEvidenceProvenanceFixtureProcessingBudget reports that a verifier's
+// fixture-wide allowance was exhausted after the per-recipe allowance passed.
+var ErrEvidenceProvenanceFixtureProcessingBudget = errors.New("fixture: exceeds cumulative recipe processing budget")
+
+// Recipe is the fixture-only, typed transform language used by the evidence
+// provenance specification. TransformProfileDigest pins all table and limit
+// choices; callers must not infer behavior from its human-readable name.
+type Recipe struct {
+	TransformProfileDigest string      `json:"transform_profile_digest"`
+	Operations             []Operation `json:"operations"`
+}
+
+// Operation is one ordered transform. Exactly one operation-specific field is
+// meaningful for each Kind.
+type Operation struct {
+	Kind          OperationKind `json:"kind"`
+	Component     Component     `json:"component,omitempty"`
+	Selector      string        `json:"selector,omitempty"`
+	Occurrence    uint32        `json:"occurrence,omitempty"`
+	Passes        uint8         `json:"passes,omitempty"`
+	Profile       string        `json:"profile,omitempty"`
+	DecodePadding bool          `json:"decode_padding,omitempty"`
+	Alphabet      string        `json:"alphabet,omitempty"`
+	Indices       QueryIndices  `json:"indices,omitempty"`
+	MinimumLength uint32        `json:"minimum_length,omitempty"`
+
+	// explicit records which parameter keys a decoded recipe spelled out,
+	// including ones set to their zero value. The profile forbids a parameter
+	// by its presence, not its value, so `"decode_padding": false` on an
+	// operation that takes no parameters is a rejection. Without this record
+	// Go could not tell that key from an absent one and accepted recipes the
+	// TypeScript, Python and Rust verifiers reject. Go never emits a
+	// zero-valued parameter (every field is omitempty), so this cannot refuse
+	// a Go-issued recipe.
+	explicit operationParams
+}
+
+// operationParams is a set of Operation parameter keys.
+type operationParams uint16
+
+const (
+	paramComponent operationParams = 1 << iota
+	paramSelector
+	paramOccurrence
+	paramPasses
+	paramProfile
+	paramDecodePadding
+	paramAlphabet
+	paramIndices
+	paramMinimumLength
+)
+
+var operationParamKeys = map[string]operationParams{
+	"component":      paramComponent,
+	"selector":       paramSelector,
+	"occurrence":     paramOccurrence,
+	"passes":         paramPasses,
+	"profile":        paramProfile,
+	"decode_padding": paramDecodePadding,
+	"alphabet":       paramAlphabet,
+	"indices":        paramIndices,
+	"minimum_length": paramMinimumLength,
+}
+
+// operationParamOrder fixes the order presence errors are reported in, so a
+// recipe with two forbidden keys always names the same one.
+var operationParamOrder = []string{
+	"component", "selector", "occurrence", "passes", "profile",
+	"decode_padding", "alphabet", "indices", "minimum_length",
+}
+
+// UnmarshalJSON decodes an operation and records which parameter keys were
+// present. It rejects unknown keys itself: a custom decoder is not covered by
+// an enclosing decoder's DisallowUnknownFields, and silently accepting a
+// stray key would be a fail-open.
+func (op *Operation) UnmarshalJSON(data []byte) error {
+	type plainOperation Operation
+	var plain plainOperation
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&plain); err != nil {
+		return err
+	}
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	*op = Operation(plain)
+	op.explicit = 0
+	for key := range keys {
+		// encoding/json matches field names case-insensitively, so
+		// "Decode_Padding" fills DecodePadding. Accept only the canonical
+		// spelling, as the other verifiers and the strict CLI decoder do;
+		// otherwise a folded key would set a parameter without its
+		// presence bit.
+		param, ok := operationParamKeys[key]
+		if !ok && key != "kind" {
+			return fmt.Errorf("unknown or non-canonical operation key %q", key)
+		}
+		op.explicit |= param
+	}
+	return nil
+}
+
+// without returns op with the given parameters cleared, value and presence
+// both, so noParametersForValidation checks only what remains.
+func (op Operation) without(params operationParams) Operation {
+	if params&paramComponent != 0 {
+		op.Component = ""
+	}
+	if params&paramSelector != 0 {
+		op.Selector = ""
+	}
+	if params&paramOccurrence != 0 {
+		op.Occurrence = 0
+	}
+	if params&paramPasses != 0 {
+		op.Passes = 0
+	}
+	if params&paramProfile != 0 {
+		op.Profile = ""
+	}
+	if params&paramDecodePadding != 0 {
+		op.DecodePadding = false
+	}
+	if params&paramAlphabet != 0 {
+		op.Alphabet = ""
+	}
+	if params&paramIndices != 0 {
+		op.Indices = nil
+	}
+	if params&paramMinimumLength != 0 {
+		op.MinimumLength = 0
+	}
+	op.explicit &^= params
+	return op
+}
+
+// QueryIndices is encoded as a JSON array of uint8 values. encoding/json treats
+// a bare []uint8 as binary data and emits a base64 string, which would violate
+// the profile's normative array<uint8> wire shape and make Go-issued recipes
+// invalid in the other reference verifiers.
+type QueryIndices []uint8
+
+// isHexDigitRune reports whether a rune is a hexadecimal digit. Named rather
+// than inlined because the negated compound form trips staticcheck's De Morgan
+// check, and the rewritten boolean it suggests reads worse than the question
+// being asked.
+func isHexDigitRune(char rune) bool {
+	return (char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')
+}
+
+func (indices QueryIndices) MarshalJSON() ([]byte, error) {
+	values := make([]uint16, len(indices))
+	for index, value := range indices {
+		values[index] = uint16(value)
+	}
+	return json.Marshal(values)
+}
+
+func (indices *QueryIndices) UnmarshalJSON(data []byte) error {
+	var values []uint16
+	if err := json.Unmarshal(data, &values); err != nil {
+		return fmt.Errorf("query indices must be an array of uint8 values: %w", err)
+	}
+	result := make(QueryIndices, len(values))
+	for index, value := range values {
+		if value > 255 {
+			return fmt.Errorf("query index %d exceeds uint8", value)
+		}
+		result[index] = uint8(value)
+	}
+	*indices = result
+	return nil
+}
+
+type OperationKind string
+
+const (
+	OperationIdentity               OperationKind = "identity"
+	OperationURLComponent           OperationKind = "url_component"
+	OperationPercentDecode          OperationKind = "percent_decode"
+	OperationDLPNormalize           OperationKind = "dlp_normalize"
+	OperationLowercase              OperationKind = "lowercase"
+	OperationInvisibleStrip         OperationKind = "invisible_strip"
+	OperationHexDecode              OperationKind = "hex_decode"
+	OperationBase32Decode           OperationKind = "base32_decode"
+	OperationBase64Decode           OperationKind = "base64_decode"
+	OperationLeetspeak              OperationKind = "leetspeak"
+	OperationVowelFold              OperationKind = "vowel_fold"
+	OperationQueryUnescape          OperationKind = "query_unescape"
+	OperationInvisibleSpace         OperationKind = "invisible_space"
+	OperationMatchingNormalize      OperationKind = "matching_normalize"
+	OperationHexDecodeLiberal       OperationKind = "hex_decode_liberal"
+	OperationBase32DecodeLiberal    OperationKind = "base32_decode_liberal"
+	OperationBase64DecodeLiberal    OperationKind = "base64_decode_liberal"
+	OperationEncodedTokenNormalize  OperationKind = "encoded_token_normalize"
+	OperationTextSegment            OperationKind = "text_segment"
+	OperationHTMLEntityDecode       OperationKind = "html_entity_decode"
+	OperationWhitespaceCompact      OperationKind = "whitespace_compact"
+	OperationURLNoiseStrip          OperationKind = "url_noise_strip"
+	OperationOrderedQueryConcat     OperationKind = "ordered_query_concat"
+	OperationQuerySubsequence       OperationKind = "query_subsequence"
+	OperationHostnameDotRemove      OperationKind = "hostname_dot_remove"
+	OperationEncodedRun             OperationKind = "encoded_run"
+	OperationCanaryCanonicalize     OperationKind = "canary_canonicalize"
+	OperationASCIIAlphanumericStrip OperationKind = "ascii_alphanumeric_strip"
+	OperationASCIIUpper             OperationKind = "ascii_upper"
+	OperationJSONUnicodeEscape      OperationKind = "json_unicode_escape"
+)
+
+// SupportedOperationKinds is the union of the registered recipe vocabularies.
+// Scanner completeness checks use it to require a replay operation for every
+// production transform. Receipt validation must use the profile-specific
+// vocabulary instead.
+func SupportedOperationKinds() []OperationKind {
+	return []OperationKind{
+		OperationIdentity, OperationURLComponent, OperationPercentDecode, OperationDLPNormalize,
+		OperationLowercase, OperationInvisibleStrip, OperationHexDecode, OperationBase32Decode,
+		OperationBase64Decode, OperationLeetspeak, OperationVowelFold,
+		OperationQueryUnescape, OperationInvisibleSpace, OperationMatchingNormalize,
+		OperationHexDecodeLiberal, OperationBase32DecodeLiberal, OperationBase64DecodeLiberal,
+		OperationEncodedTokenNormalize, OperationTextSegment, OperationHTMLEntityDecode,
+		OperationWhitespaceCompact, OperationURLNoiseStrip, OperationOrderedQueryConcat,
+		OperationQuerySubsequence, OperationHostnameDotRemove, OperationEncodedRun,
+		OperationCanaryCanonicalize, OperationASCIIAlphanumericStrip,
+		OperationASCIIUpper, OperationJSONUnicodeEscape,
+	}
+}
+
+// SupportedOperationKindsForProfile returns the exact recipe vocabulary for a
+// registered transform profile. V1 stays frozen even when a later profile adds
+// an operation.
+func SupportedOperationKindsForProfile(digest string) []OperationKind {
+	// Published vocabularies have fixed lengths; new kinds append to the list.
+	kinds := SupportedOperationKinds()
+	switch digest {
+	case EvidenceProvenanceProfileV1Digest:
+		return kinds[:27]
+	case EvidenceProvenanceProfileV2Digest:
+		return kinds[:28]
+	case EvidenceProvenanceProfileV3Digest:
+		return kinds[:30]
+	case EvidenceProvenanceProfileV4Digest, EvidenceProvenanceProfileV5Digest:
+		return kinds
+	default:
+		return nil
+	}
+}
+
+type Component string
+
+const (
+	ComponentURL      Component = "url"
+	ComponentHostname Component = "hostname"
+	ComponentPath     Component = "path"
+	ComponentQueryKey Component = "query_key"
+	ComponentQueryVal Component = "query_value"
+	ComponentRawQuery Component = "raw_query"
+)
+
+const evidenceProvenanceProfileMaxDecodePasses = 4
+
+const (
+	// ScannerQueryUnescapeMaxRounds is shared with the production scanner so
+	// receipt replay cannot drift from IterativeDecode's safety ceiling.
+	ScannerQueryUnescapeMaxRounds = 500
+	// ScannerHTMLEntityMaxPasses is shared with the production scanner's
+	// entity decoder for the same reason.
+	ScannerHTMLEntityMaxPasses = 16
+
+	// evidenceProvenanceMaxOperations bounds recipe length. Per-operation input
+	// and output caps do not bound verifier work when the attacker controls how
+	// MANY operations run: a long sequence of individually legal transforms each
+	// stays under the intermediate limit while the total cost grows without
+	// bound. Provenance verification runs against externally supplied receipts
+	// during incident review, so an unbounded recipe is an availability attack
+	// on the audit path.
+	evidenceProvenanceMaxOperations = 32
+	// evidenceProvenanceMaxTotalBytes bounds CUMULATIVE bytes processed across
+	// every operation and every internal pass. Round caps alone are insufficient
+	// because a single operation may legally repeat near the maximum size, so
+	// the budget is charged in aggregate and exhaustion is a rejection.
+	evidenceProvenanceMaxTotalBytes = 16 << 20
+
+	evidenceProvenanceScannerMaxDecodeRounds = ScannerQueryUnescapeMaxRounds
+	evidenceProvenanceHTMLMaxDecodePasses    = ScannerHTMLEntityMaxPasses
+	evidenceProvenanceQueryMaxValues         = 20
+	evidenceProvenanceQueryMinIndices        = 2
+	evidenceProvenanceQueryMaxIndices        = 4
+)
+
+const (
+	// EvidenceProvenanceProfileV1Digest identifies the fixture-only evidence
+	// provenance transform profile v1, not the source-span transform profile.
+	EvidenceProvenanceProfileV1Digest = "sha256:3de14968449593cae58da869cfc97855cb098e491494390a12ba742cb0b70f94"
+	// EvidenceProvenanceProfileV2Digest identifies the profile whose token and
+	// URL-noise transforms match the current scanner keep-sets. Profiles are
+	// selected only by this exact digest; never by a profile name or fallback.
+	EvidenceProvenanceProfileV2Digest = "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7"
+	// EvidenceProvenanceProfileV3Digest identifies the profile that adds ASCII
+	// uppercase folding, JSON unicode-escape decoding, base32hex, and NFC
+	// recomposition of matching_normalize.
+	EvidenceProvenanceProfileV3Digest = "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e"
+	// EvidenceProvenanceProfileV4Digest preserves malformed escapes during query decoding.
+	EvidenceProvenanceProfileV4Digest = "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37"
+	// EvidenceProvenanceProfileV5Digest pins operation-boundary byte decoding.
+	EvidenceProvenanceProfileV5Digest       = "sha256:1ba7ea1a9a18622e259531bab86e4e2671fbfabe8259fde38223b0d80ca6d441"
+	evidenceProvenanceProfileMaxInputBytes  = 2 << 20
+	evidenceProvenanceProfileMaxOutputBytes = 1 << 20
+)
+
+type transformProfileVersion uint8
+
+const (
+	transformProfileV1 transformProfileVersion = iota + 1
+	transformProfileV2
+	transformProfileV3
+	transformProfileV4
+	transformProfileV5
+)
+
+type transformProfile struct {
+	maxInputBytes  int
+	maxOutputBytes int
+	version        transformProfileVersion
+}
+
+// evidenceProvenanceProfiles is the exact-digest registry for fixture replay.
+// An absent digest is rejected before a recipe operation is validated or run.
+var evidenceProvenanceProfiles = map[string]transformProfile{
+	EvidenceProvenanceProfileV1Digest: {
+		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV1,
+	},
+	EvidenceProvenanceProfileV2Digest: {
+		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV2,
+	},
+	EvidenceProvenanceProfileV3Digest: {
+		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV3,
+	},
+	EvidenceProvenanceProfileV4Digest: {
+		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV4,
+	},
+	EvidenceProvenanceProfileV5Digest: {
+		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV5,
+	},
+}
+
+func resolveTransformProfile(digest string) (transformProfile, error) {
+	if len(digest) != len("sha256:")+64 || !strings.HasPrefix(digest, "sha256:") {
+		return transformProfile{}, fmt.Errorf("transform profile digest: invalid SHA-256 digest")
+	}
+	for _, char := range digest[len("sha256:"):] {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return transformProfile{}, fmt.Errorf("transform profile digest: invalid SHA-256 digest")
+		}
+	}
+	profile, ok := evidenceProvenanceProfiles[digest]
+	if !ok {
+		return transformProfile{}, fmt.Errorf("transform profile digest: unknown profile %q", digest)
+	}
+	return profile, nil
+}
+
+// Validate checks that the recipe names a known profile and has an unambiguous
+// operation shape. It does not require source bytes.
+func (r Recipe) Validate() error {
+	if r.TransformProfileDigest == "" {
+		return fmt.Errorf("recipe: missing transform profile digest")
+	}
+	profile, err := resolveTransformProfile(r.TransformProfileDigest)
+	if err != nil {
+		return fmt.Errorf("recipe: %w", err)
+	}
+	if len(r.Operations) > evidenceProvenanceMaxOperations {
+		return fmt.Errorf("recipe: exceeds %d operations", evidenceProvenanceMaxOperations)
+	}
+	for index, op := range r.Operations {
+		if err := op.validate(); err != nil {
+			return fmt.Errorf("recipe operation %d (%s): %w", index, op.Kind, err)
+		}
+		if err := operationAllowedByProfile(op, profile.version); err != nil {
+			return fmt.Errorf("recipe operation %d (%s): %w", index, op.Kind, err)
+		}
+	}
+	return nil
+}
+
+// operationAllowedByProfile rejects operations and parameters a frozen
+// profile does not define. v1 and v2 documents stay on their published
+// vocabularies when a later profile adds a step.
+func operationAllowedByProfile(op Operation, version transformProfileVersion) error {
+	switch op.Kind {
+	case OperationASCIIAlphanumericStrip:
+		if version < transformProfileV2 {
+			return fmt.Errorf("unsupported by transform profile")
+		}
+	case OperationASCIIUpper, OperationJSONUnicodeEscape:
+		if version < transformProfileV3 {
+			return fmt.Errorf("unsupported by transform profile")
+		}
+	case OperationBase32Decode, OperationBase32DecodeLiberal:
+		if op.Alphabet != "" && version < transformProfileV3 {
+			return fmt.Errorf("unsupported by transform profile")
+		}
+	}
+	return nil
+}
+
+// Apply deterministically executes recipe on input. It deliberately rejects
+// invalid UTF-8 rather than replacing bytes, because replacement corrupts byte
+// offsets. The transform-profile document supplies the bound and invalid-input
+// policy for interoperable implementations.
+func (r Recipe) Apply(input string) (string, error) {
+	budget := processingBudget(evidenceProvenanceMaxTotalBytes)
+	return r.apply(input, &budget)
+}
+
+// ApplyWithinBudget executes a recipe while charging every operation and
+// internal pass against the per-recipe profile limit first and the caller's
+// limit second. It returns the caller-budget bytes charged so a fixture
+// verifier can enforce one allowance across many recipes.
+func (r Recipe) ApplyWithinBudget(input string, limit int) (string, int, error) {
+	if limit < 0 {
+		limit = 0
+	}
+	recipeBudget := processingBudget(evidenceProvenanceMaxTotalBytes)
+	fixtureBudget := processingBudget(limit)
+	budget := combinedProcessingBudget{recipe: &recipeBudget, fixture: &fixtureBudget}
+	value, err := r.apply(input, &budget)
+	return value, limit - int(fixtureBudget), err
+}
+
+type chargeBudget interface {
+	charge(string) error
+}
+
+func (r Recipe) apply(input string, budget chargeBudget) (string, error) {
+	if !utf8.ValidString(input) {
+		return "", fmt.Errorf("recipe input: invalid UTF-8")
+	}
+	if err := r.Validate(); err != nil {
+		return "", err
+	}
+	profile, err := resolveTransformProfile(r.TransformProfileDigest)
+	if err != nil {
+		return "", fmt.Errorf("recipe: %w", err)
+	}
+	if len(input) > profile.maxInputBytes {
+		return "", fmt.Errorf("recipe input: exceeds profile byte limit")
+	}
+	value := input
+	for index, op := range r.Operations {
+		// Charge the operation's input against the cumulative budget BEFORE
+		// running it, so an expensive operation cannot spend work it has not
+		// been granted.
+		if err := budget.charge(value); err != nil {
+			return "", err
+		}
+		value, err = op.apply(value, budget, profile)
+		if err != nil {
+			return "", fmt.Errorf("recipe operation %d (%s): %w", index, op.Kind, err)
+		}
+		if !utf8.ValidString(value) {
+			return "", fmt.Errorf("recipe operation %d (%s): output: invalid UTF-8", index, op.Kind)
+		}
+		if len(value) > profile.maxOutputBytes {
+			return "", fmt.Errorf("recipe operation %d (%s): output exceeds profile byte limit", index, op.Kind)
+		}
+	}
+	if len(value) > profile.maxOutputBytes {
+		return "", fmt.Errorf("recipe output exceeds profile byte limit")
+	}
+	return value, nil
+}
+
+type processingBudget int
+
+func (budget *processingBudget) charge(value string) error {
+	if len(value) > int(*budget) {
+		return ErrEvidenceProvenanceProcessingBudget
+	}
+	*budget -= processingBudget(len(value))
+	return nil
+}
+
+type combinedProcessingBudget struct {
+	recipe  *processingBudget
+	fixture *processingBudget
+}
+
+func (budget *combinedProcessingBudget) charge(value string) error {
+	if err := budget.recipe.charge(value); err != nil {
+		return err
+	}
+	if len(value) > int(*budget.fixture) {
+		return ErrEvidenceProvenanceFixtureProcessingBudget
+	}
+	*budget.fixture -= processingBudget(len(value))
+	return nil
+}
+
+// ValidateOutput checks that value is valid UTF-8 and fits the recipe's
+// resolved transform profile. It is for commitment constructors that receive
+// an already reconstructed view rather than source bytes to transform.
+func (r Recipe) ValidateOutput(value string) error {
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("recipe output: invalid UTF-8")
+	}
+	profile, err := resolveTransformProfile(r.TransformProfileDigest)
+	if err != nil {
+		return fmt.Errorf("recipe: %w", err)
+	}
+	if len(value) > profile.maxOutputBytes {
+		return fmt.Errorf("recipe output exceeds profile byte limit")
+	}
+	return nil
+}
+
+func (op Operation) apply(value string, budget chargeBudget, profile transformProfile) (string, error) {
+	switch op.Kind {
+	case OperationIdentity:
+		return value, nil
+	case OperationURLComponent:
+		return op.selectURLComponent(value)
+	case OperationPercentDecode:
+		for range op.Passes {
+			if err := budget.charge(value); err != nil {
+				return "", err
+			}
+			decoded, err := url.PathUnescape(value)
+			if err != nil {
+				return "", fmt.Errorf("percent decode: %w", err)
+			}
+			value = decoded
+		}
+		return value, nil
+	case OperationDLPNormalize:
+		// Published transform profiles pin the strip-before-NFKC order.
+		return dlpNormalizeFull(value, false), nil
+	case OperationLowercase:
+		return strings.ToLower(value), nil
+	case OperationInvisibleStrip:
+		return StripZeroWidth(value), nil
+	case OperationHexDecode:
+		decoded, err := hex.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("hex decode: %w", err)
+		}
+		if hex.EncodeToString(decoded) != value {
+			return "", fmt.Errorf("hex decode: non-canonical encoding")
+		}
+		if !utf8.Valid(decoded) {
+			return "", fmt.Errorf("hex decode output: invalid UTF-8")
+		}
+		return string(decoded), nil
+	case OperationBase32Decode:
+		encoding, err := scannerBase32Encoding(op.Alphabet, op.DecodePadding)
+		if err != nil {
+			return "", err
+		}
+		decoded, err := encoding.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("base32 decode: %w", err)
+		}
+		if encoding.EncodeToString(decoded) != value {
+			return "", fmt.Errorf("base32 decode: non-canonical encoding")
+		}
+		if !utf8.Valid(decoded) {
+			return "", fmt.Errorf("base32 decode output: invalid UTF-8")
+		}
+		return string(decoded), nil
+	case OperationBase64Decode:
+		encoding := base64.StdEncoding
+		if !op.DecodePadding {
+			encoding = base64.RawStdEncoding
+		}
+		decoded, err := encoding.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("base64 decode: %w", err)
+		}
+		if encoding.EncodeToString(decoded) != value {
+			return "", fmt.Errorf("base64 decode: non-canonical encoding")
+		}
+		if !utf8.Valid(decoded) {
+			return "", fmt.Errorf("base64 decode output: invalid UTF-8")
+		}
+		return string(decoded), nil
+	case OperationLeetspeak:
+		return Leetspeak(value), nil
+	case OperationVowelFold:
+		return FoldVowels(value), nil
+	case OperationQueryUnescape:
+		return scannerQueryUnescape(value, budget, profile.version)
+	case OperationInvisibleSpace:
+		return ReplaceInvisibleWithSpace(value), nil
+	case OperationMatchingNormalize:
+		// Replay follows the published profile, independently of live scanning.
+		return matchingPipelineFull(value, profile.version >= transformProfileV3, false), nil
+	case OperationASCIIUpper:
+		return ASCIIUpper(value), nil
+	case OperationJSONUnicodeEscape:
+		return DecodeJSONUnicodeEscapes(value), nil
+	case OperationHexDecodeLiberal:
+		decoded, err := hex.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("liberal hex decode: %w", err)
+		}
+		return string(decoded), nil
+	case OperationBase32DecodeLiberal:
+		encoding, err := scannerBase32Encoding(op.Alphabet, op.DecodePadding)
+		if err != nil {
+			return "", err
+		}
+		decoded, err := encoding.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("liberal base32 decode: %w", err)
+		}
+		return string(decoded), nil
+	case OperationBase64DecodeLiberal:
+		encoding, err := scannerBase64Encoding(op.Alphabet, op.DecodePadding)
+		if err != nil {
+			return "", err
+		}
+		decoded, err := encoding.DecodeString(value)
+		if err != nil {
+			return "", fmt.Errorf("liberal base64 decode: %w", err)
+		}
+		return string(decoded), nil
+	case OperationEncodedTokenNormalize:
+		return scannerEncodedTokenNormalize(value, op.Alphabet, profile.version), nil
+	case OperationTextSegment:
+		return selectScannerTextSegment(value, op.Occurrence)
+	case OperationHTMLEntityDecode:
+		return scannerHTMLEntityDecode(value, budget, profile.version)
+	case OperationWhitespaceCompact:
+		return scannerWhitespaceCompact(value), nil
+	case OperationURLNoiseStrip:
+		return scannerURLNoiseStrip(value, profile.version), nil
+	case OperationOrderedQueryConcat:
+		return scannerOrderedQueryConcat(value, budget, profile.version)
+	case OperationQuerySubsequence:
+		return scannerQuerySubsequence(value, op.Indices, budget, profile.version)
+	case OperationHostnameDotRemove:
+		return strings.ReplaceAll(value, ".", ""), nil
+	case OperationEncodedRun:
+		return selectScannerEncodedRun(value, op.Occurrence, op.MinimumLength)
+	case OperationCanaryCanonicalize:
+		return scannerCanaryCanonicalize(value), nil
+	case OperationASCIIAlphanumericStrip:
+		return scannerASCIIAlphanumericStrip(value), nil
+	default:
+		return "", fmt.Errorf("unknown operation %q", op.Kind)
+	}
+}
+
+func (op Operation) validate() error {
+	reject := func(field string) error {
+		return fmt.Errorf("unsupported %s for %s", field, op.Kind)
+	}
+	// The Typed recipe language clause prohibits Unicode control characters in
+	// selector and profile values, so implementations reject them before
+	// evaluating the operation-specific parameter shape.
+	for _, field := range []struct {
+		name  string
+		value string
+	}{{"selector", op.Selector}, {"profile", op.Profile}} {
+		for _, r := range field.value {
+			if unicode.IsControl(r) {
+				return fmt.Errorf("%s for %s contains control character %U", field.name, op.Kind, r)
+			}
+		}
+	}
+	noParameters := func() error {
+		return op.noParametersForValidation(reject)
+	}
+	switch op.Kind {
+	case OperationIdentity, OperationLowercase, OperationInvisibleStrip, OperationLeetspeak, OperationVowelFold,
+		OperationQueryUnescape, OperationInvisibleSpace, OperationWhitespaceCompact,
+		OperationURLNoiseStrip, OperationOrderedQueryConcat, OperationHostnameDotRemove,
+		OperationCanaryCanonicalize, OperationASCIIAlphanumericStrip, OperationHTMLEntityDecode, OperationHexDecodeLiberal,
+		OperationASCIIUpper, OperationJSONUnicodeEscape:
+		return noParameters()
+	case OperationURLComponent:
+		switch op.Component {
+		case ComponentURL, ComponentHostname, ComponentPath, ComponentRawQuery:
+			if op.Selector != "" {
+				return reject("selector")
+			}
+			if op.Occurrence != 0 {
+				return reject("occurrence")
+			}
+		case ComponentQueryKey, ComponentQueryVal:
+			if op.Selector == "" {
+				return fmt.Errorf("query component: missing selector")
+			}
+		default:
+			return fmt.Errorf("unknown URL component %q", op.Component)
+		}
+		return op.without(paramComponent | paramSelector | paramOccurrence).noParametersForValidation(reject)
+	case OperationPercentDecode:
+		if op.Passes == 0 || op.Passes > evidenceProvenanceProfileMaxDecodePasses {
+			return fmt.Errorf("percent decode passes must be 1..%d", evidenceProvenanceProfileMaxDecodePasses)
+		}
+		return op.without(paramPasses).noParametersForValidation(reject)
+	case OperationDLPNormalize:
+		if op.Profile != "pipelock-dlp-v1" {
+			return fmt.Errorf("unknown DLP profile %q", op.Profile)
+		}
+		return op.without(paramProfile).noParametersForValidation(reject)
+	case OperationHexDecode:
+		return noParameters()
+	case OperationBase32Decode:
+		if (op.Alphabet != "" || op.explicit&paramAlphabet != 0) && op.Alphabet != "standard" && op.Alphabet != "base32hex" {
+			return fmt.Errorf("unknown base32 alphabet %q", op.Alphabet)
+		}
+		return op.without(paramDecodePadding | paramAlphabet).noParametersForValidation(reject)
+	case OperationBase64Decode:
+		return op.without(paramDecodePadding).noParametersForValidation(reject)
+	case OperationMatchingNormalize:
+		if op.Profile != "pipelock-matching-v1" {
+			return fmt.Errorf("unknown matching profile %q", op.Profile)
+		}
+		return op.without(paramProfile).noParametersForValidation(reject)
+	case OperationBase32DecodeLiberal:
+		if (op.Alphabet != "" || op.explicit&paramAlphabet != 0) && op.Alphabet != "standard" && op.Alphabet != "base32hex" {
+			return fmt.Errorf("unknown base32 alphabet %q", op.Alphabet)
+		}
+		return op.without(paramDecodePadding | paramAlphabet).noParametersForValidation(reject)
+	case OperationBase64DecodeLiberal:
+		if op.Alphabet != "standard" && op.Alphabet != "url" {
+			return fmt.Errorf("unknown base64 alphabet %q", op.Alphabet)
+		}
+		return op.without(paramAlphabet | paramDecodePadding).noParametersForValidation(reject)
+	case OperationEncodedTokenNormalize:
+		switch op.Alphabet {
+		case "hex", "base32", "base64_standard", "base64_url":
+		default:
+			return fmt.Errorf("unknown encoded-token alphabet %q", op.Alphabet)
+		}
+		return op.without(paramAlphabet).noParametersForValidation(reject)
+	case OperationTextSegment:
+		return op.without(paramOccurrence).noParametersForValidation(reject)
+	case OperationQuerySubsequence:
+		if len(op.Indices) < evidenceProvenanceQueryMinIndices || len(op.Indices) > evidenceProvenanceQueryMaxIndices {
+			return fmt.Errorf("query subsequence indices must contain 2..4 entries")
+		}
+		for index, value := range op.Indices {
+			if value >= evidenceProvenanceQueryMaxValues {
+				return fmt.Errorf("query subsequence index %d exceeds scanner limit", value)
+			}
+			if index > 0 && value <= op.Indices[index-1] {
+				return fmt.Errorf("query subsequence indices must be strictly increasing")
+			}
+		}
+		return op.without(paramIndices).noParametersForValidation(reject)
+	case OperationEncodedRun:
+		if op.MinimumLength == 0 {
+			return fmt.Errorf("encoded run minimum_length must be positive")
+		}
+		return op.without(paramOccurrence | paramMinimumLength).noParametersForValidation(reject)
+	default:
+		return fmt.Errorf("unknown operation %q", op.Kind)
+	}
+}
+
+func (op Operation) noParametersForValidation(reject func(string) error) error {
+	switch {
+	case op.Component != "":
+		return reject("component")
+	case op.Selector != "":
+		return reject("selector")
+	case op.Occurrence != 0:
+		return reject("occurrence")
+	case op.Passes != 0:
+		return reject("passes")
+	case op.Profile != "":
+		return reject("profile")
+	case op.DecodePadding:
+		return reject("decode_padding")
+	case op.Alphabet != "":
+		return reject("alphabet")
+	case len(op.Indices) != 0:
+		return reject("indices")
+	case op.MinimumLength != 0:
+		return reject("minimum_length")
+	}
+	// A parameter spelled out with its zero value is still present.
+	for _, key := range operationParamOrder {
+		if op.explicit&operationParamKeys[key] != 0 {
+			return reject(key)
+		}
+	}
+	return nil
+}
+
+func (op Operation) selectURLComponent(value string) (string, error) {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("URL parse: invalid absolute URL")
+	}
+	switch op.Component {
+	case ComponentURL:
+		return value, nil
+	case ComponentHostname:
+		return parsed.Hostname(), nil
+	case ComponentPath:
+		return parsed.EscapedPath(), nil
+	case ComponentRawQuery:
+		return parsed.RawQuery, nil
+	case ComponentQueryKey, ComponentQueryVal:
+		if op.Selector == "" {
+			return "", fmt.Errorf("query component: missing selector")
+		}
+		query, err := url.ParseQuery(parsed.RawQuery)
+		if err != nil {
+			return "", fmt.Errorf("query parse: %w", err)
+		}
+		values, ok := query[op.Selector]
+		if !ok || uint64(op.Occurrence) >= uint64(len(values)) {
+			return "", fmt.Errorf("query component: occurrence %d unavailable", op.Occurrence)
+		}
+		if op.Component == ComponentQueryKey {
+			return op.Selector, nil
+		}
+		return values[op.Occurrence], nil
+	default:
+		return "", fmt.Errorf("unknown URL component %q", op.Component)
+	}
+}
+
+func scannerQueryUnescape(value string, budget chargeBudget, version transformProfileVersion) (string, error) {
+	for range evidenceProvenanceScannerMaxDecodeRounds {
+		if err := budget.charge(value); err != nil {
+			return "", err
+		}
+		decoded, err := url.QueryUnescape(value)
+		if version >= transformProfileV4 {
+			decoded, err = QueryUnescapePartial(value), nil
+		}
+		if err != nil || decoded == value {
+			break
+		}
+		value = decoded
+	}
+	return value, nil
+}
+
+func scannerBase32Encoding(alphabet string, padded bool) (*base32.Encoding, error) {
+	var encoding *base32.Encoding
+	switch alphabet {
+	case "", "standard":
+		encoding = base32.StdEncoding
+	case "base32hex":
+		encoding = base32.HexEncoding
+	default:
+		return nil, fmt.Errorf("unknown base32 alphabet %q", alphabet)
+	}
+	if !padded {
+		encoding = encoding.WithPadding(base32.NoPadding)
+	}
+	return encoding, nil
+}
+
+func scannerBase64Encoding(alphabet string, padded bool) (*base64.Encoding, error) {
+	var encoding *base64.Encoding
+	switch alphabet {
+	case "standard":
+		encoding = base64.StdEncoding
+	case "url":
+		encoding = base64.URLEncoding
+	default:
+		return nil, fmt.Errorf("unknown base64 alphabet %q", alphabet)
+	}
+	if !padded {
+		encoding = encoding.WithPadding(base64.NoPadding)
+	}
+	return encoding, nil
+}
+
+func scannerEncodedTokenNormalize(value, alphabet string, version transformProfileVersion) string {
+	if version == transformProfileV1 {
+		return scannerEncodedTokenNormalizeV1(value, alphabet)
+	}
+	return scannerEncodedTokenNormalizeV2(value, alphabet)
+}
+
+// scannerEncodedTokenNormalizeV2 replays normalizeHex (alphabet=="hex") and
+// normalizeEncodedToken (all other alphabet values) from internal/scanner.
+// It keeps only each target alphabet's data bytes. This replay deliberately
+// stays versioned because older receipts bind the v1 allow-list semantics.
+func scannerEncodedTokenNormalizeV2(value, alphabet string) string {
+	if len(value) < 4 {
+		return ""
+	}
+	if alphabet == "hex" {
+		value = stripV2HexPrefixes(value)
+		// Reject on an out-of-alphabet letter rather than stripping it. A
+		// separator is punctuation or whitespace, never a letter, so a g-z
+		// byte means this is prose rather than a separator-split token. The
+		// scanner applies the identical rule; they are proven equal by
+		// TestHexReplayMatchesScannerNormalizer.
+		var builder strings.Builder
+		builder.Grow(len(value))
+		for index := 0; index < len(value); index++ {
+			switch char := value[index]; {
+			case char >= '0' && char <= '9', char >= 'a' && char <= 'f', char >= 'A' && char <= 'F':
+				builder.WriteByte(char)
+			case char == 'x', char == 'X':
+				// the radix/escape marker; a stray one is noise, not data.
+			case char >= 'g' && char <= 'z', char >= 'G' && char <= 'Z':
+				return ""
+			}
+		}
+		value = builder.String()
+		if len(value) == 0 || len(value)%2 != 0 || len(value) > maxReassembledTokenLen {
+			return ""
+		}
+		return value
+	}
+
+	isData := func(char byte) bool {
+		switch {
+		case char >= 'A' && char <= 'Z':
+			return true
+		case char >= 'a' && char <= 'z':
+			return alphabet != "base32"
+		case char >= '0' && char <= '9':
+			return alphabet != "base32" || char >= '2' && char <= '7'
+		case char == '=':
+			return true
+		case char == '+' || char == '/':
+			return alphabet == "base64_standard"
+		case char == '-' || char == '_':
+			return alphabet == "base64_url"
+		default:
+			return false
+		}
+	}
+	var result strings.Builder
+	result.Grow(len(value))
+	changed := false
+	for index := range len(value) {
+		char := value[index]
+		if isData(char) {
+			result.WriteByte(char)
+			continue
+		}
+		changed = true
+	}
+	if !changed || result.Len() < 4 || result.Len() > maxReassembledTokenLen {
+		return ""
+	}
+	return result.String()
+}
+
+// maxReassembledTokenLen mirrors internal/scanner. A reassembly view larger
+// than a plausible credential is prose, and the scanner refuses to build one,
+// so the replay must refuse identically or a receipt would not reproduce.
+const maxReassembledTokenLen = 4096
+
+// stripV2HexPrefixes removes a hexadecimal radix or escape prefix only when
+// the following two bytes form the hex pair it introduces. A stray "0x" must
+// leave its zero for the alphabet filter: consuming it would erase token data.
+func stripV2HexPrefixes(value string) string {
+	var result strings.Builder
+	result.Grow(len(value))
+	for index := 0; index < len(value); {
+		if index+3 < len(value) &&
+			(value[index] == '0' || value[index] == '\\') &&
+			(value[index+1] == 'x' || value[index+1] == 'X') &&
+			isHexDigitRune(rune(value[index+2])) && isHexDigitRune(rune(value[index+3])) {
+			index += 2
+			continue
+		}
+		result.WriteByte(value[index])
+		index++
+	}
+	return result.String()
+}
+
+// scannerEncodedTokenNormalizeV1 preserves the normative v1 allow-list of
+// separator bytes. Do not fold this into v2: replaying a receipt is evidence
+// reconstruction, so selecting a newer transform changes what was attested.
+func scannerEncodedTokenNormalizeV1(value, alphabet string) string {
+	if len(value) < 4 {
+		return ""
+	}
+	if alphabet == "hex" {
+		value = strings.NewReplacer(`\x`, "", `\X`, "", "0x", "", "0X", "").Replace(value)
+		value = strings.Map(func(r rune) rune {
+			switch r {
+			case ':', ' ', '-', ',':
+				return -1
+			default:
+				return r
+			}
+		}, value)
+		if len(value) == 0 || len(value)%2 != 0 {
+			return ""
+		}
+		for _, char := range value {
+			if !isHexDigitRune(char) {
+				return ""
+			}
+		}
+		return value
+	}
+	isData := func(char byte) bool {
+		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '=' {
+			return true
+		}
+		switch alphabet {
+		case "base64_standard":
+			return char == '+' || char == '/'
+		case "base64_url":
+			return char == '-' || char == '_'
+		default:
+			return false
+		}
+	}
+	isSeparator := func(char byte) bool {
+		if char == ' ' || char == '\t' || char == '\n' || char == '\r' || char == '\f' || char == '\v' || char == '.' {
+			return true
+		}
+		switch alphabet {
+		case "base64_standard":
+			return char == '-' || char == '_'
+		case "base64_url":
+			return char == '/' || char == '+'
+		case "base32":
+			return char == '-' || char == '_' || char == '/'
+		default:
+			return false
+		}
+	}
+	var result strings.Builder
+	result.Grow(len(value))
+	changed := false
+	for index := range len(value) {
+		char := value[index]
+		switch {
+		case isData(char):
+			result.WriteByte(char)
+		case isSeparator(char):
+			changed = true
+		default:
+			return ""
+		}
+	}
+	if !changed || result.Len() < 4 {
+		return ""
+	}
+	return result.String()
+}
+
+func selectScannerTextSegment(value string, occurrence uint32) (string, error) {
+	segments := strings.FieldsFunc(value, func(r rune) bool {
+		switch r {
+		case '/', '?', '&', '=', ' ', '\n', '\r', '\t', '"', '\'', '`', '{', '}', '[', ']', '(', ')', '<', '>', ':', ',', ';':
+			return true
+		default:
+			return false
+		}
+	})
+	if uint64(occurrence) >= uint64(len(segments)) {
+		return "", fmt.Errorf("text segment: occurrence %d unavailable", occurrence)
+	}
+	return segments[occurrence], nil
+}
+
+func scannerHTMLEntityDecode(value string, budget chargeBudget, version transformProfileVersion) (string, error) {
+	if !strings.Contains(value, "&") {
+		return value, nil
+	}
+	for range evidenceProvenanceHTMLMaxDecodePasses {
+		if err := budget.charge(value); err != nil {
+			return "", err
+		}
+		var decoded string
+		if version == transformProfileV5 {
+			decoded = htmlEntityDecodeV5(value)
+		} else {
+			decoded = html.UnescapeString(value)
+		}
+		if decoded == value {
+			break
+		}
+		value = decoded
+	}
+	return value, nil
+}
+
+// htmlEntityDecodeV5 decodes each reference from the original pass input.
+// An ampersand produced by a reference is decoded only on the next charged pass.
+func htmlEntityDecodeV5(value string) string {
+	var out strings.Builder
+	for {
+		start := strings.IndexByte(value, '&')
+		if start < 0 {
+			out.WriteString(value)
+			return out.String()
+		}
+		out.WriteString(value[:start])
+		value = value[start:]
+		end := len(value)
+		if next := strings.IndexByte(value[1:], '&'); next >= 0 {
+			end = next + 1
+		}
+		part := value[:end]
+		if strings.HasPrefix(part, "&#") {
+			out.WriteString(htmlNumericReferenceV5(part))
+		} else {
+			out.WriteString(htmlNamedReferenceV5(part))
+		}
+		value = value[end:]
+	}
+}
+
+// htmlNamedReferenceV5 uses the pinned WHATWG text-state table. The longest
+// matching name wins; only table entries without a semicolon allow omission.
+func htmlNamedReferenceV5(value string) string {
+	end := 1
+	for end < len(value) && end <= html5MaxNameBytes {
+		ch := value[end]
+		if ch == ';' {
+			end++
+			break
+		}
+		if (ch < 'a' || ch > 'z') && (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') {
+			break
+		}
+		end++
+	}
+	for end > 1 {
+		if decoded, ok := html5NamedReferences[value[1:end]]; ok {
+			return decoded + value[end:]
+		}
+		end--
+	}
+	return value
+}
+
+// htmlC1ReferenceReplacements is read-only after initialization. Only original
+// scalar values in the C1 window have entries.
+var htmlC1ReferenceReplacements = map[uint32]uint32{
+	0x80: 0x20ac,
+	0x81: 0x81,
+	0x82: 0x201a,
+	0x83: 0x192,
+	0x84: 0x201e,
+	0x85: 0x2026,
+	0x86: 0x2020,
+	0x87: 0x2021,
+	0x88: 0x2c6,
+	0x89: 0x2030,
+	0x8a: 0x160,
+	0x8b: 0x2039,
+	0x8c: 0x152,
+	0x8d: 0x8d,
+	0x8e: 0x17d,
+	0x8f: 0x8f,
+	0x90: 0x90,
+	0x91: 0x2018,
+	0x92: 0x2019,
+	0x93: 0x201c,
+	0x94: 0x201d,
+	0x95: 0x2022,
+	0x96: 0x2013,
+	0x97: 0x2014,
+	0x98: 0x2dc,
+	0x99: 0x2122,
+	0x9a: 0x161,
+	0x9b: 0x203a,
+	0x9c: 0x153,
+	0x9d: 0x9d,
+	0x9e: 0x17e,
+	0x9f: 0x178,
+}
+
+func htmlNumericReferenceV5(value string) string {
+	pos, radix := 2, uint32(10)
+	if pos < len(value) && (value[pos] == 'x' || value[pos] == 'X') {
+		pos++
+		radix = 16
+	}
+	digits := pos
+	var scalar uint32
+	for pos < len(value) {
+		var digit uint32
+		switch ch := value[pos]; {
+		case ch >= '0' && ch <= '9':
+			digit = uint32(ch - '0')
+		case radix == 16 && ch >= 'a' && ch <= 'f':
+			digit = uint32(ch-'a') + 10
+		case radix == 16 && ch >= 'A' && ch <= 'F':
+			digit = uint32(ch-'A') + 10
+		default:
+			goto decoded
+		}
+		// Saturate before overflow, but consume every remaining digit.
+		scalar = min(scalar*radix+digit, uint32(utf8.MaxRune)+1)
+		pos++
+	}
+decoded:
+	if pos == digits {
+		return value
+	}
+	if pos < len(value) && value[pos] == ';' {
+		pos++
+	}
+	if replacement, ok := htmlC1ReferenceReplacements[scalar]; ok {
+		scalar = replacement
+	}
+	if scalar == 0 || scalar > utf8.MaxRune || scalar >= 0xd800 && scalar <= 0xdfff {
+		scalar = utf8.RuneError
+	}
+	return string(rune(scalar)) + value[pos:]
+}
+
+func scannerWhitespaceCompact(value string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, value)
+}
+
+func scannerURLNoiseStrip(value string, version transformProfileVersion) string {
+	if version == transformProfileV1 {
+		return scannerURLNoiseStripV1(value)
+	}
+	return scannerURLNoiseStripV2(value)
+}
+
+// scannerURLNoiseStripV2 replays the scanner's current keep-set. Its v1
+// counterpart remains separate so historical proof reconstruction is stable.
+func scannerURLNoiseStripV2(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		case r == '-' || r == '_' || r == '=':
+			return r
+		}
+		return -1
+	}, value)
+}
+
+func scannerURLNoiseStripV1(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '.', '/', ' ', '\t', '\n', '\r', '+', ',', ';', '|':
+			return -1
+		default:
+			return r
+		}
+	}, value)
+}
+
+func scannerOrderedQueryConcat(rawQuery string, budget chargeBudget, version transformProfileVersion) (string, error) {
+	var result strings.Builder
+	for _, pair := range strings.Split(rawQuery, "&") {
+		_, value, _ := strings.Cut(pair, "=")
+		if value != "" {
+			decoded, err := scannerQueryUnescape(value, budget, version)
+			if err != nil {
+				return "", err
+			}
+			result.WriteString(decoded)
+		}
+	}
+	return result.String(), nil
+}
+
+func scannerQuerySubsequence(rawQuery string, indices []uint8, budget chargeBudget, version transformProfileVersion) (string, error) {
+	values := make([]string, 0, evidenceProvenanceQueryMaxValues)
+	for _, pair := range strings.Split(rawQuery, "&") {
+		_, value, _ := strings.Cut(pair, "=")
+		if value != "" {
+			decoded, err := scannerQueryUnescape(value, budget, version)
+			if err != nil {
+				return "", err
+			}
+			values = append(values, decoded)
+			if len(values) == evidenceProvenanceQueryMaxValues {
+				break
+			}
+		}
+	}
+	var result strings.Builder
+	for _, index := range indices {
+		if int(index) >= len(values) {
+			return "", fmt.Errorf("query subsequence: index %d unavailable", index)
+		}
+		result.WriteString(values[index])
+	}
+	return result.String(), nil
+}
+
+func selectScannerEncodedRun(value string, occurrence, minimumLength uint32) (string, error) {
+	runs := make([]string, 0)
+	start := -1
+	for index := 0; index < len(value); index++ {
+		char := value[index]
+		inAlphabet := (char >= 'A' && char <= 'Z') || (char >= 'a' && char <= 'z') ||
+			(char >= '0' && char <= '9') || char == '+' || char == '/' || char == '-' || char == '_'
+		if inAlphabet {
+			if start < 0 {
+				start = index
+			}
+			continue
+		}
+		if start >= 0 {
+			end := index
+			for pad := 0; pad < 2 && end < len(value) && value[end] == '='; pad++ {
+				end++
+			}
+			if int64(end-start) >= int64(minimumLength) {
+				runs = append(runs, value[start:end])
+			}
+		}
+		start = -1
+	}
+	if start >= 0 && int64(len(value)-start) >= int64(minimumLength) {
+		runs = append(runs, value[start:])
+	}
+	if uint64(occurrence) >= uint64(len(runs)) {
+		return "", fmt.Errorf("encoded run: occurrence %d unavailable", occurrence)
+	}
+	return runs[occurrence], nil
+}
+
+func scannerCanaryCanonicalize(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case '.', '/', '\\', '?', '&', '=', ' ', '\t', '\n', '\r', ':', ';', ',', '-', '_', '@', '%', '+', '#':
+			return -1
+		default:
+			return r
+		}
+	}, value)
+}
+
+// scannerASCIIAlphanumericStrip replays the scanner's query-concatenation
+// alphanumeric view. It is v2-only because v1's frozen profile did not define
+// this operation.
+func scannerASCIIAlphanumericStrip(value string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			return r
+		default:
+			return -1
+		}
+	}, value)
+}

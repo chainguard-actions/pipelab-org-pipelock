@@ -1,0 +1,738 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"html"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// jsonNull is the literal JSON null, used to detect nil-equivalent RawMessage values.
+const jsonNull = "null"
+
+var embeddedHTTPURLTokenRe = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>\\]+`)
+
+const (
+	maxEmbeddedURLDecodePasses = 6 // combined percent + HTML-entity decode passes
+	maxEmbeddedURLScans        = 32
+	maxEmbeddedURLTextViews    = 16
+)
+
+type embeddedURLScanResults struct {
+	results   []scanner.Result
+	truncated bool
+}
+
+// executeScan dispatches to the appropriate scanner for the requested kind.
+// Returns both the response body and the HTTP status code.
+// 200 = completed (allow, warn, or deny), 503 = retryable failure, 500 = internal error.
+func (h *Handler) executeScan(ctx context.Context, req *Request) (Response, int) {
+	cfg := h.currentConfig()
+	sc := h.currentScanner()
+	policyCfg := h.currentPolicyCfg()
+	if cfg == nil || sc == nil {
+		return errorResponse(req.Kind, "scan_unavailable", "Scan engine unavailable", true), http.StatusServiceUnavailable
+	}
+
+	switch req.Kind {
+	case KindURL:
+		// The url kind evaluates a URL string as content to classify, not a
+		// request this instance is forwarding on the caller's behalf, so
+		// there is no outbound query/path to fold into cross-request
+		// accumulation the way the forward proxy and fetch mode do for their
+		// OWN request's URL (internal/proxy/cee.go queryParamPayload /
+		// pathSegments). Documented exception: see docs/scan-api.md.
+		return h.scanURL(ctx, sc, req)
+	case KindDLP:
+		return h.scanDLP(ctx, cfg, sc, req)
+	case KindPromptInjection:
+		return h.scanPromptInjection(ctx, cfg, sc, req)
+	case KindToolCall:
+		return h.scanToolCall(ctx, cfg, sc, policyCfg, req)
+	default:
+		// Should not reach here (validated in handler), but fail-closed.
+		return errorResponse(req.Kind, "invalid_kind", "Unknown kind", false), http.StatusBadRequest
+	}
+}
+
+func (h *Handler) scanURL(ctx context.Context, sc *scanner.Scanner, req *Request) (Response, int) {
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+
+	result := sc.Scan(ctx, req.Input.URL)
+
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+
+	resp := Response{
+		Status: StatusCompleted,
+		Kind:   req.Kind,
+		ScanID: generateScanID(),
+	}
+	if result.Allowed {
+		resp.Decision = DecisionAllow
+	} else {
+		resp.Decision = DecisionDeny
+		resp.Findings = urlFindings(result)
+	}
+	return resp, http.StatusOK
+}
+
+func (h *Handler) scanDLP(ctx context.Context, cfg *config.Config, sc *scanner.Scanner, req *Request) (Response, int) {
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+
+	result := sc.ScanTextForDLP(ctx, req.Input.Text)
+	urlResults := scanEmbeddedTextURLs(ctx, sc, req.Input.Text)
+
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+
+	resp := Response{
+		Status: StatusCompleted,
+		Kind:   req.Kind,
+		ScanID: generateScanID(),
+	}
+	if len(result.Matches) == 0 && len(urlResults.results) == 0 && !urlResults.truncated {
+		resp.Decision = DecisionAllow
+	} else {
+		resp.Decision = DecisionDeny
+		if len(urlResults.results) == 0 && !urlResults.truncated {
+			resp.Decision = cardDLPDecision(result.Matches)
+		}
+		if len(result.Matches) > 0 {
+			resp.Findings = append(resp.Findings, dlpFindings(result, req.Options)...)
+		}
+		for _, urlResult := range urlResults.results {
+			resp.Findings = append(resp.Findings, urlFindings(urlResult)...)
+		}
+		if urlResults.truncated {
+			resp.Findings = append(resp.Findings, embeddedURLTruncatedFinding())
+		}
+	}
+	// Cross-request fragment reassembly: only run on a request this
+	// per-request scan did not already deny, mirroring the MCP proxy's
+	// "cross-request exfiltration check on clean outbound messages"
+	// (internal/mcp/input.go). Feeding an already-denied payload into the
+	// buffer would add no detection value and would let a deliberately
+	// malicious probe consume another session's byte budget.
+	if resp.Decision != DecisionDeny {
+		outcome := h.runCrossRequest(ctx, cfg, sc, req, []byte(req.Input.Text), resp.ScanID)
+		applyCrossRequestOutcome(&resp, outcome, "dlp")
+	}
+	return resp, http.StatusOK
+}
+
+func scanEmbeddedTextURLs(ctx context.Context, sc *scanner.Scanner, text string) embeddedURLScanResults {
+	tokens, truncated := embeddedHTTPURLTokens(text, maxEmbeddedURLScans)
+	results := embeddedURLScanResults{truncated: truncated}
+	seenFindings := make(map[string]struct{})
+	for _, token := range tokens {
+		result := sc.Scan(ctx, token)
+		if err := ctx.Err(); err != nil {
+			return embeddedURLScanResults{}
+		}
+		if result.Allowed || !embeddedURLResultIsFinding(result) {
+			continue
+		}
+		key := result.Scanner + "\x00" + result.Reason + "\x00" + result.Hint
+		if _, ok := seenFindings[key]; ok {
+			continue
+		}
+		seenFindings[key] = struct{}{}
+		results.results = append(results.results, result)
+	}
+	return results
+}
+
+func embeddedHTTPURLTokens(text string, limit int) ([]string, bool) {
+	seen := make(map[string]struct{})
+	tokens := make([]string, 0, limit)
+	views, viewsTruncated := embeddedURLTextViews(text)
+	for _, view := range views {
+		for _, raw := range embeddedHTTPURLTokenRe.FindAllString(view, -1) {
+			token := strings.TrimRight(raw, ".,;)]}")
+			if token == "" {
+				continue
+			}
+			if _, ok := seen[token]; ok {
+				continue
+			}
+			seen[token] = struct{}{}
+			if len(tokens) >= limit {
+				return tokens, true
+			}
+			tokens = append(tokens, token)
+		}
+	}
+	// A view-building bound that stopped early means the token list may be
+	// incomplete even when the token cap was never reached.
+	return tokens, viewsTruncated
+}
+
+// embeddedURLTextViews builds the decoded views the URL token matcher reads.
+// It returns truncated=true when either bound stopped it while more decoding
+// was still productive: the view cap, or the decode-pass budget. Both were
+// previously silent, so a URL wrapped past the ceiling yielded no token and the
+// caller reported a clean allow on content it had not finished inspecting. The
+// token-count cap already reported this way; these two now match it.
+func embeddedURLTextViews(text string) ([]string, bool) {
+	views := make([]string, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	truncated := false
+	// addView records a view and, when that view carries escaped slashes, its
+	// slash-decoded form. Both are decided in ONE capacity check: the cap could
+	// otherwise fill between the two appends and drop the decoded form, which
+	// may be the first form containing a literal scheme. A view the bound
+	// refuses must set truncated rather than vanish, because the caller treats
+	// truncation as "inspection did not finish" and denies.
+	addView := func(view string) {
+		if _, ok := seen[view]; ok {
+			return
+		}
+		slashDecoded := ""
+		if strings.Contains(view, `\/`) {
+			if decoded := strings.ReplaceAll(view, `\/`, `/`); decoded != view {
+				if _, dup := seen[decoded]; !dup {
+					slashDecoded = decoded
+				}
+			}
+		}
+		needed := 1
+		if slashDecoded != "" {
+			needed = 2
+		}
+		if len(views)+needed > maxEmbeddedURLTextViews {
+			truncated = true
+			return
+		}
+		seen[view] = struct{}{}
+		views = append(views, view)
+		if slashDecoded != "" {
+			seen[slashDecoded] = struct{}{}
+			views = append(views, slashDecoded)
+		}
+	}
+	addView(text)
+
+	converged := false
+	for range maxEmbeddedURLDecodePasses {
+		startLen := len(views)
+		for _, view := range views[:startLen] {
+			if strings.Contains(view, "%") {
+				decoded, err := url.PathUnescape(view)
+				if err == nil && decoded != view {
+					addView(decoded)
+				}
+			}
+			if strings.Contains(view, "&") {
+				decoded := html.UnescapeString(view)
+				if decoded != view {
+					addView(decoded)
+				}
+			}
+		}
+		if len(views) == startLen {
+			// Nothing new decoded, so the payload is fully peeled. This is the
+			// normal exit and the only one that proves inspection completed.
+			converged = true
+			break
+		}
+	}
+	if !converged && anyViewDecodesFurther(views, seen) {
+		// The pass budget ran out AND a further pass would still produce a view
+		// nobody has seen, so a layer genuinely went unread. Exhausting the
+		// budget alone is not evidence of that: a payload can converge exactly
+		// on the final pass, having been fully decoded, and flagging that as
+		// truncated denies content the scanner actually finished inspecting.
+		truncated = true
+	}
+	return views, truncated
+}
+
+// anyViewDecodesFurther reports whether decoding the current views once more
+// would yield a view not already collected. It is a read-only probe: it does not
+// add views, so it answers "was inspection incomplete" without extending the
+// bound the caller chose.
+func anyViewDecodesFurther(views []string, seen map[string]struct{}) bool {
+	for _, view := range views {
+		if strings.Contains(view, "%") {
+			if decoded, err := url.PathUnescape(view); err == nil && decoded != view {
+				if _, ok := seen[decoded]; !ok {
+					return true
+				}
+			}
+		}
+		if strings.Contains(view, "&") {
+			if decoded := html.UnescapeString(view); decoded != view {
+				if _, ok := seen[decoded]; !ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func embeddedURLResultIsFinding(result scanner.Result) bool {
+	return !result.IsInfrastructureError()
+}
+
+func embeddedURLTruncatedFinding() Finding {
+	return Finding{
+		Scanner:  "url",
+		RuleID:   "URL-embedded-url-scan-truncated",
+		Severity: "medium",
+		Message:  "Embedded URL scan stopped after bounded inspection limit",
+	}
+}
+
+func (h *Handler) scanPromptInjection(ctx context.Context, cfg *config.Config, sc *scanner.Scanner, req *Request) (Response, int) {
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+
+	result := sc.ScanResponse(ctx, req.Input.Content)
+
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+	if result.Failed() {
+		return h.injectionErrorResponse(req.Kind, result.Assessment), http.StatusInternalServerError
+	}
+
+	resp := Response{
+		Status:     StatusCompleted,
+		Kind:       req.Kind,
+		ScanID:     generateScanID(),
+		Assessment: &result.Assessment,
+	}
+	if result.Clean {
+		resp.Decision = DecisionAllow
+		if len(result.WarnedMatches) > 0 {
+			resp.Decision = DecisionWarn
+			resp.Findings = warnedInjectionFindings(result)
+		}
+	} else {
+		resp.Decision = DecisionDeny
+		resp.Findings = injectionFindings(result, req.Options)
+	}
+	// The fragment buffer only ever evaluates DLP credential patterns
+	// (scanner.scanFragmentsForSecrets), independent of scan kind, matching
+	// the MCP proxy's CEE check which runs on the raw frame regardless of
+	// message type. A prompt_injection request's content can still carry
+	// half a split secret.
+	if resp.Decision != DecisionDeny {
+		outcome := h.runCrossRequest(ctx, cfg, sc, req, []byte(req.Input.Content), resp.ScanID)
+		applyCrossRequestOutcome(&resp, outcome, "prompt_injection")
+	}
+	return resp, http.StatusOK
+}
+
+func (h *Handler) scanToolCall(
+	ctx context.Context,
+	cfg *config.Config,
+	sc *scanner.Scanner,
+	policyCfg *policy.Config,
+	req *Request,
+) (Response, int) {
+	if err := ctx.Err(); err != nil {
+		return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+	}
+
+	resp := Response{
+		Status:     StatusCompleted,
+		Decision:   DecisionAllow,
+		Kind:       req.Kind,
+		ScanID:     generateScanID(),
+		Assessment: &scanner.InjectionAssessment{Checker: scanner.InjectionCheckerBasic, Status: scanner.AssessmentNotAssessed},
+	}
+	if sc.PromptInjectionMode() == config.ActionAllow {
+		resp.Assessment.Status = scanner.AssessmentOff
+	}
+
+	// Stage 1: Key+value extraction from arguments.
+	// Uses extract.AllStringsFromJSON (keys AND values) because secrets
+	// can be encoded as JSON object keys. See spec: tool_call wiring detail.
+	// Tool policy also matches the string values on their own, as the MCP
+	// proxy does (see policy.CheckToolCallJSON).
+	var argStrings, policyArgs []string
+	var cardAtoms []extract.DLPAtom
+	if len(req.Input.Arguments) > 0 && string(req.Input.Arguments) != jsonNull {
+		extracted := extract.AllStringsFromJSONResult(json.RawMessage(req.Input.Arguments))
+		var valuesTruncated bool
+		policyArgs, valuesTruncated = policy.ArgValues(json.RawMessage(req.Input.Arguments))
+		if extracted.Truncated || valuesTruncated {
+			resp.Assessment.Status = scanner.AssessmentIncomplete
+			resp.Decision = DecisionDeny
+			resp.Findings = append(resp.Findings, Finding{
+				Scanner:  "tool_call",
+				RuleID:   "UNINSPECTABLE-json-depth",
+				Severity: "critical",
+				Message:  "Tool call arguments exceed maximum inspectable nesting depth",
+			})
+			return resp, http.StatusOK
+		}
+		argStrings = extracted.Strings
+		cardAtoms = extracted.Atoms
+	}
+	scanText := strings.Join(argStrings, " ")
+
+	// Stage 2: DLP + injection sub-scans (independent of tool policy).
+	//
+	// These run whenever a tool_call scan is requested, NOT gated on
+	// cfg.MCPInputScanning.Enabled. The scan API is an explicit on-demand
+	// request surface: whether tool_call is offered at all is governed by
+	// scan_api.kinds.tool_call (default true). Gating Stage 2 on the
+	// inline-proxy MCPInputScanning toggle (default false) made a caller's
+	// tool_call request return allow with zero findings - a fail-open where
+	// the API silently declined to scan what it was asked to. The sibling
+	// kinds (url / dlp / prompt_injection) all scan unconditionally; tool_call
+	// now matches that contract.
+	var dlpMatches []scanner.TextDLPMatch
+	var injResult scanner.ResponseScanResult
+	if scanText != "" {
+		dlpResult := sc.ScanTextForDLPWithTypedCardView(ctx, scanText, extract.JoinCardAtoms(cardAtoms, " "))
+		// A joined view cannot retain each leaf's scalar or encoded spelling.
+		// Inspect leaves independently, preserving numeric card views as the
+		// inline MCP input scanner does. Number-only evidence must not skip
+		// a later enforcing finding.
+		if dlpResult.Clean || scanner.OnlyInformational(dlpResult.Matches) {
+			for _, atom := range cardAtoms {
+				if err := ctx.Err(); err != nil {
+					return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+				}
+				leaf := sc.ScanTextForDLPWithCardView(ctx, atom.Text, atom.Card)
+				if len(leaf.Matches) > 0 {
+					dlpResult.Matches = appendNewDLPMatches(dlpResult.Matches, leaf.Matches)
+					dlpResult.Clean = !scanner.HasEnforcingMatch(dlpResult.Matches)
+					if !scanner.OnlyInformational(leaf.Matches) {
+						break
+					}
+				}
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+		}
+		if len(dlpResult.Matches) > 0 {
+			dlpMatches = dlpResult.Matches
+		}
+
+		injResult = sc.ScanResponse(ctx, scanText)
+		if err := ctx.Err(); err != nil {
+			return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+		}
+		if injResult.Failed() {
+			return h.injectionErrorResponse(req.Kind, injResult.Assessment), http.StatusInternalServerError
+		}
+		resp.Assessment = &injResult.Assessment
+		if !injResult.Clean {
+			resp.Decision = DecisionDeny
+		}
+	}
+	if resp.Decision != DecisionDeny && !scanner.HasEnforcingMatch(dlpMatches) {
+		dlpMatches = appendNewDLPMatches(dlpMatches, sc.ScanJSONCardRuns(ctx, string(req.Input.Arguments)))
+	}
+	if len(dlpMatches) > 0 {
+		if resp.Decision != DecisionDeny {
+			resp.Decision = cardDLPDecision(dlpMatches)
+		}
+		resp.Findings = append(resp.Findings, dlpFindings(scanner.TextDLPResult{Matches: dlpMatches}, req.Options)...)
+	}
+	if len(injResult.Matches) > 0 {
+		resp.Findings = append(resp.Findings, injectionFindings(injResult, req.Options)...)
+	}
+	if len(injResult.WarnedMatches) > 0 {
+		// Global warn-only wording findings only escalate allow to warn.
+		if resp.Decision == DecisionAllow {
+			resp.Decision = DecisionWarn
+		}
+		resp.Findings = append(resp.Findings, warnedInjectionFindings(injResult)...)
+	}
+
+	// Stage 3: Policy check.
+	if policyCfg != nil {
+		if err := ctx.Err(); err != nil {
+			return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+		}
+		var rawArgs json.RawMessage
+		if len(req.Input.Arguments) > 0 && string(req.Input.Arguments) != jsonNull {
+			rawArgs = json.RawMessage(req.Input.Arguments)
+		}
+		verdict := policyCfg.CheckToolCallJSON(req.Input.ToolName, policyArgs, argStrings, rawArgs)
+		if err := ctx.Err(); err != nil {
+			return h.contextErrorResponse(req.Kind, err), h.contextErrorStatus(err)
+		}
+		if verdict.Matched {
+			// A decision only escalates. A DLP or injection finding above
+			// already set deny; a warn-configured policy match must not
+			// downgrade that to warn.
+			if resp.Decision != DecisionDeny {
+				resp.Decision = policyDecision(verdict.Action)
+			}
+			resp.Findings = append(resp.Findings, policyFindings(verdict)...)
+		}
+	}
+
+	// Cross-request accumulation runs only after every denial-producing
+	// stage: a tool call the policy denies never retains bytes in the
+	// session, so it cannot poison later matches or spend the caller's
+	// budget.
+	if resp.Decision != DecisionDeny && scanText != "" {
+		outcome := h.runCrossRequest(ctx, cfg, sc, req, []byte(scanText), resp.ScanID)
+		applyCrossRequestOutcome(&resp, outcome, "tool_call")
+	}
+
+	return resp, http.StatusOK
+}
+
+// contextErrorResponse builds a 503/500 error response for context failures.
+func (h *Handler) contextErrorResponse(kind string, err error) Response {
+	code := "internal_error"
+	message := "Scan failed"
+	retryable := false
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		code = errorCodeScanDeadlineExceeded
+		message = "Scan timed out"
+		retryable = true
+	} else if errors.Is(err, context.Canceled) {
+		code = "request_canceled"
+		message = "Request canceled by client"
+	}
+
+	resp := Response{
+		Status:        StatusError,
+		Kind:          kind,
+		ScanID:        generateScanID(),
+		EngineVersion: h.version,
+		Errors:        []APIError{{Code: code, Message: message, Retryable: retryable}},
+	}
+	if kind == KindPromptInjection || kind == KindToolCall {
+		resp.Assessment = &scanner.InjectionAssessment{Checker: scanner.InjectionCheckerBasic, Status: scanner.AssessmentIncomplete}
+	}
+	return resp
+}
+
+// injectionErrorResponse never exposes internal scan errors or calls incomplete
+// assessment a content detection. The delivery decision remains fail-closed.
+func (h *Handler) injectionErrorResponse(kind string, assessment scanner.InjectionAssessment) Response {
+	resp := errorResponse(kind, "assessment_incomplete", "Wording assessment did not complete", false)
+	resp.EngineVersion = h.version
+	resp.Assessment = &assessment
+	return resp
+}
+
+// contextErrorStatus maps context errors to HTTP status codes.
+func (h *Handler) contextErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusServiceUnavailable // 503: retryable timeout
+	}
+	return http.StatusInternalServerError // 500: client cancel or other
+}
+
+// Finding constructors: translate scanner results to API findings.
+// Message fields use pattern names only, never raw matched content.
+
+func urlFindings(result scanner.Result) []Finding {
+	return []Finding{{
+		Scanner:  "url",
+		RuleID:   urlRuleID(result),
+		Severity: urlSeverity(result),
+		Message:  result.Reason,
+	}}
+}
+
+func dlpFindings(result scanner.TextDLPResult, opts *RequestOptions) []Finding {
+	findings := make([]Finding, 0, len(result.Matches))
+	for _, m := range result.Matches {
+		f := Finding{
+			Scanner:  "dlp",
+			RuleID:   "DLP-" + m.PatternName,
+			Severity: m.Severity,
+			Message:  "Secret-like token detected (" + m.PatternName + ")",
+		}
+		if m.IsInformational() {
+			f.Message = "Informational JSON card run detected (action=warn)"
+		}
+		if opts != nil && opts.IncludeEvidence {
+			encoding := m.Encoded
+			if encoding == "" {
+				encoding = "plaintext"
+			}
+			f.Evidence = &Evidence{Encoding: encoding}
+		}
+		findings = append(findings, f)
+	}
+	return findings
+}
+
+func injectionFindings(result scanner.ResponseScanResult, opts *RequestOptions) []Finding {
+	findings := make([]Finding, 0, len(result.Matches))
+	for _, m := range result.Matches {
+		f := Finding{
+			Scanner:  "prompt_injection",
+			RuleID:   "INJ-" + m.PatternName,
+			Severity: "high",
+			Message:  "Prompt injection pattern matched: " + m.PatternName,
+		}
+		// No evidence for injection matches: Position is post-normalization
+		// and does not reliably map to original input bytes.
+		_ = opts // intentionally unused for injection evidence
+		findings = append(findings, f)
+	}
+	return findings
+}
+
+// warnedInjectionFindings reports wording matches that the global
+// prompt_injection_detection warn-only policy withheld from enforcement.
+func warnedInjectionFindings(result scanner.ResponseScanResult) []Finding {
+	findings := make([]Finding, 0, len(result.WarnedMatches))
+	for _, m := range result.WarnedMatches {
+		findings = append(findings, Finding{
+			Scanner:  "prompt_injection",
+			RuleID:   "INJ-" + m.PatternName,
+			Severity: "medium",
+			Message:  "Prompt injection pattern matched (warn-only): " + m.PatternName,
+		})
+	}
+	return findings
+}
+
+func policyFindings(verdict policy.Verdict) []Finding {
+	findings := make([]Finding, 0, len(verdict.Rules))
+	severity, message := policyFindingDetails(verdict.Action)
+	for _, rule := range verdict.Rules {
+		findings = append(findings, Finding{
+			Scanner:  "tool_policy",
+			RuleID:   "POLICY-" + rule,
+			Severity: severity,
+			Message:  message + ": " + rule,
+		})
+	}
+	if len(findings) == 0 {
+		// Matched but no named rules (unnamed policy match).
+		ruleID := "POLICY-DENY"
+		if verdict.Action == config.ActionWarn {
+			ruleID = "POLICY-WARN"
+		}
+		findings = append(findings, Finding{
+			Scanner:  "tool_policy",
+			RuleID:   ruleID,
+			Severity: severity,
+			Message:  message,
+		})
+	}
+	return findings
+}
+
+// policyDecision maps a matched MCP tool-policy action to the Scan API's
+// evaluation-only decision vocabulary:
+//
+//	policy action | Scan API decision | live MCP proxy effect
+//	warn          | warn              | forwards with audit
+//	block         | deny              | blocks
+//	redirect      | deny              | replaces the call with a local response
+//	defer         | deny              | holds or blocks, depending on transport
+//	unknown/empty | deny              | fails closed
+//
+// The Scan API cannot execute a redirect or hold a deferred action, so it
+// denies the original call rather than reporting it as a clean allow.
+func policyDecision(action string) string {
+	if action == config.ActionWarn {
+		return DecisionWarn
+	}
+	return DecisionDeny
+}
+
+func policyFindingDetails(action string) (severity, message string) {
+	if action == config.ActionWarn {
+		return "medium", "Tool call warned by policy rule"
+	}
+	return "high", "Tool call denied by policy rule"
+}
+
+func urlRuleID(r scanner.Result) string {
+	switch r.Scanner {
+	case scanner.ScannerSSRF:
+		return "SSRF-Private-IP"
+	case scanner.ScannerDLP:
+		return "DLP-URL-Exfil"
+	case scanner.ScannerBlocklist:
+		return "BLOCK-Domain"
+	default:
+		return "URL-" + r.Scanner
+	}
+}
+
+func urlSeverity(r scanner.Result) string {
+	switch r.Scanner {
+	case scanner.ScannerDLP:
+		return "critical"
+	case scanner.ScannerSSRF:
+		return "high"
+	default:
+		return "medium"
+	}
+}
+
+func errorResponse(kind, code, message string, retryable bool) Response {
+	return Response{
+		Status: StatusError,
+		Kind:   kind,
+		ScanID: generateScanID(),
+		Errors: []APIError{
+			{Code: code, Message: message, Retryable: retryable},
+		},
+	}
+}
+
+// appendNewDLPMatches adds leaf matches the joined scan has not already
+// reported. A leaf that is itself the whole joined text, such as a lone string
+// holding serialized JSON, repeats the joined match, and the response promises
+// one finding per scanner match. Identity matches the MCP input merge: pattern,
+// encoding, and whether the match is informational card evidence.
+func appendNewDLPMatches(existing, incoming []scanner.TextDLPMatch) []scanner.TextDLPMatch {
+	type matchKey struct {
+		name          string
+		encoded       string
+		informational bool
+	}
+	seen := make(map[matchKey]struct{}, len(existing)+len(incoming))
+	for _, match := range existing {
+		seen[matchKey{name: match.PatternName, encoded: match.Encoded, informational: match.IsInformational()}] = struct{}{}
+	}
+	for _, match := range incoming {
+		key := matchKey{name: match.PatternName, encoded: match.Encoded, informational: match.IsInformational()}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		existing = append(existing, match)
+	}
+	return existing
+}
+
+func cardDLPDecision(matches []scanner.TextDLPMatch) string {
+	if scanner.OnlyInformational(matches) {
+		return DecisionWarn
+	}
+	return DecisionDeny
+}

@@ -1,0 +1,692 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package config
+
+import (
+	"encoding/json"
+	"sort"
+	"strings"
+	"sync/atomic"
+
+	"github.com/luckyPipewrench/pipelock/internal/digestorigin"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+)
+
+// CanonicalPolicyHash returns a stable SHA-256 digest (hex-encoded) of the
+// policy-semantic subset of the config. Unlike Hash(), which digests the
+// raw on-disk YAML bytes and so drifts on whitespace or comment changes,
+// CanonicalPolicyHash is invariant under anything that does not change
+// effective enforcement:
+//
+//   - Whitespace and indentation changes
+//   - YAML comments
+//   - Reordering top-level sections
+//   - Logging, telemetry, Sentry, emit destinations, flight recorder paths,
+//     license metadata, and the envelope signing key path
+//
+// It IS sensitive to anything that changes enforcement:
+//
+//   - mode, enforce, explain_blocks
+//   - DLP patterns, MCP tool policy rules, chain detection rules
+//     (order-preserving - rule order is first-match-wins semantics)
+//   - scanner thresholds, action verdicts, allowlists/blocklists
+//   - kill switch sources, adaptive enforcement, taint, rules bundle
+//   - transport policy knobs under fetch_proxy / forward_proxy /
+//     websocket_proxy / reverse_proxy (Blocklist, entropy thresholds,
+//     SNIVerification, rate limits, RedirectWebSocketHosts, timeouts
+//     that bound DoS exposure). Listen / Upstream addresses under those
+//     same structs are operational plumbing and are explicitly excluded
+//     so ops can rebind ports without shifting ph.
+//
+// The output is the full 64-character hex (32-byte) SHA-256 of a canonicalised
+// JSON encoding of the scanner-relevant config view. Callers that need the
+// shortened wire form (ph dictionary key) hand this string to the envelope
+// emitter, which decodes the hex and truncates to 16 bytes. Both
+// computeCanonicalPolicyHash and the cached CanonicalPolicyHash wrapper
+// return the full hex digest, not a truncated prefix.
+//
+// Per-effective-config: callers pass the resolved *Config for the specific
+// agent handling the request, not the global one. Per-agent profiles
+// produce distinct canonical hashes; the global config's canonical hash is
+// what requests without an agent binding see.
+//
+// Caching: the hash is memoized on the *Config value via an unexported
+// atomic.Value. First call computes and stores; subsequent calls return
+// the cached hex string. This is safe because Config instances are
+// treated as immutable after Load() - documented invariant. Mutating a
+// Config after a canonical hash has been computed will silently return
+// a stale hash. Tests must use fresh Config values for sensitivity.
+func (c *Config) CanonicalPolicyHash() string {
+	if c.canonicalHashCache == nil {
+		// Avoid lazy pointer writes here. CanonicalPolicyHash is used in
+		// request paths, and callers may share a manually constructed Config
+		// across goroutines. Defaults(), Load(), and Clone() install a cache
+		// holder; zero-value Config falls back to uncached computation.
+		return c.computeCanonicalPolicyHash()
+	}
+	if cached, ok := c.canonicalHashCache.Load().(cachedPolicyHash); ok {
+		return cached.hash
+	}
+
+	h := c.canonicalPolicyDigest()
+	c.canonicalHashCache.Store(h)
+	return h.hash
+}
+
+// cachedPolicyHash is the cached canonical policy hash. It keeps the
+// digest's origin for the Config's lifetime, so a receipt stamped with this
+// Config's policy hash never has that hash scanned as content.
+type cachedPolicyHash struct {
+	hash   string
+	origin digestorigin.Digest
+}
+
+// computeCanonicalPolicyHash is CanonicalPolicyHash without the cache.
+// Exported only through the cached wrapper; kept separate so tests can
+// exercise the determinism guarantees on fresh Config values.
+func (c *Config) computeCanonicalPolicyHash() string {
+	return c.canonicalPolicyDigest().hash
+}
+
+func (c *Config) canonicalPolicyDigest() cachedPolicyHash {
+	view := c.policySemanticView()
+	data, err := json.Marshal(view)
+	if err != nil {
+		// json.Marshal of a Config value only fails on programming errors
+		// (channels, functions, cycles). Fall back to the raw byte hash
+		// so the proxy stays up. Stale / non-canonical ph is a soft
+		// regression; a panicked proxy is not.
+		return cachedPolicyHash{hash: c.Hash()}
+	}
+	d := policyHashOrigin.Sum(data)
+	return cachedPolicyHash{hash: d.String(), origin: d}
+}
+
+// policySemanticView returns a shallow copy of Config with noise fields
+// zeroed. The resulting value, when JSON-marshalled, is the canonical
+// policy-semantic projection of the config.
+//
+// A field is noise when its value does not change what pipelock would
+// decide about a scanned request - listen addresses, log destinations,
+// telemetry endpoints, flight recorder paths, Sentry config, license
+// metadata, and the envelope signing key path (that changes how we sign
+// but not WHAT we scan, and must never flow into an emitted ph value).
+//
+// Agents are zeroed in the global view because per-agent profiles are
+// hashed through the agent's own resolved *Config; mixing them into the
+// global hash would cause a global hash collision whenever an agent
+// profile changed.
+//
+// Behavioral slice order is preserved by shallow copy (DLP rules, MCP
+// tool policy rules, chain detection rules, suppress entries). Only
+// set-like string slices with no semantic order (api_allowlist, internal
+// SSRF block, trusted_domains) are sorted into canonical order.
+type canonicalPolicyView struct {
+	Config
+	Guard *Guard `json:"guard,omitempty"`
+}
+
+func (c *Config) policySemanticView() canonicalPolicyView {
+	view := *c
+	view.DLP.Patterns = cloneDLPPatterns(c.DLP.Patterns)
+	for i := range view.DLP.Patterns {
+		p := &view.DLP.Patterns[i]
+		if len(p.Keywords) > 0 {
+			p.Keywords = p.CanonicalKeywords()
+			w := p.EffectiveKeywordWindow()
+			p.KeywordWindow = &w
+		}
+	}
+	switch c.PromptInjectionMode() {
+	case ActionAllow:
+		enabled := false
+		view.PromptInjectionDetection = &PromptInjectionDetection{Enabled: &enabled}
+	case ActionWarn:
+		view.PromptInjectionDetection = &PromptInjectionDetection{Action: ActionWarn}
+	default:
+		view.PromptInjectionDetection = nil
+	}
+
+	// Transport structs (FetchProxy, ForwardProxy, WebSocketProxy,
+	// ReverseProxy) stay in the canonical view because they carry
+	// enforcement-relevant fields: Monitoring.Blocklist, entropy
+	// thresholds, rate limits, ForwardProxy.SNIVerification,
+	// MaxTunnelSeconds, RedirectWebSocketHosts - all of which change
+	// what pipelock would decide about a scanned request. A blanket
+	// struct-zero would drop those policy knobs and leave ph
+	// insensitive to real policy changes, breaking the admission-grade
+	// contract.
+	//
+	// Listen / Upstream addresses under those structs are operational
+	// plumbing and must not flow into ph. Rebinding `fetch_proxy.listen:
+	// :8888 → :8889` or pointing a reverse proxy at a different upstream
+	// changes where bytes go, not what gets enforced. Zero them
+	// surgically below - keeping the surrounding enforcement fields
+	// (Monitoring, SNIVerification, timeouts, etc.) intact.
+	view.MetricsListen = ""
+	view.FetchProxy.Listen = ""
+	view.ReverseProxy.Listen = ""
+	view.ReverseProxy.Upstream = ""
+
+	// Telemetry and operational outputs - emit destinations, log
+	// formatting, Sentry DSN, flight recorder path/key/retention. None of
+	// these affect detection decisions; they affect where observations go.
+	// flight_recorder.require_receipts is intentionally preserved below:
+	// it changes enforcement posture by escalating receipt-emission failure
+	// from warn-and-forward to block.
+	view.Logging = LoggingConfig{}
+	view.Sentry = SentryConfig{}
+	view.Emit = EmitConfig{}
+	view.FlightRecorder = FlightRecorder{RequireReceipts: view.FlightRecorder.RequireReceipts}
+	// Policy identity tracks EFFECTIVE enforcement, not how the operator wrote
+	// it. fragment_reassembly.max_sessions is a pointer so validation can tell
+	// an omitted value from an explicit one, and that distinction is a loading
+	// concern: a config that omits the field and a config that sets it to the
+	// default enforce identically and must share an identity. Resolving it here
+	// also keeps the identity stable across a build that changed the field's
+	// representation rather than its meaning.
+	// While the feature is disabled the value cannot affect any decision, so it
+	// stays out of the identity entirely rather than asserting a bound nothing
+	// consults.
+	if view.CrossRequestDetection.Enabled && view.CrossRequestDetection.FragmentReassembly.Enabled {
+		resolvedMaxSessions := view.CrossRequestDetection.FragmentReassembly.ResolvedMaxSessions()
+		view.CrossRequestDetection.FragmentReassembly.MaxSessions = &resolvedMaxSessions
+	} else {
+		view.CrossRequestDetection.FragmentReassembly.MaxSessions = nil
+	}
+	view.EvidenceProvenance = EvidenceProvenance{}
+	view.Conductor = Conductor{}
+	// The override's existence changes sandbox posture, but its operator note
+	// and expiry do not change request-time scanner decisions.
+	view.Sandbox.BestEffortReason = ""
+	view.Sandbox.BestEffortExpiry = ""
+
+	// License metadata - determines whether a tier feature is available,
+	// but the effective per-agent config that the request-time path
+	// resolves to already reflects gating outcomes (e.g. agent profile
+	// not applied when the agents feature is unlicensed). Including
+	// the raw license bytes here would produce different ph values for
+	// identical effective policies across license refreshes.
+	view.LicenseKey = ""
+	view.LicenseFile = ""
+	view.LicenseCRLFile = ""
+	view.LicenseIntermediateFile = ""
+	view.LicenseIntermediateCert = nil
+	view.LicenseIntermediateLoadError = ""
+	view.LicenseRequireIntermediate = nil
+	view.LicenseRequireIntermediateResolved = false
+	view.LicenseRequireIntermediateEnvError = ""
+	view.LicenseCRLMaxAge = ""
+	view.LicenseCRLMaxAgeResolved = 0
+	view.LicenseCRLMaxAgeError = ""
+	// A deprecated-alias notice records how the operator spelled an
+	// unchanged effective policy (new_tool_action vs new_tool_admission),
+	// not the policy itself; it must never make two equivalent configs hash
+	// differently.
+	view.NewToolActionAliasWarning = ""
+	// The canonical view deliberately serializes the pre-rename spelling -
+	// JSON key "NewToolAction" (pinned by the field's json tag) with
+	// warn|block values - so hashes are stable across the
+	// mcp_tool_scanning.new_tool_action -> new_tool_admission rename and no
+	// deployment's receipt policy hash moves on upgrade. The mapping is
+	// applied to the VIEW copy only; the loaded config keeps the
+	// admit|withhold vocabulary everywhere else. Empty stays empty: an
+	// omitted new_tool_admission hashed as "" before the rename and still
+	// must.
+	switch view.MCPToolScanning.NewToolAdmission {
+	case NewToolAdmit:
+		view.MCPToolScanning.NewToolAdmission = ActionWarn
+	case NewToolWithhold:
+		view.MCPToolScanning.NewToolAdmission = ActionBlock
+	}
+	view.LicensePublicKey = ""
+	view.LicenseExpiresAt = 0
+	view.LicenseIssuedAt = 0
+	view.LicenseTier = ""
+	view.LicenseID = ""
+	view.LicenseCRLExpiresAt = 0
+	view.LicenseCRLSHA256 = ""
+	view.LicenseRevoked = false
+	view.LicenseRevocationReason = ""
+	view.LicenseAgentsFeature = false
+	view.LicenseDisabledAgents = nil
+	view.LicenseDisabledReason = ""
+
+	// Envelope signing key path - infrastructure, not policy. The key
+	// material itself is never read here (we only hold a path), but
+	// including the path would cause ph to shift whenever ops rotates
+	// the file location without changing any detection semantics.
+	// sign, key_id, signed_components, created_skew_seconds, and
+	// max_body_bytes DO affect the envelope contract and stay in view.
+	view.MediationEnvelope.SigningKeyPath = ""
+
+	// MCPToolPolicy.QuarantineDir is an operational filesystem path, not policy.
+	// Its default is derived from os.TempDir(), so leaving it in the view makes
+	// the hash depend on the ambient TMPDIR (the same policy resolves to a
+	// different path across environments), which breaks the admission-grade
+	// contract that identical policy yields an identical hash. Where redirected
+	// tool-call payloads land does not change what pipelock decides about a
+	// scanned request; the tool-policy enabled flag, action, and rules stay in
+	// view because those do affect detection.
+	view.MCPToolPolicy.QuarantineDir = ""
+	// on_incomplete_check stays in view because it decides allow or block.
+	// An omitted value means warn, so both spellings hash the same.
+	if view.MCPToolPolicy.OnIncompleteCheck == ActionWarn {
+		view.MCPToolPolicy.OnIncompleteCheck = ""
+	}
+
+	// MCPDataClassLabels is a foundation-only config surface until the
+	// derivation path populates receipt fields. Exclude it from the semantic
+	// policy hash while it has no runtime decision effect.
+	view.MCPDataClassLabels = MCPDataClassLabels{}
+
+	// HealthWatchdog is excluded from the canonical hash via the `json:"-"`
+	// tag on the Config field - operational liveness, not policy. Whether
+	// the watchdog is enabled or what tick interval it uses does not change
+	// what pipelock would decide about a scanned request; it only changes
+	// whether /health flips to 503 when internal state is wedged.
+
+	// Agents map - handled via per-agent resolved configs. See the
+	// CanonicalPolicyHash doc comment.
+	view.Agents = nil
+
+	// The unexported rawBytes and canonicalHashCache fields are skipped
+	// by encoding/json automatically because they are unexported. No
+	// explicit handling needed.
+
+	// Set-like string slices: canonicalise to sorted order so two
+	// configs that list the same domains in different order hash equal.
+	view.APIAllowlist = canonicalHostSet(view.APIAllowlist)
+	view.Internal = sortedCopy(view.Internal)
+	view.TrustedDomains = canonicalHostSet(view.TrustedDomains)
+	view.DestinationGrants = canonicalDestinationGrants(view.DestinationGrants)
+	// Declared credential-audience hosts are exact-match sets; order and case
+	// never change which destination receives a credential.
+	view.DLP.GitHubEnterpriseHosts = canonicalHostSet(view.DLP.GitHubEnterpriseHosts)
+	view.DLP.GitLabHosts = canonicalHostSet(view.DLP.GitLabHosts)
+	view.Taint.TrustedMCPServers = sortedCopy(view.Taint.TrustedMCPServers)
+	view.A2AScanning.TrustedAgentCardKeys = canonicalA2ATrustedCardKeys(view.A2AScanning.TrustedAgentCardKeys)
+	view.ResponseScanning.ExemptDomains = canonicalHostSet(view.ResponseScanning.ExemptDomains)
+	view.ResponseScanning.SizeExemptDomains = canonicalHostSet(view.ResponseScanning.SizeExemptDomains)
+	view.ResponseScanning.SizeExemptScanLimits = canonicalResponseSizeScanLimits(view.ResponseScanning.SizeExemptScanLimits)
+	view.ResponseScanning.UnscannablePassthrough = canonicalUnscannablePassthrough(view.ResponseScanning.UnscannablePassthrough)
+	view.ResponseScanning.AuthenticatedArtifacts = canonicalAuthenticatedArtifacts(view.ResponseScanning.AuthenticatedArtifacts)
+	view.ResponseScanning.MCPServers = canonicalMCPResponseServers(view.ResponseScanning.MCPServers)
+	view.MCPIdentities = canonicalMCPIdentities(view.MCPIdentities)
+	view.FetchProxy.Monitoring.QueryEntropyParamExclusions = canonicalQueryEntropyParamExclusions(view.FetchProxy.Monitoring.QueryEntropyParamExclusions)
+	view.FetchProxy.Monitoring.OAuthAuthorizationEndpoints = canonicalOAuthAuthorizationEndpoints(view.FetchProxy.Monitoring.OAuthAuthorizationEndpoints)
+	view.FetchProxy.Monitoring.IssuedRedirectDelegations = canonicalIssuedRedirectDelegations(view.FetchProxy.Monitoring.IssuedRedirectDelegations)
+	view.FetchProxy.Monitoring.PathEntropyExclusions = canonicalPathEntropyExclusions(view.FetchProxy.Monitoring.PathEntropyExclusions)
+	view.FetchProxy.Monitoring.Blocklist = canonicalHostSet(view.FetchProxy.Monitoring.Blocklist)
+	view.FetchProxy.Monitoring.SubdomainEntropyExclusions = canonicalHostSet(view.FetchProxy.Monitoring.SubdomainEntropyExclusions)
+	view.FetchProxy.Monitoring.QueryEntropyExclusions = canonicalHostSet(view.FetchProxy.Monitoring.QueryEntropyExclusions)
+	view.RequestBodyScanning.ContentEntropyExclusions = canonicalEntropyHostExclusions(view.RequestBodyScanning.ContentEntropyExclusions)
+	view.RequestBodyScanning.TrustedHosts = canonicalHostSet(view.RequestBodyScanning.TrustedHosts)
+	view.RequestBodyScanning.ContentEntropyWarnRoutes = canonicalRequestBodyEntropyWarnRoutes(view.RequestBodyScanning.ContentEntropyWarnRoutes)
+	view.RequestBodyScanning.SigV4CredentialRoutes = canonicalRequestBodySigV4CredentialRoutes(view.RequestBodyScanning.SigV4CredentialRoutes)
+	view.WebSocketProxy.ContentEntropyExclusions = canonicalEntropyHostExclusions(view.WebSocketProxy.ContentEntropyExclusions)
+	if view.Redaction.Enabled {
+		view.Redaction.AllowlistUnparseable = canonicalHostSet(view.Redaction.AllowlistUnparseable)
+	} else {
+		view.Redaction.AllowlistUnparseable = nil
+	}
+	view.Redaction.AllowlistUnparseableRoutes = canonicalUnparseableRoutes(view.Redaction.Enabled, view.Redaction.AllowlistUnparseableRoutes)
+	view.Redaction.Providers = canonicalRedactionProviders(view.Redaction.Enabled, view.Redaction.Providers)
+
+	// Guard declarations are set-like startup policy. The execution surface
+	// consumes them, so they belong in the policy hash; sorting copies keeps
+	// declaration order from creating false policy drift.
+	guard := canonicalGuard(view.Guard)
+	view.Guard = Guard{}
+
+	// Resolve omitted-or-zero learn-inference fields to their effective
+	// defaults so the policy hash reflects the runtime-effective policy,
+	// not the literal YAML representation. Without this, a YAML omitting
+	// learn.inference.floors.* and a YAML setting them explicitly to
+	// 5/20/3 would produce different hashes despite describing the same
+	// effective policy. The drift would surface as spurious verifier
+	// rejections on merge requests that just clarify defaults.
+	view.Learn.Inference.Floors = view.Learn.Inference.Floors.Resolved()
+	view.Learn.Inference.Normalization = view.Learn.Inference.Normalization.Resolved()
+
+	var guardView *Guard
+	if len(guard.Services) > 0 || len(guard.Profiles) > 0 || len(guard.Manifests) > 0 {
+		guardView = &guard
+	}
+	return canonicalPolicyView{Config: view, Guard: guardView}
+}
+
+func canonicalRequestBodySigV4CredentialRoutes(entries []RequestBodySigV4CredentialRoute) []RequestBodySigV4CredentialRoute {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := append([]RequestBodySigV4CredentialRoute(nil), entries...)
+	for i := range out {
+		out[i].ContentTypes = sortedCopy(out[i].ContentTypes)
+		out[i].Methods = sortedCopy(out[i].Methods)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return sigV4CredentialRouteIdentity(out[i]) < sigV4CredentialRouteIdentity(out[j])
+	})
+	return out
+}
+
+func canonicalAuthenticatedArtifacts(entries []AuthenticatedArtifactEntry) []AuthenticatedArtifactEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := append([]AuthenticatedArtifactEntry(nil), entries...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Host != out[j].Host {
+			return out[i].Host < out[j].Host
+		}
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		return out[i].BundleName < out[j].BundleName
+	})
+	return out
+}
+
+func canonicalGuard(g Guard) Guard {
+	out := Guard{
+		Services:  append([]GuardService(nil), g.Services...),
+		Profiles:  make([]GuardProfile, len(g.Profiles)),
+		Manifests: make([]GuardManifest, len(g.Manifests)),
+	}
+	for i, service := range out.Services {
+		out.Services[i].Protocol = strings.ToLower(service.Protocol)
+		out.Services[i].Host = strings.TrimRight(strings.ToLower(service.Host), ".")
+	}
+	sort.Slice(out.Services, func(i, j int) bool {
+		a, b := out.Services[i], out.Services[j]
+		if a.Protocol != b.Protocol {
+			return a.Protocol < b.Protocol
+		}
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Port != b.Port {
+			return a.Port < b.Port
+		}
+		return a.Name < b.Name
+	})
+	for i, profile := range g.Profiles {
+		out.Profiles[i] = profile
+		out.Profiles[i].Manifests = sortedCopy(profile.Manifests)
+	}
+	sort.Slice(out.Profiles, func(i, j int) bool { return out.Profiles[i].Name < out.Profiles[j].Name })
+	for i, manifest := range g.Manifests {
+		out.Manifests[i] = manifest
+		out.Manifests[i].ReadOnly = sortedCopy(manifest.ReadOnly)
+		out.Manifests[i].ReadOnlyDirectories = sortedCopy(manifest.ReadOnlyDirectories)
+		out.Manifests[i].ReadWrite = sortedCopy(manifest.ReadWrite)
+		out.Manifests[i].ReadWriteDirectories = sortedCopy(manifest.ReadWriteDirectories)
+	}
+	sort.Slice(out.Manifests, func(i, j int) bool { return out.Manifests[i].Name < out.Manifests[j].Name })
+	return out
+}
+
+func canonicalA2ATrustedCardKeys(keys []A2ATrustedCardKey) []A2ATrustedCardKey {
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make([]A2ATrustedCardKey, len(keys))
+	for i, key := range keys {
+		out[i] = key
+		out[i].AllowedOrigins = sortedCopy(key.AllowedOrigins)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].KeyID != out[j].KeyID {
+			return out[i].KeyID < out[j].KeyID
+		}
+		if out[i].PublicKey != out[j].PublicKey {
+			return out[i].PublicKey < out[j].PublicKey
+		}
+		left, _ := json.Marshal(out[i].AllowedOrigins)
+		right, _ := json.Marshal(out[j].AllowedOrigins)
+		return string(left) < string(right)
+	})
+	return out
+}
+
+func canonicalUnscannablePassthrough(entries []UnscannablePassthroughEntry) []UnscannablePassthroughEntry {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]UnscannablePassthroughEntry, len(entries))
+	for i, entry := range entries {
+		out[i] = entry
+		out[i].Paths = sortedCopy(entry.Paths)
+		out[i].ContentTypes = sortedCopy(entry.ContentTypes)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if strings.Join(a.Paths, "\x00") != strings.Join(b.Paths, "\x00") {
+			return strings.Join(a.Paths, "\x00") < strings.Join(b.Paths, "\x00")
+		}
+		if strings.Join(a.ContentTypes, "\x00") != strings.Join(b.ContentTypes, "\x00") {
+			return strings.Join(a.ContentTypes, "\x00") < strings.Join(b.ContentTypes, "\x00")
+		}
+		if a.Reason != b.Reason {
+			return a.Reason < b.Reason
+		}
+		if a.Added != b.Added {
+			return a.Added < b.Added
+		}
+		return a.Expires < b.Expires
+	})
+	return out
+}
+
+func canonicalRequestBodyEntropyWarnRoutes(entries []RequestBodyEntropyWarnRoute) []RequestBodyEntropyWarnRoute {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]RequestBodyEntropyWarnRoute, len(entries))
+	for i, entry := range entries {
+		out[i] = entry
+		out[i].ContentTypes = sortedCopy(entry.ContentTypes)
+		out[i].Methods = sortedCopy(entry.Methods)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		return a.Host+"\x00"+a.Path+"\x00"+a.PathPrefix+"\x00"+strings.Join(a.Methods, "\x00")+"\x00"+strings.Join(a.ContentTypes, "\x00")+"\x00"+a.Owner+"\x00"+a.Reason+"\x00"+a.Expires <
+			b.Host+"\x00"+b.Path+"\x00"+b.PathPrefix+"\x00"+strings.Join(b.Methods, "\x00")+"\x00"+strings.Join(b.ContentTypes, "\x00")+"\x00"+b.Owner+"\x00"+b.Reason+"\x00"+b.Expires
+	})
+	return out
+}
+
+func canonicalMCPResponseServers(entries []MCPResponseServerTrust) []MCPResponseServerTrust {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := append([]MCPResponseServerTrust(nil), entries...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Server == out[j].Server {
+			return out[i].Trust < out[j].Trust
+		}
+		return out[i].Server < out[j].Server
+	})
+	return out
+}
+
+// canonicalPathEntropyExclusions keeps only the fields that change DETECTION
+// and drops the governance metadata. Scheme, host and path prefix decide
+// whether the path gate runs, so they belong in the policy hash a receipt
+// carries. Expiry ends enforcement and belongs in identity. Reason and owner are
+// governance metadata and do not change the effective policy.
+func canonicalPathEntropyExclusions(entries []PathEntropyExclusion) []PathEntropyExclusion {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]PathEntropyExclusion, len(entries))
+	for i, entry := range entries {
+		scheme := entry.Scheme
+		if scheme == "" {
+			scheme = QueryEntropyParamDefaultScheme
+		}
+		out[i] = PathEntropyExclusion{
+			Scheme:     strings.ToLower(scheme),
+			Host:       strings.TrimSuffix(strings.ToLower(entry.Host), "."),
+			PathPrefix: entry.PathPrefix,
+			Expires:    entry.Expires,
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Scheme != b.Scheme {
+			return a.Scheme < b.Scheme
+		}
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.PathPrefix != b.PathPrefix {
+			return a.PathPrefix < b.PathPrefix
+		}
+		return a.Expires < b.Expires
+	})
+	return out
+}
+
+func canonicalQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) []QueryEntropyParamExclusion {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]QueryEntropyParamExclusion, len(entries))
+	for i, entry := range entries {
+		scheme := entry.Scheme
+		if scheme == "" {
+			scheme = QueryEntropyParamDefaultScheme
+		}
+		out[i] = QueryEntropyParamExclusion{
+			Scheme:  strings.ToLower(scheme),
+			Host:    strings.TrimSuffix(strings.ToLower(entry.Host), "."),
+			Path:    entry.Path,
+			Param:   entry.Param,
+			Expires: entry.Expires,
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Scheme != b.Scheme {
+			return a.Scheme < b.Scheme
+		}
+		if a.Host != b.Host {
+			return a.Host < b.Host
+		}
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		if a.Param != b.Param {
+			return a.Param < b.Param
+		}
+		return a.Expires < b.Expires
+	})
+	return out
+}
+
+func canonicalUnparseableRoutes(enabled bool, routes []redact.UnparseableRouteSpec) []redact.UnparseableRouteSpec {
+	if !enabled || len(routes) == 0 {
+		return nil
+	}
+	out := make([]redact.UnparseableRouteSpec, len(routes))
+	for i, route := range routes {
+		cpy := route
+		cpy.Methods = sortedCopy(cpy.Methods)
+		cpy.PathPrefixes = sortedCopy(cpy.PathPrefixes)
+		cpy.PathSuffixes = sortedCopy(cpy.PathSuffixes)
+		cpy.ContentTypes = sortedCopy(cpy.ContentTypes)
+		out[i] = cpy
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left, _ := json.Marshal(out[i])
+		right, _ := json.Marshal(out[j])
+		return string(left) < string(right)
+	})
+	return out
+}
+
+func canonicalRedactionProviders(enabled bool, providers map[string]redact.ProviderSpec) map[string]redact.ProviderSpec {
+	if !enabled || len(providers) == 0 {
+		return nil
+	}
+	out := make(map[string]redact.ProviderSpec, len(providers))
+	for name, spec := range providers {
+		cpy := spec
+		cpy.HostPatterns = canonicalHostSet(cpy.HostPatterns)
+		cpy.PathPrefixes = sortedCopy(cpy.PathPrefixes)
+		out[name] = cpy
+	}
+	return out
+}
+
+// sortedCopy returns a sorted copy of s. Nil in, nil out so that an
+// omitted-slice field and an empty-slice field hash identically.
+func sortedCopy(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	out := make([]string, len(s))
+	copy(out, s)
+	sort.Strings(out)
+	return out
+}
+
+// canonicalHostSet returns a sorted, lowercase copy of a set-like host or host
+// pattern list. Host matching is case-insensitive, so case-only edits cannot
+// represent a different effective policy or change its canonical hash.
+// canonicalEntropyHostExclusions is canonicalHostSet for entries that may carry
+// an expiry. Plain entries reduce to exactly what canonicalHostSet produced, so
+// the policy hash of a config that has none of the mapping form is unchanged.
+func canonicalEntropyHostExclusions(entries []EntropyHostExclusion) []EntropyHostExclusion {
+	if len(entries) == 0 {
+		return nil
+	}
+	seen := make(map[EntropyHostExclusion]struct{}, len(entries))
+	out := make([]EntropyHostExclusion, 0, len(entries))
+	for _, e := range entries {
+		e.Host = strings.TrimSuffix(strings.ToLower(e.Host), ".")
+		// Construction and wire decoding can differ only in mapping provenance.
+		// Canonical identity follows the effective temporary form, not its origin.
+		e.mapped = e.temporary()
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		return a.Host+"\x00"+a.Expires+"\x00"+a.Owner+"\x00"+a.Reason < b.Host+"\x00"+b.Expires+"\x00"+b.Owner+"\x00"+b.Reason
+	})
+	return out
+}
+
+func canonicalHostSet(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(s))
+	out := make([]string, 0, len(s))
+	for _, host := range s {
+		host = strings.TrimSuffix(strings.ToLower(host), ".")
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// canonicalHashCacheHolder is the unexported field type added to Config
+// for atomic memoisation. It is declared here so the Config struct only
+// needs a single field addition and so the canonical hash machinery is
+// self-contained in this file.
+type canonicalHashCacheHolder = atomic.Value

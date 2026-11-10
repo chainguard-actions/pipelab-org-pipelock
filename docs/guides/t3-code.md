@@ -1,0 +1,270 @@
+# Route T3 Code MCP tools through Pipelock
+
+T3 Code can launch an operator-selected stdio wrapper for its built-in MCP
+server. Pipelock can be that wrapper: it scans tool arguments, tool definitions,
+and responses between a provider and T3's MCP endpoint.
+
+This is an opt-in, prerelease integration. It requires the implementation in
+[T3 Code PR #15273](https://github.com/pingdotgg/t3code/pull/15273). The T3 setting
+is vendor-neutral and does not require Pipelock.
+
+## Requirements and tested scope
+
+Use a Pipelock build containing the T3 compatibility fixes in
+[#1778](https://github.com/pipelab-org/pipelock/pull/1778),
+[#1780](https://github.com/pipelab-org/pipelock/pull/1780),
+[#1787](https://github.com/pipelab-org/pipelock/pull/1787), and
+[#1792](https://github.com/pipelab-org/pipelock/pull/1792).
+These fixes ship in v3.7.0 and later. v3.6.0 doesn't contain them, so installing
+v3.6.0 isn't equivalent to this setup.
+
+The Linux setup below was exercised with T3 revision `3fb5ae602c` and a Pipelock
+development binary reporting revision `eb1ed809f`. Claude and Codex both
+completed a T3-owned child task, received its completion, and passed T3's live
+verifier restart check. A separate protocol probe retrieved 80 tools, completed
+a normal capabilities call, and received a Pipelock `dlp_match` refusal for a
+synthetic credential in tool arguments. This is integration evidence, not a
+release-candidate certification.
+
+The shell instructions require a Unix host with `pipelock` on the T3 server's
+`PATH`. Windows installation and provider-version combinations beyond these
+live checks need separate verification.
+
+## Install the wrapper
+
+Create a private wrapper directory:
+
+```sh
+install -d -m 700 "$HOME/.local/libexec"
+```
+
+Save the following as `$HOME/.local/libexec/t3-pipelock`:
+
+```sh
+#!/bin/sh
+set -eu
+umask 077
+
+: "${T3_MCP_URL:?T3 must supply its MCP endpoint}"
+: "${T3_MCP_AUTHORIZATION:?T3 must supply its session authorization}"
+
+headers=$(mktemp)
+proxy_pid=
+cleanup() {
+  trap '' HUP INT TERM
+  if [ -n "$proxy_pid" ]; then
+    kill -TERM "$proxy_pid" 2>/dev/null || :
+    wait "$proxy_pid" 2>/dev/null || :
+  fi
+  rm -f -- "$headers"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+printf 'Authorization: %s\n' "$T3_MCP_AUTHORIZATION" > "$headers"
+
+pipelock mcp proxy \
+  --upstream "$T3_MCP_URL" \
+  --header-file "$headers" \
+  --header 'MCP-Protocol-Version: 2025-06-18' \
+  --server-name t3-code <&0 &
+proxy_pid=$!
+wait "$proxy_pid"
+```
+
+Then make it executable and configure the environment of the process that
+starts the T3 server:
+
+```sh
+chmod 700 "$HOME/.local/libexec/t3-pipelock"
+export T3_MCP_STDIO_WRAPPER="$HOME/.local/libexec/t3-pipelock"
+```
+
+Restart T3 from that environment. Setting the variable in an agent's terminal
+after T3 has started does not configure the server. For a service-managed T3
+installation, put the absolute wrapper path in the service's environment.
+
+T3 supplies the endpoint and bearer value separately for each provider session.
+The wrapper puts the authorization header in an owner-only temporary file,
+keeping the credential out of process arguments. It removes the file on normal
+exit and handled signals, stopping and waiting for the proxy child first.
+The explicit stdin redirection keeps MCP input connected to the background
+child. Configure the service supervisor to stop the whole process group too;
+shell traps cannot guarantee cleanup during every launch-time race or if the
+child does not terminate. A forced kill or host crash can leave the temporary
+file behind; treat the temporary directory as credential-bearing storage.
+Do not enable shell tracing or copy these values into logs.
+
+The explicit protocol header is the starting value. The tested T3 endpoint
+negotiated `2025-06-18` and rejected later requests without that header. The
+tested development binary predates negotiated-version propagation, so it sent
+this value on every request. Recheck it when upgrading T3.
+
+Builds that include
+[#1846](https://github.com/pipelab-org/pipelock/pull/1846) send the explicit
+header on the initialize request and on anything sent before negotiation
+finishes. Once the upstream answers that request with a successful, well-formed
+initialize result carrying a date-shaped `protocolVersion`, Pipelock replaces
+the explicit header with that negotiated value on later POST requests, the GET
+event stream, and the session DELETE. An error response, or a result without a
+valid `protocolVersion`, negotiates nothing: later requests keep the explicit
+header, or carry no protocol header if none is configured. The end of the
+session clears the negotiated value, and so does a new initialize request that
+is well-formed JSON-RPC 2.0 with a string or number `id` and no duplicate keys or noncanonical aliases of protocol fields.
+Malformed JSON and key-validation errors block the request before forwarding.
+Other malformed initialize-shaped requests do not clear the negotiated value.
+Free-form tool arguments and JSON Schema properties keep case-sensitive keys.
+
+`--header-carrier` is intended for Pipelock's VS Code carrier namespace; it does
+not accept `T3_MCP_AUTHORIZATION` directly. Use the header file above, or copy
+the value into a carrier variable as shown in the next section.
+
+`--server-name t3-code` is an operator label. It names the server in logs and
+selects the per-server settings that use that name, and it is not proof that the
+endpoint is T3. The next section is the way to prove that.
+
+## Acknowledge T3's session credential once (optional)
+
+T3 issues a new endpoint credential, and usually a new port, for every provider
+session. Without more, an acknowledgment of that credential does not carry from
+one session to the next. If you want to acknowledge it once, register T3's local
+MCP service so Pipelock checks, on every connection, which process owns the
+other end. The mechanism is general: the full reference, including what each
+check proves and what it does not, is in
+[Registered local MCP services](../configuration.md#registered-local-mcp-services-mcp_identities).
+This section covers only the T3 specifics.
+
+This path is Linux only. A launch whose upstream matches a registration refuses to
+start on any other host.
+
+1. With a T3 server running, find the endpoint it hands to a provider session
+   (the value of `T3_MCP_URL`) and run the register command against it. Run it
+   as the same user as the T3 server, and only while you trust the running
+   server, because what it observes becomes what is pinned:
+
+   ```sh
+   pipelock mcp identity register \
+     --upstream "$T3_MCP_URL" \
+     --name local-orchestrator \
+     --mapped-file /opt/t3/current/native/addon.node \
+     --session-header Authorization \
+     --carrier PIPELOCK_VSCODE_T3_MCP_AUTH
+   ```
+
+   The command prints an `mcp_identities` entry and writes nothing. T3's server
+   runs under a language runtime, so the executable digest pins that runtime
+   binary, and the native modules the process loads are the files that decide what
+   it does. Pin each one you rely on with `--mapped-file`, choosing paths inside
+   an immutable release directory and not a path that an update or the T3 user
+   can rewrite in place. Fill in any `control_environment` value the command
+   lists, because those variables change what code the runtime loads.
+
+2. Review the entry, then add it to a config that only the new Pipelock binary
+   loads. An older binary rejects unknown fields, so a shared config would stop
+   it starting. Add the acknowledgment for the registered name with
+   `server_binding_mode: verified-local-session`, as described in the reference.
+
+3. Pass the credential to the proxy through the carrier variable and name the
+   config, so the wrapper no longer needs the header file for it. Replace the
+   header-file lines of the wrapper with:
+
+   ```sh
+   PIPELOCK_VSCODE_T3_MCP_AUTH="$T3_MCP_AUTHORIZATION"
+   export PIPELOCK_VSCODE_T3_MCP_AUTH
+
+   pipelock mcp proxy \
+     --config "$HOME/.config/pipelock/t3-identities.yaml" \
+     --upstream "$T3_MCP_URL" \
+     --header-carrier Authorization=PIPELOCK_VSCODE_T3_MCP_AUTH \
+     --header 'MCP-Protocol-Version: 2025-06-18' <&0 &
+   ```
+
+   Drop `--server-name` here: the registered name becomes the server name, and a
+   different explicit name is refused.
+
+4. Check the result from the launch environment where T3 supplies the current session's `T3_MCP_URL` and `T3_MCP_AUTHORIZATION`, using the same carrier mapping as the proxy. The wrapper's export does not set the variable in a separate operator shell. Set it for this invocation without printing the credential:
+
+   ```sh
+   PIPELOCK_VSCODE_T3_MCP_AUTH="$T3_MCP_AUTHORIZATION" \
+   pipelock mcp identity inspect \
+     --config "$HOME/.config/pipelock/t3-identities.yaml" \
+     --upstream "$T3_MCP_URL" \
+     --header-carrier Authorization=PIPELOCK_VSCODE_T3_MCP_AUTH
+   ```
+
+   Then start a fresh session and look for the startup line
+   `MCP identity: server=local-orchestrator source=verified-local-service
+   binding=verified-local-session` on the wrapper's stderr.
+
+The carrier variable holds the live credential, so do not print it or write it to
+disk. A same-user process on the same host can still impersonate the same executable,
+so this narrows who can receive the credential and does not replace the
+isolation discussed under the security boundary below.
+
+## Verify the path
+
+Start a fresh Claude or Codex session and request a harmless T3 operation such
+as listing the available orchestration capabilities. Confirm that a Pipelock
+MCP proxy process starts and the provider invokes the T3 MCP tool. A successful
+answer alone is insufficient: a provider can use native tools or the direct
+HTTP endpoint instead.
+
+For a source checkout of the tested T3 revision, the existing
+`apps/server/scripts/verify-background-live.ts` verifier exercises app-owned
+delegation and completion with disposable T3 state. Run its `idle` scenario
+with the wrapper environment configured, using an installed, authenticated
+provider and a model available to that provider. It rejects native delegation
+as the wrong path. Preserve its verdict and exact binary/revision identities.
+
+Pipelock auto-enables MCP input, tool-definition, and tool-policy scanning when
+no explicit configuration overrides them. The effective no-config actions are
+input `block`, response `warn`, tool definitions `warn`, and tool policy
+`warn`. The routing checks above do not establish each scanner's behavior.
+Send scanner-specific MCP probes through the wrapper and check the results:
+
+- An ordinary capabilities call succeeds.
+- A tool argument containing a synthetic credential is refused by input DLP
+  with `dlp_match`, before the upstream tool executes.
+- A tool definition matching a tool-scanning rule produces the expected warning.
+- A call matching a tool-policy rule produces the configured policy decision.
+- Under the no-config defaults, a tool response matching a response-scanning
+  rule produces a warning and is forwarded.
+- To test response blocking, explicitly set `response_scanning.action: block`
+  in the configuration passed to the wrapper with `--config`. Repeat the probe
+  and confirm the matching response content does not reach the provider.
+
+Use synthetic fixtures, never real credentials. Exercise tool-definition,
+tool-policy, and response probes against a disposable test MCP server through
+the same wrapper and configuration; do not alter a live T3 tool or execute a
+dangerous operation to trigger a rule. A warning is not a block. Preserve the
+matched rule, configured action, and observed result for each check.
+
+If you add `--config` to the wrapper, validate that configuration and repeat
+these probes against its expected actions. Do not silently disable scanning
+to fix a tool discovery failure. See [false-positive tuning](false-positive-tuning.md).
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| T3 refuses startup | The wrapper path must be absolute, executable, and correctly quoted. |
+| Provider reports a closed MCP connection | Run the wrapper with synthetic endpoint/authorization values and inspect stderr; keep stdout reserved for MCP messages. |
+| Upstream HTTP 400 after initialization | Check that initialization succeeded. Pipelock switches to the negotiated `MCP-Protocol-Version` only after a successful initialize result; before that, and on builds without #1846, requests carry the explicit header, so check it against T3's negotiated version. |
+| Warning about `request_secret` tool text | Inspect the reported rule and configured action; the tested default tool-definition action warns. A warning is not proof that the tool was blocked. |
+| Pi refuses the session | The tested Pi adapter does not support this stdio path. |
+| External OpenCode refuses the session | A remote OpenCode server cannot launch the wrapper on the T3 server's machine. Use a supported local provider. |
+
+## Security boundary
+
+This setup mediates the T3 MCP traffic that providers send through the wrapper.
+It does not cover all provider network traffic, shell commands, other MCP
+servers, or browser traffic. It does not make credentials inaccessible to the
+provider. The selected wrapper receives an existing session credential and
+must be trusted with that credential and the tool traffic.
+
+An agent with access to the endpoint credential can connect directly. Mandatory
+mediation needs operating-system or network isolation and restrictions on
+direct endpoint access. Credential isolation is a separate design problem.
+Do not describe this setting as a sandbox or as guaranteed exfiltration
+prevention.

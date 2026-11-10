@@ -1,0 +1,2014 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package proxy
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/luckyPipewrench/pipelock/internal/ceereason"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+const (
+	testCEEClientIP   = "10.0.0.1"
+	testCEEAgent      = "test-agent"
+	testCEERequestID  = "req-001"
+	testCEESessionKey = "test-session"
+	testCEEParamValue = "value"
+)
+
+func TestCeeSessionKey_WithAgent(t *testing.T) {
+	got := CeeSessionKey(testCEEAgent, testCEEClientIP)
+	want := testCEEAgent + "|" + testCEEClientIP
+	if got != want {
+		t.Errorf("CeeSessionKey(%q, %q) = %q, want %q", testCEEAgent, testCEEClientIP, got, want)
+	}
+}
+
+func TestCeeSessionKey_EmptyAgent(t *testing.T) {
+	got := CeeSessionKey("", testCEEClientIP)
+	if got != testCEEClientIP {
+		t.Errorf("CeeSessionKey(%q, %q) = %q, want %q", "", testCEEClientIP, got, testCEEClientIP)
+	}
+}
+
+func TestCeeSessionKey_AnonymousAgent(t *testing.T) {
+	got := CeeSessionKey(agentAnonymous, testCEEClientIP)
+	if got != testCEEClientIP {
+		t.Errorf("CeeSessionKey(%q, %q) = %q, want %q", agentAnonymous, testCEEClientIP, got, testCEEClientIP)
+	}
+}
+
+func TestCaptureSessionKey_SafeForRecorderDirectory(t *testing.T) {
+	if got := captureSessionKey(testCEEAgent, testCEEClientIP); got != testCEEAgent+"|"+testCEEClientIP {
+		t.Fatalf("safe captureSessionKey = %q, want %q", got, testCEEAgent+"|"+testCEEClientIP)
+	}
+	got := captureSessionKey("../bad/agent", testCEEClientIP)
+	if !strings.HasPrefix(got, "capture-") {
+		t.Fatalf("unsafe captureSessionKey = %q, want hashed capture prefix", got)
+	}
+	if strings.ContainsAny(got, `/\`) || strings.Contains(got, "..") {
+		t.Fatalf("unsafe captureSessionKey produced invalid directory segment %q", got)
+	}
+}
+
+// TestCaptureSessionKey_HashesInvalidUTF8 pins that an agent identity with
+// invalid UTF-8 becomes a hashed capture key instead of reaching the recorder,
+// which refuses such a session id and would drop the capture.
+func TestCaptureSessionKey_HashesInvalidUTF8(t *testing.T) {
+	agent := "agent" + string([]byte{0xff})
+	safe, original := captureSessionKeyAndOriginal(agent, testCEEClientIP)
+	if !strings.HasPrefix(safe, "capture-") || !utf8.ValidString(safe) {
+		t.Fatalf("captureSessionKey = %q, want a hashed UTF-8 capture key", safe)
+	}
+	if original == safe {
+		t.Fatalf("original identity not preserved for audit: %q", original)
+	}
+}
+
+func TestCaptureSessionKeyAndOriginal_PreservesUnsafeIdentity(t *testing.T) {
+	// Safe input: original equals safe (no hashing happened, audit needs no
+	// extra provenance).
+	safe, original := captureSessionKeyAndOriginal(testCEEAgent, testCEEClientIP)
+	if safe != testCEEAgent+"|"+testCEEClientIP || original != safe {
+		t.Fatalf("safe identity: got (%q, %q), want both = %q", safe, original, testCEEAgent+"|"+testCEEClientIP)
+	}
+
+	// Unsafe input: safe is hashed, but original retains the raw key so audit
+	// can map an opaque "capture-<hex>" directory back to the agent identity
+	// that triggered sanitization.
+	rawAgent := "../bad/agent"
+	rawKey := rawAgent + "|" + testCEEClientIP
+	safe, original = captureSessionKeyAndOriginal(rawAgent, testCEEClientIP)
+	if !strings.HasPrefix(safe, "capture-") {
+		t.Fatalf("unsafe safe key = %q, want capture- prefix", safe)
+	}
+	if original != rawKey {
+		t.Fatalf("unsafe original = %q, want %q (raw logical key for audit correlation)", original, rawKey)
+	}
+	if safe == original {
+		t.Fatalf("safe and original must differ when sanitization triggered: %q", safe)
+	}
+}
+
+func TestExtractOutboundPayload_QueryParams(t *testing.T) {
+	// Keys are intentionally out of alphabetical order to prove wire-order extraction.
+	r := &http.Request{
+		URL: &url.URL{
+			RawQuery: "other=data&key=secret_value",
+		},
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	got := string(payload)
+
+	// Wire order preserved, values only (keys excluded for fragment contiguity).
+	want := "datasecret_value"
+	if got != want {
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, want)
+	}
+}
+
+func TestExtractOutboundPayload_Body(t *testing.T) {
+	body := "request body content"
+	r := &http.Request{
+		URL:           &url.URL{},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	got := string(payload)
+	if got != body {
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, body)
+	}
+
+	// Body must still be readable after extraction (re-wrapping).
+	remaining, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("reading body after extraction: %v", err)
+	}
+	if string(remaining) != body {
+		t.Errorf("body after extraction = %q, want %q", string(remaining), body)
+	}
+}
+
+func TestExtractOutboundPayload_QueryAndBody(t *testing.T) {
+	body := "body-data"
+	r := &http.Request{
+		URL: &url.URL{
+			RawQuery: "q=query-data",
+		},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	got := string(payload)
+
+	// Query values first, then body, concatenated without separator.
+	want := "query-data" + body
+	if got != want {
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, want)
+	}
+
+	// Body must still be readable after extraction (re-wrapping).
+	remaining, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("reading body after extraction: %v", err)
+	}
+	if string(remaining) != body {
+		t.Errorf("body after extraction = %q, want %q", string(remaining), body)
+	}
+}
+
+func TestExtractOutboundPayload_NoQueryNoBody(t *testing.T) {
+	r := &http.Request{
+		URL: &url.URL{},
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	if len(payload) != 0 {
+		t.Errorf("expected empty payload, got %q", string(payload))
+	}
+}
+
+func TestExtractOutboundPayload_NilBody(t *testing.T) {
+	r := &http.Request{
+		URL:  &url.URL{},
+		Body: nil,
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	if len(payload) != 0 {
+		t.Errorf("expected empty payload for nil body, got %q", string(payload))
+	}
+}
+
+// testCEEPartitionKey stands in for the buffer-lifetime root secret. A real
+// caller reads it from the live FragmentBuffer; the value only has to be
+// stable within one test, because the bucket map is keyed, not public.
+var testCEEPartitionKey = []byte("cee-partition-root-key-for-tests")
+
+// A leaf must never be omitted, and the reason a body was not fully
+// partitioned must reach the operator. The failure direction that matters is
+// the one this replaced: returning no buckets left the body on the raw
+// concatenated stream only, which cannot rejoin a split separated by
+// unrelated padding, so a one-byte suffix disabled the whole control.
+func TestJSONBodyFragmentPayloadsUseFixedStableBuckets(t *testing.T) {
+	secret := testCEEAWSKeyPrefix + testCEEAWSKeySuffix
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantValues  []string
+		wantNil     bool
+		wantReason  string
+	}{
+		{
+			name: "valid JSON partitions leaf", contentType: "application/json",
+			body: `{"messages":[{"content":"value"}]}`, wantValues: []string{"value"},
+		},
+		{
+			name: "every leaf remains represented above the former stream ceiling", contentType: "application/json",
+			body: forwardCEEJSONWithManyLeaves("first", "last"), wantValues: []string{"first", "last"},
+		},
+		{
+			// The cheapest omission trigger found on this branch: one trailing
+			// non-whitespace byte. The parsed leaf is kept and the shortfall is
+			// reported rather than the whole body silently falling back to raw.
+			name: "a trailing byte keeps the parsed leaf", contentType: "application/json",
+			body: `{"a":"` + secret + `"} x`, wantValues: []string{secret}, wantReason: ceeJSONPartitionReasonIncomplete,
+		},
+		{
+			name: "a second top-level value keeps the parsed leaf", contentType: "application/json",
+			body: `{"a":"` + secret + `"}{}`, wantValues: []string{secret}, wantReason: ceeJSONPartitionReasonIncomplete,
+		},
+		{
+			name: "a truncated document keeps what parsed", contentType: "application/json",
+			body: `{"keep":"` + secret + `","drop":"`, wantValues: []string{secret}, wantReason: ceeJSONPartitionReasonIncomplete,
+		},
+		{
+			// Nothing parsed, so there is genuinely nothing to retain. This is
+			// the only shape whose empty result is honest, and it still reports.
+			name: "an unparseable document salvages nothing and says so", contentType: "application/json",
+			body: `{"unterminated"`, wantNil: true, wantReason: ceeJSONPartitionReasonMalformed,
+		},
+		{
+			// Not a fallback: JSON partitioning does not claim to cover other
+			// media types, so there is no shortfall to report.
+			name: "non JSON reports no shortfall", contentType: "text/plain",
+			body: `{"content":"` + secret + `"}`, wantNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, reason := jsonBodyFragmentPayloads(tt.contentType, []byte(tt.body), "session", testCEEPartitionKey)
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("payloads = %#v, want no partitions", got)
+				}
+				return
+			}
+			var values strings.Builder
+			for _, value := range got {
+				values.Write(value)
+			}
+			for _, want := range tt.wantValues {
+				if !strings.Contains(values.String(), want) {
+					t.Fatalf("bucket payloads = %#v, missing %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// Without a key there is no safe bucket map, and the public-digest fallback
+// this replaced was grindable offline in a few thousand candidates. The
+// caller must therefore learn that the body was not partitioned rather than
+// receive buckets it would treat as complete inspection.
+func TestJSONBodyFragmentPayloadsRefuseToPartitionUnkeyed(t *testing.T) {
+	body := []byte(`{"a":"` + testCEEAWSKeyPrefix + testCEEAWSKeySuffix + `"}`)
+
+	keyed, reason := jsonBodyFragmentPayloads("application/json", body, "session", testCEEPartitionKey)
+	if len(keyed) == 0 || reason != "" {
+		t.Fatalf("keyed control = (%#v, %q), want partitions and no shortfall", keyed, reason)
+	}
+
+	for _, key := range [][]byte{nil, {}} {
+		got, reason := jsonBodyFragmentPayloads("application/json", body, "session", key)
+		if got != nil {
+			t.Fatalf("unkeyed payloads = %#v, want no partitions", got)
+		}
+		if reason != ceeJSONPartitionReasonUnkeyed {
+			t.Fatalf("unkeyed reason = %q, want %q", reason, ceeJSONPartitionReasonUnkeyed)
+		}
+	}
+}
+
+// The bucket map is per session, so a path an attacker ground into a chosen
+// bucket under one session identity does not land in that bucket under
+// another. Same path, same session is still stable, which is the only
+// property cross-request reassembly actually needs.
+func TestJSONBodyFragmentPayloadsBucketMapIsPerSession(t *testing.T) {
+	body := []byte(`{"a":"value"}`)
+
+	first, _ := jsonBodyFragmentPayloads("application/json", body, "session-a", testCEEPartitionKey)
+	repeat, _ := jsonBodyFragmentPayloads("application/json", body, "session-a", testCEEPartitionKey)
+	other, _ := jsonBodyFragmentPayloads("application/json", body, "session-b", testCEEPartitionKey)
+
+	bucketOf := func(payloads map[string][]byte) string {
+		for bucket := range payloads {
+			return bucket
+		}
+		return ""
+	}
+	if bucketOf(first) == "" || bucketOf(first) != bucketOf(repeat) {
+		t.Fatalf("same session buckets = %q and %q, want one stable bucket", bucketOf(first), bucketOf(repeat))
+	}
+	if bucketOf(other) == bucketOf(first) {
+		t.Fatalf("session-b reused session-a's bucket %q; a ground path would carry across identities", bucketOf(first))
+	}
+}
+
+func TestResetCEEStateClearsJSONBodyStreams(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	fb := scanner.NewFragmentBuffer(1024, 10, 60)
+	sessionKey := CeeSessionKey(testCEEAgent, testCEEClientIP)
+	buckets, _ := jsonBodyFragmentPayloads("application/json", []byte(`{"messages":[{"content":"value"}]}`), sessionKey, testCEEPartitionKey)
+	if len(buckets) != 1 {
+		t.Fatalf("bucket count = %d, want 1", len(buckets))
+	}
+	var bucket string
+	for bucket = range buckets {
+	}
+	bodyKey := ceeJSONBodyFragmentSessionKey(sessionKey, bucket)
+
+	if result := fb.Append(testCEEIdentity(bodyKey), []byte(testCEEAWSKeyPrefix)); result.CapacityExceeded {
+		t.Fatal("first body fragment exceeded capacity")
+	}
+	if result := fb.Append(testCEEIdentity(bodyKey), []byte(testCEEAWSKeySuffix)); result.CapacityExceeded {
+		t.Fatal("second body fragment exceeded capacity")
+	}
+	if matches := fb.ScanForSecrets(t.Context(), testCEEStream(bodyKey), sc); len(matches) == 0 {
+		t.Fatal("control did not reassemble the JSON body stream")
+	}
+
+	if result := fb.Append(testCEEIdentity(bodyKey), []byte(testCEEAWSKeyPrefix)); result.CapacityExceeded {
+		t.Fatal("post-control first fragment exceeded capacity")
+	}
+	ResetCEEState(testCEEAgent, testCEEClientIP, nil, fb)
+	if result := fb.Append(testCEEIdentity(bodyKey), []byte(testCEEAWSKeySuffix)); result.CapacityExceeded {
+		t.Fatal("post-reset second fragment exceeded capacity")
+	}
+	if matches := fb.ScanForSecrets(t.Context(), testCEEStream(bodyKey), sc); len(matches) != 0 {
+		t.Fatalf("reset retained JSON body fragments: %#v", matches)
+	}
+}
+
+// The ownership guard's failure direction, at the gate rather than the buffer.
+// A stream that already holds another identity's evidence cannot accept this
+// request's fragment, and the request must be reported as uninspected instead
+// of being scanned against a blend of two clients' data. Unreachable through
+// production keys, which embed the session key, so it is driven here by
+// seeding the exact key the gate will use under a different owner.
+func TestCEEFragmentOwnerMismatchFailsClosed(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.Action = config.ActionBlock
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = false
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 1024
+	maxSessions := 10
+	cfg.CrossRequestDetection.FragmentReassembly.MaxSessions = &maxSessions
+	cfg.ApplyDefaults()
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	fb := scanner.NewFragmentBuffer(1024, 10, 300)
+	t.Cleanup(fb.Close)
+	logger := audit.NewNop()
+	m := metrics.New()
+
+	const sessionKey = "victim-session"
+	admit := func() ceeResult {
+		return ceeAdmit(t.Context(), ceeAdmitOptions{
+			Outbound: []byte("ordinary"),
+			ClientIP: sessionKey, TargetURL: "http://api.vendor.example", Config: cfg.CrossRequestDetection,
+			Fragments: fb, Scanner: sc, Logger: logger, Metrics: m,
+		})
+	}
+
+	// Control: the same call is admitted when the stream is unclaimed, so a
+	// block below is attributable to ownership and not to the setup.
+	if control := admit(); control.Blocked {
+		t.Fatalf("unclaimed stream = %+v, want admission", control)
+	}
+
+	fb.Close()
+	foreign := testCEEIdentity("victim")
+	if seeded := fb.AppendOwned(foreign, foreign.Stream("-session"), []byte("foreign")); seeded.OwnerMismatch || seeded.CapacityExceeded {
+		t.Fatalf("seeding a foreign-owned stream = %+v, want admission", seeded)
+	}
+	result := admit()
+	if !result.Blocked {
+		t.Fatalf("foreign-owned stream = %+v, want fail-closed block", result)
+	}
+	if result.Reason != ceereason.ClientOwnerMismatch {
+		t.Fatalf("reason = %q, want it to name the ownership conflict", result.Reason)
+	}
+	// The remedy must not point at a tunable: no configuration permits blending
+	// two identities' fragments, so naming one would teach the operator that
+	// policy changed when nothing did.
+	if strings.Contains(result.Reason, "max_sessions") {
+		t.Fatalf("reason = %q, must not name a control that cannot fix this", result.Reason)
+	}
+	// The counter is the operator's only signal that this happened, so the block
+	// and the record are asserted together. Their MCP twin asserts the same
+	// thing; a signal proven on one transport and not the other is how a gap
+	// survives a review.
+	if got := testutil.ToFloat64(m.CrossRequestFragmentOwnerMismatch); got != 1 {
+		t.Fatalf("owner mismatch counter = %v, want 1; the block is invisible to an operator without it", got)
+	}
+}
+
+func TestCEEFragmentGlobalCapacityFailsClosed(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.Action = config.ActionBlock
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = false
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 1024
+	ledgerSlots := 3
+	cfg.CrossRequestDetection.FragmentReassembly.MaxSessions = &ledgerSlots
+	cfg.ApplyDefaults()
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	fb := scanner.NewFragmentBuffer(1024, 3, 300)
+	t.Cleanup(fb.Close)
+	logger := audit.NewNop()
+	m := metrics.New()
+
+	admit := func(sessionKey string, buckets map[string][]byte) ceeResult {
+		return ceeAdmit(t.Context(), ceeAdmitOptions{
+			Outbound: []byte("ordinary"), BodyFragmentPayloads: buckets,
+			ClientIP: sessionKey, TargetURL: "http://api.vendor.example", Config: cfg.CrossRequestDetection,
+			Fragments: fb, Scanner: sc, Logger: logger, Metrics: m,
+		})
+	}
+
+	// One identity holding many bucket streams must NOT exhaust the ledger.
+	// This is the availability finding this branch exists to fix: charging the
+	// ledger per stream let one client take 4,099 of 10,000 slots, so about
+	// three clients denied everyone else a fragment stream.
+	crowded := admit("client-a", map[string][]byte{
+		"$/a": []byte("ordinary"), "$/b": []byte("ordinary"), "$/c": []byte("ordinary"),
+		"$/d": []byte("ordinary"), "$/e": []byte("ordinary"),
+	})
+	if crowded.Blocked {
+		t.Fatalf("one identity with five bucket streams = %+v, want admission on a single ledger slot", crowded)
+	}
+
+	// The ledger still bounds IDENTITIES, and exhausting it fails closed for a
+	// new one rather than skipping inspection. A skip was the bypass a previous
+	// round introduced here, so the direction is the whole point.
+	for _, session := range []string{"client-b", "client-c"} {
+		if result := admit(session, map[string][]byte{"$/a": []byte("ordinary")}); result.Blocked {
+			t.Fatalf("identity %q = %+v, want admission below the identity cap", session, result)
+		}
+	}
+	overflow := admit("client-d", map[string][]byte{"$/a": []byte("ordinary")})
+	if !overflow.Blocked {
+		t.Fatalf("new identity beyond the ledger = %+v, want fail-closed block", overflow)
+	}
+}
+
+func BenchmarkExtractOutboundPayloadsJSONFields(b *testing.B) {
+	padding := strings.Repeat("ordinary prose ", ceeForwardConversationPaddingBytes/len("ordinary prose "))
+	body := `{"messages":[{"role":"user","content":"fragment"}],"history":"` + padding + `"}`
+	b.ReportAllocs()
+	for b.Loop() {
+		req := &http.Request{
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			URL:           &url.URL{},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		payloads := extractOutboundPayloads(req, true, "session", testCEEPartitionKey)
+		if len(payloads.bodyFragmentPayloads) != 3 {
+			b.Fatalf("body field streams = %d, want 3", len(payloads.bodyFragmentPayloads))
+		}
+	}
+}
+
+func BenchmarkExtractOutboundPayloadsJSONFieldsDisabled(b *testing.B) {
+	padding := strings.Repeat("ordinary prose ", ceeForwardConversationPaddingBytes/len("ordinary prose "))
+	body := `{"messages":[{"role":"user","content":"fragment"}],"history":"` + padding + `"}`
+	b.ReportAllocs()
+	for b.Loop() {
+		req := &http.Request{
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			URL:           &url.URL{},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		payloads := extractOutboundPayloads(req, false, "session", testCEEPartitionKey)
+		if len(payloads.bodyFragmentPayloads) != 0 {
+			b.Fatalf("disabled body field streams = %d, want 0", len(payloads.bodyFragmentPayloads))
+		}
+	}
+}
+
+func TestExtractOutboundPayloadsDisabledSkipsJSONPartitioning(t *testing.T) {
+	body := `{"messages":[{"content":"fragment"}]}`
+	req := &http.Request{
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		URL:           &url.URL{},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	payloads := extractOutboundPayloads(req, false, "session", testCEEPartitionKey)
+	if len(payloads.bodyFragmentPayloads) != 0 {
+		t.Fatalf("disabled body field streams = %d, want 0", len(payloads.bodyFragmentPayloads))
+	}
+	if got := string(payloads.outbound); got != body {
+		t.Fatalf("disabled raw outbound = %q, want %q", got, body)
+	}
+}
+
+func TestExtractOutboundPayload_ZeroContentLength(t *testing.T) {
+	// ContentLength == 0 should skip body reading even if Body is non-nil.
+	r := &http.Request{
+		URL:           &url.URL{},
+		Body:          io.NopCloser(strings.NewReader("should not be read")),
+		ContentLength: 0,
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	if len(payload) != 0 {
+		t.Errorf("expected empty payload for zero content-length, got %q", string(payload))
+	}
+}
+
+func TestCeeRecordSignals_BothHits(t *testing.T) {
+	cfg := &config.SessionProfiling{
+		Enabled:                true,
+		AnomalyAction:          "warn",
+		DomainBurst:            5,
+		WindowMinutes:          5,
+		MaxSessions:            100,
+		SessionTTLMinutes:      30,
+		CleanupIntervalSeconds: 60,
+	}
+	m := metrics.New()
+	sm := NewSessionManager(cfg, nil, m)
+	defer sm.Close()
+
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	result := ceeResult{
+		EntropyHit:  true,
+		FragmentHit: true,
+		Blocked:     true,
+	}
+
+	// Fragment DLP contributes three points; entropy is score-neutral.
+	threshold := 1.0
+	ceeRecordSignals(result, sm, testCEESessionKey, threshold, logger, m, testCEEClientIP, testCEERequestID)
+
+	sess := sm.GetOrCreate(testCEESessionKey)
+	score := sess.ThreatScore()
+	if score != 3.0 {
+		t.Errorf("expected fragment-only threat score 3.0, got %.1f", score)
+	}
+}
+
+func TestCeeRecordSignals_NoHits(t *testing.T) {
+	cfg := &config.SessionProfiling{
+		Enabled:                true,
+		AnomalyAction:          "warn",
+		DomainBurst:            5,
+		WindowMinutes:          5,
+		MaxSessions:            100,
+		SessionTTLMinutes:      30,
+		CleanupIntervalSeconds: 60,
+	}
+	m := metrics.New()
+	sm := NewSessionManager(cfg, nil, m)
+	defer sm.Close()
+
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	result := ceeResult{
+		EntropyHit:  false,
+		FragmentHit: false,
+	}
+
+	ceeRecordSignals(result, sm, testCEESessionKey, 5.0, logger, m, testCEEClientIP, testCEERequestID)
+
+	sess := sm.GetOrCreate(testCEESessionKey)
+	score := sess.ThreatScore()
+	if score != 0 {
+		t.Errorf("expected threat score 0 for no hits, got %.1f", score)
+	}
+}
+
+func TestCeeRecordSignals_NilSessionManager(t *testing.T) {
+	// Nil session manager should be a no-op (no panic).
+	result := ceeResult{EntropyHit: true, FragmentHit: true}
+	ceeRecordSignals(result, nil, testCEESessionKey, 5.0, nil, nil, testCEEClientIP, testCEERequestID)
+}
+
+func TestCEERecordSignalsAndBlockAll_UsesCEEKey(t *testing.T) {
+	cfg := &config.SessionProfiling{
+		Enabled:                true,
+		AnomalyAction:          "warn",
+		DomainBurst:            5,
+		WindowMinutes:          5,
+		MaxSessions:            100,
+		SessionTTLMinutes:      30,
+		CleanupIntervalSeconds: 60,
+	}
+	m := metrics.New()
+	sm := NewSessionManager(cfg, nil, m)
+	defer sm.Close()
+
+	adaptiveCfg := config.AdaptiveEnforcement{
+		Enabled:             true,
+		EscalationThreshold: 3.0,
+	}
+	adaptiveCfg.Levels.Elevated.BlockAll = ptrBool(true)
+
+	rawKey := CeeSessionKey("rotated-agent", testCEEClientIP)
+	foldedKey := testCEEClientIP
+	if rawKey == foldedKey {
+		t.Fatalf("test setup: raw and folded keys must differ")
+	}
+
+	rec, blocked := ceeRecordSignalsAndBlockAll(ceeSignalParams{
+		Result: ceeResult{FragmentHit: true, Blocked: true}, Sessions: sm, SessionKey: foldedKey,
+		AdaptiveCfg: &adaptiveCfg, Logger: audit.NewNop(), Metrics: m,
+		ClientIP: testCEEClientIP, RequestID: testCEERequestID,
+	})
+	if !blocked {
+		t.Fatal("CEE fragment signal should escalate the folded session to block_all")
+	}
+	if recEscalationLevel(rec) == 0 {
+		t.Fatal("folded CEE recorder was not escalated")
+	}
+	if rawLevel := sm.GetOrCreate(rawKey).EscalationLevel(); rawLevel != 0 {
+		t.Fatalf("raw per-agent recorder should not receive folded CEE signals, got level %d", rawLevel)
+	}
+}
+
+func TestCEEEntropyOnlyDoesNotScore(t *testing.T) {
+	cfg := &config.SessionProfiling{Enabled: true, MaxSessions: 100, SessionTTLMinutes: 30, CleanupIntervalSeconds: 60}
+	sm := NewSessionManager(cfg, nil, metrics.New())
+	defer sm.Close()
+	key := "entropy-only-session"
+	rec := ceeRecordSignals(ceeResult{EntropyHit: true}, sm, key, 1, audit.NewNop(), metrics.New(), testCEEClientIP, testCEERequestID)
+	if rec == nil || rec.ThreatScore() != 0 {
+		t.Fatalf("entropy-only CEE score = %v, want 0", rec)
+	}
+	ceeRecordSignals(ceeResult{EntropyHit: true, FragmentHit: true, Blocked: true}, sm, key, 1, audit.NewNop(), metrics.New(), testCEEClientIP, testCEERequestID)
+	if rec.ThreatScore() == 0 {
+		t.Fatal("fragment DLP in mixed CEE result must still score")
+	}
+}
+
+// --- ceeAdmit unit tests ---
+
+func TestCeeAdmit_EmptyOutbound(t *testing.T) {
+	// Empty outbound should return clean result immediately.
+	ceeCfg := config.CrossRequestDetection{
+		EntropyBudget: config.CrossRequestEntropyBudget{Enabled: true},
+	}
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg})
+	if result.Blocked || result.EntropyHit || result.FragmentHit {
+		t.Error("expected clean result for empty outbound")
+	}
+
+	// Also test zero-length slice.
+	result = ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte{}, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg})
+	if result.Blocked || result.EntropyHit || result.FragmentHit {
+		t.Error("expected clean result for zero-length outbound")
+	}
+}
+
+func TestCeeAdmit_EntropyBudgetBlock(t *testing.T) {
+	// 1-bit budget: any real payload exceeds immediately.
+	et := scanner.NewEntropyTracker(1.0, 300)
+	defer et.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1.0,
+			WindowMinutes: 5,
+			Action:        config.ActionBlock,
+		},
+	}
+
+	payload := []byte("some outbound data with entropy")
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: payload, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
+	if !result.Blocked {
+		t.Fatal("expected block on entropy budget exceeded")
+	}
+	if !result.EntropyHit {
+		t.Error("expected EntropyHit = true")
+	}
+	if result.Reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+func TestCeeAdmit_EntropyBudgetWarn(t *testing.T) {
+	// Warn mode: detect but don't block.
+	et := scanner.NewEntropyTracker(1.0, 300)
+	defer et.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1.0,
+			WindowMinutes: 5,
+			Action:        config.ActionWarn,
+		},
+	}
+
+	payload := []byte("outbound data that exceeds budget")
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: payload, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
+	if result.Blocked {
+		t.Error("expected no block in warn mode")
+	}
+	if !result.EntropyHit {
+		t.Error("expected EntropyHit = true even in warn mode")
+	}
+}
+
+// TestCeeAdmit_EntropyBudgetActionWinsOverSectionAction is the production-
+// behavior proof behind the config action-divergence advisory in
+// internal/config/action_divergence.go. The sibling tests above set only the
+// entropy-budget action and leave the section action empty, so none of them
+// covers the case an operator actually hits: the section set to block while
+// the nested budget stays warn, which is what configs/strict.yaml ships.
+//
+// The advisory claims the child action decides. This asserts that against the
+// real admit path rather than against YAML: a crossing is detected and
+// recorded, and the request is still forwarded.
+//
+// NON-VACUITY: point the consumer at internal/proxy/cee.go:381 to the section
+// action (ceeCfg.Action instead of ceeCfg.EntropyBudget.Action) and this test
+// must fail by blocking. If it still passes, the advisory is describing
+// something that is not happening.
+func TestCeeAdmit_EntropyBudgetActionWinsOverSectionAction(t *testing.T) {
+	// 1-bit budget: any real payload exceeds immediately.
+	et := scanner.NewEntropyTracker(1.0, 300)
+	defer et.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		Enabled: true,
+		// The operator configured enforcement at the section level.
+		Action: config.ActionBlock,
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1.0,
+			WindowMinutes: 5,
+			// The nested sub-detector is weaker, and it is the one consulted.
+			Action: config.ActionWarn,
+		},
+	}
+
+	payload := []byte("outbound data that exceeds budget")
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: payload, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
+
+	if result.Blocked {
+		t.Fatal("entropy budget action warn must decide; a section action of block does not apply to budget crossings")
+	}
+	if !result.EntropyHit {
+		t.Error("expected EntropyHit = true: the crossing is detected and recorded, it is simply not enforced")
+	}
+}
+
+func TestCeeAdmit_FragmentDLPBlock(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	fb := scanner.NewFragmentBuffer(65536, 1000, 300)
+	defer fb.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionBlock,
+	}
+
+	// Split fake AWS key across two ceeAdmit calls.
+	part1 := "AKI" + "A"
+	part2 := "IOSF" + "ODNN7EXAMPLE"
+
+	result1 := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(part1), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if result1.Blocked {
+		t.Fatal("first fragment should not block")
+	}
+
+	result2 := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(part2), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if !result2.Blocked {
+		t.Fatal("expected block after fragment reassembly completes secret")
+	}
+	if !result2.FragmentHit {
+		t.Error("expected FragmentHit = true")
+	}
+}
+
+func TestCeeAdmit_FragmentSessionCapacityFailsClosedAndCounts(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+
+	fb := scanner.NewFragmentBuffer(65536, 1, 300)
+	t.Cleanup(fb.Close)
+	trusted := testCEEIdentity(testCEEClientIP)
+	if result := fb.Append(trusted, []byte("first fragment")); result.CapacityExceeded {
+		t.Fatal("trusted session did not fit")
+	}
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+	ceeCfg := config.CrossRequestDetection{
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionWarn,
+	}
+
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte("new fragment"), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: "new-client", RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	// The client reason is deliberately neutral: the capacity knob stays in the
+	// operator log and audit record. The receipt-facing evidence is BlockKind.
+	if !result.Blocked || result.Reason != "cross-request inspection capacity exhausted" {
+		t.Fatalf("capacity result = %+v, want neutral fail-closed capacity denial", result)
+	}
+	if result.BlockKind != ceeBlockKindSessionCapacity {
+		t.Fatalf("capacity BlockKind = %q, want %q", result.BlockKind, ceeBlockKindSessionCapacity)
+	}
+	established := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte("second fragment"), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if established.Blocked {
+		t.Fatalf("established session = %+v, want admission at capacity", established)
+	}
+	assertMetricsContain(t, m, "pipelock_cross_request_fragment_session_capacity_exceeded_total 1")
+}
+
+func TestCeeFragmentScanSegments_NilPayloadNoop(t *testing.T) {
+	result := ceeFragmentScanSegments(t.Context(), "session", nil, ceeStreamContext{
+		TargetURL: "http://example.com", Agent: testCEEAgent,
+		ClientIP: testCEEClientIP, RequestID: testCEERequestID,
+	})
+	if result != nil {
+		t.Fatalf("nil path payload = %+v, want no CEE result", result)
+	}
+}
+
+func TestCeeAdmit_FragmentDLPWarn(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	fb := scanner.NewFragmentBuffer(65536, 1000, 300)
+	defer fb.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionWarn, // warn, not block
+	}
+
+	// Split fake AWS key across two requests for cross-request detection.
+	// Single-request secrets are caught by body DLP, not fragment reassembly.
+	prefix := "AKI" + "A"
+	suffix := "IOSF" + "ODNN7EXAMPLE"
+
+	// First request - prefix only.
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(prefix), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if result.FragmentHit {
+		t.Error("prefix alone should not trigger FragmentHit")
+	}
+
+	// Second request - suffix completes the secret across fragments.
+	result = ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(suffix), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: "req-2", Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if result.Blocked {
+		t.Error("expected no block in warn mode")
+	}
+	if !result.FragmentHit {
+		t.Error("expected FragmentHit for cross-request secret in warn mode")
+	}
+}
+
+func TestCeeAdmit_SingleBodyNoFragmentHit(t *testing.T) {
+	// A complete secret in a single request body should NOT trigger FragmentHit.
+	// Body DLP already catches it; double-scoring causes adaptive death spiral.
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	fb := scanner.NewFragmentBuffer(65536, 1000, 300)
+	defer fb.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionWarn,
+	}
+
+	fakeKey := "AKI" + "A" + "IOSF" + "ODNN7EXAMPLE"
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(fakeKey), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if result.FragmentHit {
+		t.Error("single-body secret should NOT trigger FragmentHit (body DLP handles it)")
+	}
+}
+
+func TestCeeAdmit_BothEntropyAndFragment(t *testing.T) {
+	// When entropy is warn and fragment is block, entropy fires first (warn,
+	// no block), then fragment fires and blocks.
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	et := scanner.NewEntropyTracker(1.0, 300) // tiny budget
+	defer et.Close()
+	fb := scanner.NewFragmentBuffer(65536, 1000, 300)
+	defer fb.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1.0,
+			WindowMinutes: 5,
+			Action:        config.ActionWarn, // entropy warns
+		},
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionBlock, // fragment blocks
+	}
+
+	// First request - prefix only. Entropy will fire on this one (tiny budget).
+	prefix := "AKI" + "A"
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(prefix), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if !result.EntropyHit {
+		t.Error("expected EntropyHit = true on first request (tiny budget)")
+	}
+
+	// Second request - suffix completes secret across fragments AND entropy.
+	suffix := "IOSF" + "ODNN7EXAMPLE"
+	result = ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte(suffix), TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: "req-2", Config: ceeCfg, Entropy: et, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if !result.FragmentHit {
+		t.Error("expected FragmentHit = true for cross-request secret")
+	}
+	if !result.Blocked {
+		t.Error("expected block from fragment DLP")
+	}
+	if result.Reason == "" {
+		t.Error("expected non-empty reason")
+	}
+}
+
+// --- updateCEEStats tests ---
+
+func TestUpdateCEEStats_WithTrackerAndBuffer(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	m := metrics.New()
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	defer p.Close()
+
+	// Hit the /stats endpoint and parse CEE data from JSON.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	m.StatsHandler().ServeHTTP(rec, req)
+
+	var resp struct {
+		CEE metrics.CEEStats `json:"cross_request_detection"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if !resp.CEE.EntropyTrackerActive {
+		t.Error("expected EntropyTrackerActive = true")
+	}
+	if !resp.CEE.FragmentBufferActive {
+		t.Error("expected FragmentBufferActive = true")
+	}
+	if resp.CEE.FragmentBufferBytes != 0 {
+		t.Errorf("expected 0 fragment bytes, got %d", resp.CEE.FragmentBufferBytes)
+	}
+}
+
+func TestUpdateCEEStats_Disabled(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg.CrossRequestDetection.Enabled = false
+
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	m := metrics.New()
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	defer p.Close()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	m.StatsHandler().ServeHTTP(rec, req)
+
+	var resp struct {
+		CEE metrics.CEEStats `json:"cross_request_detection"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if resp.CEE.EntropyTrackerActive {
+		t.Error("expected EntropyTrackerActive = false when disabled")
+	}
+	if resp.CEE.FragmentBufferActive {
+		t.Error("expected FragmentBufferActive = false when disabled")
+	}
+}
+
+// --- queryParamPayload determinism test ---
+
+func TestQueryParamPayload_WireOrder(t *testing.T) {
+	// Keys in reverse alphabetical order to prove wire-order preservation.
+	u := &url.URL{RawQuery: "z=last&a=first&m=middle"}
+	payload := queryParamPayload(u)
+	got := string(payload)
+
+	// Wire order preserved, values only (keys excluded for fragment contiguity).
+	want := "lastfirstmiddle"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q (wire order)", got, want)
+	}
+}
+
+func TestQueryParamPayload_MultipleValues(t *testing.T) {
+	u := &url.URL{RawQuery: "k=v1&k=v2&k=v3"}
+	payload := queryParamPayload(u)
+	got := string(payload)
+
+	// Values only: "v1" + "v2" + "v3".
+	want := "v1v2v3"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q", got, want)
+	}
+}
+
+func TestQueryParamPayload_Empty(t *testing.T) {
+	u := &url.URL{}
+	payload := queryParamPayload(u)
+	if payload != nil {
+		t.Errorf("expected nil for empty query, got %q", string(payload))
+	}
+}
+
+// --- queryParamKeys tests ---
+
+func TestQueryParamKeys_WireOrder(t *testing.T) {
+	u := &url.URL{RawQuery: "z=last&a=first&m=middle"}
+	got := string(queryParamKeys(u))
+	want := "zam"
+	if got != want {
+		t.Errorf("queryParamKeys = %q, want %q (wire order)", got, want)
+	}
+}
+
+func TestQueryParamKeys_BareTokenExcluded(t *testing.T) {
+	// Bare tokens (no '=') are handled by queryParamPayload, not keys.
+	u := &url.URL{RawQuery: "baretoken&key=val"}
+	got := string(queryParamKeys(u))
+	want := "key"
+	if got != want {
+		t.Errorf("queryParamKeys = %q, want %q (bare tokens excluded)", got, want)
+	}
+}
+
+func TestQueryParamKeys_SecretInKeys(t *testing.T) {
+	// Secret split across parameter keys: ?AKIA=1&IOSFODNN7EXAMPLE=2
+	u := &url.URL{RawQuery: "AKI" + "A" + "=1&" + "IOSF" + "ODNN7EXAMPLE" + "=2"}
+	got := string(queryParamKeys(u))
+	want := "AKI" + "A" + "IOSF" + "ODNN7EXAMPLE"
+	if got != want {
+		t.Errorf("queryParamKeys = %q, want %q (secret in keys)", got, want)
+	}
+}
+
+func TestQueryParamKeys_Empty(t *testing.T) {
+	u := &url.URL{}
+	keys := queryParamKeys(u)
+	if keys != nil {
+		t.Errorf("expected nil for empty query, got %q", string(keys))
+	}
+}
+
+func TestQueryParamKeys_EmptyKeyNames(t *testing.T) {
+	// =val has empty key, should be skipped.
+	u := &url.URL{RawQuery: "=val&k=v"}
+	got := string(queryParamKeys(u))
+	want := "k"
+	if got != want {
+		t.Errorf("queryParamKeys = %q, want %q", got, want)
+	}
+}
+
+// --- ceeAdmit key-fragment reconstruction test ---
+
+func TestCeeAdmit_KeyFragmentDLPBlock(t *testing.T) {
+	// Secret split across query parameter keys, detected via key-fragment
+	// stream in ceeAdmit. Simulates ?AKIA=1 then ?IOSFODNN7EXAMPLE=2.
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	fb := scanner.NewFragmentBuffer(65536, 1000, 300)
+	defer fb.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionBlock,
+	}
+
+	keyPart1 := []byte("AKI" + "A")
+	keyPart2 := []byte("IOSF" + "ODNN7EXAMPLE")
+
+	// Request 1: first key fragment.
+	result1 := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte("1"), KeyPayload: keyPart1, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if result1.Blocked {
+		t.Fatal("first key fragment should not block")
+	}
+
+	// Request 2: second key fragment completes the secret.
+	result2 := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte("2"), KeyPayload: keyPart2, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if !result2.Blocked {
+		t.Fatal("expected block after key-fragment reassembly completes secret")
+	}
+	if !result2.FragmentHit {
+		t.Error("expected FragmentHit = true")
+	}
+}
+
+func TestCeeAdmit_KeyEntropyTracked(t *testing.T) {
+	// High-entropy query keys (not matching DLP patterns) must still trigger
+	// entropy budget. Without this, ?x7k9mQ2pR4wL8nJ5=1 contributes zero
+	// entropy even though the key carries the exfiltrated data.
+	et := scanner.NewEntropyTracker(1.0, 300) // 1-bit budget
+	defer et.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1.0,
+			WindowMinutes: 5,
+			Action:        config.ActionBlock,
+		},
+	}
+
+	// keyPayload carries all the entropy; outbound value is just "1".
+	keyPayload := []byte("x7k9mQ2pR4wL8nJ5vB3cT6yH0")
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: []byte("1"), KeyPayload: keyPayload, TargetURL: "http://example.com", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
+	if !result.Blocked {
+		t.Fatal("expected block: high-entropy key payload should exceed 1-bit budget")
+	}
+	if !result.EntropyHit {
+		t.Error("expected EntropyHit = true")
+	}
+}
+
+// --- urlPayload tests ---
+
+func TestUrlPayload_PathAndQuery(t *testing.T) {
+	// Path is excluded from this stream; it is carried by pathSegments instead.
+	u := &url.URL{Path: "/api/v1/tokens", RawQuery: "key=value"}
+	got := string(urlPayload(u))
+	want := testCEEParamValue
+	if got != want {
+		t.Errorf("urlPayload = %q, want %q", got, want)
+	}
+}
+
+func TestUrlPayload_PathOnly(t *testing.T) {
+	// Path-only URLs produce nil payload (path excluded from fragment buffer).
+	u := &url.URL{Path: "/api/data"}
+	payload := urlPayload(u)
+	if payload != nil {
+		t.Errorf("expected nil for path-only URL, got %q", string(payload))
+	}
+}
+
+func TestUrlPayload_RootPathOnly(t *testing.T) {
+	// Bare root "/" is excluded (no useful payload).
+	u := &url.URL{Path: "/"}
+	payload := urlPayload(u)
+	if payload != nil {
+		t.Errorf("expected nil for root path, got %q", string(payload))
+	}
+}
+
+func TestUrlPayload_QueryOnly(t *testing.T) {
+	u := &url.URL{RawQuery: "a=1&b=2"}
+	got := string(urlPayload(u))
+	want := "12"
+	if got != want {
+		t.Errorf("urlPayload = %q, want %q", got, want)
+	}
+}
+
+func TestExtractOutboundPayload_ExcludesPath(t *testing.T) {
+	// Path is excluded from this stream; it is carried by pathSegments instead.
+	r := &http.Request{
+		URL: &url.URL{
+			Path:     "/api/secret-data",
+			RawQuery: "key=value",
+		},
+	}
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
+	got := string(payload)
+	want := testCEEParamValue
+	if got != want {
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, want)
+	}
+}
+
+// --- Path-split secret regression tests ---
+
+func TestCeeAdmit_EntropyBudgetRecordsOutboundBytes(t *testing.T) {
+	// Tests the entropy-budget path directly with representative outbound bytes.
+	// HTTP handlers carry URL paths separately, so this is not path coverage.
+	et := scanner.NewEntropyTracker(1.0, 300) // 1-bit budget
+	defer et.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1.0,
+			WindowMinutes: 5,
+			Action:        config.ActionBlock,
+		},
+	}
+
+	outbound := []byte("opaque-outbound-x7k9mQ2pR4wL8nJ5")
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: outbound, TargetURL: "http://example.com/api/tokens/x7k9mQ2pR4wL8nJ5", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
+	if !result.Blocked {
+		t.Fatal("expected block: high-entropy outbound bytes should exceed 1-bit budget")
+	}
+	if !result.EntropyHit {
+		t.Error("expected EntropyHit = true")
+	}
+}
+
+func TestCeeAdmit_OutboundFragmentReassemblySecret(t *testing.T) {
+	// Named for what it proves: fragment-reassembly DLP over the Outbound
+	// byte stream. The fixture bytes are path-shaped, but production sends
+	// URL paths through PathPayload, not Outbound, so this does NOT cover
+	// HTTP path or query handling. Renamed from PathQueryBoundarySecret,
+	// whose name asserted that coverage.
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	fb := scanner.NewFragmentBuffer(65536, 1000, 300)
+	defer fb.Close()
+	m := metrics.New()
+	logger, _ := audit.New("json", "stdout", "", false, false)
+
+	ceeCfg := config.CrossRequestDetection{
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled:        true,
+			MaxBufferBytes: 65536,
+			WindowMinutes:  5,
+		},
+		Action: config.ActionBlock,
+	}
+
+	// First request: secret prefix spans path and query data.
+	// Passed directly to ceeAdmit (not via urlPayload which excludes paths).
+	payload1 := []byte("/check/" + "AKI" + "A" + "IOSF")
+	result1 := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: payload1, TargetURL: "http://example.com/check", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if result1.Blocked {
+		t.Fatal("first fragment should not block")
+	}
+
+	// Second request: remaining secret suffix.
+	payload2 := []byte("ODNN7EXAMPLE1234")
+	result2 := ceeAdmit(context.Background(), ceeAdmitOptions{Outbound: payload2, TargetURL: "http://example.com/data", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Fragments: fb, Scanner: sc, Logger: logger, Metrics: m})
+	if !result2.Blocked {
+		t.Fatal("expected block after fragment reassembly completes secret across path/query boundary")
+	}
+	if !result2.FragmentHit {
+		t.Error("expected FragmentHit = true")
+	}
+}
+
+func TestQueryParamPayload_WireOrderSecretReconstruction(t *testing.T) {
+	// Secret split across two query param values in wire order:
+	// ?b=AKIA&a=IOSFODNN7EXAMPLE → values "AKIA" + "IOSFODNN7EXAMPLE"
+	// contiguous = DLP match. Wire order (not sorted) ensures correct
+	// reconstruction.
+	u := &url.URL{RawQuery: "b=" + "AKI" + "A" + "&a=" + "IOSF" + "ODNN7EXAMPLE"}
+	got := string(queryParamPayload(u))
+	// Values only, contiguous: "AKIA" + "IOSFODNN7EXAMPLE" = full AWS key.
+	want := "AKI" + "A" + "IOSF" + "ODNN7EXAMPLE"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q (wire order must preserve secret)", got, want)
+	}
+}
+
+func TestQueryParamPayload_BareToken(t *testing.T) {
+	// Bare tokens (no '=') must be included. An agent can exfiltrate secrets
+	// as valueless query params: ?AKIA...EXAMPLE
+	u := &url.URL{RawQuery: "AKI" + "A" + "IOSF" + "ODNN7EXAMPLE"}
+	got := string(queryParamPayload(u))
+	want := "AKI" + "A" + "IOSF" + "ODNN7EXAMPLE"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q", got, want)
+	}
+}
+
+func TestQueryParamPayload_SecretInKey(t *testing.T) {
+	// Secret embedded in the parameter key name: only the value "1" is
+	// extracted. Key-embedded secrets are caught by per-request DLP, which
+	// scans the full URL on every individual request. CEE fragment payloads
+	// intentionally exclude keys to keep values contiguous across requests.
+	u := &url.URL{RawQuery: "AKI" + "A" + "IOSF" + "ODNN7EXAMPLE" + "=1"}
+	got := string(queryParamPayload(u))
+	want := "1"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q", got, want)
+	}
+}
+
+// --- Payload determinism across calls ---
+
+func TestExtractOutboundPayload_Deterministic(t *testing.T) {
+	// Run extraction 100 times to verify deterministic output.
+	// Wire order is inherently stable (RawQuery is a string, not a map).
+	for i := range 100 {
+		r := &http.Request{
+			URL: &url.URL{
+				RawQuery: "z=zval&a=aval&m=mval",
+			},
+		}
+		payload := extractOutboundPayloads(r, false, "", nil).outbound
+		got := string(payload)
+		// Wire order, values only: zval, aval, mval.
+		want := "zvalavalmval"
+		if got != want {
+			t.Errorf("iteration %d: extractOutboundPayloads outbound = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// --- Reload CEE teardown ---
+
+func TestReload_CEETeardownAndRebuild(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	m := metrics.New()
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	defer p.Close()
+
+	getCEEStats := func() metrics.CEEStats {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+		m.StatsHandler().ServeHTTP(rec, req)
+		var resp struct {
+			CEE metrics.CEEStats `json:"cross_request_detection"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode stats: %v", err)
+		}
+		return resp.CEE
+	}
+
+	// Verify initial state has CEE active.
+	stats := getCEEStats()
+	if !stats.EntropyTrackerActive || !stats.FragmentBufferActive {
+		t.Fatal("expected both CEE components active after New()")
+	}
+
+	// Reload with CEE disabled.
+	cfg2 := config.Defaults()
+	cfg2.Internal = nil
+	cfg2.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg2.CrossRequestDetection.Enabled = false
+	sc2 := scanner.MustNew(cfg2)
+
+	p.Reload(cfg2, sc2)
+
+	// After reload, CEE should be inactive.
+	stats = getCEEStats()
+	if stats.EntropyTrackerActive {
+		t.Error("expected EntropyTrackerActive = false after reload with CEE disabled")
+	}
+	if stats.FragmentBufferActive {
+		t.Error("expected FragmentBufferActive = false after reload with CEE disabled")
+	}
+
+	// Reload again with CEE re-enabled.
+	cfg3 := config.Defaults()
+	cfg3.Internal = nil
+	cfg3.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg3.CrossRequestDetection.Enabled = true
+	cfg3.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg3.CrossRequestDetection.FragmentReassembly.Enabled = true
+	sc3 := scanner.MustNew(cfg3)
+
+	p.Reload(cfg3, sc3)
+
+	stats = getCEEStats()
+	if !stats.EntropyTrackerActive || !stats.FragmentBufferActive {
+		t.Error("expected both CEE components active after re-enabling")
+	}
+}
+
+func TestReload_CEEPreservesStateAndAppliesLimits(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 8
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 12
+	cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+
+	sc := scanner.MustNew(cfg)
+	p, err := New(cfg, audit.NewNop(), sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	tracker := p.EntropyTrackerPtr().Load()
+	buffer := p.FragmentBufferPtr().Load()
+	tracker.Record(testCEEIdentity("session"), []byte("abc"))
+	buffer.Append(testCEEIdentity("session"), []byte("first-"))
+
+	unrelated := cfg.Clone()
+	unrelated.KillSwitch.Message = "preserve CEE history"
+	if ok := p.Reload(unrelated, scanner.MustNew(unrelated)); !ok {
+		t.Fatal("unrelated reload failed")
+	}
+	if p.EntropyTrackerPtr().Load() != tracker || p.FragmentBufferPtr().Load() != buffer {
+		t.Fatal("unrelated reload replaced CEE state")
+	}
+	tracker.Record(testCEEIdentity("session"), []byte("abc"))
+	if !tracker.BudgetExceeded(testCEEIdentity("session")) {
+		t.Fatal("unrelated reload cleared entropy history")
+	}
+
+	tuned := unrelated.Clone()
+	tuned.CrossRequestDetection.EntropyBudget.BitsPerWindow = 6
+	tuned.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 8
+	if ok := p.Reload(tuned, scanner.MustNew(tuned)); !ok {
+		t.Fatal("CEE limit reload failed")
+	}
+	if p.EntropyTrackerPtr().Load() != tracker || p.FragmentBufferPtr().Load() != buffer {
+		t.Fatal("CEE limit reload replaced state")
+	}
+	if got := tracker.Budget(); got != 6 {
+		t.Fatalf("entropy budget after reload = %v, want 6", got)
+	}
+	buffer.Append(testCEEIdentity("session"), []byte("second"))
+	if got := buffer.TotalBufferBytes(); got > 8 {
+		t.Fatalf("fragment buffer retained %d bytes after limit reload, want at most 8", got)
+	}
+}
+
+func TestReload_CEEPathPositionStatePersistsAndAppliesLimits(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 32
+	cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	buffer := p.FragmentBufferPtr().Load()
+	const pathKey = "path-session|path"
+	buffer.AppendPathSegments(testCEEIdentity(pathKey), [][]byte{[]byte("upload"), []byte("one")})
+
+	unrelated := cfg.Clone()
+	unrelated.KillSwitch.Message = "preserve path CEE history"
+	if ok := p.Reload(unrelated, scanner.MustNew(unrelated)); !ok {
+		t.Fatal("unrelated reload failed")
+	}
+	if p.FragmentBufferPtr().Load() != buffer {
+		t.Fatal("unrelated reload replaced path CEE state")
+	}
+	buffer.AppendPathSegments(testCEEIdentity(pathKey), [][]byte{[]byte("upload"), []byte("two")})
+	if got, want := buffer.TotalBufferBytes(), len("uploadonetwo"); got != want {
+		t.Fatalf("reload lost path position state: buffered %d bytes, want %d", got, want)
+	}
+
+	tuned := unrelated.Clone()
+	tuned.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 8
+	if ok := p.Reload(tuned, scanner.MustNew(tuned)); !ok {
+		t.Fatal("path CEE limit reload failed")
+	}
+	if retained := buffer.TotalBufferBytes(); retained > 8 {
+		t.Fatalf("path CEE retained %d bytes after limit reload, want at most 8", retained)
+	}
+}
+
+func TestReload_CEEAdmissionSnapshotsPolicyAndStateTogether(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.EntropyBudget.Action = config.ActionBlock
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	admissionLocked := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	p.ceeAdmissionLocked = func() {
+		close(admissionLocked)
+		<-releaseAdmission
+	}
+	t.Cleanup(func() { p.ceeAdmissionLocked = nil })
+	admissionDone := make(chan ceeAdmission, 1)
+	go func() {
+		admissionDone <- p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+			Outbound: []byte("abc"), TargetURL: "https://api.vendor.example",
+			ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+		})
+	}()
+	<-admissionLocked
+
+	// The production admission now owns the read snapshot. A reload cannot
+	// publish its permissive generation until that admission releases it.
+	permissive := cfg.Clone()
+	permissive.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1000
+	reloadLocked := make(chan struct{})
+	p.reloadLocked = func() { close(reloadLocked) }
+	t.Cleanup(func() { p.reloadLocked = nil })
+	reloadDone := make(chan bool, 1)
+	permissiveScanner := scanner.MustNew(permissive)
+	go func() {
+		reloadDone <- p.Reload(permissive, permissiveScanner)
+	}()
+	select {
+	case <-reloadLocked:
+		t.Fatal("permissive reload completed while old CEE snapshot was active")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseAdmission)
+
+	admission := <-admissionDone
+	if !admission.Active || !admission.Result.Blocked || admission.Config.EntropyBudget.BitsPerWindow != 1 {
+		t.Fatalf("old CEE snapshot = %+v", admission)
+	}
+	select {
+	case ok := <-reloadDone:
+		if !ok {
+			t.Fatal("permissive reload failed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("permissive reload remained wedged after the admission released its snapshot")
+	}
+	p.ceeAdmissionLocked = nil
+	admission = p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+		Outbound: []byte(""), TargetURL: "https://api.vendor.example",
+		ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+	})
+	if !admission.Active || admission.Result.Blocked || admission.Config.EntropyBudget.BitsPerWindow != 1000 {
+		t.Fatalf("new CEE snapshot = %+v", admission)
+	}
+}
+
+func TestReload_CEEAdmissionUsesLiveScannerAndMetadata(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.Action = config.ActionBlock
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 1024
+	cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+	cfg.AdaptiveEnforcement.Enabled = true
+	cfg.AdaptiveEnforcement.EscalationThreshold = 100
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	const payload = "reload_secret_"
+	before := p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+		Outbound: []byte(payload), TargetURL: "https://api.vendor.example",
+		ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+	})
+	if !before.Active || before.Result.FragmentHit {
+		t.Fatalf("pre-reload admission = %+v, want no custom-pattern match", before)
+	}
+
+	reloaded := cfg.Clone()
+	reloaded.DLP.Patterns = append(reloaded.DLP.Patterns, config.DLPPattern{
+		Name:     "Reload Canary",
+		Regex:    `reload_secret_[a-z]+`,
+		Severity: "high",
+	})
+	reloaded.AdaptiveEnforcement.EscalationThreshold = 1
+	newScanner := scanner.MustNew(reloaded)
+	if !p.Reload(reloaded, newScanner) {
+		newScanner.Close()
+		t.Fatal("scanner policy reload failed")
+	}
+
+	after := p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+		Outbound: []byte("canary"), TargetURL: "https://api.vendor.example",
+		ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+	})
+	if !after.Active || !after.Result.Blocked || !after.Result.FragmentHit {
+		t.Fatalf("post-reload admission = %+v, want live scanner to block retained canary", after)
+	}
+	if after.PolicyHash != reloaded.CanonicalPolicyHash() || after.AdaptiveConfig.EscalationThreshold != 1 {
+		t.Fatalf("post-reload metadata = hash:%q threshold:%v", after.PolicyHash, after.AdaptiveConfig.EscalationThreshold)
+	}
+}
+
+func TestCurrentCEEEntropySnapshotsAdaptiveGeneration(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.EntropyBudget.Action = config.ActionWarn
+	cfg.SessionProfiling.Enabled = true
+	cfg.AdaptiveEnforcement.Enabled = true
+	cfg.AdaptiveEnforcement.EscalationThreshold = 100
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	const sessionKey = "connect-session"
+	p.entropyTrackerPtr.Load().Record(testCEEIdentity(sessionKey), []byte("high-entropy-payload-abcdefghijklmnop"))
+
+	reloaded := cfg.Clone()
+	reloaded.AdaptiveEnforcement.EscalationThreshold = 1
+	newScanner := scanner.MustNew(reloaded)
+	if !p.Reload(reloaded, newScanner) {
+		newScanner.Close()
+		t.Fatal("adaptive policy reload failed")
+	}
+
+	snapshot := p.currentCEEEntropy(testCEEIdentity(sessionKey))
+	if !snapshot.Active || !snapshot.Exceeded {
+		t.Fatalf("entropy snapshot = %+v, want active exceeded state", snapshot)
+	}
+	if snapshot.AdaptiveConfig.EscalationThreshold != 1 {
+		t.Fatalf("adaptive threshold = %v, want live threshold 1", snapshot.AdaptiveConfig.EscalationThreshold)
+	}
+	if snapshot.Sessions == nil || snapshot.Sessions != p.sessionMgrPtr.Load() {
+		t.Fatal("entropy snapshot did not retain the live session manager")
+	}
+	if snapshot.Recorder == nil || snapshot.Recorder != snapshot.Sessions.GetOrCreate(sessionKey) {
+		t.Fatal("entropy snapshot did not retain the live session recorder")
+	}
+	postRec, postAdaptive := connectPostCEEAdaptiveState(snapshot, nil, config.AdaptiveEnforcement{})
+	if postRec != snapshot.Recorder || postAdaptive.EscalationThreshold != 1 {
+		t.Fatalf("post-CEE state = recorder:%p threshold:%v, want snapshot recorder and threshold 1", postRec, postAdaptive.EscalationThreshold)
+	}
+	fallbackRec := snapshot.Sessions.GetOrCreate("fallback")
+	fallbackCfg := config.AdaptiveEnforcement{Enabled: true, EscalationThreshold: 77}
+	postRec, postAdaptive = connectPostCEEAdaptiveState(ceeEntropySnapshot{}, fallbackRec, fallbackCfg)
+	if postRec != fallbackRec || postAdaptive.EscalationThreshold != 77 {
+		t.Fatalf("inactive post-CEE state = recorder:%p threshold:%v, want fallback", postRec, postAdaptive.EscalationThreshold)
+	}
+}
+
+// --- Fetch CEE integration ---
+
+func TestFetchEndpoint_CEEEntropyBlock(t *testing.T) {
+	upstream := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg.APIAllowlist = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	// 1-bit budget: first request with query params exceeds it.
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1.0
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.EntropyBudget.Action = config.ActionBlock
+
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+	m := metrics.New()
+	p, err := New(cfg, logger, sc, m)
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	defer p.Close()
+
+	// Target URL has query params, which become the outbound entropy payload.
+	targetURL := upstream.URL + "/text?payload=abcdefghijklmnopqrstuvwxyz0123456789"
+
+	// First request: should be blocked because 1-bit budget is exceeded.
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+url.QueryEscape(targetURL), nil)
+	w := httptest.NewRecorder()
+	p.handleFetch(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 from CEE entropy block on first request, got %d (body: %s)", w.Code, w.Body.String())
+	}
+}
+
+func TestCeeEntropyExempt(t *testing.T) {
+	tests := []struct {
+		name   string
+		url    string
+		exempt []string
+		want   bool
+	}{
+		{"exact match", "https://api.telegram.org/bot123/getUpdates", []string{"api.telegram.org"}, true},
+		{"wildcard match", "https://api.minimax.io/v1/chat", []string{"*.minimax.io"}, true},
+		{"no match", "https://evil.com/exfil", []string{"api.telegram.org"}, false},
+		{"empty list", "https://api.telegram.org/bot123/getUpdates", nil, false},
+		{"case insensitive", "https://API.Telegram.Org/bot123", []string{"api.telegram.org"}, true},
+		{"wildcard no match", "https://telegram.org/page", []string{"*.minimax.io"}, false},
+		{"invalid url", "://bad", []string{"bad"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ceeEntropyExempt(tt.url, tt.exempt)
+			if got != tt.want {
+				t.Errorf("ceeEntropyExempt(%q, %v) = %v, want %v", tt.url, tt.exempt, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- queryParamPayload edge cases ---
+
+func TestQueryParamPayload_URLEncodedValue(t *testing.T) {
+	// Percent-encoded value should be decoded before extraction.
+	u := &url.URL{RawQuery: "key=hello%20world"}
+	got := string(queryParamPayload(u))
+	want := "hello world"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q (URL-decoded)", got, want)
+	}
+}
+
+func TestQueryParamPayload_EmptyValueBetweenAmpersands(t *testing.T) {
+	// Empty pairs between ampersands should be skipped.
+	u := &url.URL{RawQuery: "a=1&&b=2"}
+	got := string(queryParamPayload(u))
+	want := "12"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q", got, want)
+	}
+}
+
+func TestQueryParamPayload_AllEmptyValues(t *testing.T) {
+	// key= with no value produces empty string which is skipped.
+	u := &url.URL{RawQuery: "a=&b=&c="}
+	got := queryParamPayload(u)
+	if got != nil {
+		t.Errorf("expected nil for all-empty values, got %q", string(got))
+	}
+}
+
+func TestQueryParamPayload_InvalidPercentEncoding(t *testing.T) {
+	// Invalid percent encoding falls back to raw value.
+	u := &url.URL{RawQuery: "key=%ZZ"}
+	got := string(queryParamPayload(u))
+	want := "%ZZ"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q (raw fallback)", got, want)
+	}
+}
+
+func TestQueryParamPayload_TrailingAmpersand(t *testing.T) {
+	u := &url.URL{RawQuery: "a=1&"}
+	got := string(queryParamPayload(u))
+	want := "1"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q", got, want)
+	}
+}
+
+func TestQueryParamPayload_LeadingAmpersand(t *testing.T) {
+	u := &url.URL{RawQuery: "&a=1"}
+	got := string(queryParamPayload(u))
+	want := "1"
+	if got != want {
+		t.Errorf("queryParamPayload = %q, want %q", got, want)
+	}
+}
+
+func TestQueryParamKeys_InvalidPercentEncoding(t *testing.T) {
+	// Invalid percent encoding in key name falls back to raw value.
+	u := &url.URL{RawQuery: "%ZZ=val"}
+	got := string(queryParamKeys(u))
+	want := "%ZZ"
+	if got != want {
+		t.Errorf("queryParamKeys = %q, want %q (raw fallback)", got, want)
+	}
+}
+
+func TestResetCEEState(t *testing.T) {
+	et := scanner.NewEntropyTracker(1000, 60)
+	defer et.Close()
+	fb := scanner.NewFragmentBuffer(4096, 100, 60)
+	defer fb.Close()
+
+	agent := "my-agent"
+	ip := "10.0.0.1"
+	key := CeeSessionKey(agent, ip)
+	keysKey := key + "|keys"
+	pathKey := key + ceeStreamPathSuffix
+
+	// Build up state.
+	et.Record(testCEEIdentity(key), []byte("high-entropy-payload-abcdefghijklmnop"))
+	fb.Append(testCEEIdentity(key), []byte("fragment-a"))
+	fb.Append(testCEEIdentity(keysKey), []byte("fragment-b"))
+	fb.AppendPathSegments(testCEEIdentity(pathKey), [][]byte{[]byte("upload"), []byte("path-data")})
+
+	if et.CurrentUsage(testCEEIdentity(key)) == 0 {
+		t.Fatal("expected non-zero entropy before reset")
+	}
+
+	ResetCEEState(agent, ip, et, fb)
+
+	if et.CurrentUsage(testCEEIdentity(key)) != 0 {
+		t.Error("entropy should be cleared after reset")
+	}
+	fb.AppendPathSegments(testCEEIdentity(pathKey), [][]byte{[]byte("upload"), []byte("IOSFODNN7EXAMPLE")})
+	sc := scanner.MustNew(config.Defaults())
+	defer sc.Close()
+	if matches := fb.ScanPathForSecrets(t.Context(), testCEEStream(pathKey), sc); len(matches) != 0 {
+		t.Errorf("reset retained path-position fragments: got %d cross-request matches", len(matches))
+	}
+
+	// Verify fragment buffer is cleared: append a partial secret suffix after
+	// reset. If old fragments were still present, concatenation with the old
+	// prefix could produce a match. An empty buffer + this suffix alone cannot.
+	fb.Append(testCEEIdentity(key), []byte("OSFODNN7EXAMPLE"))
+	totalAfter := fb.TotalBufferBytes()
+	// Only post-reset data should be present: the generic suffix plus the
+	// position-aware path's static route and suffix.
+	if totalAfter > len("OSFODNN7EXAMPLE")+len("upload")+len("IOSFODNN7EXAMPLE") {
+		t.Errorf("fragment buffer should be cleared; total bytes %d suggests old data remains", totalAfter)
+	}
+}
+
+func TestResetCEEState_NilTrackers(t *testing.T) {
+	// Should not panic when trackers are nil (CEE disabled).
+	ResetCEEState("agent", "10.0.0.1", nil, nil)
+}
+
+func TestCeeSessionKey_Exported(t *testing.T) {
+	// Verify the exported function works correctly.
+	if got := CeeSessionKey("agent", "10.0.0.1"); got != "agent|10.0.0.1" {
+		t.Errorf("got %q, want agent|10.0.0.1", got)
+	}
+	if got := CeeSessionKey("", "10.0.0.1"); got != "10.0.0.1" {
+		t.Errorf("anonymous: got %q, want 10.0.0.1", got)
+	}
+}
+
+// TestCEEFragmentEvaluate_BlockKindKeysReceiptEvidence proves every CEE denial
+// carries a stable machine token for the signed receipt Pattern field. Client
+// reasons are neutral prose by design, so without this token the receipt would
+// record a sentence and lose which control fired and which pattern matched.
+func TestCEEFragmentEvaluate_BlockKindKeysReceiptEvidence(t *testing.T) {
+	logger := audit.NewNop()
+	sctx := ceeStreamContext{
+		TargetURL: "http://example.com", Agent: testCEEAgent,
+		ClientIP: testCEEClientIP, RequestID: testCEERequestID,
+		Config: config.CrossRequestDetection{Action: config.ActionBlock},
+		Logger: logger, Metrics: metrics.New(),
+	}
+
+	tests := []struct {
+		name     string
+		appended scanner.FragmentAppendResult
+		matches  []scanner.DLPMatch
+		wantKind string
+	}{
+		{name: "depth", appended: scanner.FragmentAppendResult{PathDepthExceeded: true}, wantKind: ceeBlockKindInspectionDepth},
+		{name: "owner mismatch", appended: scanner.FragmentAppendResult{OwnerMismatch: true}, wantKind: ceeBlockKindOwnerMismatch},
+		{name: "capacity", appended: scanner.FragmentAppendResult{CapacityExceeded: true}, wantKind: ceeBlockKindSessionCapacity},
+		{name: "dlp match", matches: []scanner.DLPMatch{{PatternName: "aws_access_key"}}, wantKind: "aws_access_key"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := ceeFragmentEvaluate(context.Background(), tt.appended, tt.matches, sctx)
+			if res == nil || !res.Blocked {
+				t.Fatalf("result = %+v, want a block", res)
+			}
+			if res.BlockKind != tt.wantKind {
+				t.Fatalf("BlockKind = %q, want %q", res.BlockKind, tt.wantKind)
+			}
+			pattern := ceeReceiptPattern(*res)
+			if pattern != tt.wantKind {
+				t.Fatalf("receipt pattern = %q, want %q", pattern, tt.wantKind)
+			}
+			if strings.Contains(pattern, " ") {
+				t.Fatalf("receipt pattern must be a machine token, got prose: %q", pattern)
+			}
+		})
+	}
+}

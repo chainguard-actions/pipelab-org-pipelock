@@ -1,0 +1,940 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package projectscan
+
+import (
+	"encoding/binary"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+)
+
+const testHostilePkg = "obliteratus"
+
+func TestDetectAgent_ClaudeCode_DotClaude(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".claude"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentClaudeCode {
+		t.Errorf("detectAgent = %q, want %q", got, AgentClaudeCode)
+	}
+}
+
+func TestDetectAgent_ClaudeCode_CLAUDE_MD(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "CLAUDE.md"), []byte("# Guide"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentClaudeCode {
+		t.Errorf("detectAgent = %q, want %q", got, AgentClaudeCode)
+	}
+}
+
+func TestDetectAgent_Cursor(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".cursor"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentCursor {
+		t.Errorf("detectAgent = %q, want %q", got, AgentCursor)
+	}
+}
+
+func TestDetectAgent_Cursor_Rules(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".cursorrules"), []byte("rules"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentCursor {
+		t.Errorf("detectAgent = %q, want %q", got, AgentCursor)
+	}
+}
+
+func TestDetectAgent_CrewAI(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("crewai>=0.1.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentCrewAI {
+		t.Errorf("detectAgent = %q, want %q", got, AgentCrewAI)
+	}
+}
+
+func TestDetectAgent_LangGraph_Python(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("langgraph\nopenai\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentLangGraph {
+		t.Errorf("detectAgent = %q, want %q", got, AgentLangGraph)
+	}
+}
+
+func TestDetectAgent_LangGraph_JS(t *testing.T) {
+	dir := t.TempDir()
+	pkg := `{"dependencies": {"@langchain/langgraph": "^0.1.0"}}`
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(pkg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentLangGraph {
+		t.Errorf("detectAgent = %q, want %q", got, AgentLangGraph)
+	}
+}
+
+func TestDetectAgent_AutoGen(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("pyautogen\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentAutoGen {
+		t.Errorf("detectAgent = %q, want %q", got, AgentAutoGen)
+	}
+}
+
+func TestDetectAgent_Generic(t *testing.T) {
+	dir := t.TempDir()
+	if got := detectAgent(dir); got != AgentGeneric {
+		t.Errorf("detectAgent = %q, want %q", got, AgentGeneric)
+	}
+}
+
+func TestDetectLanguages(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]int{
+		"main.go":    3,
+		"util.go":    0,
+		"handler.go": 0,
+		"app.py":     0,
+		"test.js":    0,
+	}
+	for name := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("// code"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	langs := detectLanguages(dir)
+	if len(langs) == 0 {
+		t.Fatal("expected at least one language")
+	}
+	if langs[0] != "Go" {
+		t.Errorf("expected Go as top language, got %q", langs[0])
+	}
+}
+
+func TestDetectLanguages_AllExtensions(t *testing.T) {
+	dir := t.TempDir()
+	// Exercise every switch branch in detectLanguages.
+	for _, name := range []string{
+		"main.go", "app.py", "index.js", "app.ts",
+		"lib.rs", "server.rb", "App.java",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("//"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	langs := detectLanguages(dir)
+	want := map[string]bool{
+		"Go": true, "Python": true, "JavaScript": true,
+		"TypeScript": true, "Rust": true, "Ruby": true, "Java": true,
+	}
+	got := make(map[string]bool)
+	for _, l := range langs {
+		got[l] = true
+	}
+	for lang := range want {
+		if !got[lang] {
+			t.Errorf("missing language %q", lang)
+		}
+	}
+}
+
+func TestDetectLanguages_WalkError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based test not reliable on Windows")
+	}
+	if os.Getuid() == 0 {
+		t.Skip("permission-based test cannot run as root")
+	}
+
+	dir := t.TempDir()
+	// Create an unreadable subdirectory to trigger the err != nil path
+	// in the WalkDir callback.
+	noread := filepath.Join(dir, "noperm")
+	if err := os.Mkdir(noread, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(noread, 0o700) }) //nolint:gosec // directory needs exec bit for TempDir cleanup
+
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("//"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	langs := detectLanguages(dir)
+	// Should still detect Go from the readable file.
+	if len(langs) == 0 || langs[0] != "Go" {
+		t.Errorf("expected Go, got %v", langs)
+	}
+}
+
+func TestDetectLanguages_SkipsDirs(t *testing.T) {
+	dir := t.TempDir()
+	nm := filepath.Join(dir, "node_modules", "pkg")
+	if err := os.MkdirAll(nm, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// Files in node_modules should be skipped
+	if err := os.WriteFile(filepath.Join(nm, "index.js"), []byte("//"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.py"), []byte("#"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	langs := detectLanguages(dir)
+	for _, l := range langs {
+		if l == "JavaScript" {
+			t.Error("should not detect JavaScript from node_modules")
+		}
+	}
+}
+
+func TestDetectLanguages_Empty(t *testing.T) {
+	dir := t.TempDir()
+	langs := detectLanguages(dir)
+	if len(langs) != 0 {
+		t.Errorf("expected no languages, got %v", langs)
+	}
+}
+
+func TestDetectEcosystems(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"package.json", "go.mod"} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ecos := detectEcosystems(dir)
+	if len(ecos) != 2 {
+		t.Fatalf("expected 2 ecosystems, got %d: %v", len(ecos), ecos)
+	}
+
+	found := make(map[string]bool)
+	for _, e := range ecos {
+		found[e] = true
+	}
+	if !found[EcoNPM] {
+		t.Error("expected npm ecosystem")
+	}
+	if !found[EcoGoMod] {
+		t.Error("expected go ecosystem")
+	}
+}
+
+func TestDetectEcosystems_Empty(t *testing.T) {
+	dir := t.TempDir()
+	ecos := detectEcosystems(dir)
+	if len(ecos) != 0 {
+		t.Errorf("expected no ecosystems, got %v", ecos)
+	}
+}
+
+func TestDetectMCPServers(t *testing.T) {
+	dir := t.TempDir()
+	mcp := `{
+		"mcpServers": {
+			"filesystem": {"command": "npx"},
+			"postgres": {"command": "npx"},
+			"github": {"command": "npx"}
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(mcp), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	servers := detectMCPServers(dir)
+	if len(servers) != 3 {
+		t.Fatalf("expected 3 servers, got %d: %v", len(servers), servers)
+	}
+}
+
+func TestDetectMCPServers_NoFile(t *testing.T) {
+	dir := t.TempDir()
+	servers := detectMCPServers(dir)
+	if len(servers) != 0 {
+		t.Errorf("expected no servers, got %v", servers)
+	}
+}
+
+func TestDetectMCPServers_InvalidJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	servers := detectMCPServers(dir)
+	if len(servers) != 0 {
+		t.Errorf("expected no servers from invalid JSON, got %v", servers)
+	}
+}
+
+func TestHasGitRepo(t *testing.T) {
+	dir := t.TempDir()
+	if hasGitRepo(dir) {
+		t.Error("expected no git repo in empty dir")
+	}
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if !hasGitRepo(dir) {
+		t.Error("expected git repo after creating .git")
+	}
+}
+
+func TestParsePythonRequirements(t *testing.T) {
+	content := `
+# comment
+crewai>=0.1.0
+openai==1.0
+-r other.txt
+langchain[llms]
+`
+	deps := parsePythonRequirements(content)
+	found := make(map[string]bool)
+	for _, d := range deps {
+		found[d] = true
+	}
+	if !found["crewai"] {
+		t.Error("expected crewai in deps")
+	}
+	if !found["openai"] {
+		t.Error("expected openai in deps")
+	}
+	if !found["langchain"] {
+		t.Error("expected langchain in deps")
+	}
+}
+
+func TestHasDependency(t *testing.T) {
+	dir := t.TempDir()
+	pkg := `{"dependencies": {"express": "^4.0"}, "devDependencies": {"jest": "^29"}}`
+	path := filepath.Join(dir, "package.json")
+	if err := os.WriteFile(path, []byte(pkg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !hasDependency(path, "express") {
+		t.Error("expected express to be found")
+	}
+	if !hasDependency(path, "jest") {
+		t.Error("expected jest to be found in devDependencies")
+	}
+	if hasDependency(path, "react") {
+		t.Error("did not expect react")
+	}
+}
+
+func TestHasDependency_NoFile(t *testing.T) {
+	if hasDependency("/nonexistent/package.json", "express") {
+		t.Error("expected false for nonexistent file")
+	}
+}
+
+func TestFileExists(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "test.txt")
+
+	if fileExists(path) {
+		t.Error("file should not exist yet")
+	}
+
+	if err := os.WriteFile(path, []byte("hi"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !fileExists(path) {
+		t.Error("file should exist now")
+	}
+
+	// Directory should not count as file
+	if fileExists(dir) {
+		t.Error("directory should not count as file")
+	}
+}
+
+func TestDirExists(t *testing.T) {
+	dir := t.TempDir()
+	if !dirExists(dir) {
+		t.Error("temp dir should exist")
+	}
+	if dirExists(filepath.Join(dir, "nope")) {
+		t.Error("nonexistent dir should not exist")
+	}
+}
+
+func TestParsePyprojectDeps(t *testing.T) {
+	content := `
+[tool.poetry.dependencies]
+python = "^3.9"
+crewai = "^0.1"
+langchain = "^0.2"
+`
+	deps := parsePyprojectDeps(content)
+	found := make(map[string]bool)
+	for _, d := range deps {
+		found[d] = true
+	}
+	if !found["crewai"] {
+		t.Error("expected crewai in deps")
+	}
+}
+
+func TestDetectAgent_Pyproject(t *testing.T) {
+	dir := t.TempDir()
+	content := `[tool.poetry.dependencies]
+crewai = "^0.1"
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := detectAgent(dir); got != AgentCrewAI {
+		t.Errorf("detectAgent = %q, want %q", got, AgentCrewAI)
+	}
+}
+
+func TestDetectHostileTooling_PythonPackage(t *testing.T) {
+	tests := []struct {
+		name    string
+		deps    string
+		wantLen int
+	}{
+		{"obliteratus", "obliteratus\ntorch\n", 1},
+		{"abliterator", "transformers\nabliterator>=1.0\n", 1},
+		{"refusal-ablation", "refusal-ablation\n", 1},
+		{"llm-abliterator", "llm-abliterator\nopenai\n", 1},
+		{"inline comment", "obliteratus # guardrail removal\n", 1},
+		{"clean project", "torch\ntransformers\nopenai\n", 0},
+		{"empty", "", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.deps != "" {
+				if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte(tt.deps), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			findings := detectHostileTooling(dir)
+			if len(findings) != tt.wantLen {
+				t.Errorf("detectHostileTooling() returned %d findings, want %d: %v", len(findings), tt.wantLen, findings)
+			}
+			for _, f := range findings {
+				if f.Severity != "warning" {
+					t.Errorf("expected severity warning, got %q", f.Severity)
+				}
+				if f.Category != "tooling" {
+					t.Errorf("expected category tooling, got %q", f.Category)
+				}
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_AblationScript(t *testing.T) {
+	scripts := []string{"abliterate.py", "abliteration.py", "remove_refusals.py", "uncensor.py"}
+
+	for _, script := range scripts {
+		t.Run(script, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, script), []byte("# ablation script"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			findings := detectHostileTooling(dir)
+			if len(findings) != 1 {
+				t.Fatalf("expected 1 finding for %s, got %d", script, len(findings))
+			}
+			if findings[0].File != script {
+				t.Errorf("expected file %q, got %q", script, findings[0].File)
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_PyprojectToml(t *testing.T) {
+	dir := t.TempDir()
+	pyproject := `[project]
+name = "my-project"
+dependencies = [
+    "torch>=2.0",
+    "obliteratus>=0.1",
+    "transformers",
+]
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 1 {
+		t.Errorf("expected 1 finding for obliteratus in pyproject.toml, got %d", len(findings))
+	}
+	if len(findings) > 0 && findings[0].Pattern != testHostilePkg {
+		t.Errorf("expected pattern obliteratus, got %q", findings[0].Pattern)
+	}
+}
+
+func TestDetectHostileTooling_PyprojectNoDuplicate(t *testing.T) {
+	dir := t.TempDir()
+	// Both requirements.txt and pyproject.toml have obliteratus; should produce 1 finding, not 2
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("obliteratus\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pyproject := `[project]
+dependencies = ["obliteratus"]
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	count := 0
+	for _, f := range findings {
+		if f.Pattern == testHostilePkg {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected 1 obliteratus finding (deduplicated), got %d", count)
+	}
+}
+
+func TestDetectHostileTooling_PyprojectPoetryStyle(t *testing.T) {
+	dir := t.TempDir()
+	pyproject := `[tool.poetry.dependencies]
+python = "^3.11"
+obliteratus = "^0.1"
+torch = "^2.0"
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 1 {
+		t.Errorf("expected 1 finding for Poetry-style obliteratus dep, got %d", len(findings))
+	}
+	if len(findings) > 0 && findings[0].Pattern != testHostilePkg {
+		t.Errorf("expected pattern obliteratus, got %q", findings[0].Pattern)
+	}
+}
+
+func TestDetectHostileTooling_PyprojectDescriptionFalsePositive(t *testing.T) {
+	dir := t.TempDir()
+	// Package name in description (not as a dependency) should NOT trigger
+	pyproject := `[project]
+name = "safe-project"
+description = "research notes about obliteratus and model ablation"
+dependencies = ["numpy", "torch"]
+`
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(pyproject), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 0 {
+		t.Errorf("expected 0 findings for mention in description, got %d: %v", len(findings), findings)
+	}
+}
+
+func TestDetectHostileTooling_PyprojectDependencyShapes(t *testing.T) {
+	tests := []struct {
+		name       string
+		pyproject  string
+		want       string
+		wantUnread bool
+	}{
+		{"one line dependency", "[project]\ndependencies = [\"obliteratus>=0.1\"]\n", "obliteratus", false},
+		{"second item on one line", "[project]\ndependencies = [\"torch>=2\", \"obliteratus>=0.1\"]\n", "obliteratus", false},
+		{"multiline dependency", "[project]\ndependencies = [\n  \"torch\",\n  \"obliteratus>=0.1\",\n]\n", "obliteratus", false},
+		{"optional dependency", "[project.optional-dependencies]\nresearch = [\"torch\", \"refusal_ablation[extra]>=1; python_version >= '3.11'\"]\n", "refusal-ablation", false},
+		{"normalized PEP 508 name", "[project]\ndependencies = [\"LLM...Abliterator @ https://api.vendor.example/pkg.whl\"]\n", "llm-abliterator", false},
+		{"Poetry quoted key and inline table", "[tool.poetry.dependencies]\n\"OblIteratus\" = { version = \"^0.1\", optional = true }\n", "obliteratus", false},
+		{"Poetry legacy dev dependencies", "[tool.poetry.dev-dependencies]\n'abliterator' = '^0.1'\n", "abliterator", false},
+		{"Poetry group dependencies", "[tool.poetry.group.research.dependencies]\n'refusal_ablation' = {version = '^1'}\n", "refusal-ablation", false},
+		{"comments do not count", "[project]\ndependencies = [\"torch\"] # obliteratus\n# dependencies = [\"obliteratus\"]\n", "", false},
+		{"description does not count", "[project]\ndescription = \"obliteratus\"\ndependencies = [\"torch\"]\n", "", false},
+		{"unrelated table key does not count", "[tool.other]\nobliteratus = \"text\"\n", "", false},
+		{"similar name does not count", "[project]\ndependencies = [\"obliteratus-extra>=1\"]\n", "", false},
+		{"empty requirement has no name", "[project]\ndependencies = [\"\"]\n", "", false},
+		{"invalid name suffix does not count", "[project]\ndependencies = [\"obliteratus?invalid\"]\n", "", false},
+		{"malformed TOML reports incomplete scan", "[project]\ndependencies = [\"obliteratus\"\n", "", true},
+		{"invalid dependency shape reports incomplete scan", "[project]\ndependencies = \"obliteratus\"\n", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte(tt.pyproject), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			findings := detectHostileTooling(dir)
+			if len(findings) != 1 && (tt.want != "" || tt.wantUnread) {
+				t.Fatalf("findings = %v, want one", findings)
+			}
+			if len(findings) != 0 && tt.want == "" && !tt.wantUnread {
+				t.Fatalf("findings = %v, want none", findings)
+			}
+			if tt.want != "" && findings[0].Pattern != tt.want {
+				t.Errorf("pattern = %q, want %q", findings[0].Pattern, tt.want)
+			}
+			if tt.wantUnread && (findings[0].File != "pyproject.toml" || !strings.Contains(strings.ToLower(findings[0].Message), "could not inspect")) {
+				t.Errorf("malformed manifest finding = %+v, want explicit inspection warning", findings[0])
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_PyprojectUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "pyproject.toml"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 1 || findings[0].File != "pyproject.toml" || !strings.Contains(strings.ToLower(findings[0].Message), "could not inspect") {
+		t.Fatalf("unreadable manifest findings = %v, want inspection warning", findings)
+	}
+}
+
+// scanHostileManifests writes the named files into a fresh directory and
+// returns the hostile-tooling findings split into matched package patterns and
+// inspection warnings, so a test can assert both without caring about order.
+func scanHostileManifests(t *testing.T, files map[string]string) (patterns []string, warnedFiles []string) {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range detectHostileTooling(dir) {
+		switch {
+		case f.Pattern != "":
+			patterns = append(patterns, f.Pattern)
+		case strings.Contains(strings.ToLower(f.Message), "could not inspect"):
+			warnedFiles = append(warnedFiles, f.File)
+		default:
+			t.Errorf("unexpected finding %+v", f)
+		}
+	}
+	return patterns, warnedFiles
+}
+
+func TestHostileToolingPackages_AreNormalized(t *testing.T) {
+	// Manifest names are normalized before lookup, so a list entry that is not
+	// already in normalized form could never match.
+	for _, pkg := range hostileToolingPackages {
+		if got := normalizePythonPackageName(pkg); got != pkg {
+			t.Errorf("hostileToolingPackages entry %q is not normalized (%q)", pkg, got)
+		}
+	}
+}
+
+func TestDetectHostileTooling_PyprojectOtherDependencyTables(t *testing.T) {
+	tests := []struct {
+		name      string
+		pyproject string
+		want      string
+	}{
+		{"PEP 735 group multiline", "[dependency-groups]\ndev = [\n  \"pytest\",\n  \"obliteratus\",\n]\n", "obliteratus"},
+		{"PEP 735 group one line", "[dependency-groups]\ndev = [\"obliteratus>=0.1\"]\n", "obliteratus"},
+		{"PEP 735 group beside include", "[dependency-groups]\nall = [{include-group = \"dev\"}, \"abliterator\"]\n", "abliterator"},
+		{"PEP 518 build requirement", "[build-system]\nrequires = [\n  \"setuptools\",\n  \"obliteratus\",\n]\n", "obliteratus"},
+		{"uv legacy dev dependencies", "[tool.uv]\ndev-dependencies = [\n  \"obliteratus\",\n]\n", "obliteratus"},
+		{"PDM legacy dev dependencies", "[tool.pdm.dev-dependencies]\nresearch = [\n  \"refusal_ablation\",\n]\n", "refusal-ablation"},
+		{"Hatch environment dependencies", "[tool.hatch.envs.default]\ndependencies = [\n  \"obliteratus\",\n]\n", "obliteratus"},
+		{"Hatch environment extra dependencies", "[tool.hatch.envs.lab]\nextra-dependencies = [\"llm-abliterator\"]\n", "llm-abliterator"},
+		{"PEP 508 compatible release", "[project]\ndependencies = [\"obliteratus~=0.1\"]\n", "obliteratus"},
+		{"PEP 508 parenthesised version", "[project]\ndependencies = [\"obliteratus (>=0.1)\"]\n", "obliteratus"},
+		{"PEP 508 URL without spaces", "[project]\ndependencies = [\"obliteratus@https://api.vendor.example/pkg.whl\"]\n", "obliteratus"},
+		{"UTF-8 byte order mark", "\xef\xbb\xbf[project]\ndependencies = [\"obliteratus\"]\n", "obliteratus"},
+		{"CRLF line endings", "[project]\r\ndependencies = [\r\n  \"obliteratus\",\r\n]\r\n", "obliteratus"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			patterns, warned := scanHostileManifests(t, map[string]string{"pyproject.toml": tt.pyproject})
+			if len(patterns) != 1 || patterns[0] != tt.want || len(warned) != 0 {
+				t.Fatalf("patterns = %v, warned = %v, want [%s] and no warning", patterns, warned, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_PyprojectCleanManifests(t *testing.T) {
+	tests := []struct {
+		name      string
+		pyproject string
+	}{
+		{"include-group only", "[dependency-groups]\nall = [{include-group = \"dev\"}]\ndev = [\"pytest\"]\n"},
+		{"dynamic dependencies", "[project]\ndynamic = [\"dependencies\"]\n[tool.setuptools.dynamic]\ndependencies = {file = [\"requirements.txt\"]}\n"},
+		{"poetry extras name no dependency", "[tool.poetry.extras]\nresearch = [\"obliteratus\"]\n"},
+		{"keywords are not dependencies", "[project]\nkeywords = [\"obliteratus\"]\ndependencies = [\"torch\"]\n"},
+		{"PDM editable entry has no name", "[tool.pdm.dev-dependencies]\nlocal = [\"-e file:///work/pkg\"]\n"},
+		{"empty file", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			patterns, warned := scanHostileManifests(t, map[string]string{"pyproject.toml": tt.pyproject})
+			if len(patterns) != 0 || len(warned) != 0 {
+				t.Fatalf("patterns = %v, warned = %v, want a clean result", patterns, warned)
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_PyprojectShapeProblemKeepsOtherNames(t *testing.T) {
+	// A wrongly shaped table must not hide a hostile package declared in a
+	// well-formed one: the package is reported and the scan is flagged
+	// incomplete.
+	tests := []struct {
+		name      string
+		pyproject string
+	}{
+		{"optional dependencies is a string", "[project]\ndependencies = [\"obliteratus\"]\n[project.optional-dependencies]\nx = \"y\"\n"},
+		{"poetry dependencies is a string", "[tool.poetry]\ndependencies = \"x\"\n[project]\ndependencies = [\"obliteratus\"]\n"},
+		{"unknown dependency-group object", "[project]\ndependencies = [\"obliteratus\"]\n[dependency-groups]\ndev = [{set-phasers-to = \"stun\"}]\n"},
+		{"include-group with extra key", "[project]\ndependencies = [\"obliteratus\"]\n[dependency-groups]\ndev = [{include-group = \"x\", extra = \"y\"}]\n"},
+		{"include-group outside dependency-groups", "[project]\ndependencies = [\"obliteratus\", {include-group = \"x\"}]\n"},
+		{"non-string requirement", "[project]\ndependencies = [\"obliteratus\", 3]\n"},
+		{"project is not a table", "project = \"x\"\n[tool.uv]\ndev-dependencies = [\"obliteratus\"]\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			patterns, warned := scanHostileManifests(t, map[string]string{"pyproject.toml": tt.pyproject})
+			if len(patterns) != 1 || patterns[0] != "obliteratus" {
+				t.Errorf("patterns = %v, want [obliteratus]", patterns)
+			}
+			if len(warned) != 1 || warned[0] != "pyproject.toml" {
+				t.Errorf("warned = %v, want one pyproject.toml inspection warning", warned)
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_OversizeManifestIsReportedNotParsed(t *testing.T) {
+	// Nested brackets overflow the TOML decoder's stack long before memory
+	// matters; the size limit must stop the read before decoding.
+	for _, file := range []string{"pyproject.toml", "requirements.txt"} {
+		t.Run(file, func(t *testing.T) {
+			body := "a = " + strings.Repeat("[", maxScanFileBytes) + "\n"
+			patterns, warned := scanHostileManifests(t, map[string]string{file: body})
+			if len(patterns) != 0 || len(warned) != 1 || warned[0] != file {
+				t.Fatalf("patterns = %v, warned = %v, want one %s inspection warning", patterns, warned, file)
+			}
+		})
+	}
+	t.Run("at the limit is still read", func(t *testing.T) {
+		pad := strings.Repeat("#", maxScanFileBytes-len("obliteratus\n#"))
+		patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": "obliteratus\n#" + pad})
+		if len(patterns) != 1 || len(warned) != 0 {
+			t.Fatalf("patterns = %v, warned = %v, want the package and no warning", patterns, warned)
+		}
+	})
+}
+
+func TestDetectHostileTooling_RequirementsShapes(t *testing.T) {
+	utf16BE := []byte{0xfe, 0xff}
+	utf32LE := []byte{0xff, 0xfe, 0x00, 0x00}
+	utf32BE := []byte{0x00, 0x00, 0xfe, 0xff}
+	for _, b := range []byte("obliteratus\n") {
+		utf16BE = binary.BigEndian.AppendUint16(utf16BE, uint16(b))
+		utf32LE = binary.LittleEndian.AppendUint32(utf32LE, uint32(b))
+		utf32BE = binary.BigEndian.AppendUint32(utf32BE, uint32(b))
+	}
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"bare name", "obliteratus\n", "obliteratus"},
+		{"exact pin", "obliteratus==0.1\n", "obliteratus"},
+		{"compatible release", "obliteratus~=0.1\n", "obliteratus"},
+		{"spaced specifier", "obliteratus >= 0.1\n", "obliteratus"},
+		{"parenthesised version", "obliteratus (>=0.1)\n", "obliteratus"},
+		{"extras", "obliteratus[extra]>=0.1\n", "obliteratus"},
+		{"marker", "obliteratus ; python_version >= '3.10'\n", "obliteratus"},
+		{"URL reference", "obliteratus @ https://api.vendor.example/pkg.whl\n", "obliteratus"},
+		{"per-requirement hash option", "obliteratus==0.1 --hash=sha256:abc\n", "obliteratus"},
+		{"bare name with hash option", "obliteratus --hash=sha256:abc\n", "obliteratus"},
+		{"tab before hash option", "obliteratus\t--hash=sha256:abc\n", "obliteratus"},
+		{"line continuation", "torch \\\n  --hash=sha256:abc\nobliteratus \\\n  >=0.1\n", "obliteratus"},
+		{"comment line does not continue", "# note \\\nobliteratus\n", "obliteratus"},
+		{"name split across continuation", "obliter\\\natus\n", "obliteratus"},
+		{"continuation at end of file", "obliteratus\\", "obliteratus"},
+		{"underscore separator", "refusal_ablation==1\n", "refusal-ablation"},
+		{"dot separator and case", "Refusal.Ablation>=1\n", "refusal-ablation"},
+		{"CRLF", "torch\r\nobliteratus\r\n", "obliteratus"},
+		{"bare CR", "torch\robliteratus\r", "obliteratus"},
+		{"vertical tab", "torch\vobliteratus\v", "obliteratus"},
+		{"form feed", "torch\fobliteratus\f", "obliteratus"},
+		{"Unicode line separator", "torch\u2028obliteratus\u2028", "obliteratus"},
+		{"byte order mark", "\xef\xbb\xbfobliteratus\n", "obliteratus"},
+		{"UTF-16 LE byte order mark", "\xff\xfeo\x00b\x00l\x00i\x00t\x00e\x00r\x00a\x00t\x00u\x00s\x00\n\x00", "obliteratus"},
+		{"UTF-16 BE byte order mark", string(utf16BE), "obliteratus"},
+		{"UTF-32 LE byte order mark", string(utf32LE), "obliteratus"},
+		{"UTF-32 BE byte order mark", string(utf32BE), "obliteratus"},
+		{"inline comment", "obliteratus  # needed\n", "obliteratus"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": tt.body})
+			if len(patterns) != 1 || patterns[0] != tt.want || len(warned) != 0 {
+				t.Fatalf("patterns = %v, warned = %v, want [%s] and no warning", patterns, warned, tt.want)
+			}
+		})
+	}
+
+	for name, body := range map[string]string{
+		"comment line":     "# obliteratus\n",
+		"option lines":     "-r obliteratus.txt\n--index-url https://api.vendor.example/simple\n",
+		"similar name":     "obliteratus-extra>=1\n",
+		"trailing comment": "torch  # not obliteratus\n",
+	} {
+		t.Run("clean "+name, func(t *testing.T) {
+			patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": body})
+			if len(patterns) != 0 || len(warned) != 0 {
+				t.Fatalf("patterns = %v, warned = %v, want a clean result", patterns, warned)
+			}
+		})
+	}
+	t.Run("malformed UTF-16 byte order mark", func(t *testing.T) {
+		patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": "\xff\xfeo"})
+		if len(patterns) != 0 || len(warned) != 1 || warned[0] != "requirements.txt" {
+			t.Fatalf("patterns = %v, warned = %v, want a requirements.txt inspection warning", patterns, warned)
+		}
+	})
+	t.Run("malformed UTF-32 byte order mark", func(t *testing.T) {
+		patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": "\xff\xfe\x00\x00\x00\x00\x11\x00"})
+		if len(patterns) != 0 || len(warned) != 1 || warned[0] != "requirements.txt" {
+			t.Fatalf("patterns = %v, warned = %v, want a requirements.txt inspection warning", patterns, warned)
+		}
+	})
+	t.Run("unpaired UTF-16 surrogate", func(t *testing.T) {
+		patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": "\xff\xfe\x00\xd8"})
+		if len(patterns) != 0 || len(warned) != 1 || warned[0] != "requirements.txt" {
+			t.Fatalf("patterns = %v, warned = %v, want a requirements.txt inspection warning", patterns, warned)
+		}
+	})
+	t.Run("invalid UTF-8", func(t *testing.T) {
+		patterns, warned := scanHostileManifests(t, map[string]string{"requirements.txt": "\xffobliteratus"})
+		if len(patterns) != 0 || len(warned) != 1 || warned[0] != "requirements.txt" {
+			t.Fatalf("patterns = %v, warned = %v, want a requirements.txt inspection warning", patterns, warned)
+		}
+	})
+}
+
+func TestDetectHostileTooling_RequirementsAndPyprojectReportOnce(t *testing.T) {
+	patterns, warned := scanHostileManifests(t, map[string]string{
+		"requirements.txt": "obliteratus\nobliteratus==0.1\n",
+		"pyproject.toml":   "[project]\ndependencies = [\"obliteratus\"]\n",
+	})
+	if len(patterns) != 1 || len(warned) != 0 {
+		t.Fatalf("patterns = %v, warned = %v, want one finding", patterns, warned)
+	}
+}
+
+func TestDetectHostileTooling_RequirementsUnreadable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "requirements.txt"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 1 || findings[0].File != "requirements.txt" || !strings.Contains(strings.ToLower(findings[0].Message), "could not inspect") {
+		t.Fatalf("unreadable requirements findings = %v, want inspection warning", findings)
+	}
+}
+
+func TestHasHostileFinding(t *testing.T) {
+	tests := []struct {
+		name     string
+		findings []Finding
+		pattern  string
+		want     bool
+	}{
+		{
+			name:     "empty findings",
+			findings: nil,
+			pattern:  testHostilePkg,
+			want:     false,
+		},
+		{
+			name: "matching pattern and category",
+			findings: []Finding{
+				{Category: "tooling", Pattern: testHostilePkg},
+			},
+			pattern: testHostilePkg,
+			want:    true,
+		},
+		{
+			name: "wrong category",
+			findings: []Finding{
+				{Category: "secret", Pattern: testHostilePkg},
+			},
+			pattern: testHostilePkg,
+			want:    false,
+		},
+		{
+			name: "wrong pattern",
+			findings: []Finding{
+				{Category: "tooling", Pattern: "other-pkg"},
+			},
+			pattern: testHostilePkg,
+			want:    false,
+		},
+		{
+			name: "multiple findings only one matches",
+			findings: []Finding{
+				{Category: "secret", Pattern: testHostilePkg},
+				{Category: "tooling", Pattern: "different"},
+				{Category: "tooling", Pattern: testHostilePkg},
+			},
+			pattern: testHostilePkg,
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasHostileFinding(tt.findings, tt.pattern)
+			if got != tt.want {
+				t.Errorf("hasHostileFinding() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDetectHostileTooling_NoMatch(t *testing.T) {
+	dir := t.TempDir()
+	// Normal Python file should not trigger
+	if err := os.WriteFile(filepath.Join(dir, "train.py"), []byte("import torch"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 0 {
+		t.Errorf("expected 0 findings for clean project, got %d", len(findings))
+	}
+}
+
+func TestDetectHostileTooling_BothPackageAndScript(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "requirements.txt"), []byte("obliteratus\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "abliterate.py"), []byte("# script"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	findings := detectHostileTooling(dir)
+	if len(findings) != 2 {
+		t.Errorf("expected 2 findings (package + script), got %d", len(findings))
+	}
+}

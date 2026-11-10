@@ -1,0 +1,277 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
+)
+
+// defaultMCPListenerSensitiveHeaders is the config default
+// request_body_scanning.sensitive_headers list plus the MCP listener's
+// Last-Event-ID carrier. TestDefaultMCPListenerSensitiveHeadersParity keeps
+// the two in step.
+var defaultMCPListenerSensitiveHeaders = []string{
+	"Authorization",
+	"Cookie",
+	listenerLastEventID,
+	"X-Api-Key",
+	"Api-Key",
+	"X-Token",
+	"Proxy-Authorization",
+	"X-Goog-Api-Key",
+	"Private-Token",
+	"Job-Token",
+}
+
+type mcpListenerHeaderDLPResult struct {
+	header  string
+	matches []scanner.TextDLPMatch
+	reason  blockreason.Reason
+}
+
+func scanMCPListenerHeadersForDLP(
+	ctx context.Context,
+	headers http.Header,
+	sc *scanner.Scanner,
+	cfg *config.RequestBodyScanning,
+) *mcpListenerHeaderDLPResult {
+	return scanMCPListenerHeadersForTarget(ctx, headers, sc, cfg, "")
+}
+
+func scanMCPListenerHeadersForTarget(
+	ctx context.Context,
+	headers http.Header,
+	sc *scanner.Scanner,
+	cfg *config.RequestBodyScanning,
+	target string,
+) *mcpListenerHeaderDLPResult {
+	if sc == nil {
+		return nil
+	}
+
+	headersToScan := mcpListenerHeadersToScan(headers, cfg)
+	allValues := make([]string, 0)
+	type namedHeaderValue struct{ name, value string }
+	decodedParamValues := make([]namedHeaderValue, 0)
+	for name, values := range headersToScan {
+		if mcpListenerShouldScanHeaderNames(cfg) {
+			result := sc.ScanTextForDLP(ctx, name)
+			if !result.Clean {
+				return mcpListenerHeaderDLPFinding(name, result)
+			}
+			allValues = append(allValues, name)
+		}
+
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+			scanVal := value
+			// Same rule as the forward-proxy header scan: a repeated
+			// Authorization header is not valid HTTP, and scrubbing each
+			// value independently would leave both the per-value and the
+			// joined scan with no access-key ID to find.
+			if http.CanonicalHeaderKey(name) == listenerAuthorization && len(values) == 1 {
+				scanVal = scanner.ScrubSigV4AuthorizationForTarget(value, target)
+			}
+			allValues = append(allValues, scanVal)
+			result := sc.ScanTextForDLP(ctx, scanVal)
+			if !result.Clean {
+				return mcpListenerHeaderDLPFinding(name, result)
+			}
+			if strings.HasPrefix(strings.ToLower(name), mcpParamHeaderPrefix) {
+				decoded, ok := decodeMCPHeaderValue(value)
+				if !ok {
+					return &mcpListenerHeaderDLPResult{header: name, reason: blockreason.BadRequest}
+				}
+				if response := sc.ScanResponse(ctx, decoded); !response.Clean {
+					if response.Failed() {
+						return &mcpListenerHeaderDLPResult{header: name, reason: blockreason.ParseError}
+					}
+					return &mcpListenerHeaderDLPResult{header: name, reason: blockreason.PromptInjection}
+				}
+				decodedParamValues = append(decodedParamValues, namedHeaderValue{name: strings.ToLower(name), value: decoded})
+				if decoded != value {
+					result = sc.ScanTextForDLP(ctx, decoded)
+					if !result.Clean {
+						return mcpListenerHeaderDLPFinding(name, result)
+					}
+				}
+			}
+			if mcpListenerShouldScanHeaderNames(cfg) {
+				result = sc.ScanTextForDLP(ctx, name+scanVal)
+				if !result.Clean {
+					return mcpListenerHeaderDLPFinding(name, result)
+				}
+			}
+		}
+	}
+
+	if len(allValues) > 1 {
+		sort.Strings(allValues)
+		result := sc.ScanTextForDLP(ctx, strings.Join(allValues, "\n"))
+		if !result.Clean {
+			return mcpListenerHeaderDLPFinding("(joined)", result)
+		}
+	}
+	if len(decodedParamValues) > 1 {
+		sort.Slice(decodedParamValues, func(i, j int) bool {
+			if decodedParamValues[i].name == decodedParamValues[j].name {
+				return decodedParamValues[i].value < decodedParamValues[j].value
+			}
+			return decodedParamValues[i].name < decodedParamValues[j].name
+		})
+		joined := make([]string, len(decodedParamValues))
+		for i := range decodedParamValues {
+			joined[i] = decodedParamValues[i].value
+		}
+		result := sc.ScanTextForDLP(ctx, strings.Join(joined, "\n"))
+		if !result.Clean {
+			return mcpListenerHeaderDLPFinding("(joined decoded parameters)", result)
+		}
+	}
+	return nil
+}
+
+// mcpListenerHeaderDLPFinding reports an unclean header scan. A scan that
+// ended before it finished carries no match; it is reported as a parse error,
+// the same reason an unfinished response scan of a decoded parameter gets.
+func mcpListenerHeaderDLPFinding(header string, result scanner.TextDLPResult) *mcpListenerHeaderDLPResult {
+	if result.Err() != nil && len(result.Matches) == 0 {
+		return &mcpListenerHeaderDLPResult{header: header, reason: blockreason.ParseError}
+	}
+	return &mcpListenerHeaderDLPResult{header: header, matches: result.Matches}
+}
+
+func mcpListenerHeadersToScan(headers http.Header, cfg *config.RequestBodyScanning) map[string][]string {
+	var out map[string][]string
+	if cfg == nil || !cfg.Enabled || !cfg.ScanHeaders {
+		out = mcpListenerExplicitHeaders(headers, []string{listenerAuthorization, listenerLastEventID})
+	} else if cfg.HeaderMode == config.HeaderModeAll {
+		ignored := make(map[string]struct{}, len(cfg.IgnoreHeaders))
+		for _, name := range cfg.IgnoreHeaders {
+			ignored[http.CanonicalHeaderKey(name)] = struct{}{}
+		}
+		out = make(map[string][]string)
+		for name, values := range headers {
+			canonical := http.CanonicalHeaderKey(name)
+			if _, skip := ignored[canonical]; skip {
+				continue
+			}
+			out[canonical] = values
+		}
+		// Last-Event-ID is a credential-bearing SSE resume cursor and is scanned
+		// unconditionally in every other header-selection path; reinsert it here so
+		// IgnoreHeaders cannot exempt it in all-header mode (fail closed).
+		if values := headers.Values(listenerLastEventID); len(values) > 0 {
+			out[http.CanonicalHeaderKey(listenerLastEventID)] = values
+		}
+	} else {
+		sensitiveHeaders := cfg.SensitiveHeaders
+		if len(sensitiveHeaders) == 0 {
+			sensitiveHeaders = defaultMCPListenerSensitiveHeaders
+		} else {
+			sensitiveHeaders = append([]string{}, sensitiveHeaders...)
+			sensitiveHeaders = append(sensitiveHeaders, listenerLastEventID)
+		}
+		out = mcpListenerExplicitHeaders(headers, sensitiveHeaders)
+	}
+	// Mcp-Param values can affect routing and authorization at the upstream.
+	// They are never exemptable, even when generic header scanning is disabled
+	// or an ignore list is configured.
+	for name, values := range headers {
+		if strings.HasPrefix(strings.ToLower(name), mcpParamHeaderPrefix) {
+			out[http.CanonicalHeaderKey(name)] = values
+		}
+	}
+	// The client controls this upstream routing value, even when it was
+	// originally issued by a server. Never exempt its bytes from DLP.
+	if values := headers.Values("Mcp-Session-Id"); len(values) > 0 {
+		out["Mcp-Session-Id"] = values
+	}
+	return out
+}
+
+func mcpListenerExplicitHeaders(headers http.Header, names []string) map[string][]string {
+	out := make(map[string][]string)
+	for _, name := range names {
+		canonical := http.CanonicalHeaderKey(name)
+		values, ok := headers[canonical]
+		if !ok || len(values) == 0 {
+			continue
+		}
+		out[canonical] = values
+	}
+	return out
+}
+
+func mcpListenerShouldScanHeaderNames(cfg *config.RequestBodyScanning) bool {
+	return cfg != nil && cfg.Enabled && cfg.ScanHeaders && cfg.HeaderMode == config.HeaderModeAll
+}
+
+// extractRPCID extracts the "id" field from a JSON-RPC message.
+// Returns nil for notifications (no id field) or parse failures.
+func extractRPCID(msg []byte) json.RawMessage {
+	var rpc struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if json.Unmarshal(msg, &rpc) != nil {
+		return nil
+	}
+	if string(rpc.ID) == jsonrpc.Null || len(rpc.ID) == 0 {
+		return nil
+	}
+	return rpc.ID
+}
+
+// validateRPCStructure checks JSON-RPC 2.0 structural requirements that
+// json.Valid() cannot catch: version field, method presence, and method type.
+// Returns an error message if invalid, empty string if ok.
+func validateRPCStructure(msg []byte) string {
+	var env struct {
+		JSONRPC string          `json:"jsonrpc"`
+		Method  json.RawMessage `json:"method"`
+	}
+	if json.Unmarshal(msg, &env) != nil {
+		return "invalid JSON structure"
+	}
+	// jsonrpc field must be exactly "2.0".
+	if env.JSONRPC != jsonrpc.Version {
+		return "jsonrpc field must be \"2.0\""
+	}
+	// method field is required for client requests.
+	if len(env.Method) == 0 {
+		return "missing required field: method"
+	}
+	// Method must be a JSON string (starts with quote).
+	if env.Method[0] != '"' {
+		return "method must be a string"
+	}
+	return ""
+}
+
+// upstreamErrorResponse creates a JSON-RPC error for HTTP transport failures.
+// If id is nil, the response uses a JSON null id (valid for unidentifiable requests).
+func upstreamErrorResponse(id json.RawMessage, upstreamErr error) []byte {
+	resp := rpcError{
+		JSONRPC: jsonrpc.Version,
+		ID:      id,
+		Error: rpcErrorDetail{
+			Code:    -32003,
+			Message: fmt.Sprintf("pipelock: upstream error: %v", upstreamErr),
+		},
+	}
+	data, _ := json.Marshal(resp) //nolint:errcheck // marshaling known-good struct
+	return data
+}
