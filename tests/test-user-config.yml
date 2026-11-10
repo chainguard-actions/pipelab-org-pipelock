@@ -1,0 +1,58 @@
+name: Test user-provided config input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan target
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-scan-target"
+          echo "# Clean project" > "$GITHUB_WORKSPACE/pipelock-scan-target/README.md"
+      - id: generate
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-act-temp
+        with:
+          version: '2.4.0'
+          directory: pipelock-scan-target
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Copy generated config
+        id: cfg
+        env:
+          GEN: ${{ steps.generate.outputs.config-path }}
+        run: |
+          echo "generated config: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then
+            echo "FAIL: no generated config"; exit 1
+          fi
+          mkdir -p /tmp/pipelock-user-cfg
+          cp "$GEN" /tmp/pipelock-user-cfg/user-pipelock.yaml
+          echo "path=/tmp/pipelock-user-cfg/user-pipelock.yaml" >> "$GITHUB_OUTPUT"
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-act-temp
+        with:
+          version: '2.4.0'
+          directory: pipelock-scan-target
+          config: ${{ steps.cfg.outputs.path }}
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert config-path echoes the user config
+        env:
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          EXPECTED: ${{ steps.cfg.outputs.path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "actual: $ACTUAL"
+          echo "expected: $EXPECTED"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "FAIL: config-path mismatch"; exit 1
+          fi
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: expected audit-failed=false"; exit 1
+          fi
+          echo "PASS"

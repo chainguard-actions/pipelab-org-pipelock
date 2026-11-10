@@ -1,0 +1,56 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosec
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose
+    - errname
+    - errorlint
+    - goconst
+    - godot
+    - misspell
+    - noctx
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+    - usestdlibvars
+    - wastedassign
+  exclusions:
+    rules:
+      - path: internal/proxy/proxy\.go
+        linters: [gosec]
+        text: "G704"
+      # Config schema holds YAML-bound container fields for user-supplied
+      # tokens (APIToken, AuthToken, BearerTokens). These are NOT hardcoded
+      # credentials — gosec G117's "field name matches secret pattern"
+      # check is a false positive for config containers.
+      - path: internal/config/schema\.go
+        linters: [gosec]
+        text: "G117"
+  settings:
+    gosec:
+      excludes:
+        # Taint analysis rules — false positives for CLI tools and HTTP proxies.
+        # Pipelock IS a proxy; client.Do(req) is its core purpose. SSRF protection
+        # lives in the scanner pipeline, not the Go type system.
+        - G704 # SSRF via taint analysis
+        - G705 # XSS via taint analysis — CLI terminal output, not web
+        - G703 # Path traversal via taint analysis — paths are validated upstream
+    revive:
+      rules:
+        - name: var-naming
+          disabled: true
+
+formatters:
+  enable:
+    - gofumpt
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5

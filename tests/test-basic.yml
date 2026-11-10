@@ -1,0 +1,59 @@
+name: Test basic usage (pinned version, clean directory)
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan target
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-scan-target"
+          echo "# Clean project" > "$GITHUB_WORKSPACE/pipelock-scan-target/README.md"
+      - id: action
+        uses: .
+        # act's artifact server rejects upload-artifact v7 requests; point the
+        # action's report dir away from runner.temp (/tmp) so the internal
+        # upload step finds no files and is skipped (if-no-files-found: ignore).
+        env:
+          RUNNER_TEMP: /tmp/pipelock-act-temp
+        with:
+          version: '2.4.0'
+          directory: pipelock-scan-target
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          scan-diff: 'false'
+      - name: Assert outputs
+        env:
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "score: $SCORE"
+          echo "findings: $FINDINGS"
+          echo "criticals: $CRITICALS"
+          echo "config-path: $CONFIG_PATH"
+          echo "audit-failed: $AUDIT_FAILED"
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: expected audit-failed=false"; exit 1
+          fi
+          for v in "$SCORE" "$FINDINGS" "$CRITICALS"; do
+            if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+              echo "FAIL: expected numeric output, got '$v'"; exit 1
+            fi
+          done
+          if [ "$SCORE" -gt 100 ]; then
+            echo "FAIL: score out of range"; exit 1
+          fi
+          if [ "$CRITICALS" -gt "$FINDINGS" ]; then
+            echo "FAIL: critical count exceeds findings count"; exit 1
+          fi
+          if [ -n "$CONFIG_PATH" ] && [ ! -f "$CONFIG_PATH" ]; then
+            echo "FAIL: config-path set but file missing"; exit 1
+          fi
+          if ! command -v pipelock >/dev/null; then
+            echo "FAIL: pipelock not on PATH"; exit 1
+          fi
+          echo "PASS"

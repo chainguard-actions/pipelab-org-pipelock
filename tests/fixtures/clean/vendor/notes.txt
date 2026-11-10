@@ -1,0 +1,1 @@
+Vendored notes file, excluded by the exclude-paths test.

@@ -1,0 +1,34 @@
+name: Test version input with v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan target
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-scan-target"
+          echo "# Clean project" > "$GITHUB_WORKSPACE/pipelock-scan-target/README.md"
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-act-temp
+        with:
+          version: 'v2.4.0'
+          directory: pipelock-scan-target
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert installed version
+        env:
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          OUT="$(pipelock version 2>&1)"
+          echo "version output: $OUT"
+          if ! echo "$OUT" | grep -q "2.4.0"; then
+            echo "FAIL: expected version 2.4.0"; exit 1
+          fi
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: expected audit-failed=false"; exit 1
+          fi
+          echo "PASS"

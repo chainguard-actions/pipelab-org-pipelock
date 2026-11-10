@@ -1,0 +1,35 @@
+name: Test default latest version resolution
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan target
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-scan-target"
+          echo "# Clean project" > "$GITHUB_WORKSPACE/pipelock-scan-target/README.md"
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-act-temp
+        with:
+          directory: pipelock-scan-target
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert binary installed and audit ran
+        env:
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+        run: |
+          echo "audit-failed: $AUDIT_FAILED"
+          echo "score: $SCORE"
+          pipelock version
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: expected audit-failed=false"; exit 1
+          fi
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: score not numeric"; exit 1
+          fi
+          echo "PASS"

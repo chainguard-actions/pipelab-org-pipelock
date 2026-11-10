@@ -1,0 +1,39 @@
+name: Test exclude-paths input
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan target
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-scan-target/vendor"
+          echo "# Clean project" > "$GITHUB_WORKSPACE/pipelock-scan-target/README.md"
+          echo "vendored notes" > "$GITHUB_WORKSPACE/pipelock-scan-target/vendor/notes.txt"
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-act-temp
+        with:
+          version: '2.4.0'
+          directory: pipelock-scan-target
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          exclude-paths: |
+            vendor/
+              *.generated.go
+      - name: Assert audit ran with excludes
+        env:
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+        run: |
+          echo "audit-failed: $AUDIT_FAILED"
+          echo "findings: $FINDINGS"
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: expected audit-failed=false"; exit 1
+          fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: findings-count not numeric"; exit 1
+          fi
+          echo "PASS"
