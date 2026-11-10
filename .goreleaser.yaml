@@ -1,0 +1,194 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: pipelock
+    main: ./cmd/pipelock
+    binary: pipelock
+    env:
+      - CGO_ENABLED=0
+    tags:
+      - enterprise
+    flags:
+      - -trimpath
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version={{.Version}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.BuildDate={{.Date}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.GitCommit={{.ShortCommit}}
+      - -X github.com/luckyPipewrench/pipelock/internal/cliutil.GoVersion={{.Env.GOVERSION}}
+      - -X github.com/luckyPipewrench/pipelock/internal/proxy.Version={{.Version}}
+      - -X github.com/luckyPipewrench/pipelock/internal/license.PublicKeyHex={{.Env.LICENSE_PUBLIC_KEY}}
+      - -X github.com/luckyPipewrench/pipelock/internal/rules.KeyringHex={{.Env.LICENSE_PUBLIC_KEY}}
+
+  # License service: cluster-only webhook handler for Polar subscription events.
+  # Linux-only (runs in k8s), not distributed via Homebrew or public archives.
+  - id: license-service
+    main: ./cmd/license-service
+    binary: license-service
+    env:
+      - CGO_ENABLED=0
+    tags:
+      - enterprise
+    flags:
+      - -trimpath
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: pipelock
+    ids: [pipelock]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+signs:
+  - cmd: cosign
+    certificate: '${artifact}.pem'
+    args:
+      - sign-blob
+      - '--yes'
+      - '--output-certificate=${certificate}'
+      - '--output-signature=${signature}'
+      - '${artifact}'
+    artifacts: checksum
+    output: true
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+brews:
+  - ids: [pipelock]
+    repository:
+      owner: luckyPipewrench
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: "https://github.com/luckyPipewrench/pipelock"
+    description: "Security firewall for AI agents"
+    license: "Apache-2.0 AND Elastic-2.0"
+    directory: Formula
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    install: |
+      bin.install "pipelock"
+    test: |
+      system "#{bin}/pipelock", "version"
+
+dockers:
+  - image_templates:
+      - "ghcr.io/luckypipewrench/pipelock:{{ .Version }}-amd64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    dockerfile: Dockerfile.goreleaser
+
+  - image_templates:
+      - "ghcr.io/luckypipewrench/pipelock:{{ .Version }}-arm64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    goarch: arm64
+    dockerfile: Dockerfile.goreleaser
+
+  # Init container image for K8s sidecar deployments (MCP stdio wrapping).
+  # Alpine-based so `cp` is available for copying the binary to shared volumes.
+  - image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}-amd64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    dockerfile: Dockerfile.init
+
+  - image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}-arm64"
+    ids: [pipelock]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    goarch: arm64
+    dockerfile: Dockerfile.init
+
+  # License service: webhook handler for Polar subscription events.
+  # Alpine-based (needs writable fs for SQLite + audit ledger).
+  - image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}-amd64"
+    ids: [license-service]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    dockerfile: Dockerfile.license-service
+
+  - image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}-arm64"
+    ids: [license-service]
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    goarch: arm64
+    dockerfile: Dockerfile.license-service
+
+docker_manifests:
+  - name_template: "ghcr.io/luckypipewrench/pipelock:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/luckypipewrench/pipelock:{{ .Version }}-amd64"
+      - "ghcr.io/luckypipewrench/pipelock:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/luckypipewrench/pipelock:latest"
+    image_templates:
+      - "ghcr.io/luckypipewrench/pipelock:{{ .Version }}-amd64"
+      - "ghcr.io/luckypipewrench/pipelock:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}-amd64"
+      - "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/luckypipewrench/pipelock-init:latest"
+    image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}-amd64"
+      - "ghcr.io/luckypipewrench/pipelock-init:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}-amd64"
+      - "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}-arm64"
+
+  - name_template: "ghcr.io/luckypipewrench/pipelock-license-service:latest"
+    image_templates:
+      - "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}-amd64"
+      - "ghcr.io/luckypipewrench/pipelock-license-service:{{ .Version }}-arm64"

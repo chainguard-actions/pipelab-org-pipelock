@@ -1,0 +1,41 @@
+name: Test pinned version with v prefix
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create a clean project to scan
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-clean-project"
+          printf '# Clean project\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/README.md"
+      # Internal upload-artifact step fails under act's artifact server;
+      # outputs are still set and asserted strictly.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: v2.3.0
+          directory: pipelock-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert pinned version installed
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: unexpected outcome '$OUTCOME'"; exit 1
+          fi
+          OUT="$(pipelock version 2>&1)"
+          echo "pipelock version: $OUT"
+          if ! echo "$OUT" | grep -q "2\.3\.0"; then
+            echo "FAIL: expected version 2.3.0"; exit 1
+          fi
+          echo "audit-failed: $AUDIT_FAILED"
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: audit-failed should be 'false'"; exit 1
+          fi
+          echo "PASS"

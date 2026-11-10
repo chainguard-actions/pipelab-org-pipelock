@@ -1,0 +1,62 @@
+name: Test basic audit of a directory
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create a clean project to scan
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/pipelock-clean-project"
+          printf '# Clean project\n\nNothing to see here.\n' > "$GITHUB_WORKSPACE/pipelock-clean-project/README.md"
+      # The action's internal actions/upload-artifact@v7 step cannot talk to
+      # act's artifact server (unknown field "mime_type"), so the composite
+      # reports failure after the audit completes. Outputs are still set and
+      # are asserted strictly below.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          directory: pipelock-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          scan-diff: 'false'
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome=$OUTCOME score=$SCORE findings=$FINDINGS criticals=$CRITICALS config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: unexpected outcome '$OUTCOME'"; exit 1
+          fi
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: audit-failed should be 'false'"; exit 1
+          fi
+          for v in "$SCORE" "$FINDINGS" "$CRITICALS"; do
+            if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+              echo "FAIL: expected numeric value, got '$v'"; exit 1
+            fi
+          done
+          if [ "$SCORE" -gt 100 ]; then
+            echo "FAIL: score out of range"; exit 1
+          fi
+          if [ "$CRITICALS" -gt "$FINDINGS" ]; then
+            echo "FAIL: critical count exceeds findings count"; exit 1
+          fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then
+            echo "FAIL: expected auto-generated config file at '$CONFIG_PATH'"; exit 1
+          fi
+          case "$CONFIG_PATH" in
+            */pipelock-reports/suggested.yaml) ;;
+            *) echo "FAIL: unexpected config path"; exit 1 ;;
+          esac
+          if ! command -v pipelock >/dev/null; then
+            echo "FAIL: pipelock not on PATH"; exit 1
+          fi
+          echo "PASS"

@@ -1,0 +1,295 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package mcp
+
+import (
+	"fmt"
+	"path"
+	"strings"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/hitl"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+const (
+	mcpTaintSourceKind  = "mcp_response"
+	taintReasonDisabled = "taint_disabled"
+	taintScopeAction    = "action"
+	taintScopeSource    = "source"
+	taintScopeTask      = "task"
+)
+
+type taintDecision struct {
+	Risk                session.SessionRisk
+	Task                session.TaskContext
+	ActionClass         session.ActionClass
+	Sensitivity         session.ActionSensitivity
+	Authority           session.AuthorityKind
+	Result              session.PolicyDecisionResult
+	ActionRef           string
+	RequiresReauth      bool
+	TaskOverrideApplied bool
+}
+
+func observeMCPResponseTaint(opts MCPProxyOpts, promptHit bool) {
+	taintCfg := opts.taintCfg()
+	if taintCfg == nil || !taintCfg.Enabled {
+		return
+	}
+	rs, ok := opts.Rec.(session.RiskState)
+	if !ok {
+		return
+	}
+	observation := session.ClassifyMCPResponseObservation(mcpTaintSourceKind, opts.TaintExternalSource, promptHit)
+	observation.MaxSources = taintCfg.RecentSources
+	rs.ObserveRisk(observation)
+}
+
+func evaluateMCPTaint(opts MCPProxyOpts, toolName, argsJSON string) taintDecision {
+	decision := taintDecision{
+		ActionClass: session.ActionClassRead,
+		Sensitivity: session.SensitivityNormal,
+		Authority:   session.AuthorityUserBroad,
+		Result:      session.PolicyDecisionResult{Decision: session.PolicyAllow, Reason: taintReasonDisabled},
+	}
+	taintCfg := opts.taintCfg()
+	if taintCfg == nil || !taintCfg.Enabled {
+		return decision
+	}
+	if rs, ok := opts.Rec.(session.RiskState); ok {
+		decision.Risk = rs.RiskSnapshot()
+	}
+	decision.ActionClass, decision.Sensitivity, decision.ActionRef = session.ClassifyMCPToolCall(
+		toolName,
+		argsJSON,
+		taintCfg.ProtectedPaths,
+		taintCfg.ElevatedPaths,
+	)
+	decision.ActionRef = mcpActionRef(toolName, decision.ActionRef)
+	if tp, ok := opts.Rec.(session.TaskContextProvider); ok {
+		decision.Task = tp.TaskSnapshot()
+		if taintRuntimeTrustOverrideApplies(tp.RuntimeTrustOverrides(), decision.Task, decision.Risk, decision.ActionRef) {
+			decision.Result = session.PolicyDecisionResult{
+				Decision: session.PolicyAllow,
+				Reason:   "taint_runtime_task_override",
+			}
+			decision.TaskOverrideApplied = true
+			return decision
+		}
+	}
+	decision.Result = session.PolicyMatrix{Profile: taintCfg.Policy}.Evaluate(
+		decision.Risk.Level,
+		decision.ActionClass,
+		decision.Sensitivity,
+		decision.Authority,
+	)
+	if taintTrustOverrideApplies(taintCfg.TrustOverrides, decision.Risk, decision.ActionRef) {
+		decision.Result = session.PolicyDecisionResult{
+			Decision: session.PolicyAllow,
+			Reason:   "taint_trust_override",
+		}
+	}
+	return decision
+}
+
+func taintDecisionRequiresApproval(opts MCPProxyOpts, toolName, reason, preview string) (bool, bool) {
+	if opts.Approver == nil {
+		return false, false
+	}
+	decision := opts.Approver.Ask(buildHITLRequestForTaint(toolName, reason, preview))
+	return decision == hitl.DecisionAllow, true
+}
+
+func approveTaintDecision(decision *taintDecision) {
+	if decision == nil {
+		return
+	}
+	decision.Authority = session.AuthorityOperatorOverride
+	decision.RequiresReauth = true
+}
+
+func buildHITLRequestForTaint(toolName, reason, preview string) *hitl.Request {
+	target := toolName
+	if target == "" {
+		target = "mcp-tools-call"
+	}
+	return &hitl.Request{
+		URL:     target,
+		Reason:  reason,
+		Preview: preview,
+	}
+}
+
+func mcpActionRef(toolName, target string) string {
+	parts := []string{"mcp", strings.ToLower(strings.TrimSpace(toolName))}
+	if strings.TrimSpace(target) != "" {
+		parts = append(parts, strings.ToLower(strings.TrimSpace(target)))
+	}
+	return strings.Join(parts, ":")
+}
+
+func taintTrustOverrideApplies(overrides []config.TaintTrustOverride, risk session.SessionRisk, actionRef string) bool {
+	for _, override := range overrides {
+		if !override.ExpiresAt.IsZero() && override.ExpiresAt.Before(time.Now().UTC()) {
+			continue
+		}
+		if !taintOverrideMatches(override, risk, actionRef) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func taintOverrideMatches(override config.TaintTrustOverride, risk session.SessionRisk, actionRef string) bool {
+	switch override.Scope {
+	case taintScopeAction:
+		if override.ActionMatch == "" || !taintWildcardMatch(actionRef, override.ActionMatch) {
+			return false
+		}
+		if override.SourceMatch != "" && !taintRiskSourceMatches(risk, override.SourceMatch) {
+			return false
+		}
+		return true
+	case taintScopeSource:
+		if override.SourceMatch == "" || !taintRiskSourceMatches(risk, override.SourceMatch) {
+			return false
+		}
+		if override.ActionMatch != "" && !taintWildcardMatch(actionRef, override.ActionMatch) {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func taintRuntimeTrustOverrideApplies(overrides []session.TrustOverride, task session.TaskContext, risk session.SessionRisk, actionRef string) bool {
+	now := time.Now().UTC()
+	for _, override := range overrides {
+		if override.Scope != taintScopeTask {
+			continue
+		}
+		if override.TaskID == "" || override.TaskID != task.CurrentTaskID {
+			continue
+		}
+		if !override.ExpiresAt.IsZero() && override.ExpiresAt.Before(now) {
+			continue
+		}
+		if override.ActionMatch != "" && !taintWildcardMatch(actionRef, override.ActionMatch) {
+			continue
+		}
+		if override.SourceMatch != "" && !taintRiskSourceMatches(risk, override.SourceMatch) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func taintRiskSourceMatches(risk session.SessionRisk, pattern string) bool {
+	return taintWildcardMatch(risk.LastExternalURL, pattern)
+}
+
+func taintWildcardMatch(value, pattern string) bool {
+	if value == "" || pattern == "" {
+		return false
+	}
+	if matched, err := path.Match(pattern, value); err == nil && matched {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return value == pattern
+	}
+	parts := strings.Split(pattern, "*")
+	pos := 0
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(value[pos:], part)
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && !strings.HasPrefix(pattern, "*") && idx != 0 {
+			return false
+		}
+		pos += idx + len(part)
+	}
+	if !strings.HasSuffix(pattern, "*") && parts[len(parts)-1] != "" && !strings.HasSuffix(value, parts[len(parts)-1]) {
+		return false
+	}
+	return true
+}
+
+func taintApprovalReason(decision taintDecision) string {
+	return fmt.Sprintf("%s after %s", decision.ActionClass.String(), decision.Result.Reason)
+}
+
+// emitMCPToolReceipt emits the post-decision tool receipt for an MCP
+// tools/call message. The receipt payload bundles redaction context,
+// transport, and the full taint snapshot. Routed through
+// EmitMCPDecision so every tool receipt in the MCP inbound pipeline
+// goes through a single emission entry point.
+func emitMCPToolReceipt(
+	receiptEmitter *receipt.Emitter,
+	transport, redactionProfile string,
+	actionID, mcpMethod, toolName, receiptVerdict string,
+	decision taintDecision,
+	report *redact.Report,
+) {
+	if actionID == "" || receiptEmitter == nil {
+		return
+	}
+	_, _ = EmitMCPDecision(receiptEmitter, nil, MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID:            actionID,
+			Verdict:             receiptVerdict,
+			RedactionProfile:    redactionProfile,
+			RedactionReport:     report,
+			Transport:           transport,
+			Target:              toolName,
+			MCPMethod:           mcpMethod,
+			ToolName:            toolName,
+			SessionTaintLevel:   decision.Risk.Level.String(),
+			SessionContaminated: decision.Risk.Contaminated,
+			RecentTaintSources:  decision.Risk.Sources,
+			SessionTaskID:       decision.Task.CurrentTaskID,
+			SessionTaskLabel:    decision.Task.CurrentTaskLabel,
+			AuthorityKind:       decision.Authority.String(),
+			TaintDecision:       decision.Result.Decision.String(),
+			TaintDecisionReason: decision.Result.Reason,
+			TaskOverrideApplied: decision.TaskOverrideApplied,
+		},
+	})
+}
+
+// decorateMCPToolMessage injects the mediation envelope for a clean or
+// warn-mode tools/call that is about to be forwarded upstream. Routed
+// through EmitMCPDecision so envelope injection shares the same
+// emission entry point as receipt emission.
+func decorateMCPToolMessage(msg []byte, emitter *envelope.Emitter, actionID, mcpMethod, toolName, receiptVerdict string, decision taintDecision) []byte {
+	if actionID == "" {
+		return msg
+	}
+	buildOpts := envelope.BuildOpts{
+		ActionID:       actionID,
+		Action:         string(receipt.ClassifyMCPTool(toolName, mcpMethod)),
+		Verdict:        receiptVerdict,
+		SessionTaint:   decision.Risk.Level.String(),
+		TaskID:         decision.Task.CurrentTaskID,
+		AuthorityKind:  decision.Authority.String(),
+		RequiresReauth: decision.RequiresReauth,
+	}
+	out, _ := EmitMCPDecision(nil, emitter, MCPDecision{
+		Envelope:   &buildOpts,
+		InboundMsg: msg,
+	})
+	return out
+}
