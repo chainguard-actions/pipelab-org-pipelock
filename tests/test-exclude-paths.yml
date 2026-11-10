@@ -1,0 +1,43 @@
+name: Test exclude-paths
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create scan directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/scan-excl/vendor"
+          echo "# Hello" > "$GITHUB_WORKSPACE/scan-excl/README.md"
+          echo "package vendor" > "$GITHUB_WORKSPACE/scan-excl/vendor/lib.go"
+          echo "package main" > "$GITHUB_WORKSPACE/scan-excl/foo.generated.go"
+      # The bundled upload-artifact step fails against act's artifact server;
+      # tolerate the composite outcome and assert the scan outputs strictly.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.2.0'
+          directory: scan-excl
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          exclude-paths: |
+            vendor/
+              *.generated.go
+
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+        run: |
+          echo "outcome=$OUTCOME audit_failed=$AUDIT_FAILED score=$SCORE findings=$FINDINGS config=$CONFIG_PATH"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome $OUTCOME"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]]; then echo "FAIL: score not numeric"; exit 1; fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then echo "FAIL: findings not numeric"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: generated config missing"; exit 1; fi
+          echo "PASS"

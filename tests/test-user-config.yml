@@ -1,0 +1,53 @@
+name: Test user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/scan-clean"
+          echo "# Hello" > "$GITHUB_WORKSPACE/scan-clean/README.md"
+      # The bundled upload-artifact step fails against act's artifact server;
+      # tolerate the composite outcome and assert outputs strictly.
+      - id: gen
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.2.0'
+          directory: scan-clean
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Copy generated config
+        env:
+          GEN: ${{ steps.gen.outputs.config-path }}
+        run: |
+          echo "generated: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then echo "FAIL: no generated config"; exit 1; fi
+          cp "$GEN" "$RUNNER_TEMP/user-pipelock.yaml"
+          echo "USER_CONFIG=$RUNNER_TEMP/user-pipelock.yaml" >> "$GITHUB_ENV"
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.2.0'
+          directory: scan-clean
+          config: ${{ env.USER_CONFIG }}
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert config-path is the user config
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          SCORE: ${{ steps.action.outputs.score }}
+        run: |
+          echo "outcome: $OUTCOME config-path: $ACTUAL audit-failed: $AUDIT_FAILED score: $SCORE"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome $OUTCOME"; exit 1; fi
+          if [ "$ACTUAL" != "$USER_CONFIG" ]; then echo "FAIL: expected $USER_CONFIG"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]]; then echo "FAIL: score not numeric"; exit 1; fi
+          pipelock check --config "$USER_CONFIG" || { echo "FAIL: user config does not validate"; exit 1; }
+          echo "PASS"

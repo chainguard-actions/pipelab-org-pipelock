@@ -1,0 +1,44 @@
+name: Test basic scan of clean directory
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean scan directory
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/scan-clean"
+          echo "# Hello" > "$GITHUB_WORKSPACE/scan-clean/README.md"
+      # The action's bundled "Upload audit report" step (always()) cannot succeed
+      # against act's artifact server (CreateArtifact rejects the request), so the
+      # composite step is reported as failed even when the scan works. Tolerate
+      # that, and validate the scan outputs strictly below.
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '2.2.0'
+          directory: scan-clean
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert outputs
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          SCORE: ${{ steps.action.outputs.score }}
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          CRITICALS: ${{ steps.action.outputs.critical-count }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome=$OUTCOME score=$SCORE findings=$FINDINGS criticals=$CRITICALS config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then echo "FAIL: unexpected outcome $OUTCOME"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if ! [[ "$SCORE" =~ ^[0-9]+$ ]] || [ "$SCORE" -gt 100 ]; then echo "FAIL: score not 0-100"; exit 1; fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then echo "FAIL: findings-count not numeric"; exit 1; fi
+          if ! [[ "$CRITICALS" =~ ^[0-9]+$ ]]; then echo "FAIL: critical-count not numeric"; exit 1; fi
+          if [ "$CRITICALS" -gt "$FINDINGS" ]; then echo "FAIL: criticals > findings"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: generated config missing"; exit 1; fi
+          if ! command -v pipelock >/dev/null; then echo "FAIL: pipelock not on PATH"; exit 1; fi
+          pipelock version
+          echo "PASS"
