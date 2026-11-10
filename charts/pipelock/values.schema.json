@@ -1,0 +1,252 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Pipelock Helm values",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["proxy", "conductor", "fleetSink"]
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": {
+          "type": "string",
+          "not": {
+            "anyOf": [
+              { "pattern": "@" },
+              { "pattern": "^sha256:" }
+            ]
+          }
+        },
+        "digest": {
+          "type": "string",
+          "oneOf": [
+            { "const": "" },
+            { "pattern": "^sha256:[a-f0-9]{64}$" }
+          ]
+        },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "automount": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "name": { "type": "string" }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "service": {
+      "type": "object",
+      "required": ["type", "port", "metricsPort"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["ClusterIP", "NodePort", "LoadBalancer"]
+        },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "mcpPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "metricsPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "adminPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "resources": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "priorityClassName": { "type": "string" },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^[0-9]+%$" }
+          ]
+        },
+        "maxUnavailable": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string", "pattern": "^[0-9]+%$" }
+          ]
+        }
+      }
+    },
+    "extraEnv": { "type": "array" },
+    "extraEnvFrom": { "type": "array" },
+    "extraVolumes": { "type": "array" },
+    "extraVolumeMounts": { "type": "array" },
+    "license": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "existingSecret": { "type": "string" },
+        "secretKey": { "type": "string" },
+        "mountPath": { "type": "string" },
+        "crlSecretRef": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" },
+            "mountPath": { "type": "string" }
+          }
+        },
+        "publicKeySecretRef": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        }
+      }
+    },
+    "conductorFollower": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "conductorURL": { "type": "string" },
+        "orgID": { "type": "string" },
+        "fleetID": { "type": "string" },
+        "instanceID": { "type": "string" },
+        "trustRosterRootFingerprint": { "type": "string" },
+        "auditSigningKeyID": { "type": "string" },
+        "recorderKeyID": { "type": "string" },
+        "pollInterval": { "type": "string" },
+        "emergencyStream": { "type": "boolean" },
+        "honorRemoteKillSwitch": { "type": "boolean" },
+        "serverCASecretRef": { "type": "object" },
+        "clientSecretRef": { "type": "object" },
+        "trustRosterSecretRef": { "type": "object" },
+        "persistence": { "type": "object" }
+      }
+    },
+    "conductor": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "conductorID": { "type": "string" },
+        "followerTrustDomain": { "type": "string" },
+        "service": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "probePort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "tls": { "type": "object" },
+        "tokens": { "type": "object" },
+        "trustedAuditKeys": { "type": "array" },
+        "trustedControlKeys": { "type": "array" },
+        "persistence": { "type": "object" },
+        "resources": { "type": "object" }
+      }
+    },
+    "fleetSink": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "replicaCount": { "type": "integer", "minimum": 1 },
+        "service": {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "probePort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+          }
+        },
+        "tls": { "type": "object" },
+        "readerToken": { "type": "object" },
+        "trustedAuditKeys": { "type": "array" },
+        "persistence": { "type": "object" },
+        "resources": { "type": "object" }
+      }
+    },
+    "sentry": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "dsnSecretRef": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        }
+      }
+    },
+    "adminApi": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "tokenSecretRef": {
+          "type": "object",
+          "properties": {
+            "name": { "type": "string" },
+            "key": { "type": "string" }
+          }
+        }
+      }
+    },
+    "pipelock": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "mcp": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "upstream": { "type": "string" },
+        "listen": { "type": "string" }
+      }
+    },
+    "podMonitor": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval": { "type": "string" },
+        "labels": { "type": "object" }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "preset": {
+          "type": "string",
+          "enum": ["dev", "restricted", "airgapped"]
+        },
+        "ingress": { "type": "array" },
+        "egress": { "type": "array" }
+      }
+    },
+    "livenessProbe": { "type": "object" },
+    "readinessProbe": { "type": "object" }
+  }
+}

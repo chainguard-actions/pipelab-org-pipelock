@@ -1,0 +1,2193 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package proxy
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/proxy/baseline"
+	"github.com/luckyPipewrench/pipelock/internal/session"
+)
+
+// SessionResult is the outcome of session profiling and adaptive signal recording.
+type SessionResult struct {
+	Blocked bool   // session-level block (anomaly in block mode)
+	Detail  string // human-readable reason
+	Level   int    // current escalation level for downstream UpgradeAction()
+}
+
+// Anomaly represents a behavioral anomaly detected in a session.
+type Anomaly struct {
+	Type   string  // domain_burst, volume_spike
+	Detail string  // human-readable description
+	Score  float64 // anomaly score contribution
+}
+
+// maxRecentEvents caps the per-session event ring buffer. Operators viewing
+// an airlocked session through `pipelock session inspect` see the last N
+// notable events (blocks, anomalies, airlock transitions); older entries are
+// discarded to bound memory growth on long-lived sessions.
+const maxRecentEvents = 20
+
+const adaptiveClassificationObserve = "observe"
+
+var cooperativeToolUserAgentPattern = regexp.MustCompile(`(?i)^(?:yt-dlp|python-requests|pip|npm|pnpm|apt|dnf|curl|git)/`)
+
+func isCooperativeToolBurstUserAgent(userAgent string) bool {
+	return cooperativeToolUserAgentPattern.MatchString(strings.TrimSpace(userAgent))
+}
+
+func signalForSessionAnomaly(anomalyType string, cooperative bool) (session.SignalType, bool) {
+	switch anomalyType {
+	case "domain_burst":
+		if cooperative {
+			return session.SignalDomainAnomalyCooperative, true
+		}
+		return session.SignalDomainAnomaly, true
+	case "ip_domain_burst":
+		if cooperative {
+			return session.SignalIPDomainAnomalyCooperative, true
+		}
+		return session.SignalIPDomainAnomaly, true
+	default:
+		return 0, false
+	}
+}
+
+// SessionEvent is a structured record of a notable event on a session used
+// by the operator admin API to explain airlock state and recent activity.
+// Events are pushed into a bounded ring buffer on SessionState and read out
+// in chronological order (oldest first).
+type SessionEvent struct {
+	At       time.Time `json:"at"`
+	Kind     string    `json:"kind"`           // e.g. "block", "anomaly", "airlock_enter"
+	Type     string    `json:"type,omitempty"` // subtype for anomaly/block events
+	Target   string    `json:"target"`         // hostname, tool name, or transport where observed
+	Detail   string    `json:"detail"`         // short human-readable description
+	Severity string    `json:"severity"`       // info / warn / critical, mirrors audit severity
+	Score    float64   `json:"score"`          // scanner score at time of event (0 when N/A)
+}
+
+// AdaptiveScopeSnapshot is an operator-facing view of one scoped adaptive
+// lane. HTTP transports use destination scopes so an airlock on one upstream
+// does not blackhole unrelated control-plane or send-path traffic.
+type AdaptiveScopeSnapshot struct {
+	Scope              string    `json:"scope"`
+	ThreatScore        float64   `json:"threat_score"`
+	EscalationLevel    string    `json:"escalation_level"`
+	EscalationLevelInt int       `json:"escalation_level_int"`
+	BlockAll           bool      `json:"block_all"`
+	AirlockTier        string    `json:"airlock_tier"`
+	AirlockEnteredAt   time.Time `json:"airlock_entered_at,omitempty"`
+}
+
+type adaptiveScopeState struct {
+	threatScore      float64
+	escalationLevel  int
+	currentThreshold float64
+	lastEscalation   time.Time
+	atBlockAll       bool
+	airlock          AirlockState
+}
+
+// SessionState tracks behavioral state for a single agent session.
+type SessionState struct {
+	mu           sync.Mutex
+	key          string
+	kind         string // "identity" or "invocation" - set at creation, not inferred from key
+	created      time.Time
+	lastActivity time.Time
+
+	// Domain tracking (rolling window)
+	domainWindows []domainEntry
+	lastBurstAt   time.Time // cooldown: fire burst anomaly once per window
+
+	// Adaptive enforcement
+	threatScore                float64
+	escalationLevel            int // 0=normal, 1=first escalation, etc.
+	currentThreshold           float64
+	lastEscalation             time.Time // when the current level was reached
+	atBlockAll                 bool      // true when current level has block_all=true
+	globalSignalsAuthoritative bool
+	scopes                     map[string]*adaptiveScopeState
+
+	// Behavioral baseline accumulation - collected per-session for
+	// baseline learning and deviation checking.
+	requestCount int
+	bytesTotal   int64
+	toolCalls    int
+	uniqueTools  map[string]struct{}
+
+	// Graduated quarantine state.
+	airlock AirlockState
+
+	// Sticky taint state used for exposure-based policy escalation.
+	risk session.SessionRisk
+
+	// Task-boundary state for taint overrides and evidence binding.
+	task             session.TaskContext
+	runtimeOverrides []session.TrustOverride
+
+	// recentEvents is a bounded ring buffer of notable events (blocks,
+	// anomalies, airlock transitions). Read by the operator admin API to
+	// populate inspect/explain responses - written by recordSessionActivity
+	// and the airlock trigger path.
+	recentEvents []SessionEvent
+}
+
+// IsResettable returns whether this session can be reset via the admin API.
+// Only identity sessions are resettable; invocation sessions (MCP transport)
+// are ephemeral and not meaningful to reset.
+func (s *SessionState) IsResettable() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kind == sessionKindIdentity
+}
+
+// Airlock returns a pointer to the session's airlock state for tier checks
+// and transitions. The returned pointer is stable for the session's lifetime.
+func (s *SessionState) Airlock() *AirlockState {
+	return &s.airlock
+}
+
+// maxAdaptiveScopes bounds the per-session destination-scope cardinality.
+// Each scope holds its own adaptive lane and airlock (mutex + cancel slice),
+// so an agent that touches an unbounded number of distinct hosts must not be
+// able to grow this map without limit. Past the cap, new destinations fall
+// back to the session-wide (global) lane, which is stricter — fail-safe.
+// Mirrors the 10,000-tool MCP baseline cap in spirit.
+const maxAdaptiveScopes = 1024
+
+func (s *SessionState) getOrCreateScopeLocked(scope string) *adaptiveScopeState {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		return nil
+	}
+	if s.scopes == nil {
+		s.scopes = make(map[string]*adaptiveScopeState)
+	}
+	st := s.scopes[scope]
+	if st == nil {
+		if len(s.scopes) >= maxAdaptiveScopes {
+			// At cap: signal the caller to use the session-wide lane rather
+			// than allocate another scope. nil never reaches a deref because
+			// every caller guards it.
+			return nil
+		}
+		st = &adaptiveScopeState{airlock: AirlockState{tier: config.AirlockTierNone}}
+		s.scopes[scope] = st
+	}
+	return st
+}
+
+func normalizeAdaptiveScope(scope string) string {
+	return strings.ToLower(strings.TrimSpace(scope))
+}
+
+func adaptiveScopeForHost(host string) string {
+	host = normalizeAdaptiveScope(host)
+	if host == "" {
+		return ""
+	}
+	return "destination:" + host
+}
+
+// AirlockForScope returns the scoped airlock state for scope, creating it when
+// needed. An empty scope falls back to the legacy session-wide airlock.
+func (s *SessionState) AirlockForScope(scope string) *AirlockState {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		return &s.airlock
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.getOrCreateScopeLocked(scope)
+	if st == nil {
+		// Scope cap reached: fall back to the session-wide airlock.
+		return &s.airlock
+	}
+	return &st.airlock
+}
+
+type domainEntry struct {
+	domain string
+	at     time.Time
+}
+
+// RecordRequest records a request and returns any anomalies detected.
+// The caller must pass the current config for threshold values.
+// When the session is at block_all level, lastActivity is NOT refreshed
+// so idle eviction can eventually clean up stuck sessions (prevents
+// death spiral where blocked retries keep the session alive forever).
+func (s *SessionState) RecordRequest(domain string, cfg *config.SessionProfiling) []Anomaly {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	// Don't refresh activity at block_all levels - let idle eviction work.
+	// Without this, blocked retries keep the session alive forever.
+	if !s.atBlockAll {
+		s.lastActivity = now
+	}
+
+	// Accumulate baseline metrics.
+	s.requestCount++
+
+	var anomalies []Anomaly
+
+	// Domain burst detection: count unique new domains in the rolling window.
+	windowCutoff := now.Add(-time.Duration(cfg.WindowMinutes) * time.Minute)
+	s.domainWindows, _ = pruneDomainWindow(s.domainWindows, domain, windowCutoff, now)
+
+	uniqueDomains := countUniqueDomains(s.domainWindows)
+	if uniqueDomains >= cfg.DomainBurst {
+		// Score only on first detection per window. Repeat detections still
+		// return the anomaly (so AnomalyAction=block fires) but with Score 0
+		// to prevent adaptive escalation from repeated signals.
+		windowDur := time.Duration(cfg.WindowMinutes) * time.Minute
+		score := 0.0
+		if s.lastBurstAt.IsZero() || now.Sub(s.lastBurstAt) >= windowDur {
+			s.lastBurstAt = now
+			score = 2.0
+		}
+		anomalies = append(anomalies, Anomaly{
+			Type:   "domain_burst",
+			Detail: fmt.Sprintf("%d new domains in %dm window (threshold: %d)", uniqueDomains, cfg.WindowMinutes, cfg.DomainBurst),
+			Score:  score,
+		})
+	}
+
+	return anomalies
+}
+
+// countUniqueDomains counts distinct domain names in the slice.
+func countUniqueDomains(entries []domainEntry) int {
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		seen[e.domain] = struct{}{}
+	}
+	return len(seen)
+}
+
+// pruneDomainWindow removes expired entries, appends domain if not already
+// present, and returns the updated slice plus the unique domain count.
+// Shared by per-session RecordRequest and per-IP RecordIPDomain.
+func pruneDomainWindow(entries []domainEntry, domain string, windowCutoff, now time.Time) ([]domainEntry, int) {
+	pruned := entries[:0]
+	for _, de := range entries {
+		if de.at.After(windowCutoff) {
+			pruned = append(pruned, de)
+		}
+	}
+
+	seen := false
+	for _, de := range pruned {
+		if de.domain == domain {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		pruned = append(pruned, domainEntry{domain: domain, at: now})
+	}
+
+	return pruned, countUniqueDomains(pruned)
+}
+
+// maxLevelDuration is the maximum time a session stays at an escalation level
+// before automatically de-escalating by one level. This prevents death spirals
+// where false positives (e.g. entropy on CONNECT hostnames) permanently lock
+// a session at critical. The session must accumulate new real signals to
+// re-escalate.
+const maxLevelDuration = 5 * time.Minute
+
+// deescalationCheckInterval is how often the background sweep checks all
+// sessions for time-based de-escalation. Runs independently of traffic so
+// idle sessions recover even when no requests arrive.
+const deescalationCheckInterval = 30 * time.Second
+
+// RecordSignal adds a threat signal to the session's score.
+// Returns (escalated, fromLevel, toLevel) if threshold was crossed.
+// Time-based recovery is handled exclusively by TryAutoRecover, not here.
+// Caller must hold no locks on SessionState.
+func (s *SessionState) RecordSignal(sig session.SignalType, threshold float64) (bool, string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.globalSignalsAuthoritative = true
+
+	escalated, from, to := recordAdaptiveSignalFields(
+		&s.threatScore,
+		&s.escalationLevel,
+		&s.currentThreshold,
+		&s.lastEscalation,
+		sig,
+		threshold,
+	)
+	return escalated, from, to
+}
+
+// RecordScopedSignal adds a threat signal to one adaptive scope. It also
+// mirrors the signal into the session-wide score without updating the
+// session-wide block_all latch; HTTP enforcement uses the scoped return value
+// for quarantine decisions while the aggregate score remains visible to
+// operators and keeps cross-destination activity from disappearing.
+func (s *SessionState) RecordScopedSignal(scope string, sig session.SignalType, threshold float64) (bool, string, string) {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		return s.RecordSignal(sig, threshold)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	st := s.getOrCreateScopeLocked(scope)
+	if st == nil {
+		// Scope cap reached: record against the session-wide lane and make it
+		// authoritative, matching the empty-scope (global) fallback above.
+		s.globalSignalsAuthoritative = true
+		return recordAdaptiveSignalFields(
+			&s.threatScore,
+			&s.escalationLevel,
+			&s.currentThreshold,
+			&s.lastEscalation,
+			sig,
+			threshold,
+		)
+	}
+	escalated, from, to := recordAdaptiveSignalFields(
+		&st.threatScore,
+		&st.escalationLevel,
+		&st.currentThreshold,
+		&st.lastEscalation,
+		sig,
+		threshold,
+	)
+	_, _, _ = recordAdaptiveSignalFields(
+		&s.threatScore,
+		&s.escalationLevel,
+		&s.currentThreshold,
+		&s.lastEscalation,
+		sig,
+		threshold,
+	)
+	return escalated, from, to
+}
+
+func recordAdaptiveSignalFields(score *float64, level *int, threshold *float64, lastEscalation *time.Time, sig session.SignalType, initialThreshold float64) (bool, string, string) {
+	*score += session.SignalPoints[sig]
+	if *threshold == 0 && initialThreshold > 0 {
+		*threshold = initialThreshold
+	}
+	if *threshold <= 0 || *score < *threshold {
+		return false, "", ""
+	}
+	oldLevel := *level
+	*level++
+	*lastEscalation = time.Now()
+	*threshold *= 2
+	return true, session.EscalationLabel(oldLevel), session.EscalationLabel(*level)
+}
+
+// RecordClean decays the threat score for a clean request (no signals).
+func (s *SessionState) RecordClean(decayRate float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	decayAdaptiveScore(&s.threatScore, decayRate)
+}
+
+// RecordScopedClean decays both the scoped and aggregate scores for a clean
+// request in that destination lane.
+func (s *SessionState) RecordScopedClean(scope string, decayRate float64) {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		s.RecordClean(decayRate)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A clean request to a destination that never raised a signal has nothing
+	// to decay; do not allocate a scope lane for it. This keeps the scope-map
+	// budget spent on destinations that actually accrued threat, so ordinary
+	// broad browsing cannot fill the cap with zero-score entries.
+	if st := s.scopes[scope]; st != nil {
+		decayAdaptiveScore(&st.threatScore, decayRate)
+	}
+	decayAdaptiveScore(&s.threatScore, decayRate)
+}
+
+func decayAdaptiveScore(score *float64, decayRate float64) {
+	*score -= decayRate
+	if *score < 0 {
+		*score = 0
+	}
+}
+
+// SetBlockAll sets whether the session is at a block_all escalation level.
+// Called by the proxy after escalation or de-escalation when it has access
+// to the adaptive enforcement config. Controls whether RecordRequest
+// refreshes lastActivity (block_all must NOT refresh to allow idle eviction).
+func (s *SessionState) SetBlockAll(blocked bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.atBlockAll = blocked
+}
+
+// SetScopedBlockAll sets the block_all latch for one adaptive scope. Empty
+// scope falls back to the legacy session-wide latch.
+func (s *SessionState) SetScopedBlockAll(scope string, blocked bool) {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		s.SetBlockAll(blocked)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.getOrCreateScopeLocked(scope)
+	if st == nil {
+		// Scope cap reached: latch on the session-wide lane instead.
+		s.atBlockAll = blocked
+		return
+	}
+	st.atBlockAll = blocked
+}
+
+// BlockAll returns whether the session is at a block_all escalation level (thread-safe).
+func (s *SessionState) BlockAll() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.atBlockAll
+}
+
+func (s *SessionState) ScopedEscalationLevel(scope string) int {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		return s.EscalationLevel()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st := s.scopes[scope]; st != nil {
+		return st.escalationLevel
+	}
+	return 0
+}
+
+// EffectiveEscalationLevel returns the escalation level that should apply to
+// a request in scope. Destination-scoped HTTP signals do not make the aggregate
+// session level globally authoritative; explicit global signals from non-HTTP
+// paths still apply everywhere.
+func (s *SessionState) EffectiveEscalationLevel(scope string) int {
+	scope = normalizeAdaptiveScope(scope)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	level := 0
+	if st := s.scopes[scope]; st != nil {
+		level = st.escalationLevel
+	}
+	if s.globalSignalsAuthoritative && s.escalationLevel > level {
+		level = s.escalationLevel
+	}
+	return level
+}
+
+func (s *SessionState) ScopedThreatScore(scope string) float64 {
+	scope = normalizeAdaptiveScope(scope)
+	if scope == "" {
+		return s.ThreatScore()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st := s.scopes[scope]; st != nil {
+		return st.threatScore
+	}
+	return 0
+}
+
+func (s *SessionState) ScopedSnapshots() []AdaptiveScopeSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return scopedSnapshotsLocked(s.scopes)
+}
+
+// TryAutoRecover checks whether the session has been at its current
+// escalation level for longer than maxLevelDuration and drops one level
+// if so. It takes a blockAllCheck callback that recomputes atBlockAll
+// from live config so custom configs with block_all at lower escalation
+// levels work correctly. This is the sole time-based recovery path.
+//
+// Returns (changed, fromLevel, toLevel). The caller is responsible for
+// emitting metrics/logs when changed is true.
+func (s *SessionState) TryAutoRecover(blockAllCheck func(int) bool) (bool, int, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.escalationLevel <= 0 || s.lastEscalation.IsZero() {
+		return false, 0, 0
+	}
+	if time.Since(s.lastEscalation) <= maxLevelDuration {
+		return false, 0, 0
+	}
+
+	from := s.escalationLevel
+	s.escalationLevel--
+	s.lastEscalation = time.Now()
+
+	if s.currentThreshold > 0 {
+		s.currentThreshold /= 2
+	}
+	s.threatScore = s.currentThreshold / 2
+	s.atBlockAll = blockAllCheck(s.escalationLevel)
+
+	return true, from, s.escalationLevel
+}
+
+// TryAutoRecoverScopes applies the same time-based recovery as TryAutoRecover
+// to each scoped adaptive lane.
+func (s *SessionState) TryAutoRecoverScopes(blockAllCheck func(int) bool) []scopedLevelTransition {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.scopes) == 0 {
+		return nil
+	}
+	changes := make([]scopedLevelTransition, 0)
+	now := time.Now()
+	for scope, st := range s.scopes {
+		if st.escalationLevel <= 0 || st.lastEscalation.IsZero() {
+			continue
+		}
+		if now.Sub(st.lastEscalation) <= maxLevelDuration {
+			continue
+		}
+		from := st.escalationLevel
+		st.escalationLevel--
+		st.lastEscalation = now
+		if st.currentThreshold > 0 {
+			st.currentThreshold /= 2
+		}
+		st.threatScore = st.currentThreshold / 2
+		st.atBlockAll = blockAllCheck(st.escalationLevel)
+		changes = append(changes, scopedLevelTransition{scope: scope, from: from, to: st.escalationLevel})
+	}
+	return changes
+}
+
+// TryDeescalateScopedAirlocks applies airlock timers to scoped destination
+// lanes. The session-wide airlock is handled separately in sweepDeescalation.
+func (s *SessionState) TryDeescalateScopedAirlocks(timers *config.AirlockTimers) []scopedAirlockTransition {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	changes := make([]scopedAirlockTransition, 0)
+	for scope, st := range s.scopes {
+		changed, from, to := st.airlock.TryDeescalate(timers)
+		if changed {
+			changes = append(changes, scopedAirlockTransition{scope: scope, from: from, to: to})
+		}
+	}
+	return changes
+}
+
+// ThreatScore returns the current threat score (thread-safe).
+func (s *SessionState) ThreatScore() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.threatScore
+}
+
+// IsEscalated returns whether this session has been escalated.
+func (s *SessionState) IsEscalated() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.escalationLevel > 0
+}
+
+// EscalationLevel returns the current escalation level (thread-safe).
+func (s *SessionState) EscalationLevel() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.escalationLevel
+}
+
+// RecordEvent appends evt to the session's recent-event ring buffer.
+// Events older than maxRecentEvents are dropped in FIFO order so an
+// attacker cannot grow SessionState memory by driving retries.
+// evt.At is set to time.Now() when zero.
+func (s *SessionState) RecordEvent(evt SessionEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if evt.At.IsZero() {
+		evt.At = time.Now()
+	}
+	if len(s.recentEvents) >= maxRecentEvents {
+		// Drop the oldest entry (index 0) by shifting the slice. In-place
+		// shift reuses the underlying array so the allocation is bounded.
+		copy(s.recentEvents, s.recentEvents[1:])
+		s.recentEvents = s.recentEvents[:maxRecentEvents-1]
+	}
+	s.recentEvents = append(s.recentEvents, evt)
+}
+
+// RecentEvents returns a copy of the session's recent-event ring buffer
+// in chronological order (oldest first). Returns an empty slice when no
+// events have been recorded.
+func (s *SessionState) RecentEvents() []SessionEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.recentEvents) == 0 {
+		return []SessionEvent{}
+	}
+	out := make([]SessionEvent, len(s.recentEvents))
+	copy(out, s.recentEvents)
+	return out
+}
+
+// Reset zeros all enforcement fields in place and refreshes lastActivity.
+// The session remains in the map so live Recorder pointers stay valid.
+// Returns previous score and level for the API response.
+func (s *SessionState) Reset() (prevScore float64, prevLevel int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.airlock.mu.Lock()
+	defer s.airlock.mu.Unlock()
+	return s.resetWhileLocked()
+}
+
+// resetWhileLocked performs the in-place reset under the assumption
+// that the caller already holds both s.mu and s.airlock.mu. Extracted
+// so SnapshotAndResetIfResettable can take the snapshot and clear the
+// session in a single critical section - without this helper,
+// releasing the session/airlock locks between the snapshot copy and
+// Reset would let concurrent mutation slip state into the audit row
+// that never actually existed at the moment of terminate.
+//
+// Callers are responsible for holding s.mu AND s.airlock.mu. Lock
+// order is sess.mu > sess.airlock.mu; acquire in that order.
+func (s *SessionState) resetWhileLocked() (prevScore float64, prevLevel int) {
+	prevScore = s.threatScore
+	prevLevel = s.escalationLevel
+
+	s.threatScore = 0
+	s.escalationLevel = 0
+	s.currentThreshold = 0
+	s.lastEscalation = time.Time{}
+	s.atBlockAll = false
+	s.globalSignalsAuthoritative = false
+	for _, scoped := range s.scopes {
+		scoped.airlock.mu.Lock()
+		scoped.airlock.callCancelFuncsLocked()
+		scoped.airlock.mu.Unlock()
+	}
+	s.scopes = nil
+	s.domainWindows = nil
+	s.lastBurstAt = time.Time{}
+	s.lastActivity = time.Now()
+	s.requestCount = 0
+	s.bytesTotal = 0
+	s.toolCalls = 0
+	s.uniqueTools = nil
+	s.recentEvents = nil
+
+	// Release airlock quarantine. Fire pending cancel funcs so in-flight
+	// long-lived connections tear down, then clear the slice so stale
+	// callbacks cannot re-fire on a future hard/drain escalation. This
+	// mirrors ForceSetTierWithProvenance(none), which explicitly clears
+	// cancelFuncs on release. Without the nil assignment, Reset() +
+	// RegisterCancel() + SetTier(hard) would re-fire every cancel from
+	// before the reset.
+	s.airlock.tier = config.AirlockTierNone
+	s.airlock.enteredAt = time.Time{}
+	s.airlock.trigger = ""
+	s.airlock.source = ""
+	s.airlock.callCancelFuncsLocked()
+	s.airlock.cancelFuncs = nil
+
+	return prevScore, prevLevel
+}
+
+// RiskSnapshot returns a copy of the session taint state.
+func (s *SessionState) RiskSnapshot() session.SessionRisk {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.risk.Snapshot()
+}
+
+// TaskSnapshot returns a copy of the session's current task context.
+func (s *SessionState) TaskSnapshot() session.TaskContext {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.task.CurrentTaskID == "" {
+		s.task = newTaskContext("", time.Now())
+	}
+	return s.task
+}
+
+// RuntimeTrustOverrides returns a copy of the session's runtime overrides.
+func (s *SessionState) RuntimeTrustOverrides() []session.TrustOverride {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]session.TrustOverride(nil), s.runtimeOverrides...)
+}
+
+// ObserveRisk folds a new taint observation into the session's sticky risk state.
+func (s *SessionState) ObserveRisk(observation session.RiskObservation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.risk.Observe(observation)
+}
+
+// BeginNewTask rotates the current task boundary and clears taint-only state.
+// Adaptive enforcement state remains intact.
+func (s *SessionState) BeginNewTask(label string) (prev, current session.TaskContext, clearedOverrides int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	if s.task.CurrentTaskID == "" {
+		s.task = newTaskContext("", now)
+	}
+	prev = s.task
+	s.task = newTaskContext(label, now)
+	s.risk = session.SessionRisk{}
+
+	if len(s.runtimeOverrides) > 0 {
+		kept := s.runtimeOverrides[:0]
+		for _, override := range s.runtimeOverrides {
+			if override.TaskID != "" && override.TaskID == prev.CurrentTaskID {
+				clearedOverrides++
+				continue
+			}
+			kept = append(kept, override)
+		}
+		s.runtimeOverrides = kept
+	}
+
+	// Refresh activity so cleanup doesn't evict a session that just had
+	// its task boundary rotated via the admin API.
+	s.lastActivity = now
+
+	return prev, s.task, clearedOverrides
+}
+
+// AddRuntimeTrustOverride stores a session-scoped trust override. Task-scoped
+// overrides are automatically bound to the current task ID.
+func (s *SessionState) AddRuntimeTrustOverride(override session.TrustOverride) session.TrustOverride {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.task.CurrentTaskID == "" {
+		s.task = newTaskContext("", time.Now())
+	}
+	if override.Scope == "task" && override.TaskID == "" {
+		override.TaskID = s.task.CurrentTaskID
+	}
+	s.runtimeOverrides = append(s.runtimeOverrides, override)
+	// Refresh activity so cleanup doesn't evict a session that just
+	// received a trust override via the admin API.
+	s.lastActivity = time.Now()
+	return override
+}
+
+// RecordBytes adds to the session's cumulative byte count.
+// Called by transport handlers after completing a request.
+func (s *SessionState) RecordBytes(n int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.bytesTotal += n
+}
+
+// RecordToolCall increments the session's tool call counter and tracks
+// unique tool names. Called by MCP proxy when a tool invocation completes.
+func (s *SessionState) RecordToolCall(toolName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolCalls++
+	if s.uniqueTools == nil {
+		s.uniqueTools = make(map[string]struct{})
+	}
+	s.uniqueTools[toolName] = struct{}{}
+}
+
+// BaselineMetrics returns a snapshot of the session's accumulated metrics
+// suitable for passing to baseline.Manager.RecordSession or Check.
+func (s *SessionState) BaselineMetrics() baseline.SessionMetrics {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return baseline.SessionMetrics{
+		ToolCalls:   s.toolCalls,
+		UniqueTools: len(s.uniqueTools),
+		Domains:     countUniqueDomains(s.domainWindows),
+		BytesTotal:  s.bytesTotal,
+		DurationSec: s.lastActivity.Sub(s.created).Seconds(),
+		Requests:    s.requestCount,
+	}
+}
+
+// Session key classification constants.
+const (
+	sessionKindIdentity   = "identity"
+	sessionKindInvocation = "invocation"
+)
+
+// invocationPrefixes lists MCP transport prefixes that identify invocation keys.
+var invocationPrefixes = []string{"mcp-stdio-", "mcp-http-", "mcp-ws-"}
+
+// SessionSnapshot is a read-only DTO for the admin API.
+type SessionSnapshot struct {
+	Key              string    `json:"key"`
+	Agent            string    `json:"agent"`
+	ClientIP         string    `json:"client_ip"`
+	Kind             string    `json:"kind"`
+	CurrentTaskID    string    `json:"current_task_id,omitempty"`
+	CurrentTaskLabel string    `json:"current_task_label,omitempty"`
+	ThreatScore      float64   `json:"threat_score"`
+	EscalationLevel  string    `json:"escalation_level"`
+	BlockAll         bool      `json:"block_all"`
+	AirlockTier      string    `json:"airlock_tier"`
+	TaintLevel       string    `json:"taint_level"`
+	Contaminated     bool      `json:"contaminated"`
+	LastActivity     time.Time `json:"last_activity"`
+}
+
+type AdaptiveTopAnomaly struct {
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+}
+
+type AdaptiveStatus struct {
+	ActiveSessions     int                  `json:"active_sessions"`
+	MaxEscalationLevel string               `json:"max_escalation_level"`
+	MaxEscalationInt   int                  `json:"max_escalation_level_int"`
+	SessionsByLevel    map[string]int       `json:"sessions_by_level"`
+	AirlockTiers       map[string]int       `json:"airlock_tiers"`
+	RecentSignalCounts map[string]int       `json:"recent_signal_counts"`
+	TopAnomalies       []AdaptiveTopAnomaly `json:"top_anomalies"`
+	LockdownTTLSeconds int64                `json:"lockdown_ttl_seconds"`
+	Sessions           []SessionSnapshot    `json:"sessions,omitempty"`
+}
+
+type AdaptiveFlushResult struct {
+	Flushed              bool `json:"flushed"`
+	IdentitySessions     int  `json:"identity_sessions"`
+	SkippedInvocations   int  `json:"skipped_invocations"`
+	IPDomainStateCleared bool `json:"ip_domain_state_cleared"`
+}
+
+type scopedLevelTransition struct {
+	scope string
+	from  int
+	to    int
+}
+
+type scopedAirlockTransition struct {
+	scope string
+	from  string
+	to    string
+}
+
+type AdaptiveWhoami struct {
+	ClientIP           string  `json:"client_ip"`
+	Agent              string  `json:"agent,omitempty"`
+	SessionKey         string  `json:"session_key"` //nolint:gosec // Operator-visible session identity, not a credential.
+	Exists             bool    `json:"exists"`
+	Classification     string  `json:"classification"`
+	EscalationLevel    string  `json:"escalation_level"`
+	EscalationLevelInt int     `json:"escalation_level_int"`
+	ThreatScore        float64 `json:"threat_score"`
+	BlockAll           bool    `json:"block_all"`
+	AirlockTier        string  `json:"airlock_tier"`
+	LockdownTTLSeconds int64   `json:"lockdown_ttl_seconds"`
+}
+
+// sessionAdminSnapshot is the internal operator-facing expansion of
+// SessionSnapshot used by inspect/explain. It captures all fields in a
+// single pass so handlers do not mix a map snapshot with a second live
+// read from the session and return self-contradictory JSON under races.
+type sessionAdminSnapshot struct {
+	SessionSnapshot
+	AirlockEnteredAt     time.Time
+	InFlight             int64
+	EscalationLevelInt   int
+	AirlockTrigger       string
+	AirlockTriggerSource string
+	RecentEvents         []SessionEvent
+	AdaptiveScopes       []AdaptiveScopeSnapshot
+}
+
+// classifySessionKey determines whether a key is an identity key or an
+// MCP invocation key, and extracts agent/IP for identity keys.
+func classifySessionKey(key string) (kind, agent, clientIP string) {
+	for _, prefix := range invocationPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return sessionKindInvocation, "", ""
+		}
+	}
+	if idx := strings.LastIndex(key, "|"); idx > 0 {
+		return sessionKindIdentity, key[:idx], key[idx+1:]
+	}
+	return sessionKindIdentity, "", key
+}
+
+func newTaskContext(label string, now time.Time) session.TaskContext {
+	return session.TaskContext{
+		CurrentTaskID:    session.NextTaskID(),
+		CurrentTaskLabel: label,
+		StartedAt:        now.UTC(),
+		LastBoundaryAt:   now.UTC(),
+	}
+}
+
+// BaselineResult holds the outcome of a behavioral baseline deviation check.
+type BaselineResult struct {
+	Blocked    bool                 // true when DeviationAction is "block" and deviations found
+	Deviations []baseline.Deviation // specific metrics that deviated
+	Action     string               // the configured action: "warn", "ask", or "block"
+}
+
+// SessionManager manages per-client sessions with eviction and cleanup.
+type SessionManager struct {
+	mu       sync.RWMutex
+	sessions map[string]*SessionState
+
+	// ipDomains tracks domain diversity per source IP, independent of agent
+	// header. This catches domain burst attacks where the attacker rotates
+	// the X-Pipelock-Agent header per request to create fresh sessions.
+	ipDomains       map[string][]domainEntry
+	ipBurstCooldown map[string]time.Time // per-IP burst cooldown timestamps
+
+	cfgPtr         atomic.Pointer[config.SessionProfiling]
+	adaptiveCfgPtr atomic.Pointer[config.AdaptiveEnforcement]
+	airlockCfgPtr  atomic.Pointer[config.Airlock]
+	metrics        *metrics.Metrics // nil-safe; used for gauge/counter updates
+	logger         *audit.Logger    // nil-safe; used for airlock de-escalation logging
+	done           chan struct{}
+	closed         sync.Once
+
+	// Behavioral baseline: profile-then-lock analysis.
+	// nil when behavioral_baseline.enabled is false.
+	baselineMgr    *baseline.Manager
+	baselineAction string // "warn", "ask", or "block" - cached from config
+}
+
+// SessionManagerOptions configures optional SessionManager behavior.
+type SessionManagerOptions struct {
+	AirlockCfg *config.Airlock
+	Logger     *audit.Logger
+}
+
+// NewSessionManager creates a session manager with background cleanup.
+// The metrics parameter is optional (nil disables gauge/counter updates).
+// The adaptiveCfg parameter is optional (nil when adaptive enforcement is disabled).
+func NewSessionManager(cfg *config.SessionProfiling, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics, opts ...SessionManagerOptions) *SessionManager {
+	sm := &SessionManager{
+		sessions:        make(map[string]*SessionState),
+		ipDomains:       make(map[string][]domainEntry),
+		ipBurstCooldown: make(map[string]time.Time),
+		metrics:         m,
+		done:            make(chan struct{}),
+	}
+	sm.cfgPtr.Store(cfg)
+	sm.adaptiveCfgPtr.Store(adaptiveCfg)
+	if len(opts) > 0 {
+		if opts[0].AirlockCfg != nil {
+			sm.airlockCfgPtr.Store(opts[0].AirlockCfg)
+		}
+		sm.logger = opts[0].Logger
+	}
+
+	go sm.cleanupLoop()
+	go sm.deescalationLoop()
+	return sm
+}
+
+// EnableBaseline initializes the behavioral baseline manager from config.
+// Must be called after NewSessionManager. No-op if cfg is nil or not enabled.
+// Returns an error if the baseline manager fails to initialize (e.g., bad
+// profile directory).
+func (sm *SessionManager) EnableBaseline(cfg *config.BehavioralBaseline) error {
+	if cfg == nil || !cfg.Enabled {
+		return nil
+	}
+	mgr, err := baseline.NewManager(baseline.Config{
+		Enabled:          cfg.Enabled,
+		LearningWindow:   cfg.LearningWindow,
+		DeviationAction:  cfg.DeviationAction,
+		ProfileDir:       cfg.ProfileDir,
+		AutoRatify:       cfg.AutoRatify,
+		SensitivitySigma: cfg.SensitivitySigma,
+		LockDimensions:   cfg.LockDimensions,
+		PoisonResistance: cfg.PoisonResistance,
+		SeasonalityMode:  cfg.SeasonalityMode,
+	})
+	if err != nil {
+		return fmt.Errorf("baseline init: %w", err)
+	}
+	sm.baselineMgr = mgr
+	sm.baselineAction = cfg.DeviationAction
+	return nil
+}
+
+// BaselineManager returns the baseline manager, or nil if not enabled.
+func (sm *SessionManager) BaselineManager() *baseline.Manager {
+	return sm.baselineMgr
+}
+
+// CheckBaseline evaluates the current session metrics against the agent's
+// locked behavioral profile. Returns nil result when baseline is disabled
+// or the agent has no locked profile yet (still learning).
+func (sm *SessionManager) CheckBaseline(agentKey string, sess *SessionState) *BaselineResult {
+	if sm.baselineMgr == nil {
+		return nil
+	}
+	metrics := sess.BaselineMetrics()
+	deviations := sm.baselineMgr.Check(agentKey, metrics)
+	if len(deviations) == 0 {
+		return nil
+	}
+	return &BaselineResult{
+		Blocked:    sm.baselineAction == config.ActionBlock,
+		Deviations: deviations,
+		Action:     sm.baselineAction,
+	}
+}
+
+// recordSessionBaseline records the session's accumulated metrics into the
+// baseline manager for learning. Called during session eviction/cleanup.
+func (sm *SessionManager) recordSessionBaseline(sess *SessionState) {
+	if sm.baselineMgr == nil {
+		return
+	}
+	// Extract agent key from session key. Only identity sessions produce
+	// meaningful baselines; invocation sessions are ephemeral.
+	sess.mu.Lock()
+	kind := sess.kind
+	key := sess.key
+	sess.mu.Unlock()
+
+	if kind != sessionKindIdentity {
+		return
+	}
+
+	_, agent, _ := classifySessionKey(key)
+	if agent == "" {
+		// Fall back to full key when no "|" separator exists.
+		agent = key
+	}
+	bm := sess.BaselineMetrics()
+	sm.baselineMgr.RecordSession(agent, bm)
+}
+
+// GetOrCreate returns the session for a key, creating if needed.
+// Evicts oldest idle session if at capacity.
+func (sm *SessionManager) GetOrCreate(key string) *SessionState {
+	// Fast path: read lock
+	sm.mu.RLock()
+	if sess, ok := sm.sessions[key]; ok {
+		sm.mu.RUnlock()
+		return sess
+	}
+	sm.mu.RUnlock()
+
+	// Slow path: write lock
+	sm.mu.Lock()
+
+	// Double-check after acquiring write lock
+	if sess, ok := sm.sessions[key]; ok {
+		sm.mu.Unlock()
+		return sess
+	}
+
+	// Evict if at capacity. Capture the evicted session for baseline
+	// recording after the lock is released.
+	var evicted *SessionState
+	cfg := sm.cfgPtr.Load()
+	if len(sm.sessions) >= cfg.MaxSessions {
+		evicted = sm.evictOldest()
+	}
+
+	// Determine session kind from key format at creation time.
+	kind := sessionKindIdentity
+	for _, prefix := range invocationPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			kind = sessionKindInvocation
+			break
+		}
+	}
+
+	now := time.Now()
+	sess := &SessionState{
+		key:              key,
+		kind:             kind,
+		created:          now,
+		lastActivity:     now,
+		currentThreshold: 0, // set by adaptive enforcement when enabled
+		airlock:          AirlockState{tier: config.AirlockTierNone},
+		task:             newTaskContext("", now),
+	}
+	sm.sessions[key] = sess
+	if sm.metrics != nil {
+		sm.metrics.SetSessionsActive(float64(len(sm.sessions)))
+	}
+	sm.mu.Unlock()
+
+	// Record evicted session's baseline after releasing the map lock.
+	if evicted != nil {
+		sm.recordSessionBaseline(evicted)
+	}
+
+	return sess
+}
+
+// Len returns the number of active sessions.
+func (sm *SessionManager) Len() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.sessions)
+}
+
+// RecordIPDomain checks domain diversity across all agent identities from the
+// same source IP. This catches header rotation attacks where an attacker sends
+// each request with a different X-Pipelock-Agent value to avoid per-session
+// domain burst detection. Returns anomalies when the IP crosses the burst
+// threshold regardless of which agent identity was used.
+func (sm *SessionManager) RecordIPDomain(clientIP, domain string, cfg *config.SessionProfiling) []Anomaly {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	now := time.Now()
+	windowCutoff := now.Add(-time.Duration(cfg.WindowMinutes) * time.Minute)
+
+	pruned, uniqueDomains := pruneDomainWindow(sm.ipDomains[clientIP], domain, windowCutoff, now)
+	sm.ipDomains[clientIP] = pruned
+
+	var anomalies []Anomaly
+	if uniqueDomains >= cfg.DomainBurst {
+		// Same cooldown pattern as per-session burst: score once per window,
+		// anomaly returned every time so AnomalyAction=block still fires.
+		windowDur := time.Duration(cfg.WindowMinutes) * time.Minute
+		lastBurst := sm.ipBurstCooldown[clientIP]
+		score := 0.0
+		if lastBurst.IsZero() || now.Sub(lastBurst) >= windowDur {
+			sm.ipBurstCooldown[clientIP] = now
+			score = 3.0
+		}
+		anomalies = append(anomalies, Anomaly{
+			Type:   "ip_domain_burst",
+			Detail: fmt.Sprintf("%d unique domains from IP in %dm window (threshold: %d)", uniqueDomains, cfg.WindowMinutes, cfg.DomainBurst),
+			Score:  score,
+		})
+	}
+
+	return anomalies
+}
+
+// UpdateConfig swaps the session manager's config pointer so that TTL,
+// capacity, threshold, and cleanup interval changes take effect on the
+// next operation. Pass nil for adaptiveCfg to clear adaptive enforcement
+// (e.g., when it is disabled via hot reload).
+func (sm *SessionManager) UpdateConfig(cfg *config.SessionProfiling, adaptiveCfg *config.AdaptiveEnforcement, airlockCfg *config.Airlock) {
+	sm.cfgPtr.Store(cfg)
+	sm.adaptiveCfgPtr.Store(adaptiveCfg)
+	sm.airlockCfgPtr.Store(airlockCfg)
+
+	// Recompute atBlockAll for all sessions from the new adaptive config.
+	// This handles three cases:
+	// - Adaptive disabled → clear all flags
+	// - block_all matrix changed → recompute per session level
+	// - No change → flags stay the same (recompute is idempotent)
+	sm.mu.RLock()
+	for _, sess := range sm.sessions {
+		if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+			sess.SetBlockAll(false)
+			sess.recomputeScopedBlockAll(nil)
+		} else {
+			level := sess.EscalationLevel()
+			isBlockAll := decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+			sess.SetBlockAll(isBlockAll)
+			sess.recomputeScopedBlockAll(adaptiveCfg)
+		}
+	}
+	sm.mu.RUnlock()
+}
+
+func (s *SessionState) recomputeScopedBlockAll(adaptiveCfg *config.AdaptiveEnforcement) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, scoped := range s.scopes {
+		scoped.atBlockAll = adaptiveCfg != nil &&
+			adaptiveCfg.Enabled &&
+			decide.UpgradeAction("", scoped.escalationLevel, adaptiveCfg) == config.ActionBlock
+	}
+}
+
+// Close stops the cleanup goroutine.
+func (sm *SessionManager) Close() {
+	sm.closed.Do(func() {
+		close(sm.done)
+	})
+}
+
+// Snapshot returns a sorted read-only snapshot of all sessions.
+// Identity sessions sort first (by key), then invocation sessions (by key).
+// Copies session pointers under RLock then releases it before reading each
+// session's state, so the manager-level lock is held only briefly.
+func (sm *SessionManager) Snapshot() []SessionSnapshot {
+	sm.mu.RLock()
+	keys := make([]string, 0, len(sm.sessions))
+	sessions := make([]*SessionState, 0, len(sm.sessions))
+	for k, s := range sm.sessions {
+		keys = append(keys, k)
+		sessions = append(sessions, s)
+	}
+	sm.mu.RUnlock()
+
+	snaps := make([]SessionSnapshot, len(sessions))
+	for i, s := range sessions {
+		s.mu.Lock()
+		kind, agent, ip := classifySessionKey(keys[i])
+		snaps[i] = SessionSnapshot{
+			Key:              keys[i],
+			Agent:            agent,
+			ClientIP:         ip,
+			Kind:             kind,
+			CurrentTaskID:    s.task.CurrentTaskID,
+			CurrentTaskLabel: s.task.CurrentTaskLabel,
+			ThreatScore:      s.threatScore,
+			EscalationLevel:  session.EscalationLabel(s.escalationLevel),
+			BlockAll:         s.atBlockAll,
+			AirlockTier:      s.airlock.Tier(),
+			TaintLevel:       s.risk.Level.String(),
+			Contaminated:     s.risk.Contaminated,
+			LastActivity:     s.lastActivity,
+		}
+		s.mu.Unlock()
+	}
+
+	sort.Slice(snaps, func(i, j int) bool {
+		if snaps[i].Kind != snaps[j].Kind {
+			return snaps[i].Kind < snaps[j].Kind // "identity" < "invocation"
+		}
+		return snaps[i].Key < snaps[j].Key
+	})
+	return snaps
+}
+
+// SessionExists returns whether the given key has an active session.
+// Uses a read lock for minimal contention on the hot path.
+func (sm *SessionManager) SessionExists(key string) bool {
+	sm.mu.RLock()
+	_, ok := sm.sessions[key]
+	sm.mu.RUnlock()
+	return ok
+}
+
+// ResetSession resets enforcement state for the given identity key.
+// Also clears IP-level burst state for the client IP and decrements
+// the adaptive gauge if the session was escalated.
+// Does NOT check session kind - caller is responsible for ensuring the key
+// belongs to a resettable session. Prefer ResetSessionIfResettable for the
+// admin API, which atomically checks kind + resets under a single lock.
+// Returns a snapshot of the previous state and whether the key was found.
+func (sm *SessionManager) ResetSession(key string) (prev SessionSnapshot, found bool) {
+	_, agent, ip := classifySessionKey(key)
+
+	sm.mu.Lock()
+	sess, ok := sm.sessions[key]
+	if !ok {
+		sm.mu.Unlock()
+		return SessionSnapshot{}, false
+	}
+
+	// Clear IP-level state (shared across all identities on this IP).
+	if ip != "" {
+		delete(sm.ipDomains, ip)
+		delete(sm.ipBurstCooldown, ip)
+	}
+
+	// Reset session in place while still holding sm.mu to prevent an
+	// eviction race between lock release and Reset.
+	prevScore, prevLevel := sess.Reset()
+	sm.mu.Unlock()
+
+	// Decrement adaptive gauge if session was escalated (lock-free prometheus op).
+	if prevLevel > 0 && sm.metrics != nil {
+		sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(prevLevel), -1)
+	}
+
+	riskSnapshot := sess.RiskSnapshot()
+	prev = SessionSnapshot{
+		Key:              key,
+		Agent:            agent,
+		ClientIP:         ip,
+		Kind:             sessionKindIdentity,
+		CurrentTaskID:    sess.TaskSnapshot().CurrentTaskID,
+		CurrentTaskLabel: sess.TaskSnapshot().CurrentTaskLabel,
+		ThreatScore:      prevScore,
+		EscalationLevel:  session.EscalationLabel(prevLevel),
+		BlockAll:         false,
+		TaintLevel:       riskSnapshot.Level.String(),
+		Contaminated:     riskSnapshot.Contaminated,
+		LastActivity:     time.Now(),
+	}
+	return prev, true
+}
+
+// ErrInvocationReset is returned when a caller attempts to reset an
+// invocation (MCP transport) session, which is ephemeral and not meaningful
+// to reset.
+var ErrInvocationReset = errors.New("cannot reset invocation session")
+
+// ErrTaskScopeOnly is returned when a runtime trust grant uses an unsupported scope.
+var ErrTaskScopeOnly = errors.New("runtime trust grants only support task scope")
+
+// ResetSessionIfResettable atomically looks up a session, verifies it is an
+// identity session (not invocation), and resets it under a single sm.mu.Lock.
+// This eliminates the TOCTOU race where a session could be evicted or replaced
+// between a separate lookup and reset.
+//
+// Returns:
+//   - found=false, err=nil: session does not exist
+//   - found=true, err=ErrInvocationReset: session exists but is not resettable
+//   - found=true, err=nil: reset succeeded, prev contains the previous state
+func (sm *SessionManager) ResetSessionIfResettable(key string) (prev SessionSnapshot, found bool, err error) {
+	_, agent, ip := classifySessionKey(key)
+
+	sm.mu.Lock()
+	sess, ok := sm.sessions[key]
+	if !ok {
+		sm.mu.Unlock()
+		return SessionSnapshot{}, false, nil
+	}
+
+	// Check kind under sm.mu to prevent TOCTOU with eviction/replacement.
+	sess.mu.Lock()
+	kind := sess.kind
+	sess.mu.Unlock()
+
+	if kind != sessionKindIdentity {
+		sm.mu.Unlock()
+		return SessionSnapshot{Key: key, Kind: kind}, true, ErrInvocationReset
+	}
+
+	// Clear IP-level state (shared across all identities on this IP).
+	if ip != "" {
+		delete(sm.ipDomains, ip)
+		delete(sm.ipBurstCooldown, ip)
+	}
+
+	// Reset session in place while still holding sm.mu to prevent an
+	// eviction race between lock release and Reset.
+	prevScore, prevLevel := sess.Reset()
+	sm.mu.Unlock()
+
+	// Decrement adaptive gauge if session was escalated (lock-free prometheus op).
+	if prevLevel > 0 && sm.metrics != nil {
+		sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(prevLevel), -1)
+	}
+
+	riskSnapshot := sess.RiskSnapshot()
+	prev = SessionSnapshot{
+		Key:              key,
+		Agent:            agent,
+		ClientIP:         ip,
+		Kind:             sessionKindIdentity,
+		CurrentTaskID:    sess.TaskSnapshot().CurrentTaskID,
+		CurrentTaskLabel: sess.TaskSnapshot().CurrentTaskLabel,
+		ThreatScore:      prevScore,
+		EscalationLevel:  session.EscalationLabel(prevLevel),
+		BlockAll:         false,
+		TaintLevel:       riskSnapshot.Level.String(),
+		Contaminated:     riskSnapshot.Contaminated,
+		LastActivity:     time.Now(),
+	}
+	return prev, true, nil
+}
+
+// SnapshotAndResetIfResettable captures the pre-reset session state
+// and then resets the session under a single critical section held
+// across sm.mu > sess.mu > sess.airlock.mu, so HandleTerminate can
+// report `previous_tier`/`previous_level`/`previous_score` values
+// that describe one consistent point in time. Splitting snapshot and
+// reset across separate locks would leave a mutation window where a
+// concurrent request-path goroutine could touch sess.threatScore,
+// sess.escalationLevel, or sess.airlock.tier between the capture and
+// the reset - resetWhileLocked closes that window by running the
+// reset with both session-level locks still held.
+//
+// Returns:
+//   - found=false, err=nil: session does not exist
+//   - found=true, err=ErrInvocationReset: session exists but is not resettable
+//   - found=true, err=nil: preSnap holds the pre-reset state
+func (sm *SessionManager) SnapshotAndResetIfResettable(key string) (preSnap sessionAdminSnapshot, found bool, err error) {
+	_, agent, ip := classifySessionKey(key)
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sess, ok := sm.sessions[key]
+	if !ok {
+		return sessionAdminSnapshot{}, false, nil
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	kind := sess.kind
+	if kind != sessionKindIdentity {
+		return sessionAdminSnapshot{SessionSnapshot: SessionSnapshot{Key: key, Kind: kind}}, true, ErrInvocationReset
+	}
+
+	sess.airlock.mu.Lock()
+	defer sess.airlock.mu.Unlock()
+
+	levelInt := sess.escalationLevel
+	preSnap = sessionAdminSnapshot{
+		SessionSnapshot: SessionSnapshot{
+			Key:              key,
+			Agent:            agent,
+			ClientIP:         ip,
+			Kind:             kind,
+			CurrentTaskID:    sess.task.CurrentTaskID,
+			CurrentTaskLabel: sess.task.CurrentTaskLabel,
+			ThreatScore:      sess.threatScore,
+			EscalationLevel:  session.EscalationLabel(levelInt),
+			BlockAll:         sess.atBlockAll,
+			AirlockTier:      sess.airlock.tier,
+			TaintLevel:       sess.risk.Level.String(),
+			Contaminated:     sess.risk.Contaminated,
+			LastActivity:     sess.lastActivity,
+		},
+		AirlockEnteredAt:     sess.airlock.enteredAt,
+		InFlight:             sess.airlock.inFlightCount.Load(),
+		EscalationLevelInt:   levelInt,
+		AirlockTrigger:       sess.airlock.trigger,
+		AirlockTriggerSource: sess.airlock.source,
+	}
+	preSnap.RecentEvents = make([]SessionEvent, len(sess.recentEvents))
+	copy(preSnap.RecentEvents, sess.recentEvents)
+
+	// Clear IP-level state (shared across all identities on this IP).
+	// Safe under sm.mu.Lock.
+	if ip != "" {
+		delete(sm.ipDomains, ip)
+		delete(sm.ipBurstCooldown, ip)
+	}
+
+	// Perform the reset while still holding sess.mu and sess.airlock.mu
+	// so the snapshot fields above and the fields being cleared come
+	// from the same critical section. No concurrent goroutine can
+	// mutate sess or sess.airlock between the capture and the reset.
+	_, _ = sess.resetWhileLocked()
+
+	// Decrement adaptive gauge if session was escalated. Lock-free
+	// prometheus op; safe to call under the session locks.
+	if levelInt > 0 && sm.metrics != nil {
+		sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(levelInt), -1)
+	}
+
+	return preSnap, true, nil
+}
+
+// ResetAllIdentitySessions clears adaptive state for every identity session
+// and drops IP-domain burst windows. Invocation sessions are left alone
+// because they are ephemeral transport contexts.
+func (sm *SessionManager) ResetAllIdentitySessions() (reset, skipped int) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for key, sess := range sm.sessions {
+		kind, _, _ := classifySessionKey(key)
+		if kind != sessionKindIdentity {
+			skipped++
+			continue
+		}
+		sess.mu.Lock()
+		sess.airlock.mu.Lock()
+		prevLevel := sess.escalationLevel
+		sess.resetWhileLocked()
+		sess.airlock.mu.Unlock()
+		sess.mu.Unlock()
+		if prevLevel > 0 && sm.metrics != nil {
+			sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(prevLevel), -1)
+		}
+		reset++
+	}
+	sm.ipDomains = make(map[string][]domainEntry)
+	sm.ipBurstCooldown = make(map[string]time.Time)
+	return reset, skipped
+}
+
+func (sm *SessionManager) AdaptiveStatus() AdaptiveStatus {
+	sm.mu.RLock()
+	keys := make([]string, 0, len(sm.sessions))
+	sessions := make([]*SessionState, 0, len(sm.sessions))
+	for key, sess := range sm.sessions {
+		keys = append(keys, key)
+		sessions = append(sessions, sess)
+	}
+	sm.mu.RUnlock()
+
+	status := AdaptiveStatus{
+		SessionsByLevel:    make(map[string]int),
+		AirlockTiers:       make(map[string]int),
+		RecentSignalCounts: make(map[string]int),
+		Sessions:           make([]SessionSnapshot, 0, len(sessions)),
+	}
+	anomalyCounts := make(map[string]int)
+	airlockCfg := sm.AirlockConfig()
+
+	for i, sess := range sessions {
+		sess.mu.Lock()
+		key := keys[i]
+		kind, agent, ip := classifySessionKey(key)
+		levelInt := sess.escalationLevel
+		level := session.EscalationLabel(levelInt)
+		tier := sess.airlock.Tier()
+		enteredAt := sess.airlock.EnteredAt()
+		if tier == "" {
+			tier = config.AirlockTierNone
+		}
+		status.ActiveSessions++
+		status.SessionsByLevel[level]++
+		status.AirlockTiers[tier]++
+		if levelInt > status.MaxEscalationInt {
+			status.MaxEscalationInt = levelInt
+			status.MaxEscalationLevel = level
+		}
+		for _, evt := range sess.recentEvents {
+			if evt.Kind != "" {
+				status.RecentSignalCounts[evt.Kind]++
+			}
+			if evt.Kind == "anomaly" && evt.Type != "" {
+				anomalyCounts[evt.Type]++
+			}
+		}
+		status.Sessions = append(status.Sessions, SessionSnapshot{
+			Key:              key,
+			Agent:            agent,
+			ClientIP:         ip,
+			Kind:             kind,
+			CurrentTaskID:    sess.task.CurrentTaskID,
+			CurrentTaskLabel: sess.task.CurrentTaskLabel,
+			ThreatScore:      sess.threatScore,
+			EscalationLevel:  level,
+			BlockAll:         sess.atBlockAll,
+			AirlockTier:      tier,
+			TaintLevel:       sess.risk.Level.String(),
+			Contaminated:     sess.risk.Contaminated,
+			LastActivity:     sess.lastActivity,
+		})
+		ttl := adaptiveLockdownTTLSeconds(tier, enteredAt, airlockCfg)
+		if ttl > status.LockdownTTLSeconds {
+			status.LockdownTTLSeconds = ttl
+		}
+		sess.mu.Unlock()
+	}
+	if status.MaxEscalationLevel == "" {
+		status.MaxEscalationLevel = session.EscalationLabel(0)
+	}
+	sort.SliceStable(status.Sessions, func(i, j int) bool {
+		if status.Sessions[i].Kind != status.Sessions[j].Kind {
+			return status.Sessions[i].Kind < status.Sessions[j].Kind
+		}
+		return status.Sessions[i].Key < status.Sessions[j].Key
+	})
+	status.TopAnomalies = topAdaptiveAnomalies(anomalyCounts)
+	return status
+}
+
+func (sm *SessionManager) AdaptiveWhoami(clientIP, agent string) AdaptiveWhoami {
+	key := sessionKeyFor(agent, clientIP)
+	out := AdaptiveWhoami{
+		ClientIP:        clientIP,
+		Agent:           agent,
+		SessionKey:      key,
+		Classification:  config.ActionAllow,
+		AirlockTier:     config.AirlockTierNone,
+		EscalationLevel: session.EscalationLabel(0),
+	}
+
+	sm.mu.RLock()
+	sess, ok := sm.sessions[key]
+	if !ok {
+		sm.mu.RUnlock()
+		return out
+	}
+	sm.mu.RUnlock()
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	out.Exists = true
+	out.EscalationLevelInt = sess.escalationLevel
+	out.EscalationLevel = session.EscalationLabel(sess.escalationLevel)
+	out.ThreatScore = sess.threatScore
+	out.BlockAll = sess.atBlockAll
+	tier := sess.airlock.Tier()
+	enteredAt := sess.airlock.EnteredAt()
+	if tier == "" {
+		tier = config.AirlockTierNone
+	}
+	out.AirlockTier = tier
+	if sess.atBlockAll || tier == config.AirlockTierHard || tier == config.AirlockTierDrain {
+		out.Classification = config.ActionBlock
+	} else if tier == config.AirlockTierSoft || sess.escalationLevel > 0 {
+		out.Classification = adaptiveClassificationObserve
+	}
+	out.LockdownTTLSeconds = adaptiveLockdownTTLSeconds(tier, enteredAt, sm.AirlockConfig())
+	return out
+}
+
+func adaptiveLockdownTTLSeconds(tier string, enteredAt time.Time, airlockCfg *config.Airlock) int64 {
+	if tier == "" || tier == config.AirlockTierNone || enteredAt.IsZero() || airlockCfg == nil {
+		return 0
+	}
+	d := deescalationDuration(tier, &airlockCfg.Timers)
+	if d <= 0 {
+		return 0
+	}
+	remaining := time.Until(enteredAt.Add(d))
+	if remaining <= 0 {
+		return 0
+	}
+	return int64(remaining.Seconds())
+}
+
+func topAdaptiveAnomalies(counts map[string]int) []AdaptiveTopAnomaly {
+	entries := make([]AdaptiveTopAnomaly, 0, len(counts))
+	for name, count := range counts {
+		entries = append(entries, AdaptiveTopAnomaly{Name: name, Count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Count == entries[j].Count {
+			return entries[i].Name < entries[j].Name
+		}
+		return entries[i].Count > entries[j].Count
+	})
+	if len(entries) > 5 {
+		entries = entries[:5]
+	}
+	return entries
+}
+
+// withMutableIdentitySession looks up a resettable identity session and runs
+// mutate while still holding sm.mu.RLock. This blocks cleanup/eviction from
+// removing the session between map lookup and the session-scoped mutation.
+//
+// Returns:
+//   - found=false, err=nil: session does not exist
+//   - found=true, err=ErrInvocationReset: session exists but is not resettable
+//   - found=true, err=nil: mutate completed
+func (sm *SessionManager) withMutableIdentitySession(key string, mutate func(*SessionState)) (found bool, err error) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	sess, ok := sm.sessions[key]
+	if !ok {
+		return false, nil
+	}
+	// Hold RLock across the kind check and mutation so cleanup/eviction
+	// can't remove the session between lookup and mutate. IsResettable and
+	// the callback both acquire sess.mu internally (lock ordering: sm.mu > sess.mu).
+	if !sess.IsResettable() {
+		return true, ErrInvocationReset
+	}
+	mutate(sess)
+	return true, nil
+}
+
+// BeginNewTask rotates the task boundary for an active session and clears
+// taint-only state while preserving adaptive profiling state.
+//
+// Only identity sessions are valid targets. Invocation sessions (ephemeral
+// per-request MCP session keys) cannot be mutated via the admin API - they
+// represent the exact execution context the caller should NOT be allowed to
+// alter, and mirror the guardrail established by ResetSessionIfResettable.
+//
+// Returns:
+//   - found=false, err=nil: session does not exist
+//   - found=true, err=ErrInvocationReset: session exists but is not resettable
+//   - found=true, err=nil: rotation succeeded
+func (sm *SessionManager) BeginNewTask(key, label string) (prev, current session.TaskContext, clearedOverrides int, found bool, err error) {
+	found, err = sm.withMutableIdentitySession(key, func(sess *SessionState) {
+		prev, current, clearedOverrides = sess.BeginNewTask(label)
+	})
+	return prev, current, clearedOverrides, found, err
+}
+
+// AddRuntimeTrustOverride binds and stores a task-scoped trust override on an
+// active session. Same identity-session guardrail as BeginNewTask applies:
+// invocation sessions cannot receive runtime trust overrides via the admin
+// API.
+//
+// The returned “applied“ override carries the task ID that was bound under
+// the session mutex. Callers must use “applied.TaskID“ for response bodies
+// or logs - a second TaskSnapshot call outside the mutex would race against
+// concurrent BeginNewTask rotations.
+func (sm *SessionManager) AddRuntimeTrustOverride(key string, override session.TrustOverride) (applied session.TrustOverride, found bool, err error) {
+	if override.Scope != "task" {
+		return session.TrustOverride{}, false, ErrTaskScopeOnly
+	}
+
+	found, err = sm.withMutableIdentitySession(key, func(sess *SessionState) {
+		applied = sess.AddRuntimeTrustOverride(override)
+	})
+	return applied, found, err
+}
+
+// SessionByKey returns a pointer to the session for the given key, or nil
+// when no such session exists. Unlike GetOrCreate, this does NOT create a
+// missing session - admin API lookups must not materialize phantom sessions.
+// The returned pointer is valid for the lifetime of the session; callers
+// must not hold it across operations that may trigger eviction.
+func (sm *SessionManager) SessionByKey(key string) *SessionState {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.sessions[key]
+}
+
+// SnapshotByKey returns a read-only snapshot of a single session and its
+// recent-event buffer, matching the shape of the Snapshot() slice element
+// with the event ring buffer attached. Returns (snap, events, true) when
+// the session exists, (zero, nil, false) when it does not. Copies state
+// under locks then releases them before returning.
+func (sm *SessionManager) SnapshotByKey(key string) (SessionSnapshot, []SessionEvent, bool) {
+	admin, ok := sm.AdminSnapshotByKey(key)
+	if !ok {
+		return SessionSnapshot{}, nil, false
+	}
+	return admin.SessionSnapshot, admin.RecentEvents, true
+}
+
+// AdminSnapshotByKey returns the operator-facing snapshot for a single
+// session. Unlike SnapshotByKey, it includes airlock timing, in-flight
+// count, numeric escalation, trigger provenance, and recent events
+// captured from one session state read so inspect/explain stay
+// internally consistent.
+//
+// The manager read lock is held across the session copy so cleanup()
+// cannot evict and GetOrCreate() cannot recreate the same key mid-read
+// - that race would let inspect/explain serialize stale state from a
+// session the map no longer points at. Lock order is sm > sess.
+func (sm *SessionManager) AdminSnapshotByKey(key string) (sessionAdminSnapshot, bool) {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	sess, ok := sm.sessions[key]
+	if !ok {
+		return sessionAdminSnapshot{}, false
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	kind, agent, ip := classifySessionKey(key)
+	sess.airlock.mu.Lock()
+	airlockTier := sess.airlock.tier
+	airlockEnteredAt := sess.airlock.enteredAt
+	airlockTrigger := sess.airlock.trigger
+	airlockTriggerSource := sess.airlock.source
+	inFlight := sess.airlock.inFlightCount.Load()
+	sess.airlock.mu.Unlock()
+
+	levelInt := sess.escalationLevel
+	snap := sessionAdminSnapshot{
+		SessionSnapshot: SessionSnapshot{
+			Key:              key,
+			Agent:            agent,
+			ClientIP:         ip,
+			Kind:             kind,
+			CurrentTaskID:    sess.task.CurrentTaskID,
+			CurrentTaskLabel: sess.task.CurrentTaskLabel,
+			ThreatScore:      sess.threatScore,
+			EscalationLevel:  session.EscalationLabel(levelInt),
+			BlockAll:         sess.atBlockAll,
+			AirlockTier:      airlockTier,
+			TaintLevel:       sess.risk.Level.String(),
+			Contaminated:     sess.risk.Contaminated,
+			LastActivity:     sess.lastActivity,
+		},
+		AirlockEnteredAt:     airlockEnteredAt,
+		InFlight:             inFlight,
+		EscalationLevelInt:   levelInt,
+		AirlockTrigger:       airlockTrigger,
+		AirlockTriggerSource: airlockTriggerSource,
+	}
+	snap.RecentEvents = make([]SessionEvent, len(sess.recentEvents))
+	copy(snap.RecentEvents, sess.recentEvents)
+	snap.AdaptiveScopes = scopedSnapshotsLocked(sess.scopes)
+
+	return snap, true
+}
+
+func scopedSnapshotsLocked(scopes map[string]*adaptiveScopeState) []AdaptiveScopeSnapshot {
+	if len(scopes) == 0 {
+		return []AdaptiveScopeSnapshot{}
+	}
+	out := make([]AdaptiveScopeSnapshot, 0, len(scopes))
+	for scope, st := range scopes {
+		st.airlock.mu.Lock()
+		tier := st.airlock.tier
+		enteredAt := st.airlock.enteredAt
+		st.airlock.mu.Unlock()
+		if tier == "" {
+			tier = config.AirlockTierNone
+		}
+		out = append(out, AdaptiveScopeSnapshot{
+			Scope:              scope,
+			ThreatScore:        st.threatScore,
+			EscalationLevel:    session.EscalationLabel(st.escalationLevel),
+			EscalationLevelInt: st.escalationLevel,
+			BlockAll:           st.atBlockAll,
+			AirlockTier:        tier,
+			AirlockEnteredAt:   enteredAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Scope < out[j].Scope })
+	return out
+}
+
+// AirlockConfig returns the current airlock config pointer, or nil when
+// airlock is not configured. Used by admin API handlers that need timer
+// values and trigger mappings to explain session state.
+func (sm *SessionManager) AirlockConfig() *config.Airlock {
+	return sm.airlockCfgPtr.Load()
+}
+
+// ForceSetAirlockTier atomically looks up a session by key and sets the
+// airlock tier under sm.mu.RLock. This eliminates the TOCTOU race where a
+// session could be evicted between a separate lookup and ForceSetTier call.
+// Returns (found, changed, from, to).
+func (sm *SessionManager) ForceSetAirlockTier(key, tier string) (found, changed bool, from, to string) {
+	sm.mu.RLock()
+	sess, exists := sm.sessions[key]
+	if !exists {
+		sm.mu.RUnlock()
+		return false, false, "", ""
+	}
+	// Hold RLock across the tier change so cleanup/eviction can't remove
+	// the session between lookup and mutation. ForceSetTier acquires its
+	// own mutex internally (lock ordering: sm.mu > airlock.mu).
+	changed, from, to = sess.Airlock().ForceSetTierWithProvenance(tier, airlockTriggerManual, airlockSourceAdminAPI)
+	if changed {
+		sess.RecordEvent(SessionEvent{
+			Kind:     "airlock_override",
+			Target:   to,
+			Detail:   from + "->" + to,
+			Severity: "warn",
+		})
+	}
+	sm.mu.RUnlock()
+	return true, changed, from, to
+}
+
+// cleanupLoop runs periodic cleanup of expired sessions.
+// Uses a timer (not ticker) so that cleanup_interval_seconds changes
+// from UpdateConfig take effect on the next iteration.
+func (sm *SessionManager) cleanupLoop() {
+	interval := time.Duration(sm.cfgPtr.Load().CleanupIntervalSeconds) * time.Second
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-sm.done:
+			return
+		case <-timer.C:
+			sm.cleanup()
+			interval = time.Duration(sm.cfgPtr.Load().CleanupIntervalSeconds) * time.Second
+			timer.Reset(interval)
+		}
+	}
+}
+
+// cleanup removes sessions idle beyond TTL and prunes stale IP domain entries.
+// Evicted sessions are recorded in the behavioral baseline (if enabled) after
+// the map lock is released to avoid holding sm.mu during baseline I/O.
+func (sm *SessionManager) cleanup() {
+	cfg := sm.cfgPtr.Load()
+	ttl := time.Duration(cfg.SessionTTLMinutes) * time.Minute
+	cutoff := time.Now().Add(-ttl)
+
+	// Phase 1: identify and remove expired sessions under lock.
+	var evictedSessions []*SessionState
+
+	sm.mu.Lock()
+	for key, sess := range sm.sessions {
+		sess.mu.Lock()
+		idle := sess.lastActivity.Before(cutoff)
+		escLevel := sess.escalationLevel
+		airlockTier := sess.airlock.Tier()
+		sess.mu.Unlock()
+
+		// Airlock sessions are exempt from idle eviction. A session in
+		// quarantine must not be evicted or it would escape enforcement.
+		// Empty string is the zero value (equivalent to "none").
+		if airlockTier != config.AirlockTierNone && airlockTier != "" {
+			continue
+		}
+
+		if idle {
+			if escLevel > 0 {
+				if sm.metrics != nil {
+					sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(escLevel), -1)
+				}
+			}
+			evictedSessions = append(evictedSessions, sess)
+			delete(sm.sessions, key)
+		}
+	}
+
+	// Prune IP domain entries and burst cooldowns older than the rolling window.
+	windowCutoff := time.Now().Add(-time.Duration(cfg.WindowMinutes) * time.Minute)
+	for ip, entries := range sm.ipDomains {
+		pruned := entries[:0]
+		for _, de := range entries {
+			if de.at.After(windowCutoff) {
+				pruned = append(pruned, de)
+			}
+		}
+		if len(pruned) == 0 {
+			delete(sm.ipDomains, ip)
+			delete(sm.ipBurstCooldown, ip)
+		} else {
+			sm.ipDomains[ip] = pruned
+		}
+	}
+
+	evicted := len(evictedSessions)
+	if sm.metrics != nil {
+		for range evicted {
+			sm.metrics.RecordSessionEvicted()
+		}
+		sm.metrics.SetSessionsActive(float64(len(sm.sessions)))
+	}
+	sm.mu.Unlock()
+
+	// Phase 2: record evicted sessions in baseline (lock-free path).
+	for _, sess := range evictedSessions {
+		sm.recordSessionBaseline(sess)
+	}
+}
+
+// deescalationLoop runs periodic de-escalation checks on all sessions.
+// Unlike cleanupLoop, this uses a fixed interval (not config-driven)
+// because recovery timing is a security property, not a tuning knob.
+func (sm *SessionManager) deescalationLoop() {
+	ticker := time.NewTicker(deescalationCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-sm.done:
+			return
+		case <-ticker.C:
+			sm.sweepDeescalation()
+		}
+	}
+}
+
+// sweepDeescalation checks all sessions for time-based de-escalation.
+// This is the primary recovery mechanism for the deny-spiral bug: it runs
+// independently of traffic so idle sessions recover even with no requests.
+func (sm *SessionManager) sweepDeescalation() {
+	adaptiveCfg := sm.adaptiveCfgPtr.Load()
+	if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return
+	}
+
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+
+	sm.mu.RLock()
+	sessions := make([]*SessionState, 0, len(sm.sessions))
+	for _, sess := range sm.sessions {
+		sessions = append(sessions, sess)
+	}
+	sm.mu.RUnlock()
+
+	for _, sess := range sessions {
+		changed, from, to := sess.TryAutoRecover(blockAllCheck)
+		if changed && sm.metrics != nil {
+			fromLabel := session.EscalationLabel(from)
+			toLabel := session.EscalationLabel(to)
+			// Only emit gauge updates if the session is still live in the map.
+			// Cleanup may have evicted and already decremented its gauge.
+			sm.mu.RLock()
+			_, stillLive := sm.sessions[sess.key]
+			sm.mu.RUnlock()
+			if stillLive {
+				sm.metrics.RecordSessionAutoDeescalation(fromLabel, toLabel)
+				if from > 0 {
+					sm.metrics.SetAdaptiveSessionLevel(fromLabel, -1)
+				}
+				if to > 0 {
+					sm.metrics.SetAdaptiveSessionLevel(toLabel, 1)
+				}
+			}
+		}
+		for _, scoped := range sess.TryAutoRecoverScopes(blockAllCheck) {
+			fromLabel := session.EscalationLabel(scoped.from)
+			toLabel := session.EscalationLabel(scoped.to)
+			sm.mu.RLock()
+			_, stillLive := sm.sessions[sess.key]
+			sm.mu.RUnlock()
+			if stillLive && sm.metrics != nil {
+				sm.metrics.RecordSessionAutoDeescalation(fromLabel, toLabel)
+				if scoped.from > 0 {
+					sm.metrics.SetAdaptiveSessionLevel(fromLabel, -1)
+				}
+				if scoped.to > 0 {
+					sm.metrics.SetAdaptiveSessionLevel(toLabel, 1)
+				}
+			}
+			if stillLive {
+				sess.RecordEvent(SessionEvent{
+					Kind:     "adaptive_deescalate",
+					Target:   scoped.scope,
+					Detail:   fromLabel + "->" + toLabel,
+					Severity: "info",
+				})
+			}
+		}
+
+		// Airlock timer-based de-escalation.
+		if airlockCfg := sm.airlockCfgPtr.Load(); airlockCfg != nil && airlockCfg.Enabled {
+			airlockChanged, airlockFrom, airlockTo := sess.airlock.TryDeescalate(&airlockCfg.Timers)
+			if airlockChanged {
+				sess.RecordEvent(SessionEvent{
+					Kind:     "airlock_deescalate",
+					Target:   airlockTo,
+					Detail:   airlockFrom + "->" + airlockTo,
+					Severity: "info",
+				})
+				if sm.metrics != nil {
+					sm.metrics.RecordAirlockTransition(airlockFrom, airlockTo, "timer")
+				}
+				if sm.logger != nil {
+					sm.logger.LogAirlockDeescalate(sess.key, airlockFrom, airlockTo, "", "")
+				}
+			}
+			for _, scoped := range sess.TryDeescalateScopedAirlocks(&airlockCfg.Timers) {
+				sess.RecordEvent(SessionEvent{
+					Kind:     "airlock_deescalate",
+					Target:   scoped.scope,
+					Detail:   scoped.from + "->" + scoped.to,
+					Severity: "info",
+				})
+				if sm.metrics != nil {
+					sm.metrics.RecordAirlockTransition(scoped.from, scoped.to, "timer")
+				}
+				if sm.logger != nil {
+					sm.logger.LogAirlockDeescalate(sess.key, scoped.from, scoped.to, "", "")
+				}
+			}
+		}
+	}
+}
+
+// trySessionRecovery attempts time-based de-escalation on a session and emits
+// metrics if recovery fires. Returns (changed, fromLabel, toLabel) for callers
+// that need to log the transition. No-op when adaptive enforcement is disabled,
+// the session is nil, or the session is not a *SessionState.
+func trySessionRecovery(rec session.Recorder, adaptiveCfg *config.AdaptiveEnforcement, m *metrics.Metrics) (bool, string, string) {
+	if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return false, "", ""
+	}
+	ss, ok := rec.(*SessionState)
+	if !ok || ss == nil {
+		return false, "", ""
+	}
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+	changed, from, to := ss.TryAutoRecover(blockAllCheck)
+	if !changed {
+		return false, "", ""
+	}
+	fromLabel := session.EscalationLabel(from)
+	toLabel := session.EscalationLabel(to)
+	if m != nil {
+		m.RecordSessionAutoDeescalation(fromLabel, toLabel)
+		if from > 0 {
+			m.SetAdaptiveSessionLevel(fromLabel, -1)
+		}
+		if to > 0 {
+			m.SetAdaptiveSessionLevel(toLabel, 1)
+		}
+	}
+	return true, fromLabel, toLabel
+}
+
+// storeAdapter wraps SessionManager to implement session.Store.
+// SessionState already satisfies session.Recorder via its RecordSignal,
+// RecordClean, EscalationLevel, and ThreatScore methods.
+type storeAdapter struct {
+	sm *SessionManager
+}
+
+func (a *storeAdapter) GetOrCreate(key string) session.Recorder {
+	return a.sm.GetOrCreate(key)
+}
+
+// AsStore returns a session.Store interface for this SessionManager.
+func (sm *SessionManager) AsStore() session.Store {
+	return &storeAdapter{sm: sm}
+}
+
+// evictOldest removes the session with the oldest lastActivity.
+// Must be called with sm.mu held for writing. Returns the evicted
+// session (if any) so the caller can record baseline metrics after
+// releasing the lock.
+func (sm *SessionManager) evictOldest() *SessionState {
+	var oldestKey string
+	var oldestTime time.Time
+	var oldestSess *SessionState
+
+	var oldestEscLevel int
+
+	for key, sess := range sm.sessions {
+		sess.mu.Lock()
+		la := sess.lastActivity
+		escLevel := sess.escalationLevel
+		airlockTier := sess.airlock.Tier()
+		sess.mu.Unlock()
+
+		// Skip quarantined sessions: evicting them would escape enforcement.
+		if airlockTier != config.AirlockTierNone && airlockTier != "" {
+			continue
+		}
+
+		if oldestKey == "" || la.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = la
+			oldestEscLevel = escLevel
+			oldestSess = sess
+		}
+	}
+
+	if oldestKey != "" {
+		if oldestEscLevel > 0 {
+			if sm.metrics != nil {
+				sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(oldestEscLevel), -1)
+			}
+		}
+		delete(sm.sessions, oldestKey)
+		if sm.metrics != nil {
+			sm.metrics.RecordSessionEvicted()
+		}
+	}
+	return oldestSess
+}

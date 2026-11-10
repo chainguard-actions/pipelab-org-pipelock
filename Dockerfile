@@ -1,0 +1,39 @@
+# Multi-stage build for minimal image size
+FROM golang:1.26-alpine@sha256:f1ddd9fe14fffc091dd98cb4bfa999f32c5fc77d2f2305ea9f0e2595c5437c14 AS builder
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+ARG VERSION=0.1.0-dev
+ARG BUILD_DATE=unknown
+ARG GIT_COMMIT=unknown
+ARG LICENSE_PUBLIC_KEY=""
+ARG RULES_KEYRING_HEX=""
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags enterprise \
+    -ldflags "-s -w \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.BuildDate=${BUILD_DATE} \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.GitCommit=${GIT_COMMIT} \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.GoVersion=$(go version | awk '{print $3}') \
+      -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION} \
+      -X github.com/luckyPipewrench/pipelock/internal/license.PublicKeyHex=${LICENSE_PUBLIC_KEY} \
+      -X github.com/luckyPipewrench/pipelock/internal/rules.KeyringHex=${RULES_KEYRING_HEX}" \
+    -o /pipelock ./cmd/pipelock
+
+# Scratch-based final image (~15MB)
+FROM scratch
+
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /pipelock /pipelock
+
+EXPOSE 8888
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["/pipelock", "healthcheck"]
+
+ENTRYPOINT ["/pipelock"]
+CMD ["run", "--listen", "0.0.0.0:8888"]

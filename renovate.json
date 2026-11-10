@@ -1,0 +1,56 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits"
+  ],
+  "minimumReleaseAge": "10 days",
+  "internalChecksFilter": "strict",
+  "prCreation": "not-pending",
+  "schedule": ["* * * * 1"],
+  "prConcurrentLimit": 5,
+  "prHourlyLimit": 2,
+  "labels": ["dependencies"],
+  "lockFileMaintenance": {
+    "enabled": false
+  },
+  "vulnerabilityAlerts": {
+    "labels": ["security", "fast-track"],
+    "minimumReleaseAge": "0 days",
+    "schedule": ["at any time"]
+  },
+  "packageRules": [
+    {
+      "description": "Keep GitHub Actions, Docker, and k8s image refs pinned to digests so the OpenSSF Scorecard pinned-dependencies check stays satisfied. The digest-maintenance PRs this produces are batched into the weekly group below, so pinning costs no extra PR noise.",
+      "matchManagers": ["github-actions", "dockerfile", "docker-compose", "kubernetes", "helm-values", "helmv3"],
+      "pinDigests": true
+    },
+    {
+      "description": "Collapse every non-major update (minor, patch, digest, pin) into ONE weekly batched PR so the PR volume stays low. Majors and security alerts are handled separately below.",
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest", "bump"],
+      "groupName": "weekly dependencies"
+    },
+    {
+      "description": "Major updates stay individual and manually reviewed (no automerge), and are not delayed to the weekly window.",
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major-update", "needs-review"],
+      "automerge": false,
+      "schedule": ["at any time"]
+    },
+    {
+      "description": "Hold TypeScript at 5.x in the verifier. TS 6.0 needs tsconfig and source migrations we have not scoped.",
+      "matchManagers": ["npm"],
+      "matchFileNames": ["sdk/verifiers/ts/**"],
+      "matchPackageNames": ["typescript"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
+    },
+    {
+      "description": "Hold jsonschema at 0.18.x in the Rust verifier. 0.19+ renames JSONSchema to Validator and changes the compile/validate API, needs manual migration.",
+      "matchManagers": ["cargo"],
+      "matchFileNames": ["sdk/verifiers/rust/**"],
+      "matchPackageNames": ["jsonschema"],
+      "allowedVersions": "<0.19"
+    }
+  ]
+}

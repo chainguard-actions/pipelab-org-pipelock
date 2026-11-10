@@ -1,0 +1,50 @@
+name: Test user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          mkdir -p pipelock-clean-fixture
+          printf '# Clean project\n\nNothing sensitive here.\n' > pipelock-clean-fixture/README.md
+          printf 'def add(a, b):\n    return a + b\n' > pipelock-clean-fixture/main.py
+      - id: generate
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-alt
+        with:
+          version: '2.8.0'
+          directory: pipelock-clean-fixture
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Copy generated config into a user path
+        env:
+          GEN: ${{ steps.generate.outputs.config-path }}
+        run: |
+          echo "generated: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then echo "FAIL: no generated config"; exit 1; fi
+          mkdir -p /tmp/pipelock-user-config
+          cp "$GEN" /tmp/pipelock-user-config/pipelock.yaml
+          echo "USER_CONFIG=/tmp/pipelock-user-config/pipelock.yaml" >> "$GITHUB_ENV"
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-alt2
+        with:
+          version: '2.8.0'
+          directory: pipelock-clean-fixture
+          config: ${{ env.USER_CONFIG }}
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert config-path is the user config
+        env:
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "actual: $ACTUAL expected: $USER_CONFIG"
+          if [ "$ACTUAL" != "$USER_CONFIG" ]; then echo "FAIL: config-path mismatch"; exit 1; fi
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          echo "PASS"

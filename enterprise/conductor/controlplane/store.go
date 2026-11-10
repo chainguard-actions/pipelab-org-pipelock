@@ -1,0 +1,1187 @@
+//go:build enterprise
+
+// Licensed under the Elastic License 2.0. See enterprise/LICENSE.
+
+// Package controlplane provides the Conductor follower-facing HTTP boundary.
+//
+// Scope and non-scope of this package:
+//
+//   - The store enforces per-audience forward-chain publication, hash-bound
+//     records, durable on-disk persistence with private modes, and idempotent
+//     re-publication of identical bundles.
+//   - The handler enforces strict JSON decoding (DisallowUnknownFields, no
+//     trailing document), body size caps, method validation, and ETag
+//     responses on the latest-bundle endpoint.
+//   - The handler does NOT cryptographically verify bundle signatures.
+//     [conductor.PolicyBundle.Validate] only checks signature count, purpose,
+//     and wire format; it does not invoke a [conductor.SignatureKeyResolver].
+//     Cryptographic verification happens on followers via
+//     [conductor.PolicyBundle.VerifySignaturesAt] using their pinned trust
+//     roster.
+//   - The handler does NOT enforce mTLS or any transport authentication. The
+//     advertised `required_mtls` capability is a descriptor of operator
+//     deployment intent. The hosting server must terminate mTLS and pass an
+//     authenticated identity to the handler via [FollowerIdentityResolver]
+//     and [PublisherAuthorizer]. Wiring either resolver to trust unauthenticated
+//     request headers in production breaks the security model.
+//   - The handler does NOT enforce a publisher-to-org binding. Production
+//     [PublisherAuthorizer] implementations must restrict each publisher to
+//     the orgs/fleets/environments it is permitted to publish into; this
+//     package only invokes the hook.
+package controlplane
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
+)
+
+const (
+	bundlesDirName          = "bundles"
+	streamHeadsDirName      = "stream-heads"
+	bundleRecordFileMode    = 0o600
+	bundleStoreDirMode      = 0o700
+	bundleStoreTempPattern  = ".bundle-*.tmp"
+	maxBundleRecordJSONSize = conductor.MaxConfigYAMLBytes * 2
+	maxStreamHeadJSONSize   = 16 * 1024
+	streamHeadRecordVersion = 1
+)
+
+var (
+	ErrStoreRequired         = errors.New("conductor control plane store required")
+	ErrBundleNotFound        = errors.New("conductor policy bundle not found")
+	ErrBundleConflict        = errors.New("conductor policy bundle conflicts with active stream")
+	ErrInvalidStoreRecord    = errors.New("conductor control plane store record invalid")
+	ErrFollowerRequired      = errors.New("conductor follower identity required")
+	ErrPublisherForbidden    = errors.New("conductor publisher authorization failed")
+	ErrAuditQueryForbidden   = errors.New("conductor audit query authorization failed")
+	ErrFollowerListForbidden = errors.New("conductor follower list authorization failed")
+	ErrStreamStatusForbidden = errors.New("conductor stream status authorization failed")
+	ErrAuditSinkRequired     = errors.New("conductor audit sink required")
+	ErrAuditKeyRequired      = errors.New("conductor audit key resolver required")
+	ErrAuditBatchNotFound    = errors.New("conductor audit batch not found")
+	ErrAuditBatchConflict    = errors.New("conductor audit batch conflicts with accepted batch")
+	ErrAuditForkDetected     = errors.New("conductor audit sequence fork detected")
+	ErrUnsupportedRollback   = errors.New("conductor control plane rollback publication not implemented")
+	// ErrVersionBelowStreamMax is returned by a forward publish whose version is
+	// not strictly greater than the highest version EVER published in the stream,
+	// yet is not below the current (possibly rolled-back) head. After a rollback
+	// the head sits at vN while vN+1..vM already exist, so a forward publish needs
+	// a version greater than M, not merely greater than N. This is a distinct case
+	// from a genuine rollback attempt (ErrUnsupportedRollback) and from a stream
+	// head-hash mismatch (ErrPreviousHashMismatch); conflating the three is what
+	// produced the misleading "version is stale" message during a live recovery.
+	ErrVersionBelowStreamMax = errors.New("conductor policy bundle version must exceed the stream's highest published version")
+	// ErrPreviousHashMismatch is returned by a forward publish whose
+	// previous_bundle_hash does not equal the current stream head hash. The version
+	// is fine; the chain pointer is wrong (typically a stale or copy-pasted hash).
+	ErrPreviousHashMismatch = errors.New("conductor policy bundle previous_bundle_hash does not match the current stream head hash")
+	ErrEmergencyKeyRequired = errors.New("conductor emergency control key resolver required")
+	// ErrAuditEvidenceTruncated is returned by ListAuditBatchEvidence when the
+	// window matches more accepted audit batches than the effective limit. Report
+	// minting must fail closed rather than sign a report over a silently truncated
+	// source set, which would misstate the completeness and summary it attests to.
+	ErrAuditEvidenceTruncated = errors.New("conductor audit evidence exceeds query limit")
+)
+
+type FollowerIdentity struct {
+	OrgID       string
+	FleetID     string
+	InstanceID  string
+	Environment string
+	Labels      map[string]string
+}
+
+type PublishedBundle struct {
+	Bundle      conductor.PolicyBundle `json:"bundle"`
+	BundleHash  string                 `json:"bundle_hash"`
+	StreamKey   string                 `json:"stream_key"`
+	PublishedAt time.Time              `json:"published_at"`
+}
+
+type PublishOptions struct {
+	Now      time.Time
+	Rollback bool
+}
+
+type BundleStore interface {
+	Publish(ctx context.Context, bundle conductor.PolicyBundle, opts PublishOptions) (PublishedBundle, bool, error)
+	Latest(ctx context.Context, follower FollowerIdentity, now time.Time) (PublishedBundle, error)
+	BundleByIDVersion(ctx context.Context, bundleID string, version uint64) (PublishedBundle, error)
+	ApplyRollbackHead(ctx context.Context, auth conductor.RollbackAuthorization, now time.Time) error
+	StreamOverview(ctx context.Context, q StreamStatusQuery) ([]StreamSummary, error)
+}
+
+// StreamStatusQuery scopes an operator stream-overview read. OrgID is mandatory
+// so the read is never globally unscoped; FleetID is optional and narrows the
+// result to a single fleet within the org.
+type StreamStatusQuery struct {
+	OrgID   string
+	FleetID string
+}
+
+// BundleChainEntry is the metadata-only view of one published bundle in a
+// stream. It deliberately omits the bundle payload, signatures, and policy hash;
+// an operator stream overview reports chain topology, not bundle content.
+type BundleChainEntry struct {
+	BundleID           string    `json:"bundle_id"`
+	Version            uint64    `json:"version"`
+	BundleHash         string    `json:"bundle_hash"`
+	PreviousBundleHash string    `json:"previous_bundle_hash,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	MinPipelockVersion string    `json:"min_pipelock_version"`
+	PublishedAt        time.Time `json:"published_at"`
+}
+
+// StreamSummary is the operator-facing view of one publication stream: its
+// effective head, the monotonicity gate (max-ever version), and the ordered
+// bundle chain. It reports stream topology only; per-follower applied version
+// and drift are NOT tracked by the Conductor and are intentionally absent.
+type StreamSummary struct {
+	StreamKey      string             `json:"stream_key"`
+	OrgID          string             `json:"org_id"`
+	FleetID        string             `json:"fleet_id"`
+	Environment    string             `json:"environment"`
+	Audience       conductor.Audience `json:"audience"`
+	HeadVersion    uint64             `json:"head_version"`
+	HeadBundleID   string             `json:"head_bundle_id"`
+	HeadBundleHash string             `json:"head_bundle_hash"`
+	MaxVersion     uint64             `json:"max_version"`
+	RolledBack     bool               `json:"rolled_back"`
+	BundleChain    []BundleChainEntry `json:"bundle_chain"`
+}
+
+// StreamOverview returns the operator view of every publication stream matching
+// the query's org (and optional fleet) scope. The result is read-only: it
+// reflects the current in-memory head, max-ever version, and bundle chain under
+// a read lock without mutating any stream state. Streams are returned sorted by
+// stream key for deterministic output.
+//
+// The reported chain is ordered ascending by version and includes every stored
+// record for the stream (including records superseded by a durable rollback
+// marker, which remain on disk as audit history); RolledBack is true when an
+// active rollback marker currently caps the effective head below the max-ever
+// version.
+func (s *FileBundleStore) StreamOverview(_ context.Context, q StreamStatusQuery) ([]StreamSummary, error) {
+	if s == nil {
+		return nil, ErrStoreRequired
+	}
+	if err := conductor.ValidateIdentifier("org_id", q.OrgID); err != nil {
+		return nil, err
+	}
+	if q.FleetID != "" {
+		if err := conductor.ValidateIdentifier("fleet_id", q.FleetID); err != nil {
+			return nil, err
+		}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	chains := make(map[string][]BundleChainEntry)
+	for _, record := range s.records {
+		if record.Bundle.OrgID != q.OrgID {
+			continue
+		}
+		if q.FleetID != "" && record.Bundle.FleetID != q.FleetID {
+			continue
+		}
+		chains[record.StreamKey] = append(chains[record.StreamKey], BundleChainEntry{
+			BundleID:           record.Bundle.BundleID,
+			Version:            record.Bundle.Version,
+			BundleHash:         record.BundleHash,
+			PreviousBundleHash: record.Bundle.PreviousBundleHash,
+			CreatedAt:          record.Bundle.CreatedAt,
+			MinPipelockVersion: record.Bundle.MinPipelockVersion,
+			PublishedAt:        record.PublishedAt,
+		})
+	}
+
+	summaries := make([]StreamSummary, 0, len(chains))
+	for streamKey, chain := range chains {
+		slices.SortFunc(chain, func(a, b BundleChainEntry) int {
+			switch {
+			case a.Version < b.Version:
+				return -1
+			case a.Version > b.Version:
+				return 1
+			default:
+				return strings.Compare(a.BundleHash, b.BundleHash)
+			}
+		})
+		head, ok := s.streams[streamKey]
+		if !ok {
+			// A stream with stored records always has a selected head; this guard
+			// is defense-in-depth so a future divergence never panics the read.
+			continue
+		}
+		// RolledBack reflects whether a rollback is still CAPPING the head, not
+		// merely whether a rollback marker exists: markers are retained as audit
+		// context after a forward publish resumes past the ceiling, so a
+		// presence check would report rolled_back=true forever. Reuse the same
+		// supersession test the store uses everywhere else so the operator view
+		// and the publish path agree.
+		rolledBack := s.rollbackSupersedesRecordLocked(head)
+		summaries = append(summaries, StreamSummary{
+			StreamKey:      streamKey,
+			OrgID:          head.Bundle.OrgID,
+			FleetID:        head.Bundle.FleetID,
+			Environment:    head.Bundle.Environment,
+			Audience:       head.Bundle.Audience,
+			HeadVersion:    head.Bundle.Version,
+			HeadBundleID:   head.Bundle.BundleID,
+			HeadBundleHash: head.BundleHash,
+			MaxVersion:     s.maxStreamVersionLocked(streamKey),
+			RolledBack:     rolledBack,
+			BundleChain:    chain,
+		})
+	}
+	slices.SortFunc(summaries, func(a, b StreamSummary) int {
+		return strings.Compare(a.StreamKey, b.StreamKey)
+	})
+	return summaries, nil
+}
+
+type FileBundleStore struct {
+	dir            string
+	bundlesDir     string
+	streamHeadsDir string
+	mu             sync.RWMutex
+	records        map[string]PublishedBundle
+	streams        map[string]PublishedBundle
+	rollbackHeads  map[string]streamHeadRecord
+}
+
+type streamHeadRecord struct {
+	Version           int       `json:"version"`
+	StreamKey         string    `json:"stream_key"`
+	TargetBundleID    string    `json:"target_bundle_id"`
+	TargetVersion     uint64    `json:"target_version"`
+	TargetBundleHash  string    `json:"target_bundle_hash"`
+	SupersededVersion uint64    `json:"superseded_version"`
+	AppliedAt         time.Time `json:"applied_at"`
+}
+
+func OpenFileBundleStore(dir string) (*FileBundleStore, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, errors.New("conductor control plane bundle store dir required")
+	}
+	root, err := secureDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	bundlesDir, err := secureDir(filepath.Join(root, bundlesDirName))
+	if err != nil {
+		return nil, err
+	}
+	streamHeadsDir, err := secureDir(filepath.Join(root, streamHeadsDirName))
+	if err != nil {
+		return nil, err
+	}
+	if err := sweepTempFiles(bundlesDir); err != nil {
+		return nil, err
+	}
+	if err := sweepTempFiles(streamHeadsDir); err != nil {
+		return nil, err
+	}
+	store := &FileBundleStore{
+		dir:            root,
+		bundlesDir:     bundlesDir,
+		streamHeadsDir: streamHeadsDir,
+		records:        make(map[string]PublishedBundle),
+		streams:        make(map[string]PublishedBundle),
+		rollbackHeads:  make(map[string]streamHeadRecord),
+	}
+	if err := store.load(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+func (s *FileBundleStore) Publish(_ context.Context, bundle conductor.PolicyBundle, opts PublishOptions) (PublishedBundle, bool, error) {
+	if s == nil {
+		return PublishedBundle{}, false, ErrStoreRequired
+	}
+	now := opts.Now
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	if opts.Rollback {
+		return PublishedBundle{}, false, ErrUnsupportedRollback
+	}
+	if err := validatePublishableBundle(bundle, now); err != nil {
+		return PublishedBundle{}, false, err
+	}
+	hash, err := bundle.CanonicalHash()
+	if err != nil {
+		return PublishedBundle{}, false, err
+	}
+	streamKey, err := streamKey(bundle)
+	if err != nil {
+		return PublishedBundle{}, false, err
+	}
+	record := PublishedBundle{
+		Bundle:      bundle,
+		BundleHash:  hash,
+		StreamKey:   streamKey,
+		PublishedAt: now,
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.records[hash]; ok {
+		s.maybeResolveRollbackHeadLocked(existing)
+		return existing, false, nil
+	}
+	if existing, err := s.bundleByIDVersionLocked(bundle.BundleID, bundle.Version); err == nil {
+		return PublishedBundle{}, false, fmt.Errorf("%w: bundle_id/version already published as %s", ErrBundleConflict, existing.BundleHash)
+	} else if !errors.Is(err, ErrBundleNotFound) {
+		return PublishedBundle{}, false, err
+	}
+	if err := s.authorizeForwardLocked(record); err != nil {
+		return PublishedBundle{}, false, err
+	}
+	if err := writeBundleRecord(s.bundlesDir, record); err != nil {
+		return PublishedBundle{}, false, err
+	}
+	s.records[hash] = record
+	if current, ok := s.streams[streamKey]; !ok || newerRecord(record, current) {
+		s.maybeResolveRollbackHeadLocked(record)
+		s.streams[streamKey] = record
+	}
+	return record, true, nil
+}
+
+func (s *FileBundleStore) Latest(_ context.Context, follower FollowerIdentity, now time.Time) (PublishedBundle, error) {
+	if s == nil {
+		return PublishedBundle{}, ErrStoreRequired
+	}
+	if err := follower.Validate(); err != nil {
+		return PublishedBundle{}, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var best PublishedBundle
+	bestSpecificity := 0
+	for _, record := range s.streams {
+		specificity := matchingSpecificity(record.Bundle, follower, now)
+		if specificity > 0 && (best.BundleHash == "" || specificity > bestSpecificity ||
+			(specificity == bestSpecificity && newerRecord(record, best))) {
+			best = record
+			bestSpecificity = specificity
+		}
+	}
+	if best.BundleHash == "" {
+		return PublishedBundle{}, ErrBundleNotFound
+	}
+	return best, nil
+}
+
+func (s *FileBundleStore) ApplyRollbackHead(_ context.Context, auth conductor.RollbackAuthorization, now time.Time) error {
+	if s == nil {
+		return ErrStoreRequired
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+	if err := auth.Validate(); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	target, err := s.bundleByIDVersionLocked(auth.TargetBundleID, auth.TargetVersion)
+	if err != nil {
+		return err
+	}
+	if auth.CurrentVersion <= target.Bundle.Version {
+		return fmt.Errorf("%w: rollback current version must exceed target version", conductor.ErrInvalidRollback)
+	}
+	currentRecord, err := s.bundleByIDVersionLocked(auth.CurrentBundleID, auth.CurrentVersion)
+	if err != nil {
+		if errors.Is(err, ErrBundleNotFound) {
+			return fmt.Errorf("%w: rollback current bundle is not present in target stream", conductor.ErrInvalidRollback)
+		}
+		return err
+	}
+	if currentRecord.StreamKey != target.StreamKey {
+		return fmt.Errorf("%w: rollback current bundle is not present in target stream", conductor.ErrInvalidRollback)
+	}
+	head, ok := s.streams[target.StreamKey]
+	if !ok {
+		return fmt.Errorf("%w: rollback target stream has no head", conductor.ErrInvalidRollback)
+	}
+	switch {
+	case head.BundleHash == target.BundleHash:
+		// Idempotent retry after the authorized rollback already moved the
+		// effective head backward. Re-write the marker if needed so retries
+		// converge after a partial previous failure.
+	case head.Bundle.Version > auth.CurrentVersion:
+		// A later forward publish has superseded this rollback; do not move the
+		// head backward again on an idempotent operator retry.
+		return nil
+	case head.Bundle.Version == auth.CurrentVersion && head.Bundle.BundleID == auth.CurrentBundleID:
+		// A 2-of-N-signed rollback is the only path that may move the effective
+		// stream head backward. Normal publish remains forward-only in
+		// authorizeForwardLocked.
+	default:
+		return fmt.Errorf("%w: rollback authorization does not match current stream head", conductor.ErrInvalidRollback)
+	}
+	marker := streamHeadRecord{
+		Version:           streamHeadRecordVersion,
+		StreamKey:         target.StreamKey,
+		TargetBundleID:    target.Bundle.BundleID,
+		TargetVersion:     target.Bundle.Version,
+		TargetBundleHash:  target.BundleHash,
+		SupersededVersion: auth.CurrentVersion,
+		AppliedAt:         now,
+	}
+	if err := writeStreamHeadRecord(s.streamHeadsDir, marker); err != nil {
+		return err
+	}
+	s.rollbackHeads[target.StreamKey] = marker
+	s.streams[target.StreamKey] = target
+	return nil
+}
+
+func (s *FileBundleStore) BundleByIDVersion(_ context.Context, bundleID string, version uint64) (PublishedBundle, error) {
+	if s == nil {
+		return PublishedBundle{}, ErrStoreRequired
+	}
+	if err := conductor.ValidateIdentifier("bundle_id", bundleID); err != nil {
+		return PublishedBundle{}, err
+	}
+	if version == 0 {
+		return PublishedBundle{}, fmt.Errorf("%w: version", conductor.ErrMissingField)
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.bundleByIDVersionLocked(bundleID, version)
+}
+
+// RollbackReconcileSkip records a persisted rollback authorization that startup
+// reconciliation could not re-apply. It is informational, not fatal: the caller
+// logs it and continues so one stale authorization never bricks the control
+// plane (see ReconcileRollbackHeads).
+type RollbackReconcileSkip struct {
+	AuthorizationID string
+	Err             error
+}
+
+// ReconcileRollbackHeads re-applies persisted rollback authorizations to the
+// stream heads at startup, healing a head whose marker write failed after the
+// authorization was accepted. It is tolerant only for logical/stale
+// authorizations that no longer apply, such as one already superseded by a
+// forward publish or one whose bundles are no longer present. Persistence and
+// other non-logical errors are fatal so startup cannot serve an un-rolled-back
+// forward head after recovery fails to durably apply the rollback marker.
+func (s *FileBundleStore) ReconcileRollbackHeads(ctx context.Context, records []StoredRollbackAuthorization, now time.Time) ([]RollbackReconcileSkip, error) {
+	if s == nil {
+		return nil, ErrStoreRequired
+	}
+	if len(records) == 0 {
+		return nil, nil
+	}
+	sorted := slices.Clone(records)
+	slices.SortFunc(sorted, func(a, b StoredRollbackAuthorization) int {
+		switch {
+		case newerRollback(a, b):
+			return -1
+		case newerRollback(b, a):
+			return 1
+		default:
+			return 0
+		}
+	})
+	var skipped []RollbackReconcileSkip
+	for _, record := range sorted {
+		if err := s.ApplyRollbackHead(ctx, record.Authorization, now); err != nil {
+			if errors.Is(err, conductor.ErrInvalidRollback) || errors.Is(err, ErrBundleNotFound) {
+				skipped = append(skipped, RollbackReconcileSkip{
+					AuthorizationID: record.Authorization.AuthorizationID,
+					Err:             err,
+				})
+				continue
+			}
+			return skipped, err
+		}
+	}
+	return skipped, nil
+}
+
+func (s *FileBundleStore) bundleByIDVersionLocked(bundleID string, version uint64) (PublishedBundle, error) {
+	var found PublishedBundle
+	for _, record := range s.records {
+		if record.Bundle.BundleID == bundleID && record.Bundle.Version == version {
+			if found.BundleHash != "" {
+				return PublishedBundle{}, fmt.Errorf("%w: duplicate bundle_id/version %q/%d", ErrInvalidStoreRecord, bundleID, version)
+			}
+			found = record
+		}
+	}
+	if found.BundleHash == "" {
+		return PublishedBundle{}, ErrBundleNotFound
+	}
+	return found, nil
+}
+
+// Validate rejects identities whose components are empty OR contain anything
+// the canonical conductor identifier validator rejects: bytes outside
+// [a-zA-Z0-9_.-], leading '_'/'-'/'.', or anything longer than
+// [conductor.MaxIDBytes]. The SPIFFE URI parser unescapes SAN path components
+// with [url.PathUnescape], so without this check a SAN of
+// 'spiffe://td/orgs/a%00b/fleets/.../...' would deliver an OrgID containing a
+// null byte and bypass the '\x00'-separator invariant in streamKey.
+//
+// Identity errors map to HTTP 401 via writeStoreError. Wrapping the inner
+// detail with [ErrFollowerRequired] preserves that mapping; the inner
+// [conductor.ErrInvalidIdentifier] is kept in the chain for diagnostics but
+// is not surfaced to clients.
+func (f FollowerIdentity) Validate() error {
+	for _, c := range []struct {
+		field, value string
+	}{
+		{"org_id", f.OrgID},
+		{"fleet_id", f.FleetID},
+		{"instance_id", f.InstanceID},
+		{"environment", f.Environment},
+	} {
+		if err := conductor.ValidateIdentifier(c.field, c.value); err != nil {
+			return fmt.Errorf("%w: %s", ErrFollowerRequired, c.field)
+		}
+	}
+	return nil
+}
+
+func (s *FileBundleStore) load() error {
+	entries, err := os.ReadDir(s.bundlesDir)
+	if err != nil {
+		return fmt.Errorf("conductor control plane read bundle dir: %w", err)
+	}
+	// Sort by filename so load order is deterministic across filesystems;
+	// stream-head selection in newerRecord still uses version/time/hash.
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		path := filepath.Join(s.bundlesDir, name)
+		record, err := readBundleRecord(path)
+		if err != nil {
+			return err
+		}
+		if _, exists := s.records[record.BundleHash]; exists {
+			return fmt.Errorf("%w: duplicate bundle_hash %q", ErrInvalidStoreRecord, record.BundleHash)
+		}
+		if _, err := s.bundleByIDVersionLocked(record.Bundle.BundleID, record.Bundle.Version); err == nil {
+			return fmt.Errorf("%w: duplicate bundle_id/version %q/%d", ErrInvalidStoreRecord, record.Bundle.BundleID, record.Bundle.Version)
+		} else if !errors.Is(err, ErrBundleNotFound) {
+			return err
+		}
+		s.records[record.BundleHash] = record
+		if current, ok := s.streams[record.StreamKey]; !ok || newerRecord(record, current) {
+			s.streams[record.StreamKey] = record
+		}
+	}
+	if err := s.loadStreamHeadRecordsLocked(); err != nil {
+		return err
+	}
+	// Defense in depth: re-verify the forward-chain integrity of every
+	// effective stream head after rollback markers are loaded. Normal
+	// handcrafted forks are rejected; records superseded by a durable rollback
+	// marker may remain unreachable audit history.
+	if err := s.verifyStreamChainsLocked(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *FileBundleStore) loadStreamHeadRecordsLocked() error {
+	entries, err := os.ReadDir(s.streamHeadsDir)
+	if err != nil {
+		return fmt.Errorf("conductor control plane read stream-head dir: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		names = append(names, entry.Name())
+	}
+	slices.Sort(names)
+	for _, name := range names {
+		marker, err := readStreamHeadRecord(filepath.Join(s.streamHeadsDir, name))
+		if err != nil {
+			return err
+		}
+		if name != streamHeadRecordFileName(marker.StreamKey) {
+			return fmt.Errorf("%w: stream-head marker filename does not match stream key", ErrInvalidStoreRecord)
+		}
+		target, ok := s.records[marker.TargetBundleHash]
+		if !ok {
+			return fmt.Errorf("%w: rollback target bundle missing", ErrInvalidStoreRecord)
+		}
+		if err := validateStreamHeadRecord(marker, target); err != nil {
+			return err
+		}
+		rawHead, ok := s.streams[marker.StreamKey]
+		if !ok {
+			return fmt.Errorf("%w: stream-head marker references unknown stream", ErrInvalidStoreRecord)
+		}
+		s.rollbackHeads[marker.StreamKey] = marker
+		if rawHead.Bundle.Version > marker.SupersededVersion {
+			// A later forward publish already moved past the rollback ceiling.
+			// Keep the marker as audit context for superseded raw records, but do
+			// not let it cap the effective head anymore.
+			continue
+		}
+		s.streams[marker.StreamKey] = target
+	}
+	return nil
+}
+
+// verifyStreamChainsLocked walks each stream head back through
+// previous_bundle_hash, ensuring every same-stream record on disk is either
+// reachable from the selected head in strictly decreasing version order, covered
+// by a durable rollback marker, or a tolerated historical fork sibling (see
+// isToleratedHistoricalForkLocked). Gap publication (e.g., v1 then v3 with
+// previous_bundle_hash=v1) is explicitly allowed.
+//
+// Genuine corruption stays fatal: a record whose chain references a missing
+// previous_bundle_hash, an ancestor in a different stream, a non-decreasing
+// version, or a cycle is rejected, as is a head whose own chain is broken and a
+// record that does not share a common ancestor with the head.
+//
+// The seen-map check is structurally unreachable for chains that pass the
+// strict-decrease check (a decreasing integer sequence cannot loop), but is
+// retained as defense-in-depth: a future reordering of these checks must not
+// silently allow infinite chain traversal.
+// Callers must either hold s.mu or run before the store is shared.
+func (s *FileBundleStore) verifyStreamChainsLocked() error {
+	for streamKey, head := range s.streams {
+		seen := make(map[string]struct{}, 4)
+		if err := s.walkChainLocked(streamKey, head, seen); err != nil {
+			return err
+		}
+		for hash, record := range s.records {
+			if record.StreamKey != streamKey {
+				continue
+			}
+			if _, ok := seen[hash]; ok {
+				continue
+			}
+			if s.rollbackSupersedesRecordLocked(record) {
+				continue
+			}
+			tolerated, err := s.isToleratedHistoricalForkLocked(streamKey, record, head, seen)
+			if err != nil {
+				return err
+			}
+			if tolerated {
+				continue
+			}
+			return fmt.Errorf("%w: stream %q record %s is not reachable from stream head %s",
+				ErrInvalidStoreRecord, streamKey, hash, head.BundleHash)
+		}
+	}
+	return nil
+}
+
+// walkChainLocked follows record's previous_bundle_hash chain to its root,
+// recording every visited bundle hash in seen, and enforcing the structural
+// invariants of a valid chain: no cycle, every previous_bundle_hash present in
+// the store, every ancestor in the same stream, and strictly decreasing version
+// along the chain. Any violation is a genuine-corruption error. On success seen
+// holds the full set of hashes on this chain, which the fork-sibling check reuses
+// to test whether a sibling shares an ancestor with the head.
+func (s *FileBundleStore) walkChainLocked(streamKey string, record PublishedBundle, seen map[string]struct{}) error {
+	cursor := record
+	for {
+		if _, cycle := seen[cursor.BundleHash]; cycle {
+			return fmt.Errorf("%w: stream %q chain has cycle at %s",
+				ErrInvalidStoreRecord, streamKey, cursor.BundleHash)
+		}
+		seen[cursor.BundleHash] = struct{}{}
+		if cursor.Bundle.PreviousBundleHash == "" {
+			return nil
+		}
+		prev, ok := s.records[cursor.Bundle.PreviousBundleHash]
+		if !ok {
+			return fmt.Errorf("%w: stream %q references missing previous_bundle_hash %s",
+				ErrInvalidStoreRecord, streamKey, cursor.Bundle.PreviousBundleHash)
+		}
+		if prev.StreamKey != cursor.StreamKey {
+			return fmt.Errorf("%w: stream %q ancestor %s belongs to different stream",
+				ErrInvalidStoreRecord, streamKey, prev.BundleHash)
+		}
+		if prev.Bundle.Version >= cursor.Bundle.Version {
+			return fmt.Errorf("%w: stream %q ancestor %s version %d does not decrease from %d",
+				ErrInvalidStoreRecord, streamKey, prev.BundleHash, prev.Bundle.Version, cursor.Bundle.Version)
+		}
+		cursor = prev
+	}
+}
+
+// isToleratedHistoricalForkLocked decides whether an off-head, rollback-uncovered
+// same-stream record is a legitimately-superseded fork sibling that should be
+// treated as historical (non-fatal) rather than as corruption that bricks startup.
+//
+// This closes the gap where repeated "rollback-to-vN then publish" cycles leave
+// abandoned fork branches below the live head: the durable rollback marker records
+// only the LAST superseded version, so an earlier abandoned sibling (e.g. a v5 that
+// diverged from v3 while the head later advanced to v6 with the marker still at
+// superseded=4) is neither on the head chain nor covered by the marker. Such a
+// sibling is genuine audit history, not a broken store.
+//
+// The predicate is deliberately narrow. ALL of these must hold; any failure is
+// either fatal corruption (returned as err) or a non-tolerated orphan (false, nil):
+//
+//  1. The stream has a durable rollback marker. A fork sibling can only arise as a
+//     byproduct of authorized rollback, which always leaves a marker; tolerating an
+//     off-chain record on a stream that never underwent rollback would mask a graft.
+//  2. The record's version is strictly below the head version. The head is the
+//     highest forward version; an off-chain record at or above the head version is a
+//     real conflict (two live heads), not a superseded historical sibling.
+//  3. The record's own ancestry chain is structurally valid — walking it back
+//     re-runs every corruption check (missing prev, cross-stream, non-monotonic,
+//     cycle). A broken sibling chain is FATAL, returned as err.
+//  4. The record's chain rejoins the head's chain at a common ancestor. This proves
+//     the sibling forked from a shared point on THIS stream rather than being a
+//     disconnected graft.
+func (s *FileBundleStore) isToleratedHistoricalForkLocked(
+	streamKey string,
+	record PublishedBundle,
+	head PublishedBundle,
+	headSeen map[string]struct{},
+) (bool, error) {
+	if _, ok := s.rollbackHeads[streamKey]; !ok {
+		return false, nil
+	}
+	if record.Bundle.Version >= head.Bundle.Version {
+		return false, nil
+	}
+	// Walk the sibling's chain into its own seen set so a broken sibling chain is
+	// reported as corruption, and detect whether it rejoins the head chain at a
+	// shared ancestor. Each link is validated with the same structural checks the
+	// head walk applies; once a validated parent is found on the head chain the
+	// sibling has rejoined a chain the head walk already verified, so it is accepted.
+	forkSeen := make(map[string]struct{}, 4)
+	cursor := record
+	for {
+		if _, cycle := forkSeen[cursor.BundleHash]; cycle {
+			return false, fmt.Errorf("%w: stream %q fork sibling chain has cycle at %s",
+				ErrInvalidStoreRecord, streamKey, cursor.BundleHash)
+		}
+		forkSeen[cursor.BundleHash] = struct{}{}
+		if cursor.Bundle.PreviousBundleHash == "" {
+			// Reached a stream root without crossing the head chain: the sibling does
+			// not share an ancestor with the head, so it is a disconnected graft, not a
+			// tolerable historical fork.
+			return false, nil
+		}
+		prev, ok := s.records[cursor.Bundle.PreviousBundleHash]
+		if !ok {
+			return false, fmt.Errorf("%w: stream %q references missing previous_bundle_hash %s",
+				ErrInvalidStoreRecord, streamKey, cursor.Bundle.PreviousBundleHash)
+		}
+		if prev.StreamKey != cursor.StreamKey {
+			return false, fmt.Errorf("%w: stream %q ancestor %s belongs to different stream",
+				ErrInvalidStoreRecord, streamKey, prev.BundleHash)
+		}
+		if prev.Bundle.Version >= cursor.Bundle.Version {
+			return false, fmt.Errorf("%w: stream %q ancestor %s version %d does not decrease from %d",
+				ErrInvalidStoreRecord, streamKey, prev.BundleHash, prev.Bundle.Version, cursor.Bundle.Version)
+		}
+		if _, shared := headSeen[prev.BundleHash]; shared {
+			// The validated parent is on the head chain: the sibling forks from a
+			// shared, head-verified ancestor. Accept it as historical.
+			return true, nil
+		}
+		cursor = prev
+	}
+}
+
+func (s *FileBundleStore) rollbackSupersedesRecordLocked(record PublishedBundle) bool {
+	marker, ok := s.rollbackHeads[record.StreamKey]
+	return ok && record.Bundle.Version <= marker.SupersededVersion
+}
+
+func (s *FileBundleStore) authorizeForwardLocked(record PublishedBundle) error {
+	current, ok := s.streams[record.StreamKey]
+	if !ok {
+		if record.Bundle.PreviousBundleHash != "" {
+			return fmt.Errorf("%w: initial bundle has previous_bundle_hash", ErrBundleConflict)
+		}
+		return nil
+	}
+	maxVersion := s.maxStreamVersionLocked(record.StreamKey)
+	switch {
+	case record.Bundle.Version <= maxVersion:
+		if record.Bundle.Version < current.Bundle.Version {
+			return fmt.Errorf("%w: %w", ErrBundleConflict, ErrUnsupportedRollback)
+		}
+		return fmt.Errorf("%w: %w (stream max version is %d)", ErrBundleConflict, ErrVersionBelowStreamMax, maxVersion)
+	case record.Bundle.PreviousBundleHash != current.BundleHash:
+		return fmt.Errorf("%w: %w (current stream head hash is %s)", ErrBundleConflict, ErrPreviousHashMismatch, current.BundleHash)
+	default:
+		return nil
+	}
+}
+
+func (s *FileBundleStore) maxStreamVersionLocked(streamKey string) uint64 {
+	var maxVersion uint64
+	for _, record := range s.records {
+		if record.StreamKey == streamKey && record.Bundle.Version > maxVersion {
+			maxVersion = record.Bundle.Version
+		}
+	}
+	return maxVersion
+}
+
+func (s *FileBundleStore) maybeResolveRollbackHeadLocked(record PublishedBundle) {
+	marker, ok := s.rollbackHeads[record.StreamKey]
+	if !ok || record.Bundle.Version <= marker.SupersededVersion {
+		return
+	}
+	// The marker is no longer an active ceiling once a later publish moves
+	// strictly past the superseded version, but it remains durable audit context
+	// explaining why older raw records may be unreachable from the new head.
+}
+
+func validatePublishableBundle(bundle conductor.PolicyBundle, now time.Time) error {
+	if err := bundle.Validate(); err != nil {
+		return err
+	}
+	if bundle.ExpiresAt.Before(now) {
+		return conductor.ErrExpired
+	}
+	return nil
+}
+
+func readBundleRecord(path string) (PublishedBundle, error) {
+	clean := filepath.Clean(path)
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return PublishedBundle{}, fmt.Errorf("conductor control plane stat bundle record: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return PublishedBundle{}, fmt.Errorf("%w: non-regular bundle record %s", ErrInvalidStoreRecord, path)
+	}
+	if info.Size() > maxBundleRecordJSONSize {
+		return PublishedBundle{}, fmt.Errorf("%w: bundle record too large", conductor.ErrPayloadTooLarge)
+	}
+	file, err := os.Open(clean)
+	if err != nil {
+		return PublishedBundle{}, fmt.Errorf("conductor control plane open bundle record: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	var record PublishedBundle
+	decoder := json.NewDecoder(io.LimitReader(file, maxBundleRecordJSONSize+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&record); err != nil {
+		return PublishedBundle{}, fmt.Errorf("%w: decode bundle record: %w", ErrInvalidStoreRecord, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return PublishedBundle{}, fmt.Errorf("%w: trailing JSON document", ErrInvalidStoreRecord)
+	}
+	if err := validateStoredRecord(record); err != nil {
+		return PublishedBundle{}, err
+	}
+	return record, nil
+}
+
+func writeBundleRecord(dir string, record PublishedBundle) error {
+	if err := validateStoredRecord(record); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return fmt.Errorf("conductor control plane marshal bundle record: %w", err)
+	}
+	data = append(data, '\n')
+	path := filepath.Join(dir, record.BundleHash+".json")
+	return durableWrite(path, data)
+}
+
+func readStreamHeadRecord(path string) (streamHeadRecord, error) {
+	clean := filepath.Clean(path)
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return streamHeadRecord{}, fmt.Errorf("conductor control plane stat stream-head record: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return streamHeadRecord{}, fmt.Errorf("%w: non-regular stream-head record %s", ErrInvalidStoreRecord, path)
+	}
+	if info.Size() > maxStreamHeadJSONSize {
+		return streamHeadRecord{}, fmt.Errorf("%w: stream-head record too large", conductor.ErrPayloadTooLarge)
+	}
+	file, err := os.Open(clean)
+	if err != nil {
+		return streamHeadRecord{}, fmt.Errorf("conductor control plane open stream-head record: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	var record streamHeadRecord
+	decoder := json.NewDecoder(io.LimitReader(file, maxStreamHeadJSONSize+1))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&record); err != nil {
+		return streamHeadRecord{}, fmt.Errorf("%w: decode stream-head record: %w", ErrInvalidStoreRecord, err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return streamHeadRecord{}, fmt.Errorf("%w: trailing JSON document", ErrInvalidStoreRecord)
+	}
+	return record, nil
+}
+
+func writeStreamHeadRecord(dir string, record streamHeadRecord) error {
+	if record.Version != streamHeadRecordVersion ||
+		record.StreamKey == "" ||
+		record.TargetBundleID == "" ||
+		record.TargetVersion == 0 ||
+		record.TargetBundleHash == "" ||
+		record.SupersededVersion == 0 ||
+		record.AppliedAt.IsZero() {
+		return fmt.Errorf("%w: invalid stream-head marker", ErrInvalidStoreRecord)
+	}
+	data, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		return fmt.Errorf("conductor control plane marshal stream-head record: %w", err)
+	}
+	data = append(data, '\n')
+	return durableWrite(filepath.Join(dir, streamHeadRecordFileName(record.StreamKey)), data)
+}
+
+func validateStreamHeadRecord(marker streamHeadRecord, target PublishedBundle) error {
+	if marker.Version != streamHeadRecordVersion {
+		return fmt.Errorf("%w: stream-head marker version=%d", ErrInvalidStoreRecord, marker.Version)
+	}
+	if marker.StreamKey == "" || marker.TargetBundleID == "" || marker.TargetVersion == 0 ||
+		marker.TargetBundleHash == "" || marker.SupersededVersion == 0 || marker.AppliedAt.IsZero() {
+		return fmt.Errorf("%w: missing stream-head marker metadata", ErrInvalidStoreRecord)
+	}
+	if marker.TargetBundleHash != target.BundleHash ||
+		marker.TargetBundleID != target.Bundle.BundleID ||
+		marker.TargetVersion != target.Bundle.Version ||
+		marker.StreamKey != target.StreamKey {
+		return fmt.Errorf("%w: stream-head marker target mismatch", ErrInvalidStoreRecord)
+	}
+	if marker.SupersededVersion <= marker.TargetVersion {
+		return fmt.Errorf("%w: stream-head marker superseded version must exceed target", ErrInvalidStoreRecord)
+	}
+	return nil
+}
+
+func streamHeadRecordFileName(streamKey string) string {
+	sum := sha256.Sum256([]byte(streamKey))
+	return hex.EncodeToString(sum[:]) + ".json"
+}
+
+func validateStoredRecord(record PublishedBundle) error {
+	if record.BundleHash == "" || len(record.BundleHash) != sha256.Size*2 {
+		return fmt.Errorf("%w: invalid bundle_hash", ErrInvalidStoreRecord)
+	}
+	if _, err := hex.DecodeString(record.BundleHash); err != nil {
+		return fmt.Errorf("%w: invalid bundle_hash", ErrInvalidStoreRecord)
+	}
+	hash, err := record.Bundle.CanonicalHash()
+	if err != nil {
+		return err
+	}
+	if hash != record.BundleHash {
+		return fmt.Errorf("%w: bundle_hash mismatch", ErrInvalidStoreRecord)
+	}
+	expectedStream, err := streamKey(record.Bundle)
+	if err != nil {
+		return err
+	}
+	if record.StreamKey != expectedStream {
+		return fmt.Errorf("%w: stream_key mismatch", ErrInvalidStoreRecord)
+	}
+	if record.PublishedAt.IsZero() {
+		return fmt.Errorf("%w: published_at", ErrInvalidStoreRecord)
+	}
+	return validatePublishableBundle(record.Bundle, record.PublishedAt)
+}
+
+func streamKey(bundle conductor.PolicyBundle) (string, error) {
+	audienceHash, err := audienceHash(bundle.Audience)
+	if err != nil {
+		return "", err
+	}
+	return bundle.OrgID + "\x00" + bundle.FleetID + "\x00" + bundle.Environment + "\x00" + audienceHash, nil
+}
+
+// audienceHash returns the canonical hash of an audience used as the stream
+// discriminator. The hash MUST be order-invariant under semantically equivalent
+// audiences: two audiences with the same instance IDs and labels but listed in
+// different order must hash identically. Without this, a publisher could bypass
+// per-stream forward-chain enforcement (forbidding rollback, requiring matching
+// previous_bundle_hash) by reordering Audience.InstanceIDs to create a parallel
+// stream. Both streams would still match the same follower via Audience.Matches,
+// and Latest() would serve whichever has the higher Version, sidestepping the
+// stream-head's previous-hash chain entirely.
+//
+// Map keys are already deterministic under encoding/json since Go 1.12, but
+// slice order is preserved as-is. We sort and compact a copy of InstanceIDs to
+// defend against accidental and adversarial reordering or duplicate IDs.
+func audienceHash(audience conductor.Audience) (string, error) {
+	canonical := conductor.Audience{
+		Labels: audience.Labels,
+	}
+	if len(audience.InstanceIDs) > 0 {
+		ids := slices.Clone(audience.InstanceIDs)
+		slices.Sort(ids)
+		ids = slices.Compact(ids)
+		canonical.InstanceIDs = ids
+	}
+	data, err := json.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func newerRecord(candidate, current PublishedBundle) bool {
+	if candidate.Bundle.Version != current.Bundle.Version {
+		return candidate.Bundle.Version > current.Bundle.Version
+	}
+	if !candidate.PublishedAt.Equal(current.PublishedAt) {
+		return candidate.PublishedAt.After(current.PublishedAt)
+	}
+	return candidate.BundleHash > current.BundleHash
+}
+
+func matchingSpecificity(bundle conductor.PolicyBundle, follower FollowerIdentity, now time.Time) int {
+	if bundle.NotBefore.After(now) || bundle.ExpiresAt.Before(now) || bundle.Environment != follower.Environment {
+		return 0
+	}
+	if bundle.ValidateForFollower(follower.OrgID, follower.FleetID, follower.InstanceID, follower.Labels) != nil {
+		return 0
+	}
+	if slices.Contains(bundle.Audience.InstanceIDs, follower.InstanceID) {
+		return 3
+	}
+	if len(bundle.Audience.Labels) > 0 {
+		return 2
+	}
+	if slices.Contains(bundle.Audience.InstanceIDs, "*") {
+		return 1
+	}
+	return 0
+}
+
+func secureDir(dir string) (string, error) {
+	clean := filepath.Clean(dir)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("conductor control plane dir must be absolute: %s", dir)
+	}
+	if isFilesystemRoot(clean) {
+		return "", fmt.Errorf("conductor control plane dir must not be filesystem root: %s", dir)
+	}
+	if err := os.MkdirAll(clean, bundleStoreDirMode); err != nil {
+		return "", fmt.Errorf("conductor control plane create dir %s: %w", clean, err)
+	}
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return "", fmt.Errorf("conductor control plane resolve dir %s: %w", clean, err)
+	}
+	info, err := os.Lstat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("conductor control plane stat dir %s: %w", resolved, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("conductor control plane dir %s must be a real directory", resolved)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(resolved, bundleStoreDirMode); err != nil {
+			return "", fmt.Errorf("conductor control plane chmod dir %s: %w", resolved, err)
+		}
+	}
+	return resolved, nil
+}
+
+func isFilesystemRoot(path string) bool {
+	clean := filepath.Clean(path)
+	volume := filepath.VolumeName(clean)
+	root := volume + string(os.PathSeparator)
+	return clean == filepath.Clean(root)
+}
+
+func durableWrite(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, bundleStoreTempPattern)
+	if err != nil {
+		return fmt.Errorf("conductor control plane create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("conductor control plane write temp: %w", err)
+	}
+	if err := tmp.Chmod(bundleRecordFileMode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("conductor control plane chmod temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("conductor control plane fsync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("conductor control plane close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("conductor control plane rename temp: %w", err)
+	}
+	return fsyncDir(dir)
+}
+
+func fsyncDir(dir string) error {
+	f, err := os.Open(filepath.Clean(dir))
+	if err != nil {
+		return fmt.Errorf("conductor control plane open dir for fsync %s: %w", dir, err)
+	}
+	defer func() { _ = f.Close() }()
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("conductor control plane fsync dir %s: %w", dir, err)
+	}
+	return nil
+}
+
+func sweepTempFiles(dir string) error {
+	matches, err := filepath.Glob(filepath.Join(dir, bundleStoreTempPattern))
+	if err != nil {
+		return fmt.Errorf("conductor control plane scan stale temps: %w", err)
+	}
+	slices.Sort(matches)
+	for _, match := range matches {
+		if err := os.Remove(match); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("conductor control plane remove stale temp %s: %w", filepath.Base(match), err)
+		}
+	}
+	return nil
+}

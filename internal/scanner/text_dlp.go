@@ -1,0 +1,628 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package scanner
+
+import (
+	"context"
+	"encoding/base32"
+	"encoding/base64"
+	"encoding/hex"
+	"net/url"
+	"regexp"
+	"strings"
+	"unicode"
+
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
+	"github.com/luckyPipewrench/pipelock/internal/seedprotect"
+)
+
+// textURLTokenRe matches URL tokens (http/https/ws/wss/ftp) so their hostnames
+// can be run through the pre-DNS structural exfil check. Conservative on
+// purpose: only scheme-prefixed URLs are extracted, so arbitrary dotted text
+// is not treated as a hostname.
+var textURLTokenRe = regexp.MustCompile(`(?i)\b(?:https?|wss?|ftp)://[^\s"'<>\\]+`)
+
+type textHostView struct {
+	host      string
+	start     int
+	end       int
+	viewLabel string
+}
+
+// extractHostsFromTextViews pulls de-duplicated hostnames out of URL tokens in
+// multiple text views. Callers pass both raw and DLP-normalized text so URL
+// extraction gets the same invisible/control/confusable hardening as pattern DLP.
+func extractHostsFromTextViews(views ...spanTextView) []textHostView {
+	seen := make(map[string]struct{})
+	var hosts []textHostView
+	for _, view := range views {
+		extractHostsFromOneText(view, seen, &hosts)
+	}
+	return hosts
+}
+
+func extractHostsFromOneText(view spanTextView, seen map[string]struct{}, hosts *[]textHostView) {
+	text := view.text
+	tokens := textURLTokenRe.FindAllString(text, -1)
+	if len(tokens) == 0 {
+		return
+	}
+	locs := textURLTokenRe.FindAllStringIndex(text, -1)
+	for i, tok := range tokens {
+		u, err := url.Parse(tok)
+		if err != nil {
+			continue
+		}
+		host := u.Hostname()
+		if host == "" {
+			continue
+		}
+		if _, dup := seen[host]; dup {
+			continue
+		}
+		hostStart := hostOffsetInURLToken(tok, u)
+		if hostStart < 0 {
+			continue
+		}
+		seen[host] = struct{}{}
+		start := locs[i][0] + hostStart
+		*hosts = append(*hosts, textHostView{
+			host:      host,
+			start:     start,
+			end:       start + len(host),
+			viewLabel: view.viewLabel,
+		})
+	}
+}
+
+func hostOffsetInURLToken(token string, u *url.URL) int {
+	host := u.Hostname()
+	if host == "" {
+		return -1
+	}
+	schemeEnd := strings.Index(token, "://")
+	if schemeEnd < 0 {
+		return -1
+	}
+	authorityStart := schemeEnd + len("://")
+	authorityEnd := authorityStart
+	for authorityEnd < len(token) && !strings.ContainsRune("/?#", rune(token[authorityEnd])) {
+		authorityEnd++
+	}
+	authority := token[authorityStart:authorityEnd]
+	if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+		authorityStart += at + 1
+		authority = authority[at+1:]
+	}
+	hostStart := indexFold(authority, host)
+	if hostStart < 0 {
+		return -1
+	}
+	return authorityStart + hostStart
+}
+
+func indexFold(s, substr string) int {
+	if substr == "" || len(substr) > len(s) {
+		return -1
+	}
+	lowerSubstr := strings.ToLower(substr)
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if strings.ToLower(s[i:i+len(substr)]) == lowerSubstr {
+			return i
+		}
+	}
+	return -1
+}
+
+// textDLPHostnameExfil is the pattern name reported when a URL embedded in
+// scanned text carries an encoded-subdomain exfiltration hostname.
+const textDLPHostnameExfil = "Hostname Exfiltration"
+
+// IsHostnameExfilMatch reports whether a text-DLP match came from the
+// structural hostname-exfil detector. Transports use this to keep hostname
+// exfiltration fail-closed even when generic DLP is configured in warn mode.
+func IsHostnameExfilMatch(m TextDLPMatch) bool {
+	return m.PatternName == textDLPHostnameExfil && m.Encoded == "subdomain"
+}
+
+// ContainsHostnameExfilMatch reports whether matches include a structural
+// hostname-exfil finding.
+func ContainsHostnameExfilMatch(matches []TextDLPMatch) bool {
+	for _, m := range matches {
+		if IsHostnameExfilMatch(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// TextDLPMatch describes a single DLP pattern match in arbitrary text.
+type TextDLPMatch struct {
+	PatternName   string `json:"pattern_name"`
+	Severity      string `json:"severity"`
+	Encoded       string `json:"encoded,omitempty"` // "", "base64", "hex", "base32", "env", "url", "subdomain", "whitespace"
+	Bundle        string `json:"bundle,omitempty"`
+	BundleVersion string `json:"bundle_version,omitempty"`
+	Warn          bool   `json:"warn,omitempty"` // true for warn-mode patterns (informational only)
+	span          MatchSpan
+}
+
+// Span returns retained coordinates for this match in the normalized scanner
+// view named by MatchSpan.ViewLabel. It never includes matched bytes.
+func (m TextDLPMatch) Span() MatchSpan {
+	return m.span
+}
+
+// TextDLPResult describes the outcome of scanning text for DLP patterns.
+type TextDLPResult struct {
+	Clean                bool           `json:"clean"`
+	Matches              []TextDLPMatch `json:"matches,omitempty"`
+	InformationalMatches []TextDLPMatch `json:"informational_matches,omitempty"` // warn-mode matches (non-blocking)
+}
+
+// textDLPOptions tunes a text-DLP scan. emitWarns controls warn-hook telemetry.
+// scanSecretLeak controls whether the agent's-own-secret exfil checks run —
+// the environment-variable and file-secret value matchers. Those checks detect
+// a secret VALUE the proxy holds (env or secrets-file) appearing in the text,
+// which only indicates exfiltration when the text is OUTBOUND. Callers scanning
+// inbound content (operator->agent messages, tool results flowing back) set it
+// false: a value the agent is receiving is not a leak, and matching it there
+// produces false positives that gag normal operation. Generic detectors
+// (regex patterns, seed phrases, canary tokens, hostname-exfil) are unaffected
+// and run in both directions.
+type textDLPOptions struct {
+	emitWarns      bool
+	scanSecretLeak bool
+}
+
+// ScanTextForDLP checks arbitrary text for DLP pattern matches and env secret leaks.
+// Unlike checkDLP (which operates on URLs), this method works on raw text strings
+// from MCP tool arguments. It applies zero-width stripping, NFKC normalization,
+// and checks encoded variants (base64, hex, base32) of the text for patterns.
+// This is the full OUTBOUND scan: it runs the agent's-own-secret exfil checks.
+func (s *Scanner) ScanTextForDLP(ctx context.Context, text string) TextDLPResult {
+	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: true, scanSecretLeak: true})
+}
+
+// ScanTextForDLPQuiet runs the same text-DLP detection logic as ScanTextForDLP
+// but suppresses warn-hook emission. Callers use this when they need to compare
+// multiple related scans without duplicating warn telemetry.
+func (s *Scanner) ScanTextForDLPQuiet(ctx context.Context, text string) TextDLPResult {
+	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: false, scanSecretLeak: true})
+}
+
+// ScanTextForDLPInbound runs text DLP for INBOUND content — text the agent is
+// receiving rather than sending (operator->agent messages, tool results flowing
+// back). It runs the full pattern / seed / canary / hostname-exfil detection but
+// SKIPS the agent's-own-secret exfil checks (environment-variable and
+// file-secret value matching). Those only indicate exfiltration on an outbound
+// surface; on inbound content the same value appearing is legitimately-received
+// data, not a leak, and scanning for it false-positives. Exfil protection is
+// untouched: the outbound surfaces still call ScanTextForDLP.
+func (s *Scanner) ScanTextForDLPInbound(ctx context.Context, text string) TextDLPResult {
+	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: true, scanSecretLeak: false})
+}
+
+// EmitTextDLPWarnMatches replays the warn hook for the provided informational
+// matches after a caller has filtered or deduplicated them.
+func (s *Scanner) EmitTextDLPWarnMatches(ctx context.Context, matches []TextDLPMatch) {
+	if len(matches) == 0 {
+		return
+	}
+
+	warns := make([]WarnMatch, 0, len(matches))
+	for _, m := range matches {
+		if !m.Warn {
+			continue
+		}
+		warns = append(warns, WarnMatch{
+			PatternName: m.PatternName,
+			Severity:    m.Severity,
+			span:        m.Span(),
+		})
+	}
+	s.emitDLPWarns(ctx, deduplicateWarnMatches(warns))
+}
+
+func (s *Scanner) scanTextForDLP(ctx context.Context, text string, opts textDLPOptions) TextDLPResult {
+	text = redactOfficialAWSExampleCredentialsForDocs(text)
+
+	// Core DLP runs FIRST - immutable safety floor. Core matches are
+	// prepended to results; main scanner also runs to capture additional
+	// findings (env leaks, seed phrases, non-core patterns).
+	coreMatches := s.scanCoreDLP(text)
+
+	if len(s.dlpPatterns) == 0 &&
+		len(s.canaryTokens) == 0 &&
+		len(s.envSecrets) == 0 &&
+		len(s.fileSecrets) == 0 &&
+		!s.seedEnabled {
+		if len(coreMatches) > 0 {
+			return TextDLPResult{Clean: false, Matches: coreMatches}
+		}
+		return TextDLPResult{Clean: true}
+	}
+
+	var matches []TextDLPMatch
+
+	// Seed phrase detection runs FIRST so seed phrases get the correct label
+	// ("BIP-39 Seed Phrase") instead of an accidental regex DLP match.
+	// A base64-encoded seed phrase can decode to text matching WIF/xprv regex,
+	// so seed detection must win the race.
+	// Uses ForMatching() normalization (preserves whitespace for word boundaries)
+	// instead of ForDLP() (strips whitespace, destroying word boundaries).
+	if s.seedEnabled {
+		seedText := normalize.ForMatching(text)
+		type seedCandidate struct {
+			text      string
+			encoded   string
+			viewLabel string
+		}
+		candidates := []seedCandidate{{seedText, "", ViewForMatching}}
+		// URL-decoded variant
+		if decoded := IterativeDecode(seedText); decoded != seedText {
+			candidates = append(candidates, seedCandidate{decoded, "url", spanViewLabel("url_decoded", ViewForMatching)})
+		}
+		// Base64-decoded variant
+		for _, enc := range []*base64.Encoding{
+			base64.StdEncoding, base64.URLEncoding,
+			base64.RawStdEncoding, base64.RawURLEncoding,
+		} {
+			if decoded, err := enc.DecodeString(strings.TrimSpace(seedText)); err == nil && len(decoded) > 0 {
+				candidates = append(candidates, seedCandidate{string(decoded), "base64", spanViewLabel("base64_decoded", ViewForMatching)})
+			}
+		}
+		// Hex-decoded variant
+		if decoded, err := hex.DecodeString(strings.TrimSpace(seedText)); err == nil && len(decoded) > 0 {
+			candidates = append(candidates, seedCandidate{string(decoded), "hex", spanViewLabel("hex_decoded", ViewForMatching)})
+		}
+		// Base32-decoded variant
+		if decoded, err := base32.StdEncoding.DecodeString(strings.TrimSpace(seedText)); err == nil && len(decoded) > 0 {
+			candidates = append(candidates, seedCandidate{string(decoded), "base32", spanViewLabel("base32_decoded", ViewForMatching)})
+		}
+		// Segment-level decoding: split on the same delimiters as decodeTextSegments()
+		// to maintain parity. Catches encoded seed phrases embedded in URLs within
+		// MCP tool arguments (e.g., "visit https://evil/<base64-seed> now").
+		segments := strings.FieldsFunc(seedText, isTextDLPEncodingDelimiter)
+		for _, seg := range segments {
+			if len(seg) < 20 { // seed phrases are long; skip short segments
+				continue
+			}
+			for _, d := range decodeEncodings(seg) {
+				candidates = append(candidates, seedCandidate{d.text, d.encoding, spanViewLabel(d.encoding+"_decoded", "text_segment")})
+			}
+		}
+		for _, c := range candidates {
+			if seedMatches := seedprotect.DetectSpans(c.text, s.seedMinWords, s.seedVerifyChecksum); len(seedMatches) > 0 {
+				span := seedMatches[0]
+				matches = append(matches, TextDLPMatch{
+					PatternName: "BIP-39 Seed Phrase",
+					Severity:    "critical",
+					Encoded:     c.encoded,
+					span: newMatchSpan(
+						span.Start,
+						span.End,
+						c.viewLabel,
+						"BIP-39 Seed Phrase",
+						"",
+						"",
+					),
+				})
+				break // one seed match per scan is sufficient
+			}
+		}
+	}
+
+	// Full normalization before DLP pattern matching: strip control chars,
+	// NFKC, cross-script confusable mapping, and combining mark removal.
+	// Must match response scanning depth - otherwise attackers use homoglyphs
+	// in key prefixes (e.g., sk-օnt-... with Armenian օ U+0585 for 'a').
+	cleaned := normalize.ForDLP(text)
+	matches = append(matches, s.scanCanaryText(cleaned)...)
+
+	// Check raw text against DLP patterns (before URL decoding).
+	// This catches secrets that aren't URL-encoded.
+	for _, idx := range s.dlpPreFilter.patternsToCheck(cleaned) {
+		p := s.dlpPatterns[idx]
+		if start, end, ok := p.matchSpan(cleaned); ok {
+			matches = append(matches, TextDLPMatch{
+				PatternName:   p.name,
+				Severity:      p.severity,
+				Bundle:        p.bundle,
+				BundleVersion: p.bundleVersion,
+				Warn:          p.warn,
+				span:          newMatchSpan(start, end, ViewDLPNormalized, p.name, p.bundle, p.bundleVersion),
+			})
+		}
+	}
+
+	// Iterative URL-decode and re-check DLP patterns (catches %2D → - etc.).
+	// Uses IterativeDecode to defeat multi-layer encoding.
+	if decoded := IterativeDecode(cleaned); decoded != cleaned {
+		matches = append(matches, s.matchDLPPatterns(decoded, "url")...)
+	}
+
+	// Dot-collapse check: catches secrets split across DNS subdomains
+	// (e.g. "sk-ant-api03.AABBCCDD.EEFFGGHH.evil.com" → "sk-ant-api03AABBCCDDEEFFGGHH...").
+	// Only applied when text contains dots that could be subdomain separators.
+	if strings.Contains(cleaned, ".") {
+		dotless := strings.ReplaceAll(cleaned, ".", "")
+		if dotless != cleaned {
+			matches = append(matches, s.matchDLPPatterns(dotless, "subdomain")...)
+		}
+	}
+
+	// ASCII whitespace collapse: catches high-confidence keys split by spaces,
+	// tabs, or newlines in headers and tool args (e.g. "AKIAIOSF ODNN7EXAMPLE").
+	if compacted := compactTextDLPWhitespace(cleaned); compacted != cleaned {
+		matches = append(matches, s.matchDLPPatterns(compacted, "whitespace")...)
+	}
+
+	// Hostname exfiltration: extract URL hostnames from the text and run the
+	// pre-DNS structural subdomain check (encoded hex/base32 labels, chunked
+	// DNS-tunneling payloads). This gives MCP tool arguments and A2A content the
+	// same hostname-exfil coverage as the URL scanner without resolving DNS —
+	// the decoded labels need not be a known DLP secret to be flagged.
+	for _, host := range extractHostsFromTextViews(
+		spanTextView{text: text, viewLabel: "raw_text"},
+		spanTextView{text: cleaned, viewLabel: ViewDLPNormalized},
+	) {
+		if res := s.checkSubdomainEntropy(host.host); !res.Allowed {
+			matches = append(matches, TextDLPMatch{
+				PatternName: textDLPHostnameExfil,
+				Severity:    "high",
+				Encoded:     "subdomain",
+				span:        newMatchSpan(host.start, host.end, host.viewLabel, textDLPHostnameExfil, "", ""),
+			})
+			break // one hostname-exfil finding is sufficient
+		}
+	}
+
+	// Fixpoint encoding decode: try base64, hex, base32, and URL decoding
+	// until no new bounded candidates appear. Catches base64(secret),
+	// hex(secret), and nested chains (e.g., base64(hex(secret))).
+	matches = append(matches, s.decodeAndMatchRecursive(cleaned, 0)...)
+
+	// Segment-level encoding detection: split text on URL/path delimiters and
+	// try decoding each segment individually. Catches encoded secrets embedded
+	// in URLs within MCP tool arguments (e.g., "https://evil.com/<hex-key>/data")
+	// where whole-string decode fails because the text isn't pure hex/base64.
+	// Only skip segment decoding when enforced matches already exist.
+	// Warn-only matches must not gate off further scanning - an enforced
+	// match might hide in a decoded segment.
+	if !hasEnforcedMatch(matches) {
+		matches = append(matches, s.decodeTextSegments(cleaned)...)
+	}
+
+	// Check for env + file secret leaks (raw + encoded forms). These detect a
+	// secret VALUE the proxy holds appearing in the text, i.e. exfiltration —
+	// meaningful only when the text is outbound. Inbound callers disable them
+	// (a received value is not a leak) to avoid gagging normal operation. The
+	// gate lives INSIDE the scan, not as a post-hoc filter on the result, so it
+	// cannot create a masking bypass: a disabled check never runs rather than
+	// running and being filtered away.
+	if opts.scanSecretLeak {
+		matches = append(matches, s.checkSecretsInText(s.envSecrets, cleaned, "Environment Variable Leak", "env")...)
+		matches = append(matches, s.checkSecretsInText(s.fileSecrets, cleaned, "Known Secret Leak", "")...)
+	}
+
+	// Deduplicate matches by pattern name + encoding.
+	matches = deduplicateMatches(matches)
+
+	// Prepend core matches - core findings cannot be overridden.
+	if len(coreMatches) > 0 {
+		matches = append(coreMatches, matches...)
+		matches = deduplicateMatches(matches)
+	}
+
+	if len(matches) == 0 {
+		return TextDLPResult{Clean: true}
+	}
+
+	// Partition matches: warn-mode patterns go to InformationalMatches,
+	// enforced patterns go to Matches. Warn-only results are Clean=true
+	// so transports take no enforcement action.
+	var enforced, informational []TextDLPMatch
+	for _, m := range matches {
+		if m.Warn {
+			informational = append(informational, m)
+		} else {
+			enforced = append(enforced, m)
+		}
+	}
+
+	// Emit warn events through the shared helper so warn-hook behavior stays centralized.
+	if opts.emitWarns && len(informational) > 0 {
+		warns := make([]WarnMatch, 0, len(informational))
+		for _, m := range informational {
+			warns = append(warns, WarnMatch{
+				PatternName: m.PatternName,
+				Severity:    m.Severity,
+				span:        m.Span(),
+			})
+		}
+		s.emitDLPWarns(ctx, deduplicateWarnMatches(warns))
+	}
+
+	return TextDLPResult{
+		Clean:                len(enforced) == 0,
+		Matches:              enforced,
+		InformationalMatches: informational,
+	}
+}
+
+// decodeAndMatchRecursive runs DLP patterns over every bounded fixpoint decode
+// candidate. The second parameter is kept for older call sites; decode bounding
+// is now candidate-count and candidate-size based instead of depth based.
+func (s *Scanner) decodeAndMatchRecursive(text string, _ int) []TextDLPMatch {
+	var matches []TextDLPMatch
+	for _, d := range decodeEncodingsRecursiveWithURL(text) {
+		matches = append(matches, s.matchDLPPatterns(d.text, d.encoding)...)
+	}
+	return matches
+}
+
+// matchDLPPatterns runs DLP regex patterns against text, tagging matches with encoding.
+// Applies full normalization to decoded text, since URL/base64/hex decoding can
+// reintroduce control chars and confusable characters after the initial pass.
+func (s *Scanner) matchDLPPatterns(text, encoding string) []TextDLPMatch {
+	text = normalize.ForDLP(text)
+	var matches []TextDLPMatch
+	for _, idx := range s.dlpPreFilter.patternsToCheck(text) {
+		p := s.dlpPatterns[idx]
+		if start, end, ok := p.matchSpan(text); ok {
+			matches = append(matches, TextDLPMatch{
+				PatternName:   p.name,
+				Severity:      p.severity,
+				Encoded:       encoding,
+				Bundle:        p.bundle,
+				BundleVersion: p.bundleVersion,
+				Warn:          p.warn,
+				span:          newMatchSpan(start, end, dlpViewLabel(encoding), p.name, p.bundle, p.bundleVersion),
+			})
+		}
+	}
+	return matches
+}
+
+func compactTextDLPWhitespace(text string) string {
+	if !strings.ContainsFunc(text, unicode.IsSpace) {
+		return text
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, text)
+}
+
+// checkSecretsInText scans text for leaked secrets (env vars or file-based).
+// If encodedOverride is non-empty, all matches use that as the Encoded field (e.g. "env").
+// Otherwise, the actual encoding label from matchSecretEncodingSpan is used.
+func (s *Scanner) checkSecretsInText(secrets []string, text, patternName, encodedOverride string) []TextDLPMatch {
+	if len(secrets) == 0 {
+		return nil
+	}
+
+	texts := []spanTextView{{text: text, viewLabel: ViewDLPNormalized}}
+	lowerTexts := []spanTextView{{text: strings.ToLower(text), viewLabel: lowerViewLabel(ViewDLPNormalized)}}
+
+	for _, secret := range secrets {
+		if matched, enc, start, end, viewLabel := matchSecretEncodingSpan(secret, texts, lowerTexts); matched {
+			m := TextDLPMatch{PatternName: patternName, Severity: "critical"}
+			if encodedOverride != "" {
+				m.Encoded = encodedOverride
+			} else {
+				m.Encoded = enc
+			}
+			m.span = newMatchSpan(start, end, viewLabel, patternName, "", "")
+			return []TextDLPMatch{m}
+		}
+	}
+	return nil
+}
+
+// deduplicateMatches removes duplicate matches with the same pattern name and encoding.
+func deduplicateMatches(matches []TextDLPMatch) []TextDLPMatch {
+	if len(matches) <= 1 {
+		return matches
+	}
+
+	type key struct {
+		name    string
+		encoded string
+	}
+	seen := make(map[key]struct{}, len(matches))
+	result := make([]TextDLPMatch, 0, len(matches))
+	for _, m := range matches {
+		k := key{name: m.PatternName, encoded: m.Encoded}
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			result = append(result, m)
+		}
+	}
+	return result
+}
+
+// hasEnforcedMatch reports whether any match in the slice is non-warn (enforced).
+func hasEnforcedMatch(matches []TextDLPMatch) bool {
+	for _, m := range matches {
+		if !m.Warn {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeTextSegments splits text on common URL/path delimiters and tries
+// hex/base64/base32 decoding on each segment. Catches encoded secrets
+// embedded in URLs (e.g., "https://evil.com/<hex-encoded-key>/data") where
+// whole-string decode fails because the surrounding text isn't valid encoding.
+func (s *Scanner) decodeTextSegments(text string) []TextDLPMatch {
+	// Split on URL-like and structured-data delimiters. Request bodies often
+	// wrap encoded secrets in JSON, YAML, CSV, or multipart text, so quotes,
+	// braces, colons, and commas must not stay attached to the encoded token.
+	segments := strings.FieldsFunc(text, isTextDLPEncodingDelimiter)
+
+	var matches []TextDLPMatch
+	for _, seg := range segments {
+		if len(seg) < 10 {
+			continue // too short to be a meaningful encoded secret
+		}
+		for _, d := range decodeEncodingsRecursiveWithURL(seg) {
+			if m := s.matchDLPPatterns(d.text, d.encoding); len(m) > 0 {
+				matches = append(matches, m...)
+				return matches // short-circuit on first match
+			}
+		}
+	}
+	return matches
+}
+
+func isTextDLPEncodingDelimiter(r rune) bool {
+	switch r {
+	case '/', '?', '&', '=', ' ', '\n', '\r', '\t',
+		'"', '\'', '`', '{', '}', '[', ']', '(', ')', '<', '>',
+		':', ',', ';':
+		return true
+	default:
+		return false
+	}
+}
+
+func redactOfficialAWSExampleCredentialsForDocs(text string) string {
+	key := rot13ASCII("NXVNVBFSBQAA7RKNZCYR")
+	secret := rot13ASCII("jWnyeKHgaSRZV/X7ZQRAT/oCkEsvPLRKNZCYRXRL")
+	if !strings.Contains(text, key) && !strings.Contains(text, secret) {
+		return text
+	}
+
+	lower := strings.ToLower(text)
+	docContext := strings.Contains(lower, "example credential") ||
+		strings.Contains(lower, "example credentials") ||
+		strings.Contains(lower, "replace these with your actual credentials") ||
+		strings.Contains(lower, "official aws example")
+	if !docContext {
+		return text
+	}
+
+	return strings.NewReplacer(
+		key, "AWS_ACCESS_KEY_ID_EXAMPLE",
+		secret, "AWS_SECRET_ACCESS_KEY_EXAMPLE",
+	).Replace(text)
+}
+
+func rot13ASCII(s string) string {
+	out := []byte(s)
+	for i, b := range out {
+		switch {
+		case b >= 'a' && b <= 'z':
+			out[i] = 'a' + (b-'a'+13)%26
+		case b >= 'A' && b <= 'Z':
+			out[i] = 'A' + (b-'A'+13)%26
+		}
+	}
+	return string(out)
+}

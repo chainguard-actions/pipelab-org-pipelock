@@ -1,0 +1,1808 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+package metrics
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+const (
+	testAgent    = "test-agent"
+	testAgentAlt = "claude-code"
+)
+
+func TestRecordAllowed(t *testing.T) {
+	m := New()
+	m.RecordAllowed(100*time.Millisecond, testAgent)
+	m.RecordAllowed(200*time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	if m.allowedCount != 2 {
+		t.Errorf("expected 2 allowed, got %d", m.allowedCount)
+	}
+	m.mu.Unlock()
+}
+
+func TestRecordBlocked(t *testing.T) {
+	m := New()
+	m.RecordBlocked("evil.com", "blocklist", 50*time.Millisecond, testAgent)
+	m.RecordBlocked("evil.com", "blocklist", 50*time.Millisecond, testAgent)
+	m.RecordBlocked("bad.org", "dlp", 30*time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	if m.blockedCount != 3 {
+		t.Errorf("expected 3 blocked, got %d", m.blockedCount)
+	}
+	if m.topBlockedDomains["evil.com"] != 2 {
+		t.Errorf("expected evil.com=2, got %d", m.topBlockedDomains["evil.com"])
+	}
+	if m.topScannerHits["blocklist"] != 2 {
+		t.Errorf("expected blocklist=2, got %d", m.topScannerHits["blocklist"])
+	}
+	m.mu.Unlock()
+}
+
+func TestPrometheusHandler(t *testing.T) {
+	m := New()
+	m.RecordAllowed(100*time.Millisecond, testAgent)
+	m.RecordBlocked("evil.com", "dlp", 50*time.Millisecond, testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	if !strings.Contains(text, "pipelock_requests_total") {
+		t.Error("expected pipelock_requests_total in /metrics output")
+	}
+	if !strings.Contains(text, `agent="test-agent"`) {
+		t.Error("expected agent label in /metrics output")
+	}
+	if !strings.Contains(text, `result="allowed"`) {
+		t.Error("expected allowed label in /metrics output")
+	}
+	if !strings.Contains(text, `result="blocked"`) {
+		t.Error("expected blocked label in /metrics output")
+	}
+	if !strings.Contains(text, "pipelock_request_duration_seconds") {
+		t.Error("expected pipelock_request_duration_seconds in /metrics output")
+	}
+	if !strings.Contains(text, "pipelock_scanner_hits_total") {
+		t.Error("expected pipelock_scanner_hits_total in /metrics output")
+	}
+}
+
+func TestStatsHandler(t *testing.T) {
+	m := New()
+	m.RecordAllowed(100*time.Millisecond, testAgent)
+	m.RecordAllowed(200*time.Millisecond, testAgent)
+	m.RecordBlocked("evil.com", "dlp", 50*time.Millisecond, testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected application/json, got %s", ct)
+	}
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats JSON: %v", err)
+	}
+
+	if stats.Requests.Total != 3 {
+		t.Errorf("expected total=3, got %d", stats.Requests.Total)
+	}
+	if stats.Requests.Allowed != 2 {
+		t.Errorf("expected allowed=2, got %d", stats.Requests.Allowed)
+	}
+	if stats.Requests.Blocked != 1 {
+		t.Errorf("expected blocked=1, got %d", stats.Requests.Blocked)
+	}
+	if stats.UptimeSeconds <= 0 {
+		t.Error("expected positive uptime")
+	}
+	if len(stats.TopBlockedDomains) != 1 {
+		t.Errorf("expected 1 top blocked domain, got %d", len(stats.TopBlockedDomains))
+	}
+	if len(stats.TopScanners) != 1 {
+		t.Errorf("expected 1 top scanner, got %d", len(stats.TopScanners))
+	}
+}
+
+func TestStatsHandler_BlockRate(t *testing.T) {
+	m := New()
+	m.RecordAllowed(10*time.Millisecond, testAgent)
+	m.RecordBlocked("x.com", "dlp", 10*time.Millisecond, testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	if stats.Requests.BlockRate != 0.5 {
+		t.Errorf("expected block_rate=0.5, got %f", stats.Requests.BlockRate)
+	}
+}
+
+func TestStatsHandler_Empty(t *testing.T) {
+	m := New()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	if stats.Requests.Total != 0 {
+		t.Errorf("expected total=0, got %d", stats.Requests.Total)
+	}
+	if stats.Requests.BlockRate != 0 {
+		t.Errorf("expected block_rate=0, got %f", stats.Requests.BlockRate)
+	}
+}
+
+func TestTopDomainsCapped(t *testing.T) {
+	m := New()
+	// Fill to the cap
+	for i := range maxTopEntries {
+		m.RecordBlocked("domain"+string(rune('A'+i%26))+string(rune('0'+i/26))+".com", "dlp", time.Millisecond, testAgent)
+	}
+
+	// This domain should be ignored (cap reached, new key)
+	m.RecordBlocked("overflow.com", "dlp", time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	if len(m.topBlockedDomains) > maxTopEntries {
+		t.Errorf("expected at most %d domains, got %d", maxTopEntries, len(m.topBlockedDomains))
+	}
+	if _, exists := m.topBlockedDomains["overflow.com"]; exists {
+		t.Error("overflow domain should not be tracked after cap")
+	}
+	m.mu.Unlock()
+}
+
+func TestTopDomainsExistingKeyStillIncrements(t *testing.T) {
+	m := New()
+	// Fill to the cap with one domain
+	for range maxTopEntries {
+		m.RecordBlocked("same.com", "dlp", time.Millisecond, testAgent)
+	}
+	// Existing key should still increment even after cap
+	m.RecordBlocked("same.com", "dlp", time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	if m.topBlockedDomains["same.com"] != maxTopEntries+1 {
+		t.Errorf("expected %d, got %d", maxTopEntries+1, m.topBlockedDomains["same.com"])
+	}
+	m.mu.Unlock()
+}
+
+func TestConcurrentAccess(t *testing.T) {
+	m := New()
+	var wg sync.WaitGroup
+	for range 100 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			m.RecordAllowed(time.Millisecond, testAgent)
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordBlocked("x.com", "dlp", time.Millisecond, testAgent)
+		}()
+	}
+	wg.Wait()
+
+	m.mu.Lock()
+	total := m.allowedCount + m.blockedCount
+	m.mu.Unlock()
+
+	if total != 200 {
+		t.Errorf("expected 200 total, got %d", total)
+	}
+}
+
+func TestTopScannersCapped(t *testing.T) {
+	m := New()
+	// Fill scanner hits to the cap with unique scanner names
+	for i := range maxTopEntries {
+		name := "scanner" + string(rune('A'+i%26)) + string(rune('0'+i/26))
+		m.RecordBlocked("test.com", name, time.Millisecond, testAgent)
+	}
+
+	// This scanner should be ignored (cap reached, new key)
+	m.RecordBlocked("test.com", "overflow_scanner", time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	if len(m.topScannerHits) > maxTopEntries {
+		t.Errorf("expected at most %d scanners, got %d", maxTopEntries, len(m.topScannerHits))
+	}
+	if _, exists := m.topScannerHits["overflow_scanner"]; exists {
+		t.Error("overflow scanner should not be tracked after cap")
+	}
+	m.mu.Unlock()
+}
+
+func TestRecordSessionAnomaly(t *testing.T) {
+	m := New()
+	m.RecordSessionAnomaly("domain_burst")
+	m.RecordSessionAnomaly("domain_burst")
+	m.RecordSessionAnomaly("volume_spike")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_session_anomalies_total{type="domain_burst"}`) {
+		t.Error("expected domain_burst anomaly counter in /metrics")
+	}
+	if !strings.Contains(text, `pipelock_session_anomalies_total{type="volume_spike"}`) {
+		t.Error("expected volume_spike anomaly counter in /metrics")
+	}
+
+	// Also verify JSON stats tracking
+	m.mu.Lock()
+	if m.sessionAnomalyCount != 3 {
+		t.Errorf("expected 3 anomalies in stats, got %d", m.sessionAnomalyCount)
+	}
+	if m.topAnomalyTypes["domain_burst"] != 2 {
+		t.Errorf("expected domain_burst=2, got %d", m.topAnomalyTypes["domain_burst"])
+	}
+	if m.topAnomalyTypes["volume_spike"] != 1 {
+		t.Errorf("expected volume_spike=1, got %d", m.topAnomalyTypes["volume_spike"])
+	}
+	m.mu.Unlock()
+}
+
+func TestRecordSessionEscalation(t *testing.T) {
+	m := New()
+	m.RecordSessionEscalation("warn", "block")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_session_escalations_total{from="warn",to="block"}`) {
+		t.Error("expected escalation counter in /metrics")
+	}
+}
+
+func TestSetSessionsActive(t *testing.T) {
+	m := New()
+	m.SetSessionsActive(42)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, "pipelock_sessions_active") {
+		t.Error("expected pipelock_sessions_active gauge in /metrics")
+	}
+}
+
+func TestRecordSessionEvicted(t *testing.T) {
+	m := New()
+	m.RecordSessionEvicted()
+	m.RecordSessionEvicted()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, "pipelock_sessions_evicted_total") {
+		t.Error("expected pipelock_sessions_evicted_total counter in /metrics")
+	}
+}
+
+func TestTopScannersExistingKeyStillIncrements(t *testing.T) {
+	m := New()
+	// Fill scanners to cap with same key
+	for range maxTopEntries {
+		m.RecordBlocked("test.com", "dlp", time.Millisecond, testAgent)
+	}
+	// Existing key should still increment
+	m.RecordBlocked("test.com", "dlp", time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	if m.topScannerHits["dlp"] != int64(maxTopEntries)+1 {
+		t.Errorf("expected %d, got %d", maxTopEntries+1, m.topScannerHits["dlp"])
+	}
+	m.mu.Unlock()
+}
+
+func TestRecordBlocked_MultipleScanners(t *testing.T) {
+	m := New()
+	m.RecordBlocked("evil.com", "dlp", time.Millisecond, testAgent)
+	m.RecordBlocked("evil.com", "ssrf", time.Millisecond, testAgent)
+	m.RecordBlocked("evil.com", "ratelimit", time.Millisecond, testAgent)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.blockedCount != 3 {
+		t.Errorf("expected 3 blocked, got %d", m.blockedCount)
+	}
+	if len(m.topScannerHits) != 3 {
+		t.Errorf("expected 3 scanner types, got %d", len(m.topScannerHits))
+	}
+}
+
+func TestTopN_SortedByCount(t *testing.T) {
+	m := map[string]int64{
+		"low":    1,
+		"high":   100,
+		"medium": 50,
+	}
+	result := topN(m)
+	if len(result) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(result))
+	}
+	if result[0].Name != "high" || result[0].Count != 100 {
+		t.Errorf("expected high=100 first, got %s=%d", result[0].Name, result[0].Count)
+	}
+	if result[1].Name != "medium" || result[1].Count != 50 {
+		t.Errorf("expected medium=50 second, got %s=%d", result[1].Name, result[1].Count)
+	}
+}
+
+func TestRecordTunnel(t *testing.T) {
+	m := New()
+	m.RecordTunnel(5*time.Second, 4096, testAgent)
+	m.RecordTunnel(10*time.Second, 8192, testAgent)
+
+	m.mu.Lock()
+	if m.tunnelCount != 2 {
+		t.Errorf("expected 2 tunnels, got %d", m.tunnelCount)
+	}
+	m.mu.Unlock()
+}
+
+func TestRecordTunnelBlocked(t *testing.T) {
+	m := New()
+	m.RecordTunnelBlocked(testAgent)
+	m.RecordTunnelBlocked(testAgent)
+
+	// Verify the Prometheus counter was incremented (check via /metrics)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_tunnels_total{agent="test-agent",result="blocked"}`) {
+		t.Error("expected pipelock_tunnels_total with blocked and agent labels in /metrics output")
+	}
+}
+
+func TestIncrDecrActiveTunnels(t *testing.T) {
+	m := New()
+	m.IncrActiveTunnels()
+	m.IncrActiveTunnels()
+	m.IncrActiveTunnels()
+	m.DecrActiveTunnels()
+
+	// Check gauge via /metrics
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, "pipelock_active_tunnels") {
+		t.Error("expected pipelock_active_tunnels in /metrics output")
+	}
+}
+
+func TestStatsHandler_IncludesTunnels(t *testing.T) {
+	m := New()
+	m.RecordTunnel(5*time.Second, 4096, testAgent)
+	m.RecordTunnel(10*time.Second, 8192, testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	if stats.Tunnels != 2 {
+		t.Errorf("expected tunnels=2, got %d", stats.Tunnels)
+	}
+}
+
+func TestPrometheusHandler_TunnelMetrics(t *testing.T) {
+	m := New()
+	m.RecordTunnel(5*time.Second, 4096, testAgent)
+	m.IncrActiveTunnels()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	if !strings.Contains(text, "pipelock_tunnels_total") {
+		t.Error("expected pipelock_tunnels_total in /metrics output")
+	}
+	if !strings.Contains(text, "pipelock_tunnel_duration_seconds") {
+		t.Error("expected pipelock_tunnel_duration_seconds in /metrics output")
+	}
+	if !strings.Contains(text, "pipelock_tunnel_bytes_total") {
+		t.Error("expected pipelock_tunnel_bytes_total in /metrics output")
+	}
+	if !strings.Contains(text, "pipelock_active_tunnels") {
+		t.Error("expected pipelock_active_tunnels in /metrics output")
+	}
+}
+
+func TestConcurrentTunnelAccess(t *testing.T) {
+	m := New()
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			m.RecordTunnel(time.Millisecond, 100, testAgent)
+		}()
+		go func() {
+			defer wg.Done()
+			m.IncrActiveTunnels()
+		}()
+		go func() {
+			defer wg.Done()
+			m.DecrActiveTunnels()
+		}()
+	}
+	wg.Wait()
+
+	m.mu.Lock()
+	if m.tunnelCount != 50 {
+		t.Errorf("expected 50 tunnels, got %d", m.tunnelCount)
+	}
+	m.mu.Unlock()
+}
+
+func TestStatsHandler_IncludesSessionData(t *testing.T) {
+	m := New()
+	m.SetSessionsActive(5)
+	m.RecordSessionAnomaly("domain_burst")
+	m.RecordSessionAnomaly("domain_burst")
+	m.RecordSessionAnomaly("ip_domain_burst")
+	m.RecordSessionEscalation("normal", "elevated")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+
+	if stats.Sessions.Active != 5 {
+		t.Errorf("expected sessions.active=5, got %d", stats.Sessions.Active)
+	}
+	if stats.Sessions.Anomalies != 3 {
+		t.Errorf("expected sessions.anomalies=3, got %d", stats.Sessions.Anomalies)
+	}
+	if stats.Sessions.Escalations != 1 {
+		t.Errorf("expected sessions.escalations=1, got %d", stats.Sessions.Escalations)
+	}
+	if len(stats.Sessions.TopAnomalies) != 2 {
+		t.Errorf("expected 2 anomaly types, got %d", len(stats.Sessions.TopAnomalies))
+	}
+	// Verify sorted by count (domain_burst=2 first)
+	if len(stats.Sessions.TopAnomalies) >= 1 && stats.Sessions.TopAnomalies[0].Name != "domain_burst" {
+		t.Errorf("expected domain_burst first (highest count), got %s", stats.Sessions.TopAnomalies[0].Name)
+	}
+}
+
+func TestStatsHandler_EmptySessionData(t *testing.T) {
+	m := New()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+
+	if stats.Sessions.Active != 0 {
+		t.Errorf("expected sessions.active=0, got %d", stats.Sessions.Active)
+	}
+	if stats.Sessions.Anomalies != 0 {
+		t.Errorf("expected sessions.anomalies=0, got %d", stats.Sessions.Anomalies)
+	}
+	if stats.Sessions.Escalations != 0 {
+		t.Errorf("expected sessions.escalations=0, got %d", stats.Sessions.Escalations)
+	}
+}
+
+func TestRecordWSCompleted(t *testing.T) {
+	m := New()
+	m.RecordWSCompleted()
+	m.RecordWSCompleted()
+
+	m.mu.Lock()
+	if m.wsConnectionCount != 2 {
+		t.Errorf("expected 2 WS completions, got %d", m.wsConnectionCount)
+	}
+	m.mu.Unlock()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	if !strings.Contains(string(body), `pipelock_ws_connections_total{result="completed"}`) {
+		t.Error("expected ws_connections_total with completed label")
+	}
+}
+
+func TestRecordWSBlocked(t *testing.T) {
+	m := New()
+	m.RecordWSBlocked()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	if !strings.Contains(string(body), `pipelock_ws_connections_total{result="blocked"}`) {
+		t.Error("expected ws_connections_total with blocked label")
+	}
+}
+
+func TestRecordWSStats(t *testing.T) {
+	m := New()
+	m.RecordWSStats(5*time.Second, 1024, 2048)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, "pipelock_ws_duration_seconds") {
+		t.Error("expected pipelock_ws_duration_seconds in /metrics")
+	}
+	if !strings.Contains(text, `pipelock_ws_bytes_total{direction="client_to_server"}`) {
+		t.Error("expected ws_bytes_total client_to_server")
+	}
+	if !strings.Contains(text, `pipelock_ws_bytes_total{direction="server_to_client"}`) {
+		t.Error("expected ws_bytes_total server_to_client")
+	}
+}
+
+func TestIncrDecrActiveWS(t *testing.T) {
+	m := New()
+	m.IncrActiveWS()
+	m.IncrActiveWS()
+	m.DecrActiveWS()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	if !strings.Contains(string(body), "pipelock_ws_active_connections") {
+		t.Error("expected pipelock_ws_active_connections gauge")
+	}
+}
+
+func TestRecordWSFrame(t *testing.T) {
+	m := New()
+	m.RecordWSFrame("text")
+	m.RecordWSFrame("binary")
+	m.RecordWSFrame("text")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_ws_frames_total{type="text"}`) {
+		t.Error("expected ws_frames_total with text type")
+	}
+	if !strings.Contains(text, `pipelock_ws_frames_total{type="binary"}`) {
+		t.Error("expected ws_frames_total with binary type")
+	}
+}
+
+func TestRecordWSScanHit(t *testing.T) {
+	m := New()
+	m.RecordWSScanHit("dlp")
+	m.RecordWSScanHit("injection")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_ws_scan_hits_total{scanner="dlp"}`) {
+		t.Error("expected ws_scan_hits_total with dlp scanner")
+	}
+	if !strings.Contains(text, `pipelock_ws_scan_hits_total{scanner="injection"}`) {
+		t.Error("expected ws_scan_hits_total with injection scanner")
+	}
+}
+
+func TestRecordWSRedirectHint(t *testing.T) {
+	m := New()
+	m.RecordWSRedirectHint()
+	m.RecordWSRedirectHint()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+	body, _ := io.ReadAll(w.Body)
+	if !strings.Contains(string(body), "pipelock_forward_ws_redirect_hint_total") {
+		t.Error("expected forward_ws_redirect_hint_total counter")
+	}
+}
+
+func TestStatsHandler_IncludesWebSockets(t *testing.T) {
+	m := New()
+	m.RecordWSCompleted()
+	m.RecordWSCompleted()
+	m.RecordWSCompleted()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	if stats.WebSockets != 3 {
+		t.Errorf("expected websockets=3, got %d", stats.WebSockets)
+	}
+}
+
+func TestTopAnomalyTypesCapped(t *testing.T) {
+	m := New()
+	// Fill anomaly types to the cap
+	for i := range maxTopEntries {
+		m.RecordSessionAnomaly("type" + string(rune('A'+i%26)) + string(rune('0'+i/26)))
+	}
+
+	// New type should be ignored after cap
+	m.RecordSessionAnomaly("overflow_type")
+
+	m.mu.Lock()
+	if len(m.topAnomalyTypes) > maxTopEntries {
+		t.Errorf("expected at most %d anomaly types, got %d", maxTopEntries, len(m.topAnomalyTypes))
+	}
+	if _, exists := m.topAnomalyTypes["overflow_type"]; exists {
+		t.Error("overflow anomaly type should not be tracked after cap")
+	}
+	m.mu.Unlock()
+}
+
+func TestConcurrentSessionMetrics(t *testing.T) {
+	m := New()
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			m.RecordSessionAnomaly("domain_burst")
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordSessionEscalation("normal", "elevated")
+		}()
+		go func() {
+			defer wg.Done()
+			m.SetSessionsActive(10)
+		}()
+	}
+	wg.Wait()
+
+	m.mu.Lock()
+	if m.sessionAnomalyCount != 50 {
+		t.Errorf("expected 50 anomalies, got %d", m.sessionAnomalyCount)
+	}
+	if m.sessionEscalationCount != 50 {
+		t.Errorf("expected 50 escalations, got %d", m.sessionEscalationCount)
+	}
+	m.mu.Unlock()
+}
+
+func TestRecordKillSwitchDenial(t *testing.T) {
+	m := New()
+	m.RecordKillSwitchDenial("http", "/fetch")
+	m.RecordKillSwitchDenial("mcp", "tools/call")
+	m.RecordKillSwitchDenial("http", "/fetch")
+
+	// Verify Prometheus metric incremented.
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `pipelock_kill_switch_denials_total{endpoint="/fetch",transport="http"} 2`) {
+		t.Errorf("expected 2 http /fetch denials in metrics output:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_kill_switch_denials_total{endpoint="tools/call",transport="mcp"} 1`) {
+		t.Errorf("expected 1 mcp tools/call denial in metrics output:\n%s", body)
+	}
+}
+
+func TestRecordChainDetection(t *testing.T) {
+	m := New()
+	m.RecordChainDetection("read-then-exec", "high", "warn")
+	m.RecordChainDetection("read-then-exec", "high", "warn")
+	m.RecordChainDetection("env-then-network", "critical", "block")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `pipelock_chain_detections_total{action="warn",pattern="read-then-exec",severity="high"} 2`) {
+		t.Errorf("expected 2 read-then-exec detections:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_chain_detections_total{action="block",pattern="env-then-network",severity="critical"} 1`) {
+		t.Errorf("expected 1 env-then-network detection:\n%s", body)
+	}
+}
+
+func TestRecordSessionAnomaly_ExistingTypeAfterCap(t *testing.T) {
+	m := New()
+	// Fill anomaly types to cap.
+	for i := range maxTopEntries {
+		m.RecordSessionAnomaly("type" + string(rune('A'+i%26)) + string(rune('0'+i/26)))
+	}
+	// Existing type should still increment even after cap.
+	m.RecordSessionAnomaly("typeA0")
+	m.mu.Lock()
+	if m.topAnomalyTypes["typeA0"] != 2 {
+		t.Errorf("expected existing anomaly type count 2, got %d", m.topAnomalyTypes["typeA0"])
+	}
+	m.mu.Unlock()
+}
+
+func TestConcurrentWSMetrics(t *testing.T) {
+	m := New()
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(4)
+		go func() {
+			defer wg.Done()
+			m.RecordWSCompleted()
+		}()
+		go func() {
+			defer wg.Done()
+			m.IncrActiveWS()
+		}()
+		go func() {
+			defer wg.Done()
+			m.DecrActiveWS()
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordWSStats(time.Millisecond, 100, 200)
+		}()
+	}
+	wg.Wait()
+
+	m.mu.Lock()
+	if m.wsConnectionCount != 50 {
+		t.Errorf("expected 50 WS completions, got %d", m.wsConnectionCount)
+	}
+	m.mu.Unlock()
+}
+
+func TestRegisterKillSwitchState(t *testing.T) {
+	m := New()
+	m.RegisterKillSwitchState(func() map[string]bool {
+		return map[string]bool{
+			"config":   false,
+			"api":      true,
+			"signal":   false,
+			"sentinel": false,
+		}
+	})
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_kill_switch_active{source="api"} 1`) {
+		t.Errorf("expected api source active (1):\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_kill_switch_active{source="config"} 0`) {
+		t.Errorf("expected config source inactive (0):\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_kill_switch_active{source="signal"} 0`) {
+		t.Errorf("expected signal source inactive (0):\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_kill_switch_active{source="sentinel"} 0`) {
+		t.Errorf("expected sentinel source inactive (0):\n%s", body)
+	}
+}
+
+func TestRegisterKillSwitchState_AllActive(t *testing.T) {
+	m := New()
+	m.RegisterKillSwitchState(func() map[string]bool {
+		return map[string]bool{
+			"config":   true,
+			"api":      true,
+			"signal":   true,
+			"sentinel": true,
+		}
+	})
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, src := range []string{"config", "api", "signal", "sentinel"} {
+		expected := fmt.Sprintf(`pipelock_kill_switch_active{source="%s"} 1`, src)
+		if !strings.Contains(body, expected) {
+			t.Errorf("expected %s active (1):\n%s", src, body)
+		}
+	}
+}
+
+func TestRecordSNI(t *testing.T) {
+	m := New()
+	m.RecordSNI("match", testAgent)
+	m.RecordSNI("match", testAgent)
+	m.RecordSNI("mismatch", testAgent)
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_sni_total{agent="test-agent",category="match"} 2`) {
+		t.Errorf("expected 2 SNI match hits:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_sni_total{agent="test-agent",category="mismatch"} 1`) {
+		t.Errorf("expected 1 SNI mismatch hit:\n%s", body)
+	}
+}
+
+func TestRecordBodyDLP(t *testing.T) {
+	m := New()
+	m.RecordBodyDLP("block", testAgent)
+	m.RecordBodyDLP("block", testAgent)
+	m.RecordBodyDLP("warn", testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_body_dlp_hits_total{action="block",agent="test-agent"} 2`) {
+		t.Errorf("expected 2 body DLP block hits:\n%s", text)
+	}
+	if !strings.Contains(text, `pipelock_body_dlp_hits_total{action="warn",agent="test-agent"} 1`) {
+		t.Errorf("expected 1 body DLP warn hit:\n%s", text)
+	}
+}
+
+func TestRecordBodyPromptInjection(t *testing.T) {
+	m := New()
+	m.RecordBodyPromptInjection("block", testAgent)
+	m.RecordBodyPromptInjection("warn", testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_body_prompt_injection_hits_total{action="block",agent="test-agent"} 1`) {
+		t.Errorf("expected body prompt injection block hit:\n%s", text)
+	}
+	if !strings.Contains(text, `pipelock_body_prompt_injection_hits_total{action="warn",agent="test-agent"} 1`) {
+		t.Errorf("expected body prompt injection warn hit:\n%s", text)
+	}
+}
+
+func TestRecordBodyRedactions(t *testing.T) {
+	m := New()
+	m.RecordBodyRedactions("connect", testAgent, "openai", "json", "env-secret", 2)
+	m.RecordBodyRedactions("connect", testAgent, "openai", "json", "env-secret", 1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	want := `pipelock_body_redactions_total{agent="test-agent",class="env-secret",parser="json",provider="openai",transport="connect"} 3`
+	if !strings.Contains(text, want) {
+		t.Errorf("expected body redaction counter %q:\n%s", want, text)
+	}
+}
+
+func TestRecordHeaderDLP(t *testing.T) {
+	m := New()
+	m.RecordHeaderDLP("block", testAgent)
+	m.RecordHeaderDLP("warn", testAgent)
+	m.RecordHeaderDLP("warn", testAgent)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_header_dlp_hits_total{action="block",agent="test-agent"} 1`) {
+		t.Errorf("expected 1 header DLP block hit:\n%s", text)
+	}
+	if !strings.Contains(text, `pipelock_header_dlp_hits_total{action="warn",agent="test-agent"} 2`) {
+		t.Errorf("expected 2 header DLP warn hits:\n%s", text)
+	}
+}
+
+func TestRegisterInfo(t *testing.T) {
+	m := New()
+	m.RegisterInfo("0.3.1-test")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_info{version="0.3.1-test"} 1`) {
+		t.Errorf("expected pipelock_info with version label:\n%s", body)
+	}
+}
+
+func TestRegisterKillSwitchState_Nil(t *testing.T) {
+	m := New()
+	// Nil sourceFunc should be a no-op (no panic, no registration).
+	m.RegisterKillSwitchState(nil)
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if strings.Contains(body, "pipelock_kill_switch_active") {
+		t.Error("nil sourceFunc should not register kill switch metric")
+	}
+}
+
+func TestRecordTLSIntercept(t *testing.T) {
+	m := New()
+	m.RecordTLSIntercept("success")
+	m.RecordTLSIntercept("success")
+	m.RecordTLSIntercept("error")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_tls_intercept_total{outcome="success"} 2`) {
+		t.Errorf("expected 2 TLS intercept success hits:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_tls_intercept_total{outcome="error"} 1`) {
+		t.Errorf("expected 1 TLS intercept error hit:\n%s", body)
+	}
+}
+
+func TestSetTLSCertCacheSize(t *testing.T) {
+	m := New()
+	m.SetTLSCertCacheSize(42)
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pipelock_tls_cert_cache_size 42") {
+		t.Errorf("expected tls_cert_cache_size gauge at 42:\n%s", body)
+	}
+}
+
+func TestRecordTLSHandshake(t *testing.T) {
+	m := New()
+	m.RecordTLSHandshake("client", 10*time.Millisecond)
+	m.RecordTLSHandshake("upstream", 25*time.Millisecond)
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_tls_handshake_duration_seconds_count{side="client"} 1`) {
+		t.Errorf("expected 1 client handshake observation:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_tls_handshake_duration_seconds_count{side="upstream"} 1`) {
+		t.Errorf("expected 1 upstream handshake observation:\n%s", body)
+	}
+}
+
+func TestRecordTLSRequestBlocked(t *testing.T) {
+	m := New()
+	m.RecordTLSRequestBlocked("dlp")
+	m.RecordTLSRequestBlocked("dlp")
+	m.RecordTLSRequestBlocked("ssrf")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_tls_request_blocked_total{reason="dlp"} 2`) {
+		t.Errorf("expected 2 TLS request blocked by dlp:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_tls_request_blocked_total{reason="ssrf"} 1`) {
+		t.Errorf("expected 1 TLS request blocked by ssrf:\n%s", body)
+	}
+}
+
+func TestRecordTLSResponseBlocked(t *testing.T) {
+	m := New()
+	m.RecordTLSResponseBlocked("injection")
+	m.RecordTLSResponseBlocked("injection")
+	m.RecordTLSResponseBlocked("size_limit")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_tls_response_blocked_total{reason="injection"} 2`) {
+		t.Errorf("expected 2 TLS response blocked by injection:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_tls_response_blocked_total{reason="size_limit"} 1`) {
+		t.Errorf("expected 1 TLS response blocked by size_limit:\n%s", body)
+	}
+}
+
+func TestConcurrentTLSMetrics(t *testing.T) {
+	m := New()
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(5)
+		go func() {
+			defer wg.Done()
+			m.RecordTLSIntercept("success")
+		}()
+		go func() {
+			defer wg.Done()
+			m.SetTLSCertCacheSize(10)
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordTLSHandshake("client", time.Millisecond)
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordTLSRequestBlocked("dlp")
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordTLSResponseBlocked("injection")
+		}()
+	}
+	wg.Wait()
+
+	// Verify counters via /metrics (no panics, correct registration).
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pipelock_tls_intercept_total") {
+		t.Error("expected pipelock_tls_intercept_total in /metrics after concurrent writes")
+	}
+	if !strings.Contains(body, "pipelock_tls_request_blocked_total") {
+		t.Error("expected pipelock_tls_request_blocked_total in /metrics after concurrent writes")
+	}
+	if !strings.Contains(body, "pipelock_tls_response_blocked_total") {
+		t.Error("expected pipelock_tls_response_blocked_total in /metrics after concurrent writes")
+	}
+}
+
+func TestPrometheusHandler_TLSMetrics(t *testing.T) {
+	m := New()
+	m.RecordTLSIntercept("success")
+	m.SetTLSCertCacheSize(5)
+	m.RecordTLSHandshake("client", 10*time.Millisecond)
+	m.RecordTLSRequestBlocked("dlp")
+	m.RecordTLSResponseBlocked("injection")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, metric := range []string{
+		"pipelock_tls_intercept_total",
+		"pipelock_tls_cert_cache_size",
+		"pipelock_tls_handshake_duration_seconds",
+		"pipelock_tls_request_blocked_total",
+		"pipelock_tls_response_blocked_total",
+	} {
+		if !strings.Contains(body, metric) {
+			t.Errorf("expected %s in /metrics output", metric)
+		}
+	}
+}
+
+func TestRequestsTotalAgentLabel(t *testing.T) {
+	m := New()
+	m.RecordAllowed(time.Millisecond, testAgentAlt)
+	m.RecordBlocked("evil.com", "dlp", time.Millisecond, testAgent)
+
+	gathering, err := m.Registry().Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, mf := range gathering {
+		if mf.GetName() == "pipelock_requests_total" {
+			for _, metric := range mf.GetMetric() {
+				for _, label := range metric.GetLabel() {
+					if label.GetName() == "agent" {
+						found = true
+					}
+				}
+			}
+		}
+	}
+	if !found {
+		t.Error("expected agent label on pipelock_requests_total")
+	}
+}
+
+func TestStatsHandler_PerAgentBreakdown(t *testing.T) {
+	m := New()
+	m.RecordAllowed(10*time.Millisecond, testAgent)
+	m.RecordAllowed(10*time.Millisecond, testAgent)
+	m.RecordBlocked("evil.com", "dlp", 10*time.Millisecond, testAgent)
+	m.RecordAllowed(10*time.Millisecond, testAgentAlt)
+	m.RecordTunnel(5*time.Second, 1024, testAgentAlt)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+
+	if len(stats.Agents) != 2 {
+		t.Fatalf("expected 2 agents, got %d", len(stats.Agents))
+	}
+
+	ta := stats.Agents[testAgent]
+	if ta.Allowed != 2 {
+		t.Errorf("%s allowed = %d, want 2", testAgent, ta.Allowed)
+	}
+	if ta.Blocked != 1 {
+		t.Errorf("%s blocked = %d, want 1", testAgent, ta.Blocked)
+	}
+
+	alt := stats.Agents[testAgentAlt]
+	if alt.Allowed != 1 {
+		t.Errorf("%s allowed = %d, want 1", testAgentAlt, alt.Allowed)
+	}
+	if alt.Tunnels != 1 {
+		t.Errorf("%s tunnels = %d, want 1", testAgentAlt, alt.Tunnels)
+	}
+}
+
+func TestStatsHandler_NoAgentsWhenEmpty(t *testing.T) {
+	m := New()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	// Raw JSON should not contain "agents" key when no traffic has been recorded.
+	body, _ := io.ReadAll(w.Body)
+	if strings.Contains(string(body), `"agents"`) {
+		t.Error("expected no agents key in empty stats response")
+	}
+}
+
+func TestStatsHandler_CEEDefaults(t *testing.T) {
+	m := New()
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	// Without a CEE stats func, all CEE fields should be zero/false.
+	if stats.CEE.EntropyTrackerActive {
+		t.Error("expected entropy_tracker_active=false without callback")
+	}
+	if stats.CEE.FragmentBufferActive {
+		t.Error("expected fragment_buffer_active=false without callback")
+	}
+	if stats.CEE.FragmentBufferBytes != 0 {
+		t.Errorf("expected fragment_buffer_bytes=0, got %d", stats.CEE.FragmentBufferBytes)
+	}
+}
+
+func TestStatsHandler_CEEWithCallback(t *testing.T) {
+	m := New()
+	m.SetCEEStatsFunc(func() CEEStats {
+		return CEEStats{
+			EntropyTrackerActive: true,
+			FragmentBufferActive: true,
+			FragmentBufferBytes:  12345,
+		}
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/stats", nil)
+	w := httptest.NewRecorder()
+	m.StatsHandler().ServeHTTP(w, req)
+
+	var stats statsResponse
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("failed to decode stats: %v", err)
+	}
+	if !stats.CEE.EntropyTrackerActive {
+		t.Error("expected entropy_tracker_active=true")
+	}
+	if !stats.CEE.FragmentBufferActive {
+		t.Error("expected fragment_buffer_active=true")
+	}
+	if stats.CEE.FragmentBufferBytes != 12345 {
+		t.Errorf("expected fragment_buffer_bytes=12345, got %d", stats.CEE.FragmentBufferBytes)
+	}
+}
+
+func TestRecordCrossRequestEntropyExceeded(t *testing.T) {
+	m := New()
+	m.RecordCrossRequestEntropyExceeded()
+	m.RecordCrossRequestEntropyExceeded()
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pipelock_cross_request_entropy_exceeded_total 2") {
+		t.Errorf("expected cross_request_entropy_exceeded_total 2:\n%s", body)
+	}
+}
+
+func TestRecordCrossRequestEntropyExceeded_NilReceiver(t *testing.T) {
+	// Nil receiver should be a no-op (no panic).
+	var m *Metrics
+	m.RecordCrossRequestEntropyExceeded()
+}
+
+func TestRecordCrossRequestDLPMatch(t *testing.T) {
+	m := New()
+	m.RecordCrossRequestDLPMatch()
+	m.RecordCrossRequestDLPMatch()
+	m.RecordCrossRequestDLPMatch()
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pipelock_cross_request_dlp_match_total 3") {
+		t.Errorf("expected cross_request_dlp_match_total 3:\n%s", body)
+	}
+}
+
+func TestRecordCrossRequestDLPMatch_NilReceiver(t *testing.T) {
+	// Nil receiver should be a no-op (no panic).
+	var m *Metrics
+	m.RecordCrossRequestDLPMatch()
+}
+
+func TestSetCrossRequestFragmentBytes(t *testing.T) {
+	m := New()
+	m.SetCrossRequestFragmentBytes(42.0)
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pipelock_cross_request_fragment_buffer_bytes 42") {
+		t.Errorf("expected cross_request_fragment_buffer_bytes 42:\n%s", body)
+	}
+}
+
+func TestSetCrossRequestFragmentBytes_NilReceiver(t *testing.T) {
+	// Nil receiver should be a no-op (no panic).
+	var m *Metrics
+	m.SetCrossRequestFragmentBytes(100.0)
+}
+
+func TestRecordScanAPIRequest(t *testing.T) {
+	m := New()
+	m.RecordScanAPIRequest("dlp", "allow", "200")
+	m.RecordScanAPIRequest("dlp", "deny", "200")
+	m.RecordScanAPIRequest("url", "allow", "200")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_scan_api_requests_total{decision="allow",kind="dlp",status_code="200"} 1`) {
+		t.Errorf("expected dlp/allow/200 = 1:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_scan_api_requests_total{decision="deny",kind="dlp",status_code="200"} 1`) {
+		t.Errorf("expected dlp/deny/200 = 1:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_scan_api_requests_total{decision="allow",kind="url",status_code="200"} 1`) {
+		t.Errorf("expected url/allow/200 = 1:\n%s", body)
+	}
+}
+
+func TestObserveScanAPIDuration(t *testing.T) {
+	m := New()
+	m.ObserveScanAPIDuration("dlp", 100*time.Millisecond)
+	m.ObserveScanAPIDuration("url", 200*time.Millisecond)
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_scan_api_duration_seconds_count{kind="dlp"} 1`) {
+		t.Errorf("expected 1 dlp duration observation:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_scan_api_duration_seconds_count{kind="url"} 1`) {
+		t.Errorf("expected 1 url duration observation:\n%s", body)
+	}
+}
+
+func TestRecordScanAPIFinding(t *testing.T) {
+	m := New()
+	m.RecordScanAPIFinding("dlp", "dlp", "critical")
+	m.RecordScanAPIFinding("dlp", "dlp", "critical")
+	m.RecordScanAPIFinding("url", "ssrf", "high")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_scan_api_findings_total{kind="dlp",scanner="dlp",severity="critical"} 2`) {
+		t.Errorf("expected dlp/dlp/critical = 2:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_scan_api_findings_total{kind="url",scanner="ssrf",severity="high"} 1`) {
+		t.Errorf("expected url/ssrf/high = 1:\n%s", body)
+	}
+}
+
+func TestRecordScanAPIError(t *testing.T) {
+	m := New()
+	m.RecordScanAPIError("dlp", "invalid_json")
+	m.RecordScanAPIError("dlp", "invalid_json")
+	m.RecordScanAPIError("", "unauthorized")
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, `pipelock_scan_api_errors_total{error_code="invalid_json",kind="dlp"} 2`) {
+		t.Errorf("expected dlp/invalid_json = 2:\n%s", body)
+	}
+	if !strings.Contains(body, `pipelock_scan_api_errors_total{error_code="unauthorized",kind=""} 1`) {
+		t.Errorf("expected empty/unauthorized = 1:\n%s", body)
+	}
+}
+
+func TestIncrDecrScanAPIInflight(t *testing.T) {
+	m := New()
+	m.IncrScanAPIInflight()
+	m.IncrScanAPIInflight()
+	m.IncrScanAPIInflight()
+	m.DecrScanAPIInflight()
+
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "pipelock_scan_api_inflight_requests 2") {
+		t.Errorf("expected inflight gauge at 2:\n%s", body)
+	}
+}
+
+func TestConcurrentScanAPIMetrics(t *testing.T) {
+	m := New()
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Add(5)
+		go func() {
+			defer wg.Done()
+			m.RecordScanAPIRequest("dlp", "allow", "200")
+		}()
+		go func() {
+			defer wg.Done()
+			m.ObserveScanAPIDuration("dlp", time.Millisecond)
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordScanAPIFinding("dlp", "dlp", "critical")
+		}()
+		go func() {
+			defer wg.Done()
+			m.RecordScanAPIError("dlp", "timeout")
+		}()
+		go func() {
+			defer wg.Done()
+			m.IncrScanAPIInflight()
+			m.DecrScanAPIInflight()
+		}()
+	}
+	wg.Wait()
+
+	// Verify no panics and metrics registered via /metrics.
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body := rec.Body.String()
+
+	for _, metric := range []string{
+		"pipelock_scan_api_requests_total",
+		"pipelock_scan_api_duration_seconds",
+		"pipelock_scan_api_findings_total",
+		"pipelock_scan_api_errors_total",
+		"pipelock_scan_api_inflight_requests",
+	} {
+		if !strings.Contains(body, metric) {
+			t.Errorf("expected %s in /metrics after concurrent writes", metric)
+		}
+	}
+}
+
+func TestSetCEEStatsFunc_NilReceiver(t *testing.T) {
+	// Nil receiver should be a no-op (no panic).
+	var m *Metrics
+	m.SetCEEStatsFunc(func() CEEStats {
+		return CEEStats{EntropyTrackerActive: true}
+	})
+}
+
+func TestRecordAdaptiveUpgrade(t *testing.T) {
+	tests := []struct {
+		name       string
+		fromAction string
+		toAction   string
+		level      string
+		wantMetric string
+	}{
+		{
+			name:       "warn to block at elevated",
+			fromAction: "warn",
+			toAction:   "block",
+			level:      "elevated",
+			wantMetric: `pipelock_adaptive_upgrades_total{from_action="warn",level="elevated",to_action="block"}`,
+		},
+		{
+			name:       "forward to warn at high",
+			fromAction: "forward",
+			toAction:   "warn",
+			level:      "high",
+			wantMetric: `pipelock_adaptive_upgrades_total{from_action="forward",level="high",to_action="warn"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New()
+			m.RecordAdaptiveUpgrade(tt.fromAction, tt.toAction, tt.level)
+			m.RecordAdaptiveUpgrade(tt.fromAction, tt.toAction, tt.level)
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+			w := httptest.NewRecorder()
+			m.PrometheusHandler().ServeHTTP(w, req)
+
+			body, _ := io.ReadAll(w.Body)
+			text := string(body)
+			if !strings.Contains(text, tt.wantMetric) {
+				t.Errorf("expected %q in /metrics output", tt.wantMetric)
+			}
+			// Verify counter value is 2
+			wantLine := tt.wantMetric + " 2"
+			if !strings.Contains(text, wantLine) {
+				t.Errorf("expected counter value 2, full /metrics:\n%s", text)
+			}
+		})
+	}
+}
+
+func TestRecordAdaptiveUpgrade_NilSafe(t *testing.T) {
+	// Nil receiver must not panic.
+	var m *Metrics
+	m.RecordAdaptiveUpgrade("warn", "block", "elevated")
+}
+
+func TestSetAdaptiveSessionLevel(t *testing.T) {
+	m := New()
+	// Add 3 sessions at "elevated".
+	m.SetAdaptiveSessionLevel("elevated", 1)
+	m.SetAdaptiveSessionLevel("elevated", 1)
+	m.SetAdaptiveSessionLevel("elevated", 1)
+	// Remove one.
+	m.SetAdaptiveSessionLevel("elevated", -1)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	wantGauge := `pipelock_adaptive_sessions_current{level="elevated"} 2`
+	if !strings.Contains(text, wantGauge) {
+		t.Errorf("expected %q in /metrics output\nfull output:\n%s", wantGauge, text)
+	}
+}
+
+func TestSetAdaptiveSessionLevel_NilSafe(t *testing.T) {
+	// Nil receiver must not panic.
+	var m *Metrics
+	m.SetAdaptiveSessionLevel("elevated", 1)
+}
+
+func TestRecordFileSentryFinding(t *testing.T) {
+	m := New()
+	m.RecordFileSentryFinding("Anthropic API Key", "critical", true)
+	m.RecordFileSentryFinding("Anthropic API Key", "critical", true)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	wantMetric := `pipelock_file_sentry_findings_total{agent="true",pattern="Anthropic API Key",severity="critical"} 2`
+	if !strings.Contains(text, wantMetric) {
+		t.Errorf("expected %q in /metrics output", wantMetric)
+	}
+}
+
+func TestRecordFileSentryFinding_AgentFalse(t *testing.T) {
+	m := New()
+	m.RecordFileSentryFinding("GitHub Token", "critical", false)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	wantMetric := `pipelock_file_sentry_findings_total{agent="false",pattern="GitHub Token",severity="critical"} 1`
+	if !strings.Contains(text, wantMetric) {
+		t.Errorf("expected %q in /metrics output", wantMetric)
+	}
+}
+
+func TestRecordFileSentryFinding_NilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordFileSentryFinding("test", "high", false) // must not panic
+}
+
+func TestRecordAddressFinding(t *testing.T) {
+	m := New()
+	m.RecordAddressFinding("eth", "blocked")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+
+	wantMetric := `pipelock_address_findings_total{chain="eth",verdict="blocked"} 1`
+	if !strings.Contains(text, wantMetric) {
+		t.Errorf("expected %q in /metrics output", wantMetric)
+	}
+}
+
+func TestRecordReverseProxyRequest(t *testing.T) {
+	m := New()
+	m.RecordReverseProxyRequest("GET", "200")
+	m.RecordReverseProxyRequest("POST", "403")
+	m.RecordReverseProxyRequest("GET", "200")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_reverse_proxy_requests_total{method="GET",status="200"} 2`) {
+		t.Errorf("expected 2 GET/200 reverse proxy requests:\n%s", text)
+	}
+	if !strings.Contains(text, `pipelock_reverse_proxy_requests_total{method="POST",status="403"} 1`) {
+		t.Errorf("expected 1 POST/403 reverse proxy request:\n%s", text)
+	}
+}
+
+func TestRecordReverseProxyScanBlocked(t *testing.T) {
+	m := New()
+	m.RecordReverseProxyScanBlocked("request", "dlp")
+	m.RecordReverseProxyScanBlocked("response", "injection")
+	m.RecordReverseProxyScanBlocked("response", "injection")
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+	w := httptest.NewRecorder()
+	m.PrometheusHandler().ServeHTTP(w, req)
+
+	body, _ := io.ReadAll(w.Body)
+	text := string(body)
+	if !strings.Contains(text, `pipelock_reverse_proxy_scan_blocked_total{direction="request",reason="dlp"} 1`) {
+		t.Errorf("expected 1 request/dlp block:\n%s", text)
+	}
+	if !strings.Contains(text, `pipelock_reverse_proxy_scan_blocked_total{direction="response",reason="injection"} 2`) {
+		t.Errorf("expected 2 response/injection blocks:\n%s", text)
+	}
+}
+
+func TestRecordReverseProxyRequest_NilReceiver(t *testing.T) {
+	var m *Metrics
+	m.RecordReverseProxyRequest("GET", "200")     // must not panic
+	m.RecordReverseProxyScanBlocked("req", "dlp") // must not panic
+}
+
+func TestRecordSessionAutoDeescalation(t *testing.T) {
+	tests := []struct {
+		name       string
+		from       string
+		to         string
+		calls      int
+		wantMetric string
+	}{
+		{
+			name:       "critical_to_high",
+			from:       "critical",
+			to:         "high",
+			calls:      2,
+			wantMetric: `pipelock_session_auto_deescalation_total{from="critical",to="high"}`,
+		},
+		{
+			name:       "high_to_elevated",
+			from:       "high",
+			to:         "elevated",
+			calls:      1,
+			wantMetric: `pipelock_session_auto_deescalation_total{from="high",to="elevated"}`,
+		},
+		{
+			name:       "elevated_to_normal",
+			from:       "elevated",
+			to:         "normal",
+			calls:      3,
+			wantMetric: `pipelock_session_auto_deescalation_total{from="elevated",to="normal"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := New()
+			for range tt.calls {
+				m.RecordSessionAutoDeescalation(tt.from, tt.to)
+			}
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil)
+			w := httptest.NewRecorder()
+			m.PrometheusHandler().ServeHTTP(w, req)
+
+			body, _ := io.ReadAll(w.Body)
+			text := string(body)
+			if !strings.Contains(text, tt.wantMetric) {
+				t.Errorf("expected %q in /metrics output", tt.wantMetric)
+			}
+			wantLine := fmt.Sprintf("%s %d", tt.wantMetric, tt.calls)
+			if !strings.Contains(text, wantLine) {
+				t.Errorf("expected counter line %q, full /metrics:\n%s", wantLine, text)
+			}
+		})
+	}
+}
+
+func TestRecordSessionAutoDeescalation_NilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordSessionAutoDeescalation("critical", "high") // must not panic
+}
+
+func TestRecordResponseScanExempt(t *testing.T) {
+	m := New()
+	m.RecordResponseScanExempt("exempt_domain", "fetch")
+	m.RecordResponseScanExempt("exempt_domain", "forward")
+	m.RecordResponseScanExempt("suppress", "connect")
+
+	body := scrapeMetrics(t, m)
+	if !strings.Contains(body, `pipelock_response_scan_exempt_total{reason="exempt_domain",transport="fetch"} 1`) {
+		t.Error("expected exempt_domain/fetch counter = 1")
+	}
+	if !strings.Contains(body, `pipelock_response_scan_exempt_total{reason="exempt_domain",transport="forward"} 1`) {
+		t.Error("expected exempt_domain/forward counter = 1")
+	}
+	if !strings.Contains(body, `pipelock_response_scan_exempt_total{reason="suppress",transport="connect"} 1`) {
+		t.Error("expected suppress/connect counter = 1")
+	}
+}
+
+func TestRecordResponseScanExempt_NilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordResponseScanExempt("exempt_domain", "fetch") // must not panic
+}
+
+func TestRecordDLPWarnMatch(t *testing.T) {
+	m := New()
+	m.RecordDLPWarnMatch("warn-url", "fetch")
+	m.RecordDLPWarnMatch("warn-url", "fetch")
+	m.RecordDLPWarnMatch("warn-body", "mcp_http")
+
+	body := scrapeMetrics(t, m)
+	if !strings.Contains(body, `pipelock_dlp_warn_matches_total{pattern="warn-url",transport="fetch"} 2`) {
+		t.Error("expected warn-url/fetch counter = 2")
+	}
+	if !strings.Contains(body, `pipelock_dlp_warn_matches_total{pattern="warn-body",transport="mcp_http"} 1`) {
+		t.Error("expected warn-body/mcp_http counter = 1")
+	}
+}
+
+func TestRecordDLPWarnMatch_NilSafe(t *testing.T) {
+	var m *Metrics
+	m.RecordDLPWarnMatch("warn-url", "fetch") // must not panic
+}
+
+func scrapeMetrics(t *testing.T, m *Metrics) string {
+	t.Helper()
+	handler := m.PrometheusHandler()
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	body, err := io.ReadAll(rec.Body)
+	if err != nil {
+		t.Fatalf("reading metrics: %v", err)
+	}
+	return string(body)
+}

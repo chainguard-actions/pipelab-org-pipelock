@@ -1,0 +1,57 @@
+name: Test built-in test vectors
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          mkdir -p pipelock-clean-fixture
+          printf '# Clean project\n\nNothing sensitive here.\n' > pipelock-clean-fixture/README.md
+          printf 'def add(a, b):\n    return a + b\n' > pipelock-clean-fixture/main.py
+      # The test-vectors step runs `pipelock test --fail-on-gap` against the
+      # auto-generated config. Whether that passes depends on pipelock's own
+      # vectors (v2.8.0 reports an entropy gap), so the step may legitimately
+      # fail. We verify the action's outcome matches an independent run.
+      - id: action
+        uses: .
+        continue-on-error: true
+        env:
+          RUNNER_TEMP: /tmp/pipelock-alt
+        with:
+          version: '2.8.0'
+          directory: pipelock-clean-fixture
+          fail-on-findings: 'false'
+          test-vectors: 'true'
+      - name: Assert audit ran and config was generated
+        env:
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "config=$CONFIG_PATH audit_failed=$AUDIT_FAILED"
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ] || [ ! -f "$CONFIG_PATH" ]; then echo "FAIL: config missing"; exit 1; fi
+          echo "PASS"
+      - name: Assert test-vectors outcome matches independent pipelock test run
+        env:
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+          OUTCOME: ${{ steps.action.outcome }}
+        run: |
+          PL=/tmp/pipelock-alt/pipelock-bin/pipelock
+          if [ ! -x "$PL" ]; then echo "FAIL: pipelock binary not installed at $PL"; exit 1; fi
+          set +e
+          "$PL" test --config "$CONFIG_PATH" --fail-on-gap > /tmp/pl-test.log 2>&1
+          RC=$?
+          set -e
+          tail -n 20 /tmp/pl-test.log
+          if ! grep -q "Results:" /tmp/pl-test.log; then
+            echo "FAIL: pipelock test did not run test vectors"; exit 1
+          fi
+          if [ "$RC" -eq 0 ]; then EXPECTED=success; else EXPECTED=failure; fi
+          echo "action outcome=$OUTCOME expected=$EXPECTED (rc=$RC)"
+          if [ "$OUTCOME" != "$EXPECTED" ]; then
+            echo "FAIL: action outcome does not match test-vector result"; exit 1
+          fi
+          echo "PASS"

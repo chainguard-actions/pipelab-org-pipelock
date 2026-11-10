@@ -1,0 +1,73 @@
+Pipelock {{ .Chart.AppVersion }} deployed as release {{ .Release.Name }}.
+
+{{- if eq (include "pipelock.mode" .) "conductor" }}
+Conductor follower mTLS endpoint:
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }}-conductor {{ .Values.conductor.service.port }}:{{ .Values.conductor.service.port }}
+
+Conductor probe endpoint:
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }}-conductor-probes {{ .Values.conductor.service.probePort }}:{{ .Values.conductor.service.probePort }}
+  curl http://127.0.0.1:{{ .Values.conductor.service.probePort }}/readyz
+
+This chart makes complete mediation deployable by wiring fleet control-plane
+storage, mTLS, and network boundaries. Mediation completeness is still
+deployment-enforced: agents must be prevented from bypassing their local
+Pipelock follower.
+{{- else if eq (include "pipelock.mode" .) "fleetSink" }}
+Fleet audit sink endpoint:
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }}-fleet-sink {{ .Values.fleetSink.service.port }}:{{ .Values.fleetSink.service.port }}
+
+Fleet sink probe endpoint:
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }}-fleet-sink-probes {{ .Values.fleetSink.service.probePort }}:{{ .Values.fleetSink.service.probePort }}
+  curl http://127.0.0.1:{{ .Values.fleetSink.service.probePort }}/health
+
+This mode runs the standalone `pipelock fleet-sink` server for signed audit
+batch ingest and query storage. It is not an inline enforcement dependency.
+{{- else }}
+Proxy endpoint:
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+
+Test the scanner:
+  export HTTPS_PROXY=http://127.0.0.1:{{ .Values.service.port }}
+  pipelock simulate --config /etc/pipelock/pipelock.yaml
+
+Health watchdog (used by liveness + readiness):
+  curl http://127.0.0.1:{{ .Values.service.port }}/health
+  # 200 = all subsystems healthy
+  # 503 = at least one subsystem wedged (Kubernetes will restart the pod)
+
+Logs:
+  kubectl logs -l app.kubernetes.io/name={{ include "pipelock.name" . }},app.kubernetes.io/instance={{ .Release.Name }} --tail=50
+
+{{- if and .Values.mcp.enabled .Values.mcp.upstream }}
+
+MCP proxy (upstream {{ .Values.mcp.upstream }}):
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }} {{ .Values.service.mcpPort }}:{{ .Values.service.mcpPort }}
+{{- end }}
+
+Prometheus metrics:
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }} {{ .Values.service.metricsPort }}:{{ .Values.service.metricsPort }}
+  curl http://127.0.0.1:{{ .Values.service.metricsPort }}/metrics
+{{- if .Values.podMonitor.enabled }}
+  # PodMonitor is enabled. Prometheus Operator scrapes this endpoint every {{ .Values.podMonitor.interval }} automatically.
+{{- end }}
+
+{{- if .Values.adminApi.enabled }}
+
+Admin API (port {{ .Values.service.adminPort }}):
+  kubectl port-forward svc/{{ include "pipelock.fullname" . }} {{ .Values.service.adminPort }}:{{ .Values.service.adminPort }}
+  # The pod sources the bearer token from Secret {{ required "adminApi.tokenSecretRef.name is required when adminApi.enabled=true" .Values.adminApi.tokenSecretRef.name }} (key: {{ required "adminApi.tokenSecretRef.key is required when adminApi.enabled=true" .Values.adminApi.tokenSecretRef.key }}).
+  # Read it locally and pass with --api-token, or export it as your env (see pipelock adaptive --help).
+  pipelock adaptive status --api-url http://127.0.0.1:{{ .Values.service.adminPort }}
+  pipelock session list   --api-url http://127.0.0.1:{{ .Values.service.adminPort }}
+{{- end }}
+{{- end }}
+
+{{- if and .Values.license.enabled (not .Values.license.existingSecret) }}
+
+WARNING: license.enabled is true but license.existingSecret is not set. Pro features will not activate.
+{{- end }}
+
+{{- if and (gt (int .Values.replicaCount) 1) (not .Values.podDisruptionBudget.enabled) }}
+
+NOTE: {{ .Values.replicaCount }} replicas running without a PodDisruptionBudget. A node drain or rollout can take all pods down at once. Set podDisruptionBudget.enabled=true to keep at least one replica available during voluntary disruptions.
+{{- end }}

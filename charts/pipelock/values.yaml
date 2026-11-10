@@ -1,0 +1,376 @@
+mode: proxy # proxy | conductor | fleetSink
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/luckypipewrench/pipelock
+  # Tag falls through to .Chart.AppVersion when empty. To pin by digest instead,
+  # set image.digest to a sha256 string and the chart renders repository@digest.
+  # A digest and a tag are never combined; a digest must not go in tag.
+  tag: ""  # defaults to .Chart.AppVersion
+  digest: ""  # optional sha256 multi-arch manifest digest, e.g. sha256:abc123...
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  # Annotations on the ServiceAccount. Useful for IRSA (AWS), Workload Identity
+  # (GCP/Azure), or Vault Agent injection patterns where the chart needs to
+  # bind a cloud identity for license fetch or Sentry DSN retrieval.
+  annotations: {}
+  # name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+  fsGroup: 65534
+  fsGroupChangePolicy: OnRootMismatch
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 65534
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8888
+  mcpPort: 8889
+  metricsPort: 9091
+  # Admin API port. Only exposed on the Service when adminApi.enabled is true.
+  adminPort: 9090
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 32Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Spread replicas across topology domains. Most useful when replicaCount >= 2.
+topologySpreadConstraints: []
+priorityClassName: ""
+
+# PodDisruptionBudget. Strongly recommended when running multiple replicas
+# behind a single Service, because pipelock is on the agent's critical
+# traffic path and a single eviction takes the proxy down for that pod.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1  # set only one of minAvailable / maxUnavailable
+
+# Additional environment variables passed to the pipelock container.
+# Used for license tokens (PIPELOCK_LICENSE_KEY), Sentry DSN, and admin API token.
+extraEnv: []
+# - name: PIPELOCK_LICENSE_KEY
+#   valueFrom:
+#     secretKeyRef:
+#       name: pipelock-license
+#       key: license.token
+
+extraEnvFrom: []
+# - secretRef:
+#     name: pipelock-secrets
+
+# Additional volumes and mounts. Useful for mounting a license token at a
+# specific path or providing extra CA bundles for TLS interception.
+extraVolumes: []
+# - name: pipelock-license
+#   secret:
+#     secretName: pipelock-license
+extraVolumeMounts: []
+# - name: pipelock-license
+#   mountPath: /etc/pipelock/license
+#   readOnly: true
+
+# Pipelock Pro / Enterprise license. Pro features (per-agent profiles,
+# CIDR matching, budgets) require a valid signed license token.
+license:
+  # Set to true to source the license token from a Secret. Community/free
+  # installs do not need this — all detection and enforcement layers ship
+  # in the open-source binary.
+  enabled: false
+  # Name of an existing Kubernetes Secret holding the license token. The
+  # Secret must contain the key named below (default: license.token).
+  existingSecret: ""
+  secretKey: "license.token"
+  # Path inside the container where the Secret is mounted. Proxy mode renders
+  # license_file to this path. Enterprise server modes still set
+  # PIPELOCK_LICENSE_KEY from the Secret because those commands do not accept
+  # a license-file flag.
+  mountPath: "/etc/pipelock/license"
+  # Optional signed license CRL mounted as a file and referenced by config or
+  # Enterprise server flags. The chart never templates CRL contents.
+  crlSecretRef:
+    name: ""
+    key: "license.crl"
+    mountPath: "/etc/pipelock/license-crl"
+  # Optional verifier public key for self-hosted/unofficial builds.
+  publicKeySecretRef:
+    name: ""
+    key: "public-key-hex"
+
+# Follower wiring keeps Pipelock in proxy mode while enabling the Enterprise
+# conductor client runtime. Followers enforce locally; Conductor only
+# coordinates signed policy bundles, remote kill, and audit transport.
+conductorFollower:
+  enabled: false
+  conductorURL: ""
+  orgID: ""
+  fleetID: ""
+  instanceID: ""
+  trustRosterRootFingerprint: ""
+  auditSigningKeyID: ""
+  recorderKeyID: ""
+  pollInterval: 30s
+  emergencyStream: true
+  honorRemoteKillSwitch: true
+  serverCASecretRef:
+    name: ""
+    key: "ca.crt"
+    mountPath: "/etc/pipelock/conductor/server-ca"
+  clientSecretRef:
+    name: ""
+    mountPath: "/etc/pipelock/conductor/client"
+  trustRosterSecretRef:
+    name: ""
+    key: "trust-roster.json"
+    mountPath: "/etc/pipelock/conductor/trust"
+  persistence:
+    bundleCache:
+      enabled: false
+      mountPath: "/var/lib/pipelock/conductor/bundles"
+      size: 1Gi
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: ""
+    auditQueue:
+      enabled: false
+      mountPath: "/var/lib/pipelock/conductor/audit-queue"
+      size: 5Gi
+      accessModes:
+        - ReadWriteOnce
+      storageClassName: ""
+
+# Enterprise Conductor control-plane mode. Requires an enterprise build image
+# and an Enterprise license with the fleet feature.
+conductor:
+  replicaCount: 1
+  conductorID: "conductor"
+  followerTrustDomain: "pipelock.local"
+  service:
+    type: ClusterIP
+    port: 8895
+    probePort: 9092
+  tls:
+    serverSecretRef:
+      name: ""
+      mountPath: "/etc/pipelock/conductor/tls/server"
+    clientCASecretRef:
+      name: ""
+      key: "ca.crt"
+      mountPath: "/etc/pipelock/conductor/tls/client-ca"
+  tokens:
+    publisher:
+      secretRef:
+        name: ""
+        key: "publisher.token"
+      mountPath: "/etc/pipelock/conductor/tokens/publisher"
+    auditor:
+      secretRef:
+        name: ""
+        key: "auditor.token"
+      mountPath: "/etc/pipelock/conductor/tokens/auditor"
+    admin:
+      secretRef:
+        name: ""
+        key: "admin.token"
+      mountPath: "/etc/pipelock/conductor/tokens/admin"
+  trustedAuditKeys: []
+  # - id: audit-signer-prod
+  #   orgID: org-prod
+  #   fleetID: fleet-prod
+  #   instanceID: ""
+  #   secretRef:
+  #     name: conductor-audit-keys
+  #     key: audit-signer-prod.pub
+  trustedControlKeys: []
+  # - id: remote-kill-1
+  #   purpose: remote-kill-signing
+  #   secretRef:
+  #     name: conductor-control-keys
+  #     key: remote-kill-1.pub
+  persistence:
+    enabled: true
+    mountPath: "/var/lib/pipelock/conductor"
+    size: 20Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# Standalone fleet audit sink mode. It remains a separate chart mode because
+# the binary exposes a dedicated `pipelock fleet-sink` server with independent
+# listener, storage, auth, mTLS, and retention characteristics.
+fleetSink:
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 8894
+    probePort: 9093
+  tls:
+    serverSecretRef:
+      name: ""
+      mountPath: "/etc/pipelock/fleet-sink/tls/server"
+    clientCASecretRef:
+      name: ""
+      key: "ca.crt"
+      mountPath: "/etc/pipelock/fleet-sink/tls/client-ca"
+  readerToken:
+    secretRef:
+      name: ""
+      key: "reader.token"
+    mountPath: "/etc/pipelock/fleet-sink/tokens/reader"
+  trustedAuditKeys: []
+  # - id: audit-signer-prod
+  #   orgID: org-prod
+  #   fleetID: fleet-prod
+  #   instanceID: ""
+  #   secretRef:
+  #     name: fleet-sink-audit-keys
+  #     key: audit-signer-prod.pub
+  persistence:
+    enabled: true
+    mountPath: "/var/lib/pipelock/fleet-sink"
+    size: 20Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# Sentry error reporting. When enabled, sets SENTRY_DSN from a Secret.
+sentry:
+  enabled: false
+  dsnSecretRef:
+    name: ""
+    key: "dsn"
+
+# Authenticated admin API for `pipelock adaptive` and `pipelock session`
+# commands. When enabled, the chart renders kill_switch.api_listen into the
+# config and exposes the admin port on the Service. This is an operational
+# control, not a paid entitlement.
+adminApi:
+  enabled: false
+  # Token Secret. Required when adminApi.enabled is true. The Secret must
+  # contain the key named below (default: token). The chart exposes the token
+  # via PIPELOCK_KILLSWITCH_API_TOKEN so it does not land in the ConfigMap.
+  tokenSecretRef:
+    name: ""
+    key: "token"
+
+# Pipelock configuration (rendered into ConfigMap as pipelock.yaml).
+# NOTE: fetch_proxy.listen and metrics_listen are templated from service.port
+# and service.metricsPort. Do not set them here; change the service values instead.
+# When adminApi.enabled is true, kill_switch.api_listen is also templated from
+# service.adminPort and should not be set here.
+#
+# Common sections you may want to add under pipelock: below:
+#   mediation_envelope:     SPIFFE actor format, inbound verification trust list
+#   health_watchdog:        wedge-detection liveness probe surface
+#   browser_shield:         oversize action, exempt domains, max bytes
+#   redaction:              Anthropic / OpenAI / Gemini parser profile
+#   learn:                  observe / compile / shadow / promote contract pipeline
+#   agents:                 per-agent profiles (Pro license required)
+#   adaptive_enforcement:   signal weights, airlock thresholds
+#   kill_switch:            sources, api_listen (auto-set when adminApi.enabled)
+#   request_body_scanning:  body-side DLP toggles
+#   file_sentry:            workspace file integrity monitoring
+#   sentry:                 DSN is set via the sentry block above
+#   license_file:           auto-set when license.enabled and existingSecret are set
+pipelock:
+  version: 1
+  mode: balanced
+  enforce: true
+  fetch_proxy:
+    timeout_seconds: 30
+    max_response_mb: 10
+  dlp:
+    include_defaults: true
+  response_scanning:
+    enabled: true
+    action: warn
+  mcp_input_scanning:
+    enabled: true
+    action: warn
+  mcp_tool_scanning:
+    enabled: true
+    detect_drift: true
+  forward_proxy:
+    enabled: true
+
+# MCP proxy sidecar mode
+mcp:
+  enabled: false
+  upstream: ""
+  listen: "0.0.0.0:8889"
+
+# Monitoring (requires Prometheus Operator CRDs)
+podMonitor:
+  enabled: false
+  interval: 30s
+  labels: {}
+
+# Network policy
+networkPolicy:
+  enabled: false
+  preset: dev # dev | restricted | airgapped
+  # Override rendered ingress/egress rules with explicit Kubernetes
+  # NetworkPolicyPeer rules. Enterprise examples set these instead of relying
+  # on broad defaults.
+  ingress: []
+  egress: []
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 30
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 2
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 2

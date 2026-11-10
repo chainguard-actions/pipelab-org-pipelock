@@ -1,0 +1,38 @@
+name: Test exclude-paths
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          mkdir -p pipelock-clean-fixture
+          printf '# Clean project\n\nNothing sensitive here.\n' > pipelock-clean-fixture/README.md
+          printf 'def add(a, b):\n    return a + b\n' > pipelock-clean-fixture/main.py
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-alt
+        with:
+          version: '2.8.0'
+          directory: pipelock-clean-fixture
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+          exclude-paths: |
+            vendor/
+              *.generated.go
+
+            node_modules/
+      - name: Assert audit ran with excludes
+        env:
+          FINDINGS: ${{ steps.action.outputs.findings-count }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+          CONFIG_PATH: ${{ steps.action.outputs.config-path }}
+        run: |
+          echo "findings=$FINDINGS audit_failed=$AUDIT_FAILED config=$CONFIG_PATH"
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]]; then echo "FAIL: findings-count not integer"; exit 1; fi
+          if [ -z "$CONFIG_PATH" ]; then echo "FAIL: config-path empty"; exit 1; fi
+          echo "PASS"

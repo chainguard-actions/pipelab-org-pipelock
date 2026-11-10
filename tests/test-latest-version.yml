@@ -1,0 +1,31 @@
+name: Test latest version resolution
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create clean project fixture
+        run: |
+          mkdir -p pipelock-clean-fixture
+          printf '# Clean project\n\nNothing sensitive here.\n' > pipelock-clean-fixture/README.md
+          printf 'def add(a, b):\n    return a + b\n' > pipelock-clean-fixture/main.py
+      - id: action
+        uses: .
+        env:
+          RUNNER_TEMP: /tmp/pipelock-alt
+        with:
+          directory: pipelock-clean-fixture
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert binary installed and audit ran
+        env:
+          SCORE: ${{ steps.action.outputs.score }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "score=$SCORE audit_failed=$AUDIT_FAILED"
+          /tmp/pipelock-alt/pipelock-bin/pipelock version || { echo "FAIL: pipelock not runnable"; exit 1; }
+          if [ "$AUDIT_FAILED" != "false" ]; then echo "FAIL: audit-failed should be false"; exit 1; fi
+          if ! [[ "$SCORE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "FAIL: score not numeric"; exit 1; fi
+          echo "PASS"

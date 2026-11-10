@@ -1,0 +1,597 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
+// Package reqpolicy implements Pipelock's request_policy layer: explicit,
+// allow-by-default deny/warn safety rails on outbound HTTP API operations.
+//
+// It is independent of request_body_scanning and complementary to the
+// learn-lock contract gate - it is neither a DLP scanner nor a behavioral
+// allowlist. It matches on route (host / effective method / normalized path /
+// content type) and optional extracted operations such as GraphQL root fields.
+// The Matcher precompiles rule regexes once at config (re)load; Evaluate is
+// allocation-light and safe on the hot request path.
+package reqpolicy
+
+import (
+	"fmt"
+	"net"
+	"net/http"
+	"net/url"
+	"path"
+	"regexp"
+	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+// methodOverrideHeaders are the headers some frameworks honor to tunnel a
+// different effective HTTP method through a POST. They must be resolved before
+// route matching, or "POST + X-HTTP-Method-Override: DELETE" trivially bypasses
+// a method-scoped rule.
+var methodOverrideHeaders = []string{"X-HTTP-Method-Override", "X-Method-Override", "X-HTTP-Method"}
+
+// maxUnescapeRounds bounds repeated percent-decoding during path normalization.
+// Bounded so a crafted deeply-encoded path cannot spin the normalizer, while
+// still collapsing multi-layer encodings (e.g. %252e%252e) that a downstream
+// server would decode more than once and act on as a dot segment.
+const maxUnescapeRounds = 5
+
+// RequestMeta is the transport-neutral view of an outbound request that
+// Evaluate needs. Transports build it once - after computing the effective
+// method and normalizing the path - and pass it in.
+type RequestMeta struct {
+	Host        string // lowercased hostname, no port
+	Method      string // effective HTTP method, uppercased
+	Path        string // normalized request path
+	ContentType string // media type only, lowercased, parameters stripped
+	// Operations are the request's extracted API operations (e.g. via
+	// ExtractGraphQL). A GraphQL rule predicate evaluates against these; an
+	// empty slice means no inspectable operations, so a GraphQL predicate does
+	// not match (fail-closed handling of parse errors / opaque requests is the
+	// caller's responsibility, driven by on_parse_error / on_opaque_operation).
+	Operations []RequestOperation
+	// JSONBody is the request body parsed as a generic JSON value, for
+	// discriminator-field predicates. JSONBodyParsed reports whether a body was
+	// read and parsed as valid JSON; a discriminator predicate is evaluated only
+	// when it is true (the caller drives the not-read / parse-error fail-closed
+	// cases via on_opaque_operation / on_parse_error, exactly as for GraphQL).
+	JSONBody       any
+	JSONBodyParsed bool
+	// JSONDupKeys is the set of top-level object keys that appeared more than
+	// once in the raw body. Go's JSON decoder keeps only the last value, but
+	// parsers disagree (first-wins vs last-wins), so a discriminator whose field
+	// is duplicated is unclassifiable and fails closed as opaque.
+	JSONDupKeys map[string]struct{}
+}
+
+// Decision is the outcome of evaluating request policy against a request.
+// A zero Decision (empty Action) means allow.
+type Decision struct {
+	Action   string // "" (allow), config.ActionWarn, or config.ActionBlock
+	RuleName string // matched rule name; safe as a bounded metric/audit label
+	Reason   string // operator-facing reason from the matched rule
+	Shadow   bool   // matched rule is shadow: log the would-be action, do not enforce
+}
+
+// Matched reports whether the decision selected a rule (enforced or shadow).
+func (d Decision) Matched() bool { return d.Action != "" }
+
+// Enforced reports whether the decision should block/warn the live request.
+// Shadow matches return false: they are logged but never enforced.
+func (d Decision) Enforced() bool { return d.Action != "" && !d.Shadow }
+
+// compiledRoute is the precompiled route-matching portion shared by a rule and
+// a batch endpoint: host / effective method / normalized path / content type.
+type compiledRoute struct {
+	hosts        []string
+	methods      map[string]struct{}
+	pathPrefixes []string
+	pathPatterns []*regexp.Regexp
+	contentTypes map[string]struct{}
+}
+
+type compiledRule struct {
+	name   string
+	action string
+	reason string
+	shadow bool
+	compiledRoute
+	graphql *gqlPredicate
+	disc    *discPredicate
+}
+
+// Matcher holds the precompiled request_policy ruleset. Build one with
+// NewMatcher at config (re)load and swap it atomically alongside the rest of
+// the runtime config.
+type Matcher struct {
+	enabled           bool
+	onParseError      string
+	onOpaqueOperation string
+	rules             []compiledRule
+	batches           []compiledBatch
+}
+
+// NewMatcher compiles cfg into a Matcher. It returns an error if any
+// path_pattern fails to compile; callers run config validation first (which
+// compiles the same patterns), so this is defense in depth. A nil cfg or a
+// disabled section yields a Matcher that allows everything.
+func NewMatcher(cfg *config.RequestPolicy) (*Matcher, error) {
+	m := &Matcher{}
+	if cfg == nil || !cfg.Enabled {
+		return m, nil
+	}
+	m.enabled = true
+	m.onParseError = cfg.OnParseError
+	if m.onParseError == "" {
+		m.onParseError = config.ActionBlock
+	}
+	m.onOpaqueOperation = cfg.OnOpaqueOperation
+	if m.onOpaqueOperation == "" {
+		m.onOpaqueOperation = config.ActionBlock
+	}
+	for i := range cfg.Rules {
+		r := &cfg.Rules[i]
+		route, err := compileRoute(r.Route)
+		if err != nil {
+			return nil, fmt.Errorf("request_policy rule %q: %w", r.Name, err)
+		}
+		pred, err := compileGraphQLPredicate(r.GraphQL)
+		if err != nil {
+			return nil, fmt.Errorf("request_policy rule %q: invalid graphql predicate: %w", r.Name, err)
+		}
+		disc, err := compileDiscriminatorPredicate(r.Discriminator)
+		if err != nil {
+			return nil, fmt.Errorf("request_policy rule %q: invalid discriminator predicate: %w", r.Name, err)
+		}
+		m.rules = append(m.rules, compiledRule{
+			name:          r.Name,
+			action:        r.Action,
+			reason:        r.Reason,
+			shadow:        r.Shadow,
+			compiledRoute: route,
+			graphql:       pred,
+			disc:          disc,
+		})
+	}
+	for i := range cfg.Batch {
+		b := &cfg.Batch[i]
+		route, err := compileRoute(b.Route)
+		if err != nil {
+			return nil, fmt.Errorf("request_policy batch %d: %w", i, err)
+		}
+		m.batches = append(m.batches, compiledBatch{
+			compiledRoute:  route,
+			requestsField:  b.RequestsField,
+			methodField:    b.MethodField,
+			urlField:       b.URLField,
+			bodyField:      b.BodyField,
+			maxSubRequests: b.MaxSubRequests,
+		})
+	}
+	return m, nil
+}
+
+// compileRoute precompiles a config route's host/method/path/content-type
+// constraints. Hosts are normalized, methods uppercased into a set, path
+// patterns compiled, prefixes normalized, content types normalized. Returns an
+// error only when a path_pattern fails to compile (config validation already
+// catches this; this is defense in depth).
+func compileRoute(route config.RequestPolicyRoute) (compiledRoute, error) {
+	var cr compiledRoute
+	if len(route.Hosts) > 0 {
+		cr.hosts = make([]string, len(route.Hosts))
+		for j, h := range route.Hosts {
+			cr.hosts[j] = NormalizeHost(h)
+		}
+	}
+	if len(route.Methods) > 0 {
+		cr.methods = make(map[string]struct{}, len(route.Methods))
+		for _, mth := range route.Methods {
+			cr.methods[strings.ToUpper(strings.TrimSpace(mth))] = struct{}{}
+		}
+	}
+	for _, p := range route.PathPatterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return compiledRoute{}, fmt.Errorf("invalid path_pattern %q: %w", p, err)
+		}
+		cr.pathPatterns = append(cr.pathPatterns, re)
+	}
+	if len(route.PathPrefixes) > 0 {
+		cr.pathPrefixes = make([]string, len(route.PathPrefixes))
+		for j, p := range route.PathPrefixes {
+			cr.pathPrefixes[j] = NormalizePath(strings.TrimSpace(p))
+		}
+	}
+	if len(route.ContentTypes) > 0 {
+		cr.contentTypes = make(map[string]struct{}, len(route.ContentTypes))
+		for _, ct := range route.ContentTypes {
+			cr.contentTypes[NormalizeContentType(ct)] = struct{}{}
+		}
+	}
+	return cr, nil
+}
+
+// OnParseError returns the configured action when an operation predicate's
+// route matches but the request body cannot be parsed.
+func (m *Matcher) OnParseError() string {
+	if m == nil || m.onParseError == "" {
+		return config.ActionBlock
+	}
+	return m.onParseError
+}
+
+// OnOpaqueOperation returns the configured action when an operation predicate's
+// route matches but the operation is opaque (for example APQ hash-only).
+func (m *Matcher) OnOpaqueOperation() string {
+	if m == nil || m.onOpaqueOperation == "" {
+		return config.ActionBlock
+	}
+	return m.onOpaqueOperation
+}
+
+// Evaluate runs meta against the ruleset and returns the strictest matching
+// Decision. Block beats warn; among equal-strictness matches an enforced rule
+// is preferred over a shadow rule so a real block is never masked by a shadow
+// entry. Returns a zero Decision (allow) when nothing matches.
+func (m *Matcher) Evaluate(meta RequestMeta) Decision {
+	if m == nil || !m.enabled {
+		return Decision{}
+	}
+	var best Decision
+	for i := range m.rules {
+		cr := &m.rules[i]
+		action, matched := m.ruleDecision(cr, meta)
+		if !matched {
+			continue
+		}
+		cand := Decision{Action: action, RuleName: cr.name, Reason: cr.reason, Shadow: cr.shadow}
+		if betterDecision(cand, best) {
+			best = cand
+		}
+	}
+	return best
+}
+
+// ruleDecision evaluates one rule against meta and returns the action to apply
+// and whether the rule fired. Route, GraphQL, and discriminator predicates
+// compose with AND: a rule with several predicates fires only when all match.
+// A discriminator that is present-but-unclassifiable (opaque) fires the
+// matcher's on_opaque_operation action instead of the rule's own action so an
+// ambiguous value type cannot slip past a deny rail; opaque=allow yields no
+// match. GraphQL parse-error / opaque handling stays the caller's job (it is
+// body-global, not per-rule), so this only matches inspectable GraphQL here.
+func (m *Matcher) ruleDecision(cr *compiledRule, meta RequestMeta) (string, bool) {
+	if !cr.routeMatches(meta) {
+		return "", false
+	}
+	if cr.graphql != nil && !cr.graphql.matches(meta.Operations) {
+		return "", false
+	}
+	if cr.disc != nil {
+		switch cr.disc.eval(meta) {
+		case discNoMatch:
+			return "", false
+		case discOpaque:
+			if m.onOpaqueOperation == "" || m.onOpaqueOperation == config.ActionAllow {
+				return "", false
+			}
+			return m.onOpaqueOperation, true
+		case discMatch:
+			// fall through to the rule's own action
+		}
+	}
+	return cr.action, true
+}
+
+// BodyPredicateKind selects which body predicates an uninspectable evaluation
+// applies to. A request body that cannot be read at all blocks every body
+// predicate (PredAnyBody); a surface-specific parse failure or opaque request
+// blocks only that surface's predicates so a GraphQL parse error does not also
+// fail-close a discriminator rule on the same (validly JSON) body, and vice
+// versa.
+type BodyPredicateKind uint8
+
+const (
+	PredAnyBody BodyPredicateKind = iota
+	PredGraphQL
+	PredDiscriminator
+)
+
+func (cr *compiledRule) hasBodyPredicate(kind BodyPredicateKind) bool {
+	switch kind {
+	case PredGraphQL:
+		return cr.graphql != nil
+	case PredDiscriminator:
+		return cr.disc != nil
+	default:
+		return cr.graphql != nil || cr.disc != nil
+	}
+}
+
+// NeedsBodyPredicate reports whether any body-predicate rule (GraphQL or
+// discriminator) route-matches this request. Transports use this to decide
+// whether they must read/parse a body independently of request_body_scanning.
+func (m *Matcher) NeedsBodyPredicate(meta RequestMeta) bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	for i := range m.rules {
+		cr := &m.rules[i]
+		if cr.hasBodyPredicate(PredAnyBody) && cr.routeMatches(meta) {
+			return true
+		}
+	}
+	return false
+}
+
+// EvaluateUninspectable returns the strictest route-matching body-predicate
+// decision using action for parse-error / opaque / unreadable fail-closed
+// cases, restricted to rules carrying a predicate of kind. A configured
+// action=allow yields no decision.
+func (m *Matcher) EvaluateUninspectable(meta RequestMeta, action string, kind BodyPredicateKind) Decision {
+	if m == nil || !m.enabled || action == "" || action == config.ActionAllow {
+		return Decision{}
+	}
+	var best Decision
+	for i := range m.rules {
+		cr := &m.rules[i]
+		if !cr.hasBodyPredicate(kind) || !cr.routeMatches(meta) {
+			continue
+		}
+		cand := Decision{Action: action, RuleName: cr.name, Reason: cr.reason, Shadow: cr.shadow}
+		if betterDecision(cand, best) {
+			best = cand
+		}
+	}
+	return best
+}
+
+// Stricter returns the stricter of two decisions using the same ordering
+// Evaluate applies internally: block > warn > allow, and at equal action an
+// enforced decision beats a shadow one. A transport that evaluates the same
+// request under more than one effective method - to stop a method-override
+// header from downgrading a method-scoped rule, per EffectiveMethod's caveat -
+// combines the per-method results with this.
+func Stricter(a, b Decision) Decision {
+	if betterDecision(a, b) {
+		return a
+	}
+	return b
+}
+
+// betterDecision reports whether cand should replace cur as the selected
+// decision. Ordering: block > warn > none; within the same action, enforced
+// (non-shadow) beats shadow.
+func betterDecision(cand, cur Decision) bool {
+	if delta := actionRank(cand.Action) - actionRank(cur.Action); delta != 0 {
+		return delta > 0
+	}
+	if cand.Action == "" {
+		return false
+	}
+	return !cand.Shadow && cur.Shadow
+}
+
+func actionRank(a string) int {
+	switch a {
+	case config.ActionBlock:
+		return 2
+	case config.ActionWarn:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func (cr *compiledRoute) routeMatches(meta RequestMeta) bool {
+	if len(cr.hosts) > 0 && !hostMatches(NormalizeHost(meta.Host), cr.hosts) {
+		return false
+	}
+	if cr.methods != nil {
+		if _, ok := cr.methods[strings.ToUpper(strings.TrimSpace(meta.Method))]; !ok {
+			return false
+		}
+	}
+	if !cr.pathMatches(NormalizePath(meta.Path)) {
+		return false
+	}
+	if cr.contentTypes != nil {
+		if _, ok := cr.contentTypes[NormalizeContentType(meta.ContentType)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (cr *compiledRoute) pathMatches(p string) bool {
+	if len(cr.pathPrefixes) == 0 && len(cr.pathPatterns) == 0 {
+		return true
+	}
+	for _, pre := range cr.pathPrefixes {
+		if strings.HasPrefix(p, pre) {
+			return true
+		}
+	}
+	for _, re := range cr.pathPatterns {
+		if re.MatchString(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// PathEntropyExempt reports whether host+path is governed by an enabled
+// request_policy route that names BOTH an explicit host and explicit path
+// constraints (path_prefixes or path_patterns). When the operator has already
+// written path rules for a host, the scanner's blunt path-entropy heuristic is
+// redundant on those exact paths and false-positives on legitimate
+// high-entropy REST resource ids (e.g. an opaque id segment in
+// /v1/messages/<id>). The scanner consults this to suppress path-entropy ONLY
+// on the governed paths; every other path on the same host, plus DLP, query
+// entropy, subdomain entropy, and SSRF, stay fully active.
+//
+// Routes without an explicit host, without path constraints, or in shadow mode
+// never exempt: each would relax path-entropy beyond what the operator actually
+// enforces. The check is deliberately narrower than the rule's own match
+// surface - it ignores method and content-type, because the only question here
+// is "does the operator already inspect this host's paths".
+func (m *Matcher) PathEntropyExempt(host, path string) bool {
+	if m == nil || !m.enabled {
+		return false
+	}
+	for i := range m.rules {
+		if m.rules[i].shadow {
+			continue
+		}
+		if m.rules[i].exemptsPathEntropy(host, path) {
+			return true
+		}
+	}
+	for i := range m.batches {
+		if m.batches[i].exemptsPathEntropy(host, path) {
+			return true
+		}
+	}
+	return false
+}
+
+// exemptsPathEntropy reports whether this route names both an explicit host and
+// explicit path constraints, and the given host+path satisfy them. A route with
+// no host, or with no path constraints (which pathMatches would otherwise treat
+// as match-all), never exempts.
+func (cr *compiledRoute) exemptsPathEntropy(host, path string) bool {
+	if len(cr.hosts) == 0 {
+		return false
+	}
+	if len(cr.pathPrefixes) == 0 && len(cr.pathPatterns) == 0 {
+		return false
+	}
+	if !hostMatches(NormalizeHost(host), cr.hosts) {
+		return false
+	}
+	return cr.pathMatches(NormalizePath(path))
+}
+
+// hostMatches reports whether host matches any pattern. Patterns are exact
+// hosts or *.suffix wildcards (already lowercased/trim-dotted at compile time).
+func hostMatches(host string, patterns []string) bool {
+	host = NormalizeHost(host)
+	for _, p := range patterns {
+		if p == host {
+			return true
+		}
+		if strings.HasPrefix(p, "*.") {
+			// "*.example.com" matches the apex "example.com" and any subdomain.
+			if host == p[2:] || strings.HasSuffix(host, p[1:]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// EffectiveMethod returns the method a downstream server would act on,
+// accounting for method-override headers. Only header-based overrides are
+// resolved here; form-field (_method) overrides require a parsed body and are
+// handled at the body hook. The result is uppercased.
+//
+// Caveat for the transport that builds RequestMeta: a valid override (e.g. GET)
+// can "downgrade" a real POST when the upstream ignores the override header. To
+// avoid evading a method-scoped deny rule that way, evaluate the ruleset
+// against both the base method and the override and block if either matches,
+// rather than trusting a single resolved method.
+func EffectiveMethod(method string, headers http.Header) string {
+	base := normalizeMethod(method)
+	for _, h := range methodOverrideHeaders {
+		if v := normalizeMethod(headers.Get(h)); isStandardMethod(v) {
+			return v
+		}
+	}
+	return base
+}
+
+func normalizeMethod(method string) string {
+	return strings.ToUpper(strings.TrimSpace(method))
+}
+
+func isStandardMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut,
+		http.MethodPatch, http.MethodDelete, http.MethodConnect,
+		http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
+}
+
+// NormalizeHost lowercases a host and strips a DNS trailing dot, optional URL
+// scheme, and optional port. It is deliberately permissive because callers may
+// hand over r.Host, URL.Host, or URL.String-derived values at different hook
+// points.
+func NormalizeHost(raw string) string {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return ""
+	}
+	if u, err := url.Parse(raw); err == nil && u.Host != "" {
+		raw = u.Host
+	}
+	if h, _, err := net.SplitHostPort(raw); err == nil {
+		raw = h
+	}
+	raw = strings.Trim(raw, "[]")
+	return strings.TrimSuffix(raw, ".")
+}
+
+// NormalizePath canonicalizes a request path for stable route matching:
+// repeated percent-decoding (bounded), per-segment removal of ;parameters, and
+// dot-segment / double-slash collapsing. Case is preserved because path IDs are
+// case-sensitive; rules needing case-insensitivity use a path_pattern.
+func NormalizePath(raw string) string {
+	if raw == "" {
+		return "/"
+	}
+	// Drop any query/fragment that slipped in.
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		raw = raw[:i]
+	}
+	// Repeatedly percent-decode until stable or the round cap is hit, so a
+	// multi-encoded ..%252e segment cannot hide from dot-segment removal.
+	for r := 0; r < maxUnescapeRounds; r++ {
+		dec, err := url.PathUnescape(raw)
+		if err != nil || dec == raw {
+			break
+		}
+		raw = dec
+	}
+	// Strip ;parameters from each segment.
+	segs := strings.Split(raw, "/")
+	for i, s := range segs {
+		if j := strings.IndexByte(s, ';'); j >= 0 {
+			segs[i] = s[:j]
+		}
+	}
+	raw = strings.Join(segs, "/")
+	// path.Clean collapses dot segments and double slashes but drops a trailing
+	// slash, so restore it when the input had one.
+	hadTrailingSlash := raw != "/" && strings.HasSuffix(raw, "/")
+	cleaned := path.Clean(raw)
+	if !strings.HasPrefix(cleaned, "/") {
+		cleaned = "/" + cleaned
+	}
+	if hadTrailingSlash && cleaned != "/" {
+		cleaned += "/"
+	}
+	return cleaned
+}
+
+// NormalizeContentType returns the lowercased media type with parameters
+// (charset, boundary, etc.) stripped, matching how rules declare content_types.
+func NormalizeContentType(ct string) string {
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(ct))
+}
