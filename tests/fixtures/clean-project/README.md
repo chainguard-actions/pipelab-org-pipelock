@@ -1,3 +1,3 @@
-# Clean project
+# Clean fixture project
 
-A tiny fixture project with no secrets, used by pipelock action tests.
+This directory is a minimal, clean project used by the pipelock action tests.

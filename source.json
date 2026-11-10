@@ -1,12 +1,11 @@
 {
-  "owner": "luckyPipewrench",
+  "owner": "pipelab-org",
   "repo": "pipelock",
   "version": "v3.8.0",
   "commit_sha": "556048c1c18d84f7d61d28f686220178a4ff2c4d",
-  "url": "https://github.com/luckyPipewrench/pipelock",
+  "url": "https://github.com/pipelab-org/pipelock",
   "policy_sha": "d636be7e43ef829af6e853da6b3c7566db9f72fe",
   "test_policy_sha": "843adf9e4b8f85d0c08b27b9d0b09dd094b54702",
   "test_agent_version": "2",
-  "harden_agent_version": "2",
-  "dependency_fingerprint": "sha256:2a03c737e64b88a8d7d6a1b1388978a70f42fd3ca5023f1239a56e0e8e31761d"
+  "harden_agent_version": "2"
 }

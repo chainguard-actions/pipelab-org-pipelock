@@ -1,6 +1,6 @@
 <!-- markdownlint-disable -->
 
-# Hardening Report: luckyPipewrench--pipelock/v3.8.0
+# Hardening Report: pipelab-org--pipelock/v3.8.0
 
 > This file was generated automatically by the hardening agent.
 
@@ -10,26 +10,27 @@
 
 **Harden Agent Version:** `2`
 
-Action **luckyPipewrench--pipelock/v3.8.0** was hardened automatically. 2 finding(s) were identified and resolved across 2 iteration(s).
+Action **pipelab-org--pipelock/v3.8.0** was hardened automatically. 2 finding(s) were identified and resolved across 1 iteration(s).
 
 ## Findings Fixed
 
 ### github-env-injection (severity: high)
 
-The 'Download Pipelock' step writes input-derived data to special environment files without sanitizing it. VERSION comes from inputs.version through PIPELOCK_VERSION, and `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"` writes it with no `printf '%s' ... | tr -d '\n\r'` step. The same step also runs `echo "$INSTALL_DIR" >> "$GITHUB_PATH"`. INSTALL_DIR is built from the inherited RUNNER_TEMP env var and is also not sanitized.
+Step 'Download Pipelock' writes values derived from untrusted input to special environment files without the `printf '%s' ... | tr -d '\n\r'` sanitization step. `echo "version=${VERSION}" >> "$GITHUB_OUTPUT"` writes VERSION, which comes from inputs.version through PIPELOCK_VERSION (or from the GitHub API response). `echo "$INSTALL_DIR" >> "$GITHUB_PATH"` writes a path built from the inherited RUNNER_TEMP env var. A value containing a newline could inject extra output keys or PATH entries. Fix: run each value through `safe=$(printf '%s' "$VERSION" | tr -d '\n\r')` before the write.
 
 Locations:
 
-- `action.yml:183`
-- `action.yml:182`
+- `action.yml:176`
+- `action.yml:177`
 
 ### github-env-injection (severity: high)
 
-The 'Run audit' step writes the CONFIG variable to GITHUB_OUTPUT without stripping newlines: `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. CONFIG comes from inputs.config through PIPELOCK_CONFIG. A newline in the input could inject extra step outputs, such as audit_failed or critical_count. Sanitize it first, e.g. `safe=$(printf '%s' "$CONFIG" | tr -d '\n\r')`.
+Step 'Run audit' writes `echo "config_path=${CONFIG}" >> "$GITHUB_OUTPUT"`. CONFIG comes straight from inputs.config through the PIPELOCK_CONFIG env var and is not sanitized. A config input containing a newline could inject arbitrary step outputs such as audit_failed or critical_count, which the later 'Check results' gate relies on. The later `config_path=${REPORT_DIR}/suggested.yaml` write also uses a path built from the inherited RUNNER_TEMP. Fix: set `safe=$(printf '%s' "$CONFIG" | tr -d '\n\r')` and write that value instead.
 
 Locations:
 
-- `action.yml:285`
+- `action.yml:283`
+- `action.yml:291`
 
 ## Iteration Notes
 
@@ -39,13 +40,5 @@ Locations:
 
 **Notes:**
 
-In action.yml, the 'Download Pipelock' step now runs INSTALL_DIR and VERSION through `printf '%s' ... | tr -d '\n\r'` before writing them to GITHUB_PATH and GITHUB_OUTPUT. The 'Run audit' step does the same to CONFIG before it writes config_path to GITHUB_OUTPUT.
-
-### Iteration 2
-
-**Fixes applied:** github-env-injection
-
-**Notes:**
-
-In action.yml's 'Run audit' step, REPORT_DIR now has \n and \r removed into SAFE_REPORT_DIR before it is written to config_path in $GITHUB_OUTPUT. This is the same fix the download step uses for INSTALL_DIR.
+action.yml: In 'Download Pipelock', INSTALL_DIR (written to GITHUB_PATH) and VERSION (written to GITHUB_OUTPUT) now have newlines stripped before the write. In 'Run audit', config_path is sanitized in both places it is written: the user's CONFIG value and the REPORT_DIR-based suggested.yaml path.
 

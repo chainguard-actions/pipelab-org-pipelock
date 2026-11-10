@@ -196,10 +196,10 @@ runs:
 
         tar -xzf "${INSTALL_DIR}/pipelock.tar.gz" -C "$INSTALL_DIR" pipelock
         chmod +x "${INSTALL_DIR}/pipelock"
-        SAFE_INSTALL_DIR=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
-        SAFE_VERSION=$(printf '%s' "$VERSION" | tr -d '\n\r')
-        echo "$SAFE_INSTALL_DIR" >> "$GITHUB_PATH"
-        echo "version=${SAFE_VERSION}" >> "$GITHUB_OUTPUT"
+        safe_install_dir=$(printf '%s' "$INSTALL_DIR" | tr -d '\n\r')
+        safe_version=$(printf '%s' "$VERSION" | tr -d '\n\r')
+        echo "$safe_install_dir" >> "$GITHUB_PATH"
+        echo "version=${safe_version}" >> "$GITHUB_OUTPUT"
 
     - name: Verify binary
       shell: bash
@@ -301,8 +301,8 @@ runs:
 
         # Determine config path: user-provided or auto-generate
         if [ -n "$CONFIG" ]; then
-          SAFE_CONFIG=$(printf '%s' "$CONFIG" | tr -d '\n\r')
-          echo "config_path=${SAFE_CONFIG}" >> "$GITHUB_OUTPUT"
+          safe_config=$(printf '%s' "$CONFIG" | tr -d '\n\r')
+          echo "config_path=${safe_config}" >> "$GITHUB_OUTPUT"
         else
           # The human-readable report this call prints echoes repository file
           # names verbatim, and the runner treats any stdout line starting with
@@ -310,8 +310,8 @@ runs:
           # file, so nothing on stdout is needed.
           pipelock audit "$DIR" -o "$REPORT_DIR/suggested.yaml" "${EXCLUDE_ARGS[@]}" >/dev/null 2>&1 || true
           if [ -f "$REPORT_DIR/suggested.yaml" ]; then
-            SAFE_REPORT_DIR=$(printf '%s' "$REPORT_DIR" | tr -d '\n\r')
-            echo "config_path=${SAFE_REPORT_DIR}/suggested.yaml" >> "$GITHUB_OUTPUT"
+            safe_report_dir=$(printf '%s' "$REPORT_DIR" | tr -d '\n\r')
+            echo "config_path=${safe_report_dir}/suggested.yaml" >> "$GITHUB_OUTPUT"
           else
             echo "config_path=" >> "$GITHUB_OUTPUT"
           fi
@@ -412,7 +412,7 @@ runs:
 
     - name: Upload audit report
       if: always()
-      uses: chainguard-actions/actions-upload-artifact@c91615377dcc230c6b156542d25044f9b8d80dd8  # v7.0.2
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
         name: pipelock-audit-report
         path: ${{ runner.temp }}/pipelock-reports/

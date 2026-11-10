@@ -1,0 +1,60 @@
+name: Test user-provided config
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # Keep reports out of ${{ runner.temp }}/pipelock-reports so the built-in
+      # upload-artifact step has nothing to upload under act.
+      RUNNER_TEMP: /tmp/pl-alt
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Create a clean project to scan
+        run: |
+          mkdir -p /tmp/pl-alt "$GITHUB_WORKSPACE/pl-clean-project"
+          printf '# Clean project\n' > "$GITHUB_WORKSPACE/pl-clean-project/README.md"
+          printf 'print("hello")\n' > "$GITHUB_WORKSPACE/pl-clean-project/main.py"
+      - id: generate
+        uses: .
+        continue-on-error: true
+        with:
+          version: '3.8.0'
+          directory: pl-clean-project
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Copy generated config to a stable location
+        env:
+          GEN: ${{ steps.generate.outputs.config-path }}
+        run: |
+          echo "generated: $GEN"
+          if [ -z "$GEN" ] || [ ! -f "$GEN" ]; then
+            echo "FAIL: no generated config"; exit 1
+          fi
+          cp "$GEN" /tmp/my-pipelock.yaml
+      - id: action
+        uses: .
+        continue-on-error: true
+        with:
+          version: '3.8.0'
+          directory: pl-clean-project
+          config: /tmp/my-pipelock.yaml
+          fail-on-findings: 'false'
+          test-vectors: 'false'
+      - name: Assert config-path echoes user config
+        env:
+          OUTCOME: ${{ steps.action.outcome }}
+          ACTUAL: ${{ steps.action.outputs.config-path }}
+          AUDIT_FAILED: ${{ steps.action.outputs.audit-failed }}
+        run: |
+          echo "outcome: $OUTCOME actual: $ACTUAL audit_failed: $AUDIT_FAILED"
+          if [ "$OUTCOME" != "success" ] && [ "$OUTCOME" != "failure" ]; then
+            echo "FAIL: unexpected outcome '$OUTCOME'"; exit 1
+          fi
+          if [ "$ACTUAL" != "/tmp/my-pipelock.yaml" ]; then
+            echo "FAIL: expected '/tmp/my-pipelock.yaml'"; exit 1
+          fi
+          if [ "$AUDIT_FAILED" != "false" ]; then
+            echo "FAIL: audit-failed expected false, got '$AUDIT_FAILED'"; exit 1
+          fi
+          echo "PASS"
